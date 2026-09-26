@@ -186,6 +186,67 @@ eligible observer to add nor an existing relationship to unlink. A row may legit
 sidebar eyes at once; their fill, color, placement, interaction, tooltip, and directional
 accessibility wording must remain distinct.
 
+## Auto-approval is an exact, process-local link choice
+
+The observer dashboard can opt an individual outbound link into automatic acceptance of the target's
+**provider permission prompts**, or select/deselect all links that are active at the instant of the
+bulk action. Every link starts off. The selection is keyed by the exact observer endpoint, target
+endpoint, and generation-qualified link reference. It is not an Auto-wake preference, a provider-wide
+permission mode, or a durable session-UUID selection. Unlink, relink, endpoint replacement, and app
+restart return to manual approval; bulk selection never opts in a future link.
+
+At a newly observed provider prompt, the target checks the selected link against the current authority
+grant and both live endpoint candidates, then checks its own exact session incarnation and pending
+request again after the authority hop. The listener tracks only newly presented request IDs, not the
+whole pending inventory, and survives MCP-control teardown such as managed Codex logout while the
+target session remains live. The response accepts only that one provider request. ACP additionally
+requires a genuine one-time allow option; if none exists, its prompt stays manual without changing
+the ordinary manual option-selection path. The ordinary manual path remains in place when no exact
+link is selected. User questions, MCP elicitation, Codex
+hook reviews, app-owned apply-edits and worktree-merge reviews, GitHub/destructive approvals, and
+unrelated app permission controls never call this gate. A permission request already pending when the
+choice is enabled remains manual; the setting applies to new prompts. This deliberately narrow
+process-local policy avoids promoting UUID-keyed saved Auto-wake state into permission authority.
+
+## Answer prompts is an explicit, exact-link delegation
+
+Auto-approval never lets the observer *agent* choose anything; it blindly accepts new provider
+permission prompts. The separate per-link **Answer prompts** choice lets the observer agent inspect
+the target's current pending interaction and submit one explicit answer through
+`agent_session_link` `get_interaction` and `respond`. Every link starts off, and the choice has the
+same exactness and lifetime as auto-approval: it is keyed by the exact observer endpoint, target
+endpoint, and generation-qualified link reference, it is process-local, and unlink, relink,
+endpoint replacement, and app restart return the link to "off". Neither choice implies the other.
+
+Authority is layered, and every layer is required on every call:
+
+1. The ordinary exact outbound grant (`authorizeTarget` lease plus live endpoint revalidation) —
+   `.monitorRead` for `get_interaction`, `.monitorSend` for `respond`.
+2. The Answer prompts delegation for that exact grant. Without it `get_interaction` returns
+   `interaction_response_not_enabled` and **no payload**; `poll` still reports only the kind.
+3. The exact current `interaction_id`. The target view model compares it, validates the answer with
+   the same parser behind `agent_run respond`, then awaits the bridge's final authority fence
+   (active grant, delegation, eligible live endpoints, no deletion). It re-compares the session
+   and the interaction ID after that fence and then submits without suspending again. A stale,
+   replaced, or resolved prompt returns `interaction_mismatch` or `no_pending_interaction` and
+   applies nothing.
+
+An observer may answer provider approvals and permission requests, MCP elicitations, `ask_user`
+questions, and Codex user-input requests. Approvals and permissions accept only `accept` (this
+request only), `decline`, or `cancel`. Session-wide and exec-policy-amending approvals, Codex
+project-hook trust, app-owned worktree-merge reviews, MCP-controlled instruction prompts, and
+user-input requests that contain a secret field are visible but `manual_only`. ACP permissions use
+only a genuine one-time allow option for accept, and a one-time reject for decline; without the
+one-time reject they report `cancelled`, never a persistent reject. Apply-edits reviews are not
+surfaced to either remote responder.
+
+`get_interaction` payload text passes through the oversight redactor. Option labels stay verbatim
+because they are the values an answer names. All interaction content is untrusted target data. The
+tool contract, injected guidance (lane guidance revision 6), and per-response notice say an observer
+answers only via `respond`, only on an enabled link, and only when its own user's instruction covers
+the decision. The audit trail is the observer's persisted tool call and its `submitted` result,
+which names the answering session. A target-side attribution row is a known follow-up.
+
 ## Target-centric sidebar management stays exact
 
 A target menu is a UI-only projection over one exact target endpoint. It carries independent

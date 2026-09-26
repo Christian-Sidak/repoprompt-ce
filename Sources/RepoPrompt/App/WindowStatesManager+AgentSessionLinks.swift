@@ -332,6 +332,36 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         )
     }
 
+    // MARK: - Answer prompts delegation
+
+    /// Routes a read-only interaction inspection to the exact owning window. Never focuses it.
+    func agentSessionLinkPendingInteraction(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkPendingInteractionInspection {
+        guard !isTerminating,
+              let window = window(withID: candidate.windowID),
+              !window.isClosing
+        else { return .none }
+        return window.agentModeViewModel.agentSessionLinkPendingInteraction(for: candidate)
+    }
+
+    /// Routes one observer answer to the exact owning window, refusing during teardown.
+    func agentSessionLinkRespondToPendingInteraction(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkInteractionResponseRequest,
+        authorize: @escaping @MainActor @Sendable () async -> Bool
+    ) async -> AgentSessionLinkInteractionResponseOutcome {
+        guard !isTerminating,
+              let window = window(withID: candidate.windowID),
+              !window.isClosing
+        else { return .unavailable }
+        return await window.agentModeViewModel.agentSessionLinkRespondToPendingInteraction(
+            for: candidate,
+            request: request,
+            authorize: authorize
+        )
+    }
+
     // MARK: - Launch restoration inputs
 
     /// Identity-only descriptors for every compose-tab binding in every window's active workspace.

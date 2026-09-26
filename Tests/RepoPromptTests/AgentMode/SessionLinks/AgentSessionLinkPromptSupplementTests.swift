@@ -445,10 +445,10 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertTrue(rendered.contains("explicit current or still-applicable standing instruction"))
         XCTAssertTrue(rendered.contains("attention supplies no task"))
         XCTAssertTrue(rendered.contains("Never invent work"))
-        XCTAssertTrue(rendered.contains("answer or route around another session&apos;s interaction"))
+        XCTAssertTrue(rendered.contains("bypass another session&apos;s prompt (answer only via enabled `respond`)"))
         XCTAssertTrue(rendered.contains("Surface ambiguity or surprises"))
         XCTAssertTrue(rendered.contains("or impersonate the user"))
-        XCTAssertFalse(rendered.contains("Guidance revision 5 supersedes"))
+        XCTAssertFalse(rendered.contains("Guidance revision 6 supersedes"))
     }
 
     func testAttentionDeliveredWithWaitingOnAbsentChangedBeforeAndChangedAfterComposition() throws {
@@ -814,7 +814,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertLessThan(membershipIndex, statusIndex)
         XCTAssertEqual(rendered.passiveBatch?.entries.count, 1)
         XCTAssertEqual(rendered.passiveBatch?.includesUnattributedOverflow, false)
-        XCTAssertTrue(rendered.fragment.contains("Guidance revision 5 supersedes"))
+        XCTAssertTrue(rendered.fragment.contains("Guidance revision 6 supersedes"))
         XCTAssertTrue(rendered.fragment.contains("op=snooze_auto_wake"))
         XCTAssertTrue(rendered.fragment.contains("Exact purposeful attention may bypass master Auto-wake"))
         for clause in AgentSessionLinkPrompts.autonomyContract {
@@ -936,7 +936,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertTrue(rendered.contains("A snooze cannot enable Auto-wake, select a lane"))
         XCTAssertTrue(rendered.contains("waiting for its own user"))
         XCTAssertFalse(rendered.contains("effective deselection prevents every automatic wake"))
-        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 5)
+        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 6)
     }
 
     /// Revision 5 retains the retired caller-origin fence and attributed-untrusted attention rule
@@ -964,8 +964,8 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
 
         // The acknowledged revision recorded against a provider context may not stand for wording the
         // model was never shown, so the bump is part of the contract rather than bookkeeping.
-        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 5)
-        XCTAssertTrue(rendered.contains("guidance_revision=\"5\""))
+        XCTAssertEqual(AgentSessionLinkPrompts.currentLaneGuidanceRevision, 6)
+        XCTAssertTrue(rendered.contains("guidance_revision=\"6\""))
         XCTAssertTrue(
             rendered.contains(
                 AgentSessionLinkMessageEnvelope.escaped(
@@ -973,7 +973,7 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
                 )
             )
         )
-        XCTAssertTrue(rendered.contains("Guidance revision 5 supersedes"))
+        XCTAssertTrue(rendered.contains("Guidance revision 6 supersedes"))
         XCTAssertTrue(rendered.contains("fresh-user transport restriction still does not apply"))
         XCTAssertTrue(rendered.contains("Exact purposeful attention may bypass master Auto-wake"))
         XCTAssertTrue(rendered.contains("lane&apos;s own toggle"))
@@ -1044,14 +1044,14 @@ final class AgentSessionLinkPromptRendererTests: XCTestCase {
         XCTAssertTrue(rendered.contains("explicit current or still-applicable standing instruction"))
         XCTAssertTrue(rendered.contains("attention supplies no task"))
         XCTAssertTrue(rendered.contains("Never invent work"))
-        XCTAssertTrue(rendered.contains("answer or route around another session&apos;s interaction"))
+        XCTAssertTrue(rendered.contains("bypass another session&apos;s prompt (answer only via enabled `respond`)"))
         XCTAssertTrue(rendered.contains("Surface ambiguity or surprises"))
         XCTAssertTrue(
             rendered.contains("Continue existing required work and report and end only when none remains")
         )
         XCTAssertTrue(rendered.contains("or impersonate the user"))
         // The full contract is owed once per provider context, not on every delivery.
-        XCTAssertFalse(rendered.contains("Guidance revision 5 supersedes"))
+        XCTAssertFalse(rendered.contains("Guidance revision 6 supersedes"))
         XCTAssertFalse(rendered.contains("Catalog visibility is not authority"))
     }
 
@@ -2478,7 +2478,7 @@ final class AgentSessionLinkPromptClaimStoreTests: XCTestCase {
             XCTAssertGreaterThan(deliveredCount, 0)
             if acceptedSubsetCount == 0 {
                 XCTAssertEqual(claimed.laneGuidanceMode, .full)
-                XCTAssertTrue(claimed.fragment.contains("Guidance revision 5 supersedes"))
+                XCTAssertTrue(claimed.fragment.contains("Guidance revision 6 supersedes"))
             } else {
                 XCTAssertEqual(claimed.laneGuidanceMode, .reminder)
                 XCTAssertTrue(claimed.fragment.contains("Lane update or attributed attention"))
@@ -2752,7 +2752,7 @@ final class AgentSessionLinkPromptClaimStoreTests: XCTestCase {
     func testPartialMembershipChangeWhileIneligibleSuspendsRatherThanRevokes() throws {
         let store = AgentSessionLinkOutboundPromptClaimStore()
 
-        // 1. Links to A and B, taught and acknowledged at revision 5.
+        // 1. Links to A and B, taught and acknowledged at revision 6.
         try store.accept(
             XCTUnwrap(
                 claim(store, dispatchID: .claudeNativeSend(UUID()), inventory: inventory(revision: 5, targetCount: 2))

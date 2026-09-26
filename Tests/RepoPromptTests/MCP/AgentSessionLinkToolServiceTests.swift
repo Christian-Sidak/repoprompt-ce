@@ -5,8 +5,9 @@ import RepoPromptDomainRuntime
 import XCTest
 
 /// Wire contract for `agent_session_link`: strict argument validation, opaque paging, and response
-/// shapes that can never carry interaction identifiers, prompts, tool payloads, paths, or worktree
-/// metadata.
+/// shapes that never carry interaction identifiers, prompts, tool payloads, paths, or worktree
+/// metadata — except the redacted interaction that `get_interaction` returns on a link where the user
+/// explicitly enabled Answer prompts.
 @MainActor
 final class AgentSessionLinkToolServiceTests: XCTestCase {
     // MARK: - Strict allowed keys
@@ -408,7 +409,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             "`waiting_on` is separate/non-atomic and may lag",
             "Do not invent or abandon instructed work",
             "surface ambiguity/surprises",
-            "Never answer/bypass another session’s interaction",
+            "Never bypass another session’s prompt",
+            "answer only via Answer-prompts `respond`",
             "Sends are attributed",
             "never impersonate the user"
         ] {
@@ -989,12 +991,182 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - Answer prompts (get_interaction / respond)
+
+    func testAnswerPromptsOperationsAcceptOnlyTheirDocumentedFields() {
+        XCTAssertEqual(AgentSessionLinkMCPToolService.getInteractionKeys, ["op", "session_id"])
+        XCTAssertEqual(
+            AgentSessionLinkMCPToolService.respondKeys,
+            ["op", "session_id", "interaction_id", "response", "answers", "skip", "content", "meta"]
+        )
+        // An observer may not amend exec policy, start a workflow, or fan out on another's behalf.
+        XCTAssertTrue(AgentSessionLinkMCPToolService.respondKeys.isDisjoint(with: [
+            "amendment", "workflow_id", "workflow_name", "session_ids", "message", "decision"
+        ]))
+    }
+
+    func testAnswerPromptsWithholdsPayloadAndRefusesWithoutTheExactLinkDelegation() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let sessionID = Value.string(fixture.target.sessionID.uuidString)
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+
+        let inspected = try await fixture.service.execute(args: [
+            "op": .string("get_interaction"), "session_id": sessionID
+        ])
+        let inspectedObject = try XCTUnwrap(inspected.objectValue)
+        XCTAssertEqual(inspectedObject["result"]?.stringValue, "interaction_response_not_enabled")
+        XCTAssertNil(inspectedObject["interaction"], "no payload without the delegation")
+        XCTAssertFalse("\(inspected)".contains(Self.sampleInteractionPrompt))
+
+        let responded = try await fixture.service.execute(args: [
+            "op": .string("respond"),
+            "session_id": sessionID,
+            "interaction_id": .string(UUID().uuidString),
+            "response": .string("accept")
+        ])
+        XCTAssertEqual(responded.objectValue?["result"]?.stringValue, "interaction_response_not_enabled")
+        XCTAssertTrue(fixture.host.respondRequests.isEmpty, "nothing reaches the target without the delegation")
+
+        // An unlinked session is the ordinary indistinguishable denial, never a delegation hint.
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("get_interaction"), "session_id": .string(UUID().uuidString)
+            ])
+            XCTFail("an unlinked target must be denied")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("No active session link"))
+        }
+    }
+
+    func testAnswerPromptsRendersInspectionAndEveryRespondOutcomeWhenEnabled() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        let enabled = await fixture.bridge.setInteractionResponse(
+            true,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+        XCTAssertTrue(enabled)
+        let sessionID = Value.string(fixture.target.sessionID.uuidString)
+
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let inspectedValue = try await fixture.service.execute(args: [
+            "op": .string("get_interaction"), "session_id": sessionID
+        ])
+        let inspected = try XCTUnwrap(inspectedValue.objectValue)
+        XCTAssertEqual(inspected["result"]?.stringValue, "pending")
+        XCTAssertEqual(inspected["respondable"], .bool(true))
+        XCTAssertEqual(inspected["manual_only_reason"], .null)
+        XCTAssertEqual(inspected["interaction"]?.objectValue?["prompt"]?.stringValue, Self.sampleInteractionPrompt)
+        XCTAssertEqual(inspected["notice"]?.stringValue, AgentSessionLinkMCPToolService.untrustedContentNotice)
+
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: .hookApproval)
+        let manualValue = try await fixture.service.execute(args: [
+            "op": .string("get_interaction"), "session_id": sessionID
+        ])
+        let manual = try XCTUnwrap(manualValue.objectValue)
+        XCTAssertEqual(manual["respondable"], .bool(false))
+        XCTAssertEqual(manual["manual_only_reason"]?.stringValue, "hook_approval")
+
+        let interactionID = UUID()
+        func respond(_ extra: [String: Value] = ["response": .string("accept")]) async throws -> [String: Value] {
+            var args: [String: Value] = [
+                "op": .string("respond"),
+                "session_id": sessionID,
+                "interaction_id": .string(interactionID.uuidString)
+            ]
+            args.merge(extra) { _, new in new }
+            let value = try await fixture.service.execute(args: args)
+            return try XCTUnwrap(value.objectValue)
+        }
+
+        fixture.host.respondOutcome = .submitted(kind: .approval, decision: "accept")
+        let submitted = try await respond()
+        XCTAssertEqual(submitted["result"]?.stringValue, "submitted")
+        XCTAssertEqual(submitted["applied"], .bool(true))
+        XCTAssertEqual(submitted["decision"]?.stringValue, "accept")
+        XCTAssertEqual(submitted["answered_by_session_id"]?.stringValue, fixture.observer.sessionID.uuidString)
+        XCTAssertEqual(fixture.host.respondRequests.last?.interactionID, interactionID)
+        XCTAssertEqual(fixture.host.respondAuthorizations.last, true, "the final fence must still hold")
+
+        let current = UUID()
+        fixture.host.respondOutcome = .interactionMismatch(currentInteractionID: current)
+        let mismatch = try await respond()
+        XCTAssertEqual(mismatch["result"]?.stringValue, "interaction_mismatch")
+        XCTAssertEqual(mismatch["applied"], .bool(false))
+        XCTAssertEqual(mismatch["current_interaction_id"]?.stringValue, current.uuidString)
+
+        fixture.host.respondOutcome = .manualOnly(.persistentDecision)
+        let persistent = try await respond(["response": .string("accept_for_session")])
+        XCTAssertEqual(persistent["result"]?.stringValue, "manual_only")
+        XCTAssertEqual(persistent["manual_only_reason"]?.stringValue, "persistent_decision")
+
+        fixture.host.respondOutcome = .invalid("response must be one of: accept, decline, cancel.")
+        do {
+            _ = try await respond(["response": .string("maybe")])
+            XCTFail("an answer that does not fit must be an invalid-params error")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("response must be one of"))
+        }
+
+        for rejected: [String: Value] in [
+            ["amendment": .string("allow ls")],
+            ["interaction_id": .string("not-a-uuid")]
+        ] {
+            do {
+                _ = try await respond(rejected)
+                XCTFail("\(rejected) must be refused before anything is authorized")
+            } catch is MCPError {}
+        }
+
+        // Revoked between authorization and the final fence: the uniform denial, nothing applied.
+        let requestsBeforeStop = fixture.host.respondRequests.count
+        _ = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+        do {
+            _ = try await respond()
+            XCTFail("a revoked link must deny")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("No active session link"))
+        }
+        XCTAssertEqual(fixture.host.respondRequests.count, requestsBeforeStop)
+    }
+
+    private static let sampleInteractionPrompt = "Run the migration script?"
+
+    private static func sampleInspection(
+        manualOnly: AgentSessionLinkInteractionManualOnlyReason?
+    ) -> AgentSessionLinkPendingInteractionInspection {
+        AgentSessionLinkPendingInteractionInspection(
+            interaction: AgentRunMCPSnapshot.Interaction(
+                id: UUID(),
+                kind: .approval,
+                responseType: .decision,
+                title: "Command approval",
+                prompt: sampleInteractionPrompt,
+                context: nil,
+                allowsMultiple: nil,
+                options: [.init(label: "accept"), .init(label: "decline"), .init(label: "cancel")],
+                fields: [],
+                details: []
+            ),
+            manualOnlyReason: manualOnly
+        )
+    }
+
     func testOperationHelpNamesEverySupportedOperation() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         for op in [
             "list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on",
-            "snooze_auto_wake", "request_attention"
+            "snooze_auto_wake", "request_attention", "get_interaction", "respond"
         ] {
             XCTAssertTrue(
                 AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
@@ -1660,6 +1832,31 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
         ) async -> AgentSessionLinkSendTransactionOutcome {
             .blocked(.targetNotIdle)
+        }
+
+        // MARK: Answer prompts
+
+        var pendingInteractionInspection: AgentSessionLinkPendingInteractionInspection = .none
+        var respondOutcome: AgentSessionLinkInteractionResponseOutcome = .noPendingInteraction
+        var respondRequests: [AgentSessionLinkInteractionResponseRequest] = []
+        var respondAuthorizations: [Bool] = []
+
+        func agentSessionLinkPendingInteraction(
+            for _: AgentSessionLinkEndpointCandidate
+        ) -> AgentSessionLinkPendingInteractionInspection {
+            pendingInteractionInspection
+        }
+
+        /// Mirrors the real host contract: the bridge's final fence runs before anything is applied.
+        func agentSessionLinkRespondToPendingInteraction(
+            for _: AgentSessionLinkEndpointCandidate,
+            request: AgentSessionLinkInteractionResponseRequest,
+            authorize: @escaping @MainActor @Sendable () async -> Bool
+        ) async -> AgentSessionLinkInteractionResponseOutcome {
+            respondRequests.append(request)
+            let authorized = await authorize()
+            respondAuthorizations.append(authorized)
+            return authorized ? respondOutcome : .unavailable
         }
     }
 

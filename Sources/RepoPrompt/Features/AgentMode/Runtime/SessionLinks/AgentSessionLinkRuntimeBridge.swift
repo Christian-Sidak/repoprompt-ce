@@ -313,6 +313,27 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome
 
+    // MARK: Answer prompts delegation
+
+    /// Redacted, observer-restricted view of one exact live target's current pending interaction.
+    ///
+    /// Read-only: it must never focus, activate, or switch the target window, and never resolve,
+    /// dismiss, or reorder the interaction.
+    func agentSessionLinkPendingInteraction(
+        for candidate: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkPendingInteractionInspection
+
+    /// Validates and submits one observer answer to the exact live target's current interaction.
+    ///
+    /// A conforming host compares `request.interactionID` against the current interaction, rejects
+    /// kinds and decisions an observer may not choose, awaits `authorize` as its final suspension
+    /// point, re-compares, and then submits without suspending again.
+    func agentSessionLinkRespondToPendingInteraction(
+        for candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkInteractionResponseRequest,
+        authorize: @escaping @MainActor @Sendable () async -> Bool
+    ) async -> AgentSessionLinkInteractionResponseOutcome
+
     // MARK: Launch restoration inputs
 
     /// Identity-only descriptors for every compose-tab binding in every active workspace.
@@ -345,6 +366,22 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
+    /// Fail-closed Answer prompts defaults: a host that does not model interactions exposes none and
+    /// answers none.
+    func agentSessionLinkPendingInteraction(
+        for _: AgentSessionLinkEndpointCandidate
+    ) -> AgentSessionLinkPendingInteractionInspection {
+        .none
+    }
+
+    func agentSessionLinkRespondToPendingInteraction(
+        for _: AgentSessionLinkEndpointCandidate,
+        request _: AgentSessionLinkInteractionResponseRequest,
+        authorize _: @escaping @MainActor @Sendable () async -> Bool
+    ) async -> AgentSessionLinkInteractionResponseOutcome {
+        .unavailable
+    }
+
     func agentSessionLinkSetWaitingOn(
         _: DomainAgentSessionWaitingOn?,
         for _: DomainAgentSessionLinkEndpointIdentity
@@ -787,6 +824,21 @@ final class AgentSessionLinkRuntimeBridge {
     private var bookkeepingByReference: [DomainAgentSessionLinkReference: ReferenceBookkeeping] = [:]
     /// Process-memory, observer-local unread baselines. Never persisted and never agent-visible.
     private var monitorSeenByReference: [DomainAgentSessionLinkReference: MonitorSeenRecord] = [:]
+    /// Explicit, process-local permission delegation for one exact active oversight grant.
+    /// A new generation or endpoint cannot inherit it, even when the session UUID pair is reused.
+    private struct AutoApprovalLink: Hashable {
+        let observer: DomainAgentSessionLinkEndpointIdentity
+        let target: DomainAgentSessionLinkEndpointIdentity
+        let reference: DomainAgentSessionLinkReference
+    }
+
+    private var autoApprovalLinks: Set<AutoApprovalLink> = []
+    /// Explicit, process-local **Answer prompts** delegation for one exact active oversight grant.
+    ///
+    /// Independent of `autoApprovalLinks`: this lets the observer agent inspect and explicitly answer
+    /// the target's current interaction through `agent_session_link`; it never answers anything by
+    /// itself. Same exactness and lifetime rules — a new generation or endpoint cannot inherit it.
+    private var interactionResponseLinks: Set<AutoApprovalLink> = []
     /// Lane status-change queues, one per **exact observer incarnation**.
     ///
     /// Created automatically for any observer that resolves at least one direct outbound target, and
@@ -3246,6 +3298,8 @@ final class AgentSessionLinkRuntimeBridge {
             // Seen state is generation-qualified: a fresh re-add of the same pair baselines against
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
+            autoApprovalLinks = autoApprovalLinks.filter { $0.reference != reference }
+            interactionResponseLinks = interactionResponseLinks.filter { $0.reference != reference }
         }
         // Generation-qualified for the same reason, and released before anything republishes: a
         // queued message must never outlive the exact grant that admitted it.
@@ -3612,7 +3666,17 @@ final class AgentSessionLinkRuntimeBridge {
                 status: presentation.status,
                 lastActivityAt: presentation.lastActivityAt,
                 hasUnreadActivity: hasUnreadActivity,
-                targetRoute: targetRoute
+                targetRoute: targetRoute,
+                autoApprovalEnabled: autoApprovalLinks.contains(AutoApprovalLink(
+                    observer: endpoint,
+                    target: targetEndpoint,
+                    reference: reference
+                )),
+                interactionResponseEnabled: interactionResponseLinks.contains(AutoApprovalLink(
+                    observer: endpoint,
+                    target: targetEndpoint,
+                    reference: reference
+                ))
             ))
         }
 
@@ -4233,6 +4297,223 @@ final class AgentSessionLinkRuntimeBridge {
             observerSessionID: observerSessionID
         )
     }
+
+    // MARK: Exact-link permission auto-approval
+
+    private func autoApprovalEndpointsAreEligible(
+        _ key: AutoApprovalLink,
+        host: any AgentSessionLinkEndpointHost
+    ) -> Bool {
+        let candidates = host.agentSessionLinkCandidates()
+        guard let observer = candidates.first(where: { $0.domainEndpoint == key.observer }),
+              let target = candidates.first(where: { $0.domainEndpoint == key.target })
+        else { return false }
+        return AgentSessionLinkEndpointEligibility.observerOperationEligibility(
+            observer.eligibilityInput,
+            roleAllowsOutboundMonitoring: observer.roleAllowsOutboundMonitoring
+        ) == .eligible
+            && AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
+    }
+
+    /// Changes only the captured active grant. This setting is deliberately not persisted: durable
+    /// Auto-wake selection is UUID-keyed and cannot safely carry permission authority across relink.
+    func setAutoApproval(
+        _ enabled: Bool,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedReference: DomainAgentSessionLinkReference
+    ) async -> Bool {
+        guard !isFrozenForTermination,
+              let grant = await authority.activeGrant(for: expectedReference),
+              grant.observer == observerEndpoint,
+              grant.target == targetEndpoint,
+              let host
+        else { return false }
+        let key = AutoApprovalLink(observer: observerEndpoint, target: targetEndpoint, reference: expectedReference)
+        guard autoApprovalEndpointsAreEligible(key, host: host) else { return false }
+        if enabled {
+            autoApprovalLinks.insert(key)
+        } else {
+            autoApprovalLinks.remove(key)
+        }
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: [observerEndpoint])
+        return true
+    }
+
+    /// Bulk selection is a snapshot of current outbound grants, not a master preference for future
+    /// links. The exact references are sourced from authority, never from possibly stale UI rows.
+    func setAutoApprovalForCurrentLinks(
+        _ enabled: Bool,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> Bool {
+        guard !isFrozenForTermination,
+              let host,
+              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return false }
+        let inputs = await authority.projectionInputs(forEndpoint: observerEndpoint)
+        guard !isFrozenForTermination,
+              let host = self.host,
+              host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
+        else { return false }
+        for item in inputs.outbound.items {
+            guard let target = inputs.outboundTargetEndpoints[item.linkID] else { continue }
+            let key = AutoApprovalLink(
+                observer: observerEndpoint,
+                target: target,
+                reference: DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+            )
+            guard autoApprovalEndpointsAreEligible(key, host: host) else { continue }
+            if enabled {
+                autoApprovalLinks.insert(key)
+            } else {
+                autoApprovalLinks.remove(key)
+            }
+        }
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: [observerEndpoint])
+        return true
+    }
+
+    /// Observation-time filter only: a prompt seen while selection is off must not become
+    /// retroactively eligible if the user enables the link before its queued task runs.
+    /// This does not replace the authority-backed admission check at response time.
+    func hasAutoApprovalSelection(for targetEndpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        autoApprovalLinks.contains { $0.target == targetEndpoint }
+    }
+
+    /// Admission check for a provider permission request on one exact target incarnation. The
+    /// caller must re-check its pending request and endpoint after this suspension, then submit
+    /// synchronously. Questions and app-owned reviews never call this gate.
+    func autoApprovalIsAuthorized(for targetEndpoint: DomainAgentSessionLinkEndpointIdentity) async -> Bool {
+        guard !isFrozenForTermination, host != nil else { return false }
+        let candidates = autoApprovalLinks.filter { $0.target == targetEndpoint }
+        for key in candidates {
+            guard let grant = await authority.activeGrant(for: key.reference),
+                  grant.observer == key.observer,
+                  grant.target == targetEndpoint,
+                  !isFrozenForTermination,
+                  autoApprovalLinks.contains(key),
+                  let host
+            else { continue }
+            if autoApprovalEndpointsAreEligible(key, host: host) { return true }
+        }
+        return false
+    }
+
+    // MARK: Exact-link Answer prompts delegation
+
+    /// Changes only the captured active grant's **Answer prompts** delegation.
+    ///
+    /// Not persisted, for the same reason as auto-approval: durable oversight state is UUID-keyed and
+    /// cannot safely carry authority to answer another session's prompts across relink or relaunch.
+    func setInteractionResponse(
+        _ enabled: Bool,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedReference: DomainAgentSessionLinkReference
+    ) async -> Bool {
+        guard !isFrozenForTermination,
+              let grant = await authority.activeGrant(for: expectedReference),
+              grant.observer == observerEndpoint,
+              grant.target == targetEndpoint,
+              !isFrozenForTermination,
+              let host
+        else { return false }
+        let key = AutoApprovalLink(observer: observerEndpoint, target: targetEndpoint, reference: expectedReference)
+        guard autoApprovalEndpointsAreEligible(key, host: host) else { return false }
+        if enabled {
+            interactionResponseLinks.insert(key)
+        } else {
+            interactionResponseLinks.remove(key)
+        }
+        requestMonitorProjectionRefresh(forExactObserverEndpoints: [observerEndpoint])
+        return true
+    }
+
+    private static func interactionResponseKey(for target: AuthorizedTarget) -> AutoApprovalLink {
+        AutoApprovalLink(
+            observer: target.lease.observer,
+            target: target.lease.target,
+            reference: DomainAgentSessionLinkReference(
+                linkID: target.lease.linkID,
+                generation: target.lease.linkGeneration
+            )
+        )
+    }
+
+    /// Whether the exact grant behind an already-authorized target carries Answer prompts.
+    func interactionResponseIsEnabled(for target: AuthorizedTarget) -> Bool {
+        interactionResponseLinks.contains(Self.interactionResponseKey(for: target))
+    }
+
+    /// Read-only inspection of the target's current pending interaction.
+    ///
+    /// The payload is withheld entirely unless the exact link carries Answer prompts: without the
+    /// delegation the observer has no use for prompt text, commands, or paths, and poll already
+    /// reports the interaction kind.
+    func pendingInteraction(target: AuthorizedTarget) -> AgentSessionLinkInteractionDisposition {
+        guard !isFrozenForTermination else { return .shuttingDown }
+        guard interactionResponseIsEnabled(for: target) else { return .notEnabled }
+        guard let host,
+              host.agentSessionLinkCandidates().contains(where: {
+                  $0.domainEndpoint == target.candidate.domainEndpoint
+              })
+        else { return .denied }
+        return .inspected(host.agentSessionLinkPendingInteraction(for: target.candidate))
+    }
+
+    /// Submits one explicit observer answer to the target's exact current interaction.
+    ///
+    /// The host validates the answer and compares the interaction ID, then calls `authorize` as the
+    /// last suspension point, re-compares, and submits synchronously. `authorize` re-proves the
+    /// exact grant, the delegation, and both live endpoints after the authority hop, so an unlink,
+    /// relink, toggle-off, or endpoint replacement that lands mid-call applies nothing.
+    func respondToInteraction(
+        target: AuthorizedTarget,
+        request: AgentSessionLinkInteractionResponseRequest
+    ) async -> AgentSessionLinkInteractionDisposition {
+        guard !isFrozenForTermination else { return .shuttingDown }
+        let key = Self.interactionResponseKey(for: target)
+        guard interactionResponseLinks.contains(key) else { return .notEnabled }
+        guard let host else { return .denied }
+        let outcome = await host.agentSessionLinkRespondToPendingInteraction(
+            for: target.candidate,
+            request: request,
+            authorize: { [weak self] in
+                guard let self else { return false }
+                return await interactionResponseIsStillAuthorized(key)
+            }
+        )
+        return .responded(outcome)
+    }
+
+    /// Final fence for one respond: exact grant, delegation, deletion state, and live endpoints.
+    private func interactionResponseIsStillAuthorized(_ key: AutoApprovalLink) async -> Bool {
+        guard !isFrozenForTermination,
+              interactionResponseLinks.contains(key),
+              let grant = await authority.activeGrant(for: key.reference),
+              grant.observer == key.observer,
+              grant.target == key.target,
+              !isFrozenForTermination,
+              interactionResponseLinks.contains(key),
+              let host,
+              autoApprovalEndpointsAreEligible(key, host: host)
+        else { return false }
+        let registry = AgentSessionDeletionRegistry.shared
+        for sessionID in [key.observer.sessionID, key.target.sessionID] {
+            if registry.isPermanentlyDeleted(sessionID: sessionID)
+                || registry.isDeletionInProgress(sessionID: sessionID)
+            {
+                return false
+            }
+        }
+        return true
+    }
+
+    #if DEBUG
+        func test_interactionResponseLinkCount() -> Int {
+            interactionResponseLinks.count
+        }
+    #endif
 
     // MARK: Routine wake interval and Wake now routing
 
