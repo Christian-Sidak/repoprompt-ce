@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -305,6 +306,36 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         func fireObservation(for sessionID: UUID) {
             liveObservations[sessionID]?()
+        }
+
+        // MARK: Answer prompts
+
+        /// Real target view model the interaction calls route to, standing in for the window host.
+        weak var interactionViewModel: AgentModeViewModel?
+        /// Runs just before the bridge's final authority fence, so a test can revoke exactly there.
+        var beforeInteractionAuthorize: (@MainActor @Sendable () async -> Void)?
+
+        func agentSessionLinkPendingInteraction(
+            for candidate: AgentSessionLinkEndpointCandidate
+        ) -> AgentSessionLinkPendingInteractionInspection {
+            interactionViewModel?.agentSessionLinkPendingInteraction(for: candidate) ?? .none
+        }
+
+        func agentSessionLinkRespondToPendingInteraction(
+            for candidate: AgentSessionLinkEndpointCandidate,
+            request: AgentSessionLinkInteractionResponseRequest,
+            authorize: @escaping @MainActor @Sendable () async -> Bool
+        ) async -> AgentSessionLinkInteractionResponseOutcome {
+            guard let interactionViewModel else { return .unavailable }
+            let beforeAuthorize = beforeInteractionAuthorize
+            return await interactionViewModel.agentSessionLinkRespondToPendingInteraction(
+                for: candidate,
+                request: request,
+                authorize: {
+                    await beforeAuthorize?()
+                    return await authorize()
+                }
+            )
         }
     }
 
@@ -662,6 +693,360 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let secondAfterDisable = await fixture.bridge.autoApprovalIsAuthorized(for: second.domainEndpoint)
         XCTAssertFalse(firstAfterDisable)
         XCTAssertFalse(secondAfterDisable)
+    }
+
+    // MARK: - Answer prompts delegation
+
+    private func authorizedTarget(
+        _ bridge: AgentSessionLinkRuntimeBridge,
+        operation: DomainAgentSessionTargetOperation,
+        observer: AgentSessionLinkEndpointCandidate,
+        target: AgentSessionLinkEndpointCandidate
+    ) async throws -> AgentSessionLinkRuntimeBridge.AuthorizedTarget {
+        switch await bridge.authorizeTarget(
+            operation: operation,
+            observerEndpoint: observer.domainEndpoint,
+            targetSessionID: target.sessionID
+        ) {
+        case let .success(authorized):
+            return authorized
+        case let .failure(failure):
+            throw MCPError.internalError("expected an authorized target, got \(failure)")
+        }
+    }
+
+    private func interactionRequest(
+        _ interactionID: UUID,
+        _ args: [String: Value]
+    ) throws -> AgentSessionLinkInteractionResponseRequest {
+        try AgentSessionLinkInteractionResponseRequest(
+            interactionID: interactionID,
+            payload: AgentRunMCPToolService.parseResponsePayload(args: args)
+        )
+    }
+
+    func testAnswerPromptsDefaultsOffIsIndependentOfAutoApprovalAndRetiresWithExactGrant() async throws {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture),
+              let reference = await linkReference(fixture)
+        else { return XCTFail("Expected an active link") }
+        let observer = fixture.observer.domainEndpoint
+        let target = fixture.target.domainEndpoint
+        let authorized = try await authorizedTarget(
+            fixture.bridge,
+            operation: .monitorRead,
+            observer: fixture.observer,
+            target: fixture.target
+        )
+
+        // Off by default: no payload and no response, even though the read grant is valid.
+        XCTAssertFalse(fixture.bridge.interactionResponseIsEnabled(for: authorized))
+        XCTAssertEqual(fixture.bridge.pendingInteraction(target: authorized), .notEnabled)
+        let offResponse = try await fixture.bridge.respondToInteraction(
+            target: authorized,
+            request: interactionRequest(UUID(), ["response": .string("accept")])
+        )
+        XCTAssertEqual(offResponse, .notEnabled)
+
+        let enabled = await fixture.bridge.setInteractionResponse(
+            true,
+            observerEndpoint: observer,
+            targetEndpoint: target,
+            expectedReference: reference
+        )
+        XCTAssertTrue(enabled)
+        XCTAssertTrue(fixture.bridge.interactionResponseIsEnabled(for: authorized))
+        XCTAssertEqual(fixture.bridge.pendingInteraction(target: authorized), .inspected(.none))
+        // Answering is never blind approval, and blind approval is never answering.
+        XCTAssertFalse(fixture.bridge.hasAutoApprovalSelection(for: target))
+        let autoApproval = await fixture.bridge.autoApprovalIsAuthorized(for: target)
+        XCTAssertFalse(autoApproval)
+        let rows = try XCTUnwrap(fixture.host.publishedProps[fixture.observer.sessionID]?.outbound)
+        if let row = rows.first(where: { $0.targetSessionID == fixture.target.sessionID }) {
+            XCTAssertFalse(row.autoApprovalEnabled)
+        }
+
+        let stopped = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: observer,
+            targetEndpoint: target,
+            expectedReference: reference
+        )
+        XCTAssertEqual(stopped, .stopped)
+        XCTAssertEqual(fixture.bridge.test_interactionResponseLinkCount(), 0)
+
+        guard case .added = await addLink(fixture),
+              let replacement = await linkReference(fixture)
+        else { return XCTFail("Expected a replacement link") }
+        XCTAssertNotEqual(replacement, reference)
+        let relinked = try await authorizedTarget(
+            fixture.bridge,
+            operation: .monitorRead,
+            observer: fixture.observer,
+            target: fixture.target
+        )
+        XCTAssertEqual(fixture.bridge.pendingInteraction(target: relinked), .notEnabled, "relink must not inherit")
+        let staleApplied = await fixture.bridge.setInteractionResponse(
+            true,
+            observerEndpoint: observer,
+            targetEndpoint: target,
+            expectedReference: reference
+        )
+        XCTAssertFalse(staleApplied, "a revoked generation can never be re-enabled")
+    }
+
+    func testAnswerPromptsRespondsOnlyToTheExactCurrentInteractionWithOneTimeDecisions() async throws {
+        let tabID = UUID()
+        let controller = ApprovalRecordingCodexController()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 94,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel,
+            tabID: tabID,
+            name: "Answer prompts target"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .codexExec
+        session.hasLoadedPersistedState = true
+        session.codexController = controller
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
+            tabID: tabID,
+            sessionID: sessionID,
+            tabName: "Target",
+            isWindowClosing: false
+        ))
+        let observer = makeCandidate(windowID: 93, displayName: "Overseer")
+        let host = FakeEndpointHost()
+        host.candidates = [observer, target]
+        host.interactionViewModel = viewModel
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        guard case .added = await bridge.addMonitorLink(
+            observerSessionID: observer.sessionID,
+            rawTargetSessionID: target.sessionID.uuidString
+        ) else { return XCTFail("Expected an exact live link") }
+        let authority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
+        let inventory = await authority.links(forObserver: observer.sessionID)
+        guard let item = inventory.items.first(where: { $0.targetSessionID == target.sessionID }) else {
+            return XCTFail("Expected the active link reference")
+        }
+        let reference = DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+
+        // Unlike auto-approval, an explicit answer may address a prompt that was already waiting.
+        let approval = AgentApprovalRequest(
+            requestID: .codex(.int(201)),
+            method: "item/commandExecution/requestApproval",
+            kind: .commandExecution,
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "pending-before-enable"
+        )
+        session.pendingApproval = approval
+        let readTarget = try await authorizedTarget(bridge, operation: .monitorRead, observer: observer, target: target)
+        XCTAssertEqual(bridge.pendingInteraction(target: readTarget), .notEnabled)
+
+        let enabled = await bridge.setInteractionResponse(
+            true,
+            observerEndpoint: observer.domainEndpoint,
+            targetEndpoint: target.domainEndpoint,
+            expectedReference: reference
+        )
+        XCTAssertTrue(enabled)
+        guard case let .inspected(inspection) = bridge.pendingInteraction(target: readTarget),
+              let interaction = inspection.interaction
+        else { return XCTFail("Expected the pending approval to be visible once enabled") }
+        XCTAssertEqual(interaction.id, approval.id)
+        XCTAssertEqual(interaction.kind, .approval)
+        XCTAssertNil(inspection.manualOnlyReason)
+        // Only one-time decisions are offered to an observer.
+        XCTAssertEqual(interaction.options.map(\.label), ["accept", "decline", "cancel"])
+
+        let sendTarget = try await authorizedTarget(bridge, operation: .monitorSend, observer: observer, target: target)
+        let stale = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(UUID(), ["response": .string("accept")])
+        )
+        XCTAssertEqual(stale, .responded(.interactionMismatch(currentInteractionID: approval.id)))
+        let sessionWide = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(approval.id, ["response": .string("accept_for_session")])
+        )
+        XCTAssertEqual(sessionWide, .responded(.manualOnly(.persistentDecision)))
+        let nonsense = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(approval.id, ["response": .string("maybe")])
+        )
+        guard case .responded(.invalid) = nonsense else { return XCTFail("Expected invalid, got \(nonsense)") }
+        XCTAssertTrue(controller.recorder.events.isEmpty, "no refused answer may reach the provider")
+        XCTAssertEqual(session.pendingApproval, approval)
+
+        let accepted = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(approval.id, ["response": .string("accept")])
+        )
+        XCTAssertEqual(accepted, .responded(.submitted(kind: .approval, decision: "accept")))
+        // The Codex coordinator hands the response to the provider asynchronously.
+        try await AsyncTestWait.waitUntil("one request-scoped provider response") {
+            await MainActor.run { !controller.recorder.events.isEmpty }
+        }
+        XCTAssertEqual(controller.recorder.events, ["201:accept"], "one request-scoped accept, never session-wide")
+        XCTAssertNil(session.pendingApproval)
+        let replay = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(approval.id, ["response": .string("accept")])
+        )
+        XCTAssertEqual(replay, .responded(.noPendingInteraction), "a resolved prompt applies nothing twice")
+
+        // Revocation landing at the final fence applies nothing and leaves the prompt manual.
+        let later = AgentApprovalRequest(
+            requestID: .codex(.int(202)),
+            method: "item/commandExecution/requestApproval",
+            kind: .commandExecution,
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "revoked-mid-call"
+        )
+        session.pendingApproval = later
+        host.beforeInteractionAuthorize = {
+            _ = await bridge.stopMonitorLink(
+                observerEndpoint: observer.domainEndpoint,
+                targetEndpoint: target.domainEndpoint,
+                expectedReference: reference
+            )
+        }
+        let revoked = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(later.id, ["response": .string("accept")])
+        )
+        XCTAssertEqual(revoked, .responded(.unavailable))
+        XCTAssertEqual(controller.recorder.events, ["201:accept"])
+        XCTAssertEqual(session.pendingApproval, later)
+        XCTAssertEqual(bridge.test_interactionResponseLinkCount(), 0)
+    }
+
+    func testAnswerPromptsAnswersAMultipleChoiceQuestionAndKeepsSecretsAndHookTrustManual() async throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 96,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel,
+            tabID: tabID,
+            name: "Question target"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let session = viewModel.session(for: tabID)
+        session.hasLoadedPersistedState = true
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
+            tabID: tabID,
+            sessionID: sessionID,
+            tabName: "Target",
+            isWindowClosing: false
+        ))
+        let observer = makeCandidate(windowID: 95, displayName: "Overseer")
+        let host = FakeEndpointHost()
+        host.candidates = [observer, target]
+        host.interactionViewModel = viewModel
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        guard case .added = await bridge.addMonitorLink(
+            observerSessionID: observer.sessionID,
+            rawTargetSessionID: target.sessionID.uuidString
+        ) else { return XCTFail("Expected an exact live link") }
+        let authority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
+        let inventory = await authority.links(forObserver: observer.sessionID)
+        guard let item = inventory.items.first(where: { $0.targetSessionID == target.sessionID }) else {
+            return XCTFail("Expected the active link reference")
+        }
+        let enabled = await bridge.setInteractionResponse(
+            true,
+            observerEndpoint: observer.domainEndpoint,
+            targetEndpoint: target.domainEndpoint,
+            expectedReference: DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+        )
+        XCTAssertTrue(enabled)
+
+        let interaction = AgentAskUserInteraction(
+            title: "Pick a scope",
+            questions: [AgentAskUserQuestion(
+                id: "scope",
+                question: "Which files should be included?",
+                options: [AgentAskUserOption(label: "Changed only"), AgentAskUserOption(label: "All relevant")],
+                allowsMultiple: false,
+                allowsCustom: false
+            )]
+        )
+        let answered = Task { @MainActor in
+            try await withCheckedThrowingContinuation { continuation in
+                session.askUserContinuation = continuation
+                session.pendingAskUser = AgentAskUserPendingState(interaction: interaction)
+            }
+        }
+        try await AsyncTestWait.waitUntil("the question to be pending") {
+            await MainActor.run { session.askUserContinuation != nil }
+        }
+
+        let readTarget = try await authorizedTarget(bridge, operation: .monitorRead, observer: observer, target: target)
+        guard case let .inspected(inspection) = bridge.pendingInteraction(target: readTarget),
+              let visible = inspection.interaction
+        else { return XCTFail("Expected the pending question to be visible") }
+        XCTAssertEqual(visible.kind, .question)
+        XCTAssertEqual(visible.fields.first?.options.map(\.label), ["Changed only", "All relevant"])
+        XCTAssertNil(inspection.manualOnlyReason)
+
+        let sendTarget = try await authorizedTarget(bridge, operation: .monitorSend, observer: observer, target: target)
+        let result = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(interaction.id, ["answers": .object(["scope": .string("All relevant")])])
+        )
+        XCTAssertEqual(result, .responded(.submitted(kind: .question, decision: "answered")))
+        _ = try await answered.value
+        XCTAssertNil(session.pendingAskUser)
+
+        // Policy that keeps prompts with the target's own user, independent of provider.
+        let secret = AgentRunMCPSnapshot.Interaction(
+            id: UUID(),
+            kind: .userInput,
+            responseType: .structured,
+            title: nil,
+            prompt: "Token?",
+            context: nil,
+            allowsMultiple: nil,
+            options: [],
+            fields: [.init(id: "token", prompt: "Token?", isSecret: true, allowsOther: false, options: [])],
+            details: []
+        )
+        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: secret, session: session), .secretInput)
+        let hook = AgentRunMCPSnapshot.Interaction(
+            id: UUID(),
+            kind: .hookApproval,
+            responseType: .decision,
+            title: nil,
+            prompt: nil,
+            context: nil,
+            allowsMultiple: nil,
+            options: [],
+            fields: [],
+            details: []
+        )
+        XCTAssertEqual(viewModel.overseerManualOnlyReason(for: hook, session: session), .hookApproval)
     }
 
     private func pollState(

@@ -390,6 +390,15 @@ struct AgentMonitorPopoverView: View {
             .disabled(isBusy || isChangingAutoApproval)
             .hoverTooltip(AgentMonitorAutoApprovalCopy.tooltip, .top)
             .accessibilityLabel("Auto-approve provider permissions for \(row.displayName)")
+            Toggle(AgentMonitorInteractionResponseCopy.laneLabel, isOn: Binding(
+                get: { row.interactionResponseEnabled },
+                set: { setLaneInteractionResponse(row, enabled: $0) }
+            ))
+            .toggleStyle(.checkbox)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            .disabled(isBusy)
+            .hoverTooltip(AgentMonitorInteractionResponseCopy.tooltip, .top)
+            .accessibilityLabel("Let this session answer prompts for \(row.displayName)")
             if let feedback = rowFeedbackByRowKey[row.rowKey] {
                 messageText(feedback.message)
             }
@@ -1382,6 +1391,25 @@ struct AgentMonitorPopoverView: View {
             )
             busyRowKeys.remove(rowKey)
             setRowFeedback(rowKey, applied ? nil : .failure(AgentMonitorAutoApprovalCopy.unavailableMessage))
+        }
+    }
+
+    private func setLaneInteractionResponse(_ row: AgentMonitorPillProps.Outbound, enabled: Bool) {
+        guard let observerEndpoint = props.endpoint else { return }
+        let rowKey = beginRowAction(row.rowKey)
+        let reference = DomainAgentSessionLinkReference(linkID: row.linkID, generation: row.generation)
+        Task {
+            let applied = await AgentSessionLinkRuntimeBridge.shared.setInteractionResponse(
+                enabled,
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: row.targetEndpoint,
+                expectedReference: reference
+            )
+            busyRowKeys.remove(rowKey)
+            setRowFeedback(
+                rowKey,
+                applied ? nil : .failure(AgentMonitorInteractionResponseCopy.unavailableMessage)
+            )
         }
     }
 

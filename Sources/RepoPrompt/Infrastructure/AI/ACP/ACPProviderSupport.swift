@@ -655,4 +655,28 @@ enum ACPPermissionOptionPolicy {
             return !id.contains("always") && !id.contains("session") && !id.contains("persist")
         }?.optionID
     }
+
+    /// An observer's explicit decline is strictly per request, like its approval. Only a genuine
+    /// one-time reject is selected; without one the caller reports `cancelled` rather than falling
+    /// back to a persistent `reject_always`.
+    static func overseerOneTimeRejectOptionID(
+        options: [(optionID: String, kind: String)]
+    ) -> String? {
+        let oneTimeRejectIDs: Set = [
+            "reject_once", "reject-once", "reject", "deny_once", "deny-once", "deny"
+        ]
+        return options.first { option in
+            guard let id = normalizedOptionValue(option.optionID),
+                  !id.contains("always"), !id.contains("session"), !id.contains("persist")
+            else { return false }
+            switch normalizedOptionValue(option.kind) {
+            case "reject_once":
+                return true
+            case nil, "reject":
+                return oneTimeRejectIDs.contains(id)
+            default:
+                return false
+            }
+        }?.optionID
+    }
 }

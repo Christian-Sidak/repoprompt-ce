@@ -176,10 +176,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     // MARK: - Guidance revision
 
-    /// A provider context that physically accepted revision 4 is re-owed revision 5 in full. Merely
-    /// rendering or abandoning revision 5 does not advance the acknowledgement; only physical
+    /// A provider context that physically accepted revision 5 is re-owed revision 6 in full. Merely
+    /// rendering or abandoning revision 6 does not advance the acknowledgement; only physical
     /// acceptance earns the reminder, and a rebuilt context owes the full block again.
-    func testRevisionFiveReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
+    func testRevisionSixReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
         let observerSessionID = UUID()
         let epoch = Self.epoch(observerSessionID: observerSessionID)
         let inventory = Self.inventory(observerSessionID: observerSessionID, revision: 1)
@@ -198,7 +198,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         // physically accepted the prior guidance revision. The memberwise copy preserves all claim
         // authority; only the revision the provider is treated as having seen is historical.
         let passive = try XCTUnwrap(first.passive)
-        let revisionFourClaim = AgentSessionLinkOutboundPromptClaim(
+        let priorRevisionClaim = AgentSessionLinkOutboundPromptClaim(
             observerSessionID: first.observerSessionID,
             dispatchID: first.dispatchID,
             epochToken: first.epochToken,
@@ -208,16 +208,16 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 observerEndpoint: passive.observerEndpoint,
                 receipt: passive.receipt,
                 includesUnattributedOverflow: passive.includesUnattributedOverflow,
-                guidanceRevision: 4,
+                guidanceRevision: 5,
                 displayAttribution: passive.displayAttribution
             ),
             laneGuidanceMode: first.laneGuidanceMode,
             fragment: first.fragment
         )
-        store.accept(revisionFourClaim)
+        store.accept(priorRevisionClaim)
         XCTAssertEqual(
             store.test_lastAcceptedLaneGuidanceRevision(observerSessionID: observerSessionID),
-            4
+            5
         )
 
         let reOwed = try XCTUnwrap(store.claim(
@@ -228,7 +228,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 5 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 6 supersedes"))
+        // The one rule revision 6 changes: a context taught never to answer is told what replaced it.
+        XCTAssertTrue(reOwed.fragment.contains("blanket ban on answering another session&apos;s prompt is replaced"))
+        XCTAssertTrue(reOwed.fragment.contains("enabled Answer prompts"))
         XCTAssertTrue(reOwed.fragment.contains("attributed attention request"))
         XCTAssertTrue(reOwed.fragment.contains("master Auto-wake"))
         XCTAssertTrue(reOwed.fragment.contains("lane&apos;s own toggle"))
@@ -269,7 +272,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertTrue(later.fragment.contains("still-applicable standing instruction"))
         XCTAssertTrue(later.fragment.contains("attention supplies no task"))
         XCTAssertTrue(later.fragment.contains("Never invent work"))
-        XCTAssertTrue(later.fragment.contains("another session&apos;s interaction"))
+        XCTAssertTrue(later.fragment.contains("bypass another session&apos;s prompt (answer only via enabled `respond`)"))
         XCTAssertTrue(later.fragment.contains("Surface ambiguity or surprises"))
         XCTAssertFalse(later.fragment.contains("idle_for_send` describes readiness at `observed_at`"))
 

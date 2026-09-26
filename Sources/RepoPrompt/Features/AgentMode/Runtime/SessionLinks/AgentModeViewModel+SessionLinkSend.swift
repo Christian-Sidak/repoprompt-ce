@@ -311,7 +311,7 @@ extension AgentModeViewModel {
 
     /// The live session for an endpoint, or `nil` unless every identity field still matches
     /// byte-for-byte and generation-for-generation.
-    private func agentSessionLinkLiveSession(
+    func agentSessionLinkLiveSession(
         matching candidate: AgentSessionLinkEndpointCandidate
     ) -> TabSession? {
         guard let session = sessions[candidate.tabID],

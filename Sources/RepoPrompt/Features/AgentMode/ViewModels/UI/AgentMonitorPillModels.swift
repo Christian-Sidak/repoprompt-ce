@@ -286,6 +286,14 @@ enum AgentMonitorAutoApprovalCopy {
     static let unavailableMessage = "That oversight link is no longer active."
 }
 
+/// Explicit, exact-link delegation letting this observer agent inspect and answer the target's
+/// current prompt through `agent_session_link`. It never answers anything by itself.
+enum AgentMonitorInteractionResponseCopy {
+    static let laneLabel = "Answer prompts"
+    static let tooltip = "Let this session inspect and explicitly answer this exact linked session's pending approval, permission, elicitation, or question when your instructions cover it. Each answer applies to the current prompt only; session-wide approvals, hook trust, worktree merges, and secret inputs stay manual. Nothing is answered automatically. This choice ends on unlink, relink, or app restart."
+    static let unavailableMessage = "That oversight link is no longer active."
+}
+
 /// Why the observer's own `Wake now` cannot run, or `nil` when it can.
 ///
 /// Shared by the action result and button availability.
@@ -1011,6 +1019,8 @@ struct AgentMonitorPillProps: Equatable {
         let isAutoWakeEffectivelySelected: Bool
         /// Explicit permission delegation for this exact grant; never inferred from Auto-wake.
         let autoApprovalEnabled: Bool
+        /// Explicit Answer prompts delegation for this exact grant; independent of auto-approval.
+        let interactionResponseEnabled: Bool
 
         init(
             linkID: UUID,
@@ -1026,7 +1036,8 @@ struct AgentMonitorPillProps: Equatable {
             targetRoute: AgentSessionDeepLinkRoute? = nil,
             autoWakeSnooze: AgentMonitorAutoWakeSnoozeState? = nil,
             isAutoWakeEffectivelySelected: Bool = false,
-            autoApprovalEnabled: Bool = false
+            autoApprovalEnabled: Bool = false,
+            interactionResponseEnabled: Bool = false
         ) {
             self.linkID = linkID
             self.generation = generation
@@ -1042,6 +1053,7 @@ struct AgentMonitorPillProps: Equatable {
             self.autoWakeSnooze = autoWakeSnooze
             self.isAutoWakeEffectivelySelected = isAutoWakeEffectivelySelected
             self.autoApprovalEnabled = autoApprovalEnabled
+            self.interactionResponseEnabled = interactionResponseEnabled
         }
 
         /// The same row carrying observer-local Auto-wake policy.
@@ -1072,7 +1084,8 @@ struct AgentMonitorPillProps: Equatable {
                 targetRoute: targetRoute,
                 autoWakeSnooze: snooze,
                 isAutoWakeEffectivelySelected: isEffectivelySelected,
-                autoApprovalEnabled: autoApprovalEnabled
+                autoApprovalEnabled: autoApprovalEnabled,
+                interactionResponseEnabled: interactionResponseEnabled
             )
         }
 

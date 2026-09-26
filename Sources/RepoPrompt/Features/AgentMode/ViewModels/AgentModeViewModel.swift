@@ -7034,7 +7034,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func mcpPendingInteraction(for session: TabSession) -> AgentRunMCPSnapshot.Interaction? {
+    /// Single source for the current pending interaction a remote responder may see: `agent_run`
+    /// snapshots and the oversight `get_interaction` projection both start from this value.
+    func mcpPendingInteraction(for session: TabSession) -> AgentRunMCPSnapshot.Interaction? {
         if let request = session.pendingCodexHookReview {
             return mcpCodexHookInteraction(
                 for: request,
@@ -10779,116 +10781,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 allowStartingRun: false,
                 workflow: workflow
             )
-        case .question:
-            guard let pendingAskUser = session.pendingAskUser,
-                  pendingAskUser.interaction.id == interactionID
-            else {
-                throw MCPError.invalidParams("The pending question no longer matches interaction_id.")
-            }
-            if payload.skip {
-                skipAskUser(tabID: session.tabID, interactionID: interactionID)
-            } else {
-                do {
-                    let drafts: [String: AgentAskUserDraft]
-                    if !payload.askUserAnswersByQuestionID.isEmpty {
-                        drafts = try pendingAskUser.interaction.drafts(from: payload.askUserAnswersByQuestionID)
-                    } else if !payload.answersByQuestionID.isEmpty {
-                        drafts = try pendingAskUser.interaction.drafts(fromFlatAnswers: payload.answersByQuestionID)
-                    } else {
-                        let response = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        guard !response.isEmpty else {
-                            throw MCPError.invalidParams("answers are required for ask_user question interactions.")
-                        }
-                        guard pendingAskUser.interaction.questions.count == 1,
-                              let question = pendingAskUser.interaction.questions.first
-                        else {
-                            throw MCPError.invalidParams("answers are required for multi-question question interactions.")
-                        }
-                        drafts = try pendingAskUser.interaction.drafts(fromFlatAnswers: [question.id: [response]])
-                    }
-                    try submitAskUserResponse(tabID: session.tabID, interactionID: interactionID, draftsByQuestionID: drafts)
-                } catch let error as MCPError {
-                    throw error
-                } catch {
-                    throw MCPError.invalidParams(error.localizedDescription)
-                }
-            }
-            handleObservedMCPStateChange(for: session)
-            return nil
-        case .mcpElicitation:
-            guard let request = session.pendingMCPElicitationRequest,
-                  request.id == interactionID
-            else {
-                throw MCPError.invalidParams("The pending MCP elicitation request no longer matches interaction_id.")
-            }
-            let rawAction = payload.elicitationActionRaw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let response: AgentMCPElicitationResponse
-            switch rawAction {
-            case "accept", "approve", "allow":
-                response = AgentMCPElicitationResponse(
-                    action: .accept,
-                    content: payload.elicitationContent,
-                    meta: payload.elicitationMeta
-                )
-            case "decline", "reject", "deny":
-                response = AgentMCPElicitationResponse(action: .decline, meta: payload.elicitationMeta)
-            case "cancel":
-                response = AgentMCPElicitationResponse(action: .cancel, meta: payload.elicitationMeta)
-            case nil, "":
-                if !payload.elicitationContent.isEmpty {
-                    response = AgentMCPElicitationResponse(
-                        action: .accept,
-                        content: payload.elicitationContent,
-                        meta: payload.elicitationMeta
-                    )
-                } else {
-                    let text = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    guard !text.isEmpty else {
-                        throw MCPError.invalidParams("response or content is required for MCP elicitation interactions.")
-                    }
-                    response = AgentMCPElicitationResponse(
-                        action: .accept,
-                        content: ["response": .string(text)],
-                        meta: payload.elicitationMeta
-                    )
-                }
-            default:
-                guard let text = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
-                    throw MCPError.invalidParams("response must be one of: accept, decline, cancel, or provide content.")
-                }
-                response = AgentMCPElicitationResponse(
-                    action: .accept,
-                    content: ["response": .string(text)],
-                    meta: payload.elicitationMeta
-                )
-            }
-            codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
-            handleObservedMCPStateChange(for: session)
-            return nil
-        case .userInput:
-            guard let request = session.pendingUserInputRequest,
-                  request.id == interactionID
-            else {
-                throw MCPError.invalidParams("The pending user input request no longer matches interaction_id.")
-            }
-            if payload.explicitSkip {
-                throw MCPError.invalidParams("skip is not supported for user_input interactions.")
-            }
-            if payload.hasStructuredAnswerObjects {
-                throw MCPError.invalidParams("user_input answers must be strings or arrays of strings.")
-            }
-            var answers = payload.answersByQuestionID
-            if answers.isEmpty,
-               let text = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !text.isEmpty
-            {
-                guard request.questions.count == 1, let question = request.questions.first else {
-                    throw MCPError.invalidParams("answers are required for multi-question user_input interactions.")
-                }
-                answers[question.id] = [text]
-            }
-            let response = AgentRequestUserInputResponse(answersByQuestionID: answers)
-            submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: response)
+        case .question, .mcpElicitation, .userInput, .approval:
+            let resolution = try mcpPendingInteractionResolution(
+                for: session,
+                kind: kind,
+                interactionID: interactionID,
+                payload: payload
+            )
+            try applyPendingInteractionResolution(resolution, to: session)
             handleObservedMCPStateChange(for: session)
             return nil
         case .hookApproval:
@@ -10982,6 +10882,140 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             handleObservedMCPStateChange(for: session)
             return nil
+        }
+    }
+
+    /// A validated answer to one pending interaction that has not been applied yet.
+    ///
+    /// Validation and application are split so a caller can put an authority check between them:
+    /// `agent_run respond` applies immediately, while an oversight `respond` re-proves its exact link
+    /// after validation and re-compares the interaction before applying. Both share one parser, so the
+    /// same answer is accepted or refused with the same message on either surface.
+    enum PendingInteractionResolution {
+        case askUserSkip(interactionID: UUID)
+        case askUser(interactionID: UUID, drafts: [String: AgentAskUserDraft])
+        case mcpElicitation(request: AgentMCPElicitationRequest, response: AgentMCPElicitationResponse)
+        case userInput(request: AgentRequestUserInputRequest, response: AgentRequestUserInputResponse)
+        case worktreeMerge(reviewID: UUID, decision: WorktreeMergeReviewDecision)
+        case permissions(request: AgentPermissionsRequest, decision: AgentApprovalDecision)
+        case approval(request: AgentApprovalRequest, decision: AgentApprovalDecision)
+    }
+
+    /// Parses an answer for a question, MCP elicitation, user-input, or approval interaction.
+    ///
+    /// Pure with respect to the session: it reads the pending request that matches `interactionID`
+    /// and throws `MCPError.invalidParams` when the answer does not fit, but it submits nothing.
+    func mcpPendingInteractionResolution(
+        for session: TabSession,
+        kind: AgentRunMCPSnapshot.Interaction.Kind,
+        interactionID: UUID,
+        payload: MCPInteractionResponsePayload
+    ) throws -> PendingInteractionResolution {
+        switch kind {
+        case .question:
+            guard let pendingAskUser = session.pendingAskUser,
+                  pendingAskUser.interaction.id == interactionID
+            else {
+                throw MCPError.invalidParams("The pending question no longer matches interaction_id.")
+            }
+            if payload.skip {
+                return .askUserSkip(interactionID: interactionID)
+            }
+            do {
+                let drafts: [String: AgentAskUserDraft]
+                if !payload.askUserAnswersByQuestionID.isEmpty {
+                    drafts = try pendingAskUser.interaction.drafts(from: payload.askUserAnswersByQuestionID)
+                } else if !payload.answersByQuestionID.isEmpty {
+                    drafts = try pendingAskUser.interaction.drafts(fromFlatAnswers: payload.answersByQuestionID)
+                } else {
+                    let response = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    guard !response.isEmpty else {
+                        throw MCPError.invalidParams("answers are required for ask_user question interactions.")
+                    }
+                    guard pendingAskUser.interaction.questions.count == 1,
+                          let question = pendingAskUser.interaction.questions.first
+                    else {
+                        throw MCPError.invalidParams("answers are required for multi-question question interactions.")
+                    }
+                    drafts = try pendingAskUser.interaction.drafts(fromFlatAnswers: [question.id: [response]])
+                }
+                return .askUser(interactionID: interactionID, drafts: drafts)
+            } catch let error as MCPError {
+                throw error
+            } catch {
+                throw MCPError.invalidParams(error.localizedDescription)
+            }
+        case .mcpElicitation:
+            guard let request = session.pendingMCPElicitationRequest,
+                  request.id == interactionID
+            else {
+                throw MCPError.invalidParams("The pending MCP elicitation request no longer matches interaction_id.")
+            }
+            let rawAction = payload.elicitationActionRaw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let response: AgentMCPElicitationResponse
+            switch rawAction {
+            case "accept", "approve", "allow":
+                response = AgentMCPElicitationResponse(
+                    action: .accept,
+                    content: payload.elicitationContent,
+                    meta: payload.elicitationMeta
+                )
+            case "decline", "reject", "deny":
+                response = AgentMCPElicitationResponse(action: .decline, meta: payload.elicitationMeta)
+            case "cancel":
+                response = AgentMCPElicitationResponse(action: .cancel, meta: payload.elicitationMeta)
+            case nil, "":
+                if !payload.elicitationContent.isEmpty {
+                    response = AgentMCPElicitationResponse(
+                        action: .accept,
+                        content: payload.elicitationContent,
+                        meta: payload.elicitationMeta
+                    )
+                } else {
+                    let text = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    guard !text.isEmpty else {
+                        throw MCPError.invalidParams("response or content is required for MCP elicitation interactions.")
+                    }
+                    response = AgentMCPElicitationResponse(
+                        action: .accept,
+                        content: ["response": .string(text)],
+                        meta: payload.elicitationMeta
+                    )
+                }
+            default:
+                guard let text = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+                    throw MCPError.invalidParams("response must be one of: accept, decline, cancel, or provide content.")
+                }
+                response = AgentMCPElicitationResponse(
+                    action: .accept,
+                    content: ["response": .string(text)],
+                    meta: payload.elicitationMeta
+                )
+            }
+            return .mcpElicitation(request: request, response: response)
+        case .userInput:
+            guard let request = session.pendingUserInputRequest,
+                  request.id == interactionID
+            else {
+                throw MCPError.invalidParams("The pending user input request no longer matches interaction_id.")
+            }
+            if payload.explicitSkip {
+                throw MCPError.invalidParams("skip is not supported for user_input interactions.")
+            }
+            if payload.hasStructuredAnswerObjects {
+                throw MCPError.invalidParams("user_input answers must be strings or arrays of strings.")
+            }
+            var answers = payload.answersByQuestionID
+            if answers.isEmpty,
+               let text = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !text.isEmpty
+            {
+                guard request.questions.count == 1, let question = request.questions.first else {
+                    throw MCPError.invalidParams("answers are required for multi-question user_input interactions.")
+                }
+                answers[question.id] = [text]
+            }
+            return .userInput(request: request, response: AgentRequestUserInputResponse(answersByQuestionID: answers))
         case .approval:
             let rawDecision = try mcpCanonicalApprovalResponse(from: payload)
             if let review = session.pendingWorktreeMergeReview,
@@ -11000,9 +11034,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 default:
                     throw MCPError.invalidParams("response must be one of: accept, decline, cancel.")
                 }
-                submitWorktreeMergeReviewDecision(tabID: session.tabID, reviewID: interactionID, decision: decision)
-                handleObservedMCPStateChange(for: session)
-                return nil
+                return .worktreeMerge(reviewID: interactionID, decision: decision)
             }
             if let request = session.pendingPermissionsRequest,
                request.id == interactionID
@@ -11024,9 +11056,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         "response must be one of: accept, accept_for_session, decline, cancel."
                     )
                 }
-                codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
-                handleObservedMCPStateChange(for: session)
-                return nil
+                return .permissions(request: request, decision: decision)
             }
             guard let approval = session.pendingApproval,
                   approval.id == interactionID
@@ -11057,9 +11087,40 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "response must be one of: \(mcpApprovalDecisionLabels(for: approval, includeAliases: false).joined(separator: ", "))."
                 )
             }
+            return .approval(request: approval, decision: decision)
+        case .instruction, .hookApproval:
+            throw MCPError.invalidParams(
+                "\(kind.rawValue) interactions are not resolved through this path. No response was applied."
+            )
+        }
+    }
+
+    /// Submits a resolution produced by `mcpPendingInteractionResolution` without suspending.
+    func applyPendingInteractionResolution(
+        _ resolution: PendingInteractionResolution,
+        to session: TabSession
+    ) throws {
+        switch resolution {
+        case let .askUserSkip(interactionID):
+            skipAskUser(tabID: session.tabID, interactionID: interactionID)
+        case let .askUser(interactionID, drafts):
+            do {
+                try submitAskUserResponse(tabID: session.tabID, interactionID: interactionID, draftsByQuestionID: drafts)
+            } catch let error as MCPError {
+                throw error
+            } catch {
+                throw MCPError.invalidParams(error.localizedDescription)
+            }
+        case let .mcpElicitation(request, response):
+            codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
+        case let .userInput(request, response):
+            submitUserInputResponse(tabID: session.tabID, requestID: request.requestID, response: response)
+        case let .worktreeMerge(reviewID, decision):
+            submitWorktreeMergeReviewDecision(tabID: session.tabID, reviewID: reviewID, decision: decision)
+        case let .permissions(request, decision):
+            codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
+        case let .approval(_, decision):
             submitApprovalDecision(tabID: session.tabID, decision: decision)
-            handleObservedMCPStateChange(for: session)
-            return nil
         }
     }
 

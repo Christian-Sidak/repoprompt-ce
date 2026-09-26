@@ -33,6 +33,26 @@ final class OverseerACPApprovalPolicyTests: XCTestCase {
         ))
     }
 
+    /// An observer's explicit decline must never become a persistent reject.
+    func testObserverDeclineSelectsOnlyAOneTimeRejectAndOtherwiseFallsBackToCancelled() {
+        XCTAssertEqual(ACPPermissionOptionPolicy.overseerOneTimeRejectOptionID(options: [
+            (optionID: "reject_always", kind: "reject_always"),
+            (optionID: "reject-once", kind: "reject_once")
+        ]), "reject-once")
+        XCTAssertEqual(ACPPermissionOptionPolicy.overseerOneTimeRejectOptionID(options: [
+            (optionID: "deny", kind: "")
+        ]), "deny")
+        // Only persistent or mislabelled rejects: nil, so the caller reports `cancelled` instead.
+        XCTAssertNil(ACPPermissionOptionPolicy.overseerOneTimeRejectOptionID(options: [
+            (optionID: "reject_always", kind: "reject_always"),
+            (optionID: "reject-always", kind: "reject_once"),
+            (optionID: "reject-session", kind: "reject")
+        ]))
+        XCTAssertNil(ACPPermissionOptionPolicy.overseerOneTimeRejectOptionID(options: [
+            (optionID: "allow-once", kind: "allow_once")
+        ]))
+    }
+
     func testProviderSpecificOptionCanUseAllowOnceKindWithoutBroadeningID() {
         XCTAssertEqual(ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
             options: [(optionID: "approve", kind: "allow_once")],
