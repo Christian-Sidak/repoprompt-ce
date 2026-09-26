@@ -410,8 +410,9 @@ extension AgentLaneUpdateDisplayAttribution {
     /// The scannable local row for one canonical lane-update item: a fixed system header, one line per
     /// named lane with its claim-time status, a truthful `+N more` tail, and the overflow disclosure.
     ///
-    /// Every field is derived from the same validated metadata as `richDisplayText`, which remains the
-    /// row's complete plain-text reading and is used verbatim as its accessibility label.
+    /// Every field is derived from the same validated claim-time metadata as `richDisplayText`. The
+    /// accessibility reading is computed from these fields rather than stored, so what VoiceOver hears
+    /// can never drift from what the row shows.
     struct RowPresentation: Equatable {
         struct Lane: Equatable {
             /// Sanitized, target-derived text. Rendered verbatim, never through Markdown.
@@ -435,13 +436,48 @@ extension AgentLaneUpdateDisplayAttribution {
         /// already states the whole count and a bare `+N` would read as additional to nothing.
         let additionalLaneCount: Int
         let overflowNote: String?
-        let accessibilityLabel: String
 
         var additionalLanesText: String? {
             guard additionalLaneCount > 0 else { return nil }
             return additionalLaneCount == 1
                 ? "+1 more overseen lane"
                 : "+\(additionalLaneCount) more overseen lanes"
+        }
+
+        /// The whole event as VoiceOver should hear it: no raw `[lane-update]` marker, and each named
+        /// lane's full claim-time transition, which sighted users otherwise only get on hover.
+        ///
+        /// Transitions are phrased in the past tense ("changed from Running to Idle") rather than
+        /// with the visible row's "now idle", because a spoken row has no adjacent timestamp to anchor
+        /// "now" and an old transcript must not sound like it describes the lane's current state.
+        var accessibilityLabel: String {
+            var sentences = ["\(Self.title).", summary]
+            for lane in lanes {
+                if let change = lane.statusChange {
+                    sentences.append(
+                        "\(lane.quotedLabel) changed from \(change.from.title) to \(change.to.title)."
+                    )
+                } else {
+                    sentences.append("\(lane.quotedLabel), status not recorded.")
+                }
+            }
+            if additionalLaneCount > 0 {
+                sentences.append(
+                    additionalLaneCount == 1
+                        ? "Plus 1 more overseen lane."
+                        : "Plus \(additionalLaneCount) more overseen lanes."
+                )
+            }
+            if let overflowNote {
+                sentences.append(overflowNote)
+            }
+            return sentences.joined(separator: " ")
+        }
+
+        /// The accessibility value carrying when the update was delivered, given the row's
+        /// already-formatted timestamp.
+        static func accessibilityDeliveryValue(timestamp: String) -> String {
+            "Delivered \(timestamp)"
         }
     }
 
@@ -465,15 +501,13 @@ extension AgentLaneUpdateDisplayAttribution {
     ) -> RowPresentation? {
         guard rawText == canonicalSystemText else { return nil }
         guard let attribution = attribution?.validated,
-              attribution.attributedLaneCount > 0,
-              let sentence = richDisplayText(rawText: rawText, attribution: attribution)
+              attribution.attributedLaneCount > 0
         else {
             return RowPresentation(
                 summary: genericRowSummary,
                 lanes: [],
                 additionalLaneCount: 0,
-                overflowNote: nil,
-                accessibilityLabel: canonicalSystemText
+                overflowNote: nil
             )
         }
         let lanes = attribution.labels.enumerated().map { index, label in
@@ -491,8 +525,7 @@ extension AgentLaneUpdateDisplayAttribution {
             additionalLaneCount: lanes.isEmpty ? 0 : count - lanes.count,
             overflowNote: attribution.includesUnattributedOverflow
                 ? unattributedOverflowSentence
-                : nil,
-            accessibilityLabel: sentence
+                : nil
         )
     }
 }

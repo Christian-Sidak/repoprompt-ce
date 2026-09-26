@@ -576,8 +576,10 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
         XCTAssertEqual(presentation.additionalLanesText, "+3 more overseen lanes")
         XCTAssertEqual(
             presentation.accessibilityLabel,
-            "\(opening) updates for overseen lanes \u{201C}Alpha\u{201D}, \u{201C}Beta\u{201D}, "
-                + "and 3 other overseen lanes."
+            "Lane update. RepoPrompt auto-woke this session for 5 overseen lanes. "
+                + "\u{201C}Alpha\u{201D}, status not recorded. "
+                + "\u{201C}Beta\u{201D}, status not recorded. "
+                + "Plus 3 more overseen lanes."
         )
     }
 
@@ -644,10 +646,11 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
         )
         XCTAssertEqual(
             presentation.accessibilityLabel,
-            AgentLaneUpdateDisplayAttribution.richDisplayText(
-                rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
-                attribution: built
-            )
+            "Lane update. RepoPrompt auto-woke this session for 5 overseen lanes. "
+                + "\u{201C}Alpha\u{201D} changed from Running to Waiting for input. "
+                + "\u{201C}kidfriendly-nova: Beta\u{201D} changed from Running to Idle. "
+                + "Plus 3 more overseen lanes. "
+                + AgentLaneUpdateDisplayAttribution.unattributedOverflowSentence
         )
     }
 
@@ -700,9 +703,103 @@ final class AgentLaneUpdateDisplayAttributionTests: XCTestCase {
             XCTAssertNil(presentation.overflowNote)
             XCTAssertEqual(
                 presentation.accessibilityLabel,
-                AgentLaneUpdateDisplayAttribution.canonicalSystemText
+                "Lane update. " + AgentLaneUpdateDisplayAttribution.genericRowSummary
             )
         }
+    }
+
+    // MARK: - Accessibility reading
+
+    /// VoiceOver hears a readable event, never the raw provider-facing marker, for every shape of row.
+    func testAccessibilityLabelNeverSpeaksTheRawMarker() throws {
+        let candidates: [AgentLaneUpdateDisplayAttribution?] = [
+            nil,
+            attribution(names: [nil, nil]),
+            attribution(names: ["Alpha"], overflow: true),
+            attribution(names: ["Alpha", "Beta", "Gamma"])
+        ]
+        for candidate in candidates {
+            let presentation = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+                rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+                attribution: candidate
+            ))
+            XCTAssertTrue(presentation.accessibilityLabel.hasPrefix("Lane update. "))
+            XCTAssertFalse(presentation.accessibilityLabel.contains("[lane-update]"))
+            XCTAssertFalse(presentation.accessibilityLabel.contains("["))
+        }
+    }
+
+    /// The spoken reading carries the full from→to transition that sighted users get on hover, in
+    /// the past tense, so an old transcript never sounds like it describes the lane's current state.
+    func testAccessibilityLabelSpeaksPastTenseTransitionsNotCurrentState() throws {
+        let built = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.make(
+            renderedEntries: [
+                entry(0, name: "Alpha", from: .waiting, to: .idle),
+                entry(1, name: "Beta", from: .idle, to: .waiting)
+            ],
+            includesUnattributedOverflow: false
+        ))
+        let label = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: built
+        )).accessibilityLabel
+
+        XCTAssertEqual(
+            label,
+            "Lane update. RepoPrompt auto-woke this session for 2 overseen lanes. "
+                + "\u{201C}Alpha\u{201D} changed from Waiting for input to Idle. "
+                + "\u{201C}Beta\u{201D} changed from Idle to Waiting for input."
+        )
+        for status in AgentLaneUpdateDisplayAttribution.LaneStatus.allCases {
+            XCTAssertFalse(
+                label.contains(status.currentStatePhrase),
+                "current-state phrasing must not be spoken: \(status.currentStatePhrase)"
+            )
+        }
+    }
+
+    func testAccessibilityLabelUsesSingularPlusTail() throws {
+        let label = try XCTUnwrap(AgentLaneUpdateDisplayAttribution.rowPresentation(
+            rawText: AgentLaneUpdateDisplayAttribution.canonicalSystemText,
+            attribution: attribution(names: ["Alpha", nil])
+        )).accessibilityLabel
+        XCTAssertTrue(label.hasSuffix(
+            "\u{201C}Alpha\u{201D} changed from Running to Idle. Plus 1 more overseen lane."
+        ))
+    }
+
+    /// Delivery time is spoken with date context, from the same formatter the visible stamp uses.
+    func testAccessibilityDeliveryValueIncludesDateContext() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "UTC"))
+        let locale = Locale(identifier: "en_US_POSIX")
+        let delivered = Date(timeIntervalSince1970: 1_790_000_000)
+
+        let sameDay = MessageTimestampFormatter.string(
+            from: delivered,
+            includeDateContext: true,
+            now: delivered.addingTimeInterval(60),
+            calendar: calendar,
+            locale: locale
+        )
+        let earlier = MessageTimestampFormatter.string(
+            from: delivered,
+            includeDateContext: true,
+            now: delivered.addingTimeInterval(60 * 60 * 24 * 40),
+            calendar: calendar,
+            locale: locale
+        )
+        XCTAssertNotEqual(sameDay, earlier, "an older delivery must carry its date")
+        XCTAssertEqual(
+            AgentLaneUpdateDisplayAttribution.RowPresentation
+                .accessibilityDeliveryValue(timestamp: sameDay),
+            "Delivered \(sameDay)"
+        )
+        XCTAssertEqual(
+            AgentLaneUpdateDisplayAttribution.RowPresentation
+                .accessibilityDeliveryValue(timestamp: earlier),
+            "Delivered \(earlier)"
+        )
     }
 
     func testRowPresentationIsDeclinedForOtherRows() throws {

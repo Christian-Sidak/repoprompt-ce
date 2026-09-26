@@ -161,6 +161,33 @@ private struct MessageFooterStrip: View {
     }
 }
 
+// MARK: - Lane Update Accessibility
+
+/// Speaks when a lane update was delivered, with date context always included.
+///
+/// The visible timestamp may omit the date, which is fine beside a row the user can see in sequence;
+/// a spoken row has no such context. Scoped to its own modifier so only lane-update rows observe the
+/// timestamp environment.
+private struct LaneUpdateDeliveryAccessibilityValue: ViewModifier {
+    let date: Date
+    @Environment(\.messageTimestampNow) private var messageTimestampNow
+    @Environment(\.calendar) private var calendar
+    @Environment(\.locale) private var locale
+
+    func body(content: Content) -> some View {
+        content.accessibilityValue(Text(
+            verbatim: AgentLaneUpdateDisplayAttribution.RowPresentation
+                .accessibilityDeliveryValue(timestamp: MessageTimestampFormatter.string(
+                    from: date,
+                    includeDateContext: true,
+                    now: messageTimestampNow,
+                    calendar: calendar,
+                    locale: locale
+                ))
+        ))
+    }
+}
+
 // MARK: - Agent Message Bubble
 
 struct CodexManagedLoginAction {
@@ -914,6 +941,7 @@ struct AgentMessageBubble: View {
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(verbatim: presentation.accessibilityLabel))
+        .modifier(LaneUpdateDeliveryAccessibilityValue(date: item.timestamp))
     }
 
     /// `“Label” — status`: the label in primary semibold, RepoPrompt's observation in secondary, so
