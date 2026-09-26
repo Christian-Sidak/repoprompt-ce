@@ -471,6 +471,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true }
         )
+        // The source-side filter runs synchronously while off; suspend only downstream delivery.
+        let permissionDeliveryQueue = DispatchQueue(label: "test.overseer.permission-delivery")
+        permissionDeliveryQueue.suspend()
+        var deliveryIsSuspended = true
+        defer { if deliveryIsSuspended { permissionDeliveryQueue.resume() } }
+        viewModel.test_permissionAutoApprovalDeliveryQueue = permissionDeliveryQueue
         let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
             on: viewModel,
             tabID: tabID,
@@ -524,8 +530,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertTrue(enabled)
         XCTAssertTrue(bridge.hasAutoApprovalSelection(for: targetEndpoint))
+        // The callback can only run now, after the exact-link selection was recorded.
+        permissionDeliveryQueue.resume()
+        deliveryIsSuspended = false
         await withCheckedContinuation { continuation in
-            DispatchQueue.main.async { continuation.resume() }
+            permissionDeliveryQueue.async { continuation.resume() }
         }
         await Task.yield()
         XCTAssertEqual(session.pendingApproval, earlier, "a request observed while opt-in was off stays manual")
@@ -545,7 +554,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
         XCTAssertNotNil(responseObserved)
         await withCheckedContinuation { continuation in
-            DispatchQueue.main.async { continuation.resume() }
+            permissionDeliveryQueue.async { continuation.resume() }
         }
         await Task.yield()
         XCTAssertEqual(controller.recorder.events, ["102:accept"], "one request-scoped accept, never session-wide")

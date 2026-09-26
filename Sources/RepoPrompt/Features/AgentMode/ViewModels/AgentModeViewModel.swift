@@ -914,6 +914,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var isAgentModeActive = false
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
+        /// Holds provider-permission delivery after observation so tests can order a later opt-in.
+        var test_permissionAutoApprovalDeliveryQueue: DispatchQueue?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
         private var test_persistentBindingResolutionSnapshotBuildCount = 0
@@ -6033,6 +6035,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // - Shared helpers: Services/MCP/Agent/AgentMCPToolHelpers.swift
 
     private func configureMCPStateObservation(for session: TabSession) {
+        #if DEBUG
+            let permissionDeliveryQueue = test_permissionAutoApprovalDeliveryQueue ?? DispatchQueue.main
+        #else
+            let permissionDeliveryQueue = DispatchQueue.main
+        #endif
         session.mcpStateObservationCancellable?.cancel()
         session.permissionAutoApprovalCancellable?.cancel()
         session.permissionAutoApprovalCancellable = Publishers.CombineLatest(
@@ -6056,7 +6063,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return AgentSessionLinkRuntimeBridge.shared.hasAutoApprovalSelection(for: endpoint)
         }
         // @Published sends before storage changes; evaluate only after the settled value is visible.
-        .receive(on: DispatchQueue.main)
+        .receive(on: permissionDeliveryQueue)
         .sink { [weak self, weak session] requestIDs in
             guard let self, let session else { return }
             Task { @MainActor [weak self, weak session] in
