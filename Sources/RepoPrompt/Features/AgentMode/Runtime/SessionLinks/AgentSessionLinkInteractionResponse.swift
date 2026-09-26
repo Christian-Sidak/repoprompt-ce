@@ -1,13 +1,15 @@
 import Foundation
 import RepoPromptDomainRuntime
 
-// Value types for the exact-link **Answer prompts** delegation: an observer agent inspecting and
-// explicitly answering its target's current pending interaction through `agent_session_link`.
+// Value types for a managing observer inspecting and explicitly answering its target's current
+// pending interaction through `agent_session_link` `get_interaction` and `respond`.
 //
 // Authority is layered and every layer is required:
-// 1. the exact outbound grant (`authorizeTarget` lease plus live endpoint revalidation),
-// 2. the user's per-exact-link Answer prompts opt-in (process-local, generation-qualified),
-// 3. the target's exact current `interaction_id` (compare-and-set before and after the final
+// 1. the exact outbound grant carrying the user's `.manage` delegation (a management lease from
+//    `authorizeTarget` plus live endpoint revalidation),
+// 2. the same lease re-validated inside the authority as the final suspension point, so a
+//    withdrawn delegation or revoked link applies nothing,
+// 3. the target's exact current `interaction_id` (compare-and-set before and after that final
 //    authority hop, with the submission made synchronously after the last check).
 //
 // Nothing here answers anything automatically. Provider permission auto-approval is a separate,
@@ -21,7 +23,8 @@ enum AgentSessionLinkInteractionManualOnlyReason: String, Equatable {
     case worktreeMergeReview = "worktree_merge_review"
     /// A field marked secret (for example a credential) is never supplied by another session.
     case secretInput = "secret_input"
-    /// MCP-controlled instruction prompts are answered by their controller, not by oversight.
+    /// A wait for the session's next instruction is not a prompt `respond` answers. A managing
+    /// observer delivers that instruction with `steer` instead.
     case instructionPrompt = "instruction_prompt"
     /// Session-wide or policy-amending approvals widen authority beyond this one request.
     case persistentDecision = "persistent_decision"
@@ -54,13 +57,13 @@ enum AgentSessionLinkInteractionResponseOutcome: Equatable {
     case manualOnly(AgentSessionLinkInteractionManualOnlyReason)
     /// The answer did not fit the interaction; the message says why. Nothing was applied.
     case invalid(String)
-    /// The target endpoint, grant, or delegation stopped holding before submission.
+    /// The target endpoint, grant, or management delegation stopped holding before submission.
     case unavailable
 }
 
-/// Bridge-level result: the delegation gate plus whatever the host reported.
+/// Bridge-level result: endpoint availability plus whatever the host reported. Management itself is
+/// proven by the lease before the bridge is called.
 enum AgentSessionLinkInteractionDisposition: Equatable {
-    case notEnabled
     case denied
     case shuttingDown
     case inspected(AgentSessionLinkPendingInteractionInspection)

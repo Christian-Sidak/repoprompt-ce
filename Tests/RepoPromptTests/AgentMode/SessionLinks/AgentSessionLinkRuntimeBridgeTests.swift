@@ -308,7 +308,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             liveObservations[sessionID]?()
         }
 
-        // MARK: Answer prompts
+        // MARK: Management
 
         /// Real target view model the interaction calls route to, standing in for the window host.
         weak var interactionViewModel: AgentModeViewModel?
@@ -695,7 +695,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertFalse(secondAfterDisable)
     }
 
-    // MARK: - Answer prompts delegation
+    // MARK: - Management delegation
 
     private func authorizedTarget(
         _ bridge: AgentSessionLinkRuntimeBridge,
@@ -725,76 +725,119 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
     }
 
-    func testAnswerPromptsDefaultsOffIsIndependentOfAutoApprovalAndRetiresWithExactGrant() async throws {
+    private func authorizationFailure(
+        _ result: Result<AgentSessionLinkRuntimeBridge.AuthorizedTarget, AgentSessionLinkRuntimeBridge.AuthorizationFailure>
+    ) -> AgentSessionLinkRuntimeBridge.AuthorizationFailure? {
+        guard case let .failure(failure) = result else { return nil }
+        return failure
+    }
+
+    func testManagementDefaultsOffIsAuthorityOwnedIndependentOfAutoApprovalAndRetiresWithExactGrant() async throws {
         let fixture = makeFixture()
         guard case .added = await addLink(fixture),
               let reference = await linkReference(fixture)
         else { return XCTFail("Expected an active link") }
         let observer = fixture.observer.domainEndpoint
         let target = fixture.target.domainEndpoint
-        let authorized = try await authorizedTarget(
-            fixture.bridge,
-            operation: .monitorRead,
-            observer: fixture.observer,
-            target: fixture.target
-        )
 
-        // Off by default: no payload and no response, even though the read grant is valid.
-        XCTAssertFalse(fixture.bridge.interactionResponseIsEnabled(for: authorized))
-        XCTAssertEqual(fixture.bridge.pendingInteraction(target: authorized), .notEnabled)
-        let offResponse = try await fixture.bridge.respondToInteraction(
-            target: authorized,
-            request: interactionRequest(UUID(), ["response": .string("accept")])
+        // Off by default: every management operation is refused as not granted, while watching works.
+        for operation in [DomainAgentSessionTargetOperation.monitorGetInteraction, .monitorRespond, .monitorSteer] {
+            let result = await fixture.bridge.authorizeTarget(
+                operation: operation,
+                observerEndpoint: observer,
+                targetSessionID: fixture.target.sessionID
+            )
+            XCTAssertEqual(authorizationFailure(result), .managementNotGranted, operation.rawValue)
+        }
+        let unlinked = await fixture.bridge.authorizeTarget(
+            operation: .monitorSteer,
+            observerEndpoint: observer,
+            targetSessionID: UUID()
         )
-        XCTAssertEqual(offResponse, .notEnabled)
+        XCTAssertEqual(authorizationFailure(unlinked), .denied, "an unlinked UUID learns nothing about management")
+        XCTAssertEqual(outboundRow(fixture)?.managementEnabled, false)
+        let revisionBefore = fixture.host.publishedPromptInventories[fixture.observer.sessionID]?.linkSetRevision
 
-        let enabled = await fixture.bridge.setInteractionResponse(
+        let enabled = await fixture.bridge.setManagement(
             true,
             observerEndpoint: observer,
             targetEndpoint: target,
             expectedReference: reference
         )
         XCTAssertTrue(enabled)
-        XCTAssertTrue(fixture.bridge.interactionResponseIsEnabled(for: authorized))
+        let authorized = try await authorizedTarget(
+            fixture.bridge,
+            operation: .monitorGetInteraction,
+            observer: fixture.observer,
+            target: fixture.target
+        )
+        XCTAssertEqual(authorized.lease.capability, .manage)
         XCTAssertEqual(fixture.bridge.pendingInteraction(target: authorized), .inspected(.none))
-        // Answering is never blind approval, and blind approval is never answering.
+        let grantedNow = await fixture.bridge.managementIsGranted(for: authorized.lease)
+        XCTAssertTrue(grantedNow)
+        // The observer is re-owed a prompt inventory that names the new capability, its dashboard row
+        // shows it, and the target's own user sees who may act for them.
+        let inventory = try XCTUnwrap(fixture.host.publishedPromptInventories[fixture.observer.sessionID])
+        XCTAssertEqual(inventory.items.first?.capabilityNames.contains("manage"), true)
+        if let revisionBefore {
+            XCTAssertGreaterThan(inventory.linkSetRevision, revisionBefore)
+        }
+        XCTAssertEqual(outboundRow(fixture)?.managementEnabled, true)
+        XCTAssertEqual(fixture.host.publishedProps[fixture.target.sessionID]?.inbound.first?.isManaging, true)
+        // Managing is never blind approval, and blind approval is never managing.
         XCTAssertFalse(fixture.bridge.hasAutoApprovalSelection(for: target))
         let autoApproval = await fixture.bridge.autoApprovalIsAuthorized(for: target)
         XCTAssertFalse(autoApproval)
-        let rows = try XCTUnwrap(fixture.host.publishedProps[fixture.observer.sessionID]?.outbound)
-        if let row = rows.first(where: { $0.targetSessionID == fixture.target.sessionID }) {
-            XCTAssertFalse(row.autoApprovalEnabled)
-        }
+        XCTAssertEqual(outboundRow(fixture)?.autoApprovalEnabled, false)
 
+        // Withdrawal applies to leases already issued, not only to later calls.
+        let disabled = await fixture.bridge.setManagement(
+            false,
+            observerEndpoint: observer,
+            targetEndpoint: target,
+            expectedReference: reference
+        )
+        XCTAssertTrue(disabled)
+        let grantedAfter = await fixture.bridge.managementIsGranted(for: authorized.lease)
+        XCTAssertFalse(grantedAfter)
+        let leaseCheck = await fixture.authority.validate(lease: authorized.lease)
+        XCTAssertEqual(leaseCheck, .capabilityDenied)
+        XCTAssertEqual(outboundRow(fixture)?.managementEnabled, false)
+        XCTAssertEqual(fixture.host.publishedProps[fixture.target.sessionID]?.inbound.first?.isManaging, false)
+
+        // Unlink and relink: the new generation starts watch-only, and the retired one is dead.
+        _ = await fixture.bridge.setManagement(
+            true,
+            observerEndpoint: observer,
+            targetEndpoint: target,
+            expectedReference: reference
+        )
         let stopped = await fixture.bridge.stopMonitorLink(
             observerEndpoint: observer,
             targetEndpoint: target,
             expectedReference: reference
         )
         XCTAssertEqual(stopped, .stopped)
-        XCTAssertEqual(fixture.bridge.test_interactionResponseLinkCount(), 0)
-
         guard case .added = await addLink(fixture),
               let replacement = await linkReference(fixture)
         else { return XCTFail("Expected a replacement link") }
         XCTAssertNotEqual(replacement, reference)
-        let relinked = try await authorizedTarget(
-            fixture.bridge,
-            operation: .monitorRead,
-            observer: fixture.observer,
-            target: fixture.target
+        let relinked = await fixture.bridge.authorizeTarget(
+            operation: .monitorRespond,
+            observerEndpoint: observer,
+            targetSessionID: fixture.target.sessionID
         )
-        XCTAssertEqual(fixture.bridge.pendingInteraction(target: relinked), .notEnabled, "relink must not inherit")
-        let staleApplied = await fixture.bridge.setInteractionResponse(
+        XCTAssertEqual(authorizationFailure(relinked), .managementNotGranted, "relink must not inherit")
+        let staleApplied = await fixture.bridge.setManagement(
             true,
             observerEndpoint: observer,
             targetEndpoint: target,
             expectedReference: reference
         )
-        XCTAssertFalse(staleApplied, "a revoked generation can never be re-enabled")
+        XCTAssertFalse(staleApplied, "a revoked generation can never be managed again")
     }
 
-    func testAnswerPromptsRespondsOnlyToTheExactCurrentInteractionWithOneTimeDecisions() async throws {
+    func testManagedRespondAnswersOnlyTheExactCurrentInteractionWithOneTimeDecisions() async throws {
         let tabID = UUID()
         let controller = ApprovalRecordingCodexController()
         let viewModel = AgentModeViewModel(
@@ -809,7 +852,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
             on: viewModel,
             tabID: tabID,
-            name: "Answer prompts target"
+            name: "Managed target"
         )
         defer { withExtendedLifetime(workspaceManager) {} }
         let session = viewModel.session(for: tabID)
@@ -851,16 +894,26 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             itemID: "pending-before-enable"
         )
         session.pendingApproval = approval
-        let readTarget = try await authorizedTarget(bridge, operation: .monitorRead, observer: observer, target: target)
-        XCTAssertEqual(bridge.pendingInteraction(target: readTarget), .notEnabled)
+        let unmanaged = await bridge.authorizeTarget(
+            operation: .monitorGetInteraction,
+            observerEndpoint: observer.domainEndpoint,
+            targetSessionID: target.sessionID
+        )
+        XCTAssertEqual(authorizationFailure(unmanaged), .managementNotGranted)
 
-        let enabled = await bridge.setInteractionResponse(
+        let enabled = await bridge.setManagement(
             true,
             observerEndpoint: observer.domainEndpoint,
             targetEndpoint: target.domainEndpoint,
             expectedReference: reference
         )
         XCTAssertTrue(enabled)
+        let readTarget = try await authorizedTarget(
+            bridge,
+            operation: .monitorGetInteraction,
+            observer: observer,
+            target: target
+        )
         guard case let .inspected(inspection) = bridge.pendingInteraction(target: readTarget),
               let interaction = inspection.interaction
         else { return XCTFail("Expected the pending approval to be visible once enabled") }
@@ -870,7 +923,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         // Only one-time decisions are offered to an observer.
         XCTAssertEqual(interaction.options.map(\.label), ["accept", "decline", "cancel"])
 
-        let sendTarget = try await authorizedTarget(bridge, operation: .monitorSend, observer: observer, target: target)
+        let sendTarget = try await authorizedTarget(bridge, operation: .monitorRespond, observer: observer, target: target)
         let stale = try await bridge.respondToInteraction(
             target: sendTarget,
             request: interactionRequest(UUID(), ["response": .string("accept")])
@@ -906,7 +959,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )
         XCTAssertEqual(replay, .responded(.noPendingInteraction), "a resolved prompt applies nothing twice")
 
-        // Revocation landing at the final fence applies nothing and leaves the prompt manual.
+        // The user withdrawing management mid-call wins at the final fence: nothing is applied.
         let later = AgentApprovalRequest(
             requestID: .codex(.int(202)),
             method: "item/commandExecution/requestApproval",
@@ -916,6 +969,30 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             itemID: "revoked-mid-call"
         )
         session.pendingApproval = later
+        host.beforeInteractionAuthorize = {
+            _ = await bridge.setManagement(
+                false,
+                observerEndpoint: observer.domainEndpoint,
+                targetEndpoint: target.domainEndpoint,
+                expectedReference: reference
+            )
+        }
+        let withdrawn = try await bridge.respondToInteraction(
+            target: sendTarget,
+            request: interactionRequest(later.id, ["response": .string("accept")])
+        )
+        XCTAssertEqual(withdrawn, .responded(.unavailable))
+        XCTAssertEqual(controller.recorder.events, ["201:accept"])
+        XCTAssertEqual(session.pendingApproval, later)
+        let regranted = await bridge.setManagement(
+            true,
+            observerEndpoint: observer.domainEndpoint,
+            targetEndpoint: target.domainEndpoint,
+            expectedReference: reference
+        )
+        XCTAssertTrue(regranted)
+
+        // Revocation landing at the final fence applies nothing and leaves the prompt manual.
         host.beforeInteractionAuthorize = {
             _ = await bridge.stopMonitorLink(
                 observerEndpoint: observer.domainEndpoint,
@@ -930,10 +1007,15 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(revoked, .responded(.unavailable))
         XCTAssertEqual(controller.recorder.events, ["201:accept"])
         XCTAssertEqual(session.pendingApproval, later)
-        XCTAssertEqual(bridge.test_interactionResponseLinkCount(), 0)
+        let afterStop = await bridge.authorizeTarget(
+            operation: .monitorRespond,
+            observerEndpoint: observer.domainEndpoint,
+            targetSessionID: target.sessionID
+        )
+        XCTAssertEqual(authorizationFailure(afterStop), .denied)
     }
 
-    func testAnswerPromptsAnswersAMultipleChoiceQuestionAndKeepsSecretsAndHookTrustManual() async throws {
+    func testManagedRespondAnswersAMultipleChoiceQuestionAndKeepsSecretsAndHookTrustManual() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
             testWindowID: 96,
@@ -975,7 +1057,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         guard let item = inventory.items.first(where: { $0.targetSessionID == target.sessionID }) else {
             return XCTFail("Expected the active link reference")
         }
-        let enabled = await bridge.setInteractionResponse(
+        let enabled = await bridge.setManagement(
             true,
             observerEndpoint: observer.domainEndpoint,
             targetEndpoint: target.domainEndpoint,
@@ -1003,7 +1085,12 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             await MainActor.run { session.askUserContinuation != nil }
         }
 
-        let readTarget = try await authorizedTarget(bridge, operation: .monitorRead, observer: observer, target: target)
+        let readTarget = try await authorizedTarget(
+            bridge,
+            operation: .monitorGetInteraction,
+            observer: observer,
+            target: target
+        )
         guard case let .inspected(inspection) = bridge.pendingInteraction(target: readTarget),
               let visible = inspection.interaction
         else { return XCTFail("Expected the pending question to be visible") }
@@ -1011,7 +1098,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertEqual(visible.fields.first?.options.map(\.label), ["Changed only", "All relevant"])
         XCTAssertNil(inspection.manualOnlyReason)
 
-        let sendTarget = try await authorizedTarget(bridge, operation: .monitorSend, observer: observer, target: target)
+        let sendTarget = try await authorizedTarget(bridge, operation: .monitorRespond, observer: observer, target: target)
         let result = try await bridge.respondToInteraction(
             target: sendTarget,
             request: interactionRequest(interaction.id, ["answers": .object(["scope": .string("All relevant")])])

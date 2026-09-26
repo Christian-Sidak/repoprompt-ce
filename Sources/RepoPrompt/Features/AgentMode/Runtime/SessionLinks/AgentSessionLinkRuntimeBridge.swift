@@ -313,7 +313,20 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
     ) async -> AgentSessionLinkSendTransactionOutcome
 
-    // MARK: Answer prompts delegation
+    // MARK: Management delegation
+
+    /// Runs one managed `steer` on the target's MainActor.
+    ///
+    /// An idle target is delivered through the send transaction (framed as managed direction); a
+    /// running target, or one waiting for its next instruction, is steered through its own provider
+    /// routing after `commitAuthorization` — which re-proves the grant and the management delegation
+    /// — returns `.committed`. A conforming host never reads, clears, or restores composer state.
+    func agentSessionLinkPerformSteer(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkSendRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome
 
     /// Redacted, observer-restricted view of one exact live target's current pending interaction.
     ///
@@ -366,8 +379,17 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
 /// topology at all. The defaults are the conservative ones: no descriptors, no discovery level, and a
 /// pending topology, which together mean automatic restoration never runs against such a host.
 extension AgentSessionLinkEndpointHost {
-    /// Fail-closed Answer prompts defaults: a host that does not model interactions exposes none and
-    /// answers none.
+    /// Fail-closed management defaults: a host that does not model interactions or steering exposes
+    /// none, answers none, and steers nothing.
+    func agentSessionLinkPerformSteer(
+        to _: AgentSessionLinkEndpointCandidate,
+        request _: AgentSessionLinkSendRequest,
+        liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        .blocked(.endpointInvalidated)
+    }
+
     func agentSessionLinkPendingInteraction(
         for _: AgentSessionLinkEndpointCandidate
     ) -> AgentSessionLinkPendingInteractionInspection {
@@ -833,12 +855,11 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     private var autoApprovalLinks: Set<AutoApprovalLink> = []
-    /// Explicit, process-local **Answer prompts** delegation for one exact active oversight grant.
-    ///
-    /// Independent of `autoApprovalLinks`: this lets the observer agent inspect and explicitly answer
-    /// the target's current interaction through `agent_session_link`; it never answers anything by
-    /// itself. Same exactness and lifetime rules — a new generation or endpoint cannot inherit it.
-    private var interactionResponseLinks: Set<AutoApprovalLink> = []
+
+    // The user's *management* delegation is deliberately not bridge state. It is the `.manage`
+    // capability on the exact grant in `DomainAgentSessionLinkAuthority`, so the advertised
+    // capabilities, the prompt inventory, and every management fence read one authority.
+
     /// Lane status-change queues, one per **exact observer incarnation**.
     ///
     /// Created automatically for any observer that resolves at least one direct outbound target, and
@@ -1007,6 +1028,10 @@ final class AgentSessionLinkRuntimeBridge {
                 case .activated:
                     await invalidateToolAdvertisement(for: event)
                     await requestProjectionRefresh(scope(for: event))
+                case .capabilitiesChanged:
+                    // Catalog visibility is unchanged; what changed is what the observer may be told
+                    // it can do, so only projections — rows and prompt inventory — are rebuilt.
+                    await requestProjectionRefresh(scope(for: event))
                 case .revoked, .targetStateChanged, .draining, .shutdown:
                     await requestProjectionRefresh(scope(for: event))
                     await invalidateToolAdvertisement(for: event)
@@ -1030,6 +1055,14 @@ final class AgentSessionLinkRuntimeBridge {
             // endpoints holding outbound grants. A membership change can cross an observer's 0↔1
             // boundary and therefore change availability in otherwise unrelated target rows.
             return .full
+        case .capabilitiesChanged:
+            // Membership did not move, so no menu availability can change: only the two endpoints of
+            // the one grant render differently (the observer's lane and prompt inventory, the
+            // target's inbound row).
+            guard let observerSessionID = event.observerSessionID,
+                  let targetSessionID = event.targetSessionID
+            else { return .full }
+            return .sessions([observerSessionID, targetSessionID])
         case .draining, .shutdown:
             return .full
         }
@@ -1064,11 +1097,11 @@ final class AgentSessionLinkRuntimeBridge {
                         inboundAdvertisementCountByTargetSession.removeValue(forKey: targetSessionID)
                         await toolAdvertisementInvalidator(targetSessionID)
                     }
-                case .targetStateChanged, .draining, .shutdown:
+                case .capabilitiesChanged, .targetStateChanged, .draining, .shutdown:
                     break
                 }
             }
-        case .targetStateChanged, .draining, .shutdown:
+        case .capabilitiesChanged, .targetStateChanged, .draining, .shutdown:
             return
         }
     }
@@ -3299,7 +3332,7 @@ final class AgentSessionLinkRuntimeBridge {
             // current activity instead of inheriting an acknowledgement made under removed authority.
             monitorSeenByReference.removeValue(forKey: reference)
             autoApprovalLinks = autoApprovalLinks.filter { $0.reference != reference }
-            interactionResponseLinks = interactionResponseLinks.filter { $0.reference != reference }
+            // Management needs no cleanup here: it lived on the grant the authority just removed.
         }
         // Generation-qualified for the same reason, and released before anything republishes: a
         // queued message must never outlive the exact grant that admitted it.
@@ -3672,11 +3705,9 @@ final class AgentSessionLinkRuntimeBridge {
                     target: targetEndpoint,
                     reference: reference
                 )),
-                interactionResponseEnabled: interactionResponseLinks.contains(AutoApprovalLink(
-                    observer: endpoint,
-                    target: targetEndpoint,
-                    reference: reference
-                ))
+                // Straight from the grant: the dashboard toggle renders exactly the authority the
+                // observer's own tools and prompt inventory report.
+                managementEnabled: item.capabilities.contains(.manage)
             ))
         }
 
@@ -3701,7 +3732,9 @@ final class AgentSessionLinkRuntimeBridge {
                 // change neither drifts the endpoint identity nor feeds the oversight change channel.
                 // A location rendered here would freeze. Provider survives that because it is locked
                 // at first send, not because anything refreshes it.
-                providerDisplayName: observer?.providerDisplayName
+                providerDisplayName: observer?.providerDisplayName,
+                // Disclosed to the target's own user: this observer may act for them here.
+                isManaging: item.capabilities.contains(.manage)
             )
         }
 
@@ -4095,7 +4128,8 @@ final class AgentSessionLinkRuntimeBridge {
             authorized = target
         case .failure(.shuttingDown):
             return .denied(message: shutdownMessage)
-        case .failure(.denied):
+        case .failure(.denied), .failure(.managementNotGranted):
+            // `.monitorPoll` never requires management; both read as a stale row.
             return .denied(message: staleMessage)
         }
 
@@ -4399,60 +4433,86 @@ final class AgentSessionLinkRuntimeBridge {
         return false
     }
 
-    // MARK: Exact-link Answer prompts delegation
+    // MARK: Exact-link management delegation
 
-    /// Changes only the captured active grant's **Answer prompts** delegation.
+    /// Grants or withdraws the user's **management** delegation on one exact outbound grant.
     ///
-    /// Not persisted, for the same reason as auto-approval: durable oversight state is UUID-keyed and
-    /// cannot safely carry authority to answer another session's prompts across relink or relaunch.
-    func setInteractionResponse(
+    /// Authority-owned rather than bridge state: the `.manage` capability lives on the grant in
+    /// `DomainAgentSessionLinkAuthority`, so `list`, `poll`, the prompt inventory, the dashboard, and
+    /// every management fence read one source. The change takes effect at the very next fence of any
+    /// management operation already in flight, and the observer's next accepted turn is re-owed a
+    /// fresh inventory because the authority advances its link-set revision.
+    ///
+    /// Not persisted, for the same reason as auto-approval: durable oversight intent is UUID-keyed
+    /// and cannot safely carry authority to act for the user across relink or relaunch. Unlink,
+    /// relink, endpoint replacement, and restart all return the link to watch-only. Granting requires
+    /// both exact endpoints to be live and eligible now; withdrawing only requires the grant to exist,
+    /// so turning management off is never refused while the link is live.
+    func setManagement(
         _ enabled: Bool,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
         expectedReference: DomainAgentSessionLinkReference
     ) async -> Bool {
-        guard !isFrozenForTermination,
-              let grant = await authority.activeGrant(for: expectedReference),
-              grant.observer == observerEndpoint,
-              grant.target == targetEndpoint,
-              !isFrozenForTermination,
-              let host
-        else { return false }
-        let key = AutoApprovalLink(observer: observerEndpoint, target: targetEndpoint, reference: expectedReference)
-        guard autoApprovalEndpointsAreEligible(key, host: host) else { return false }
+        guard !isFrozenForTermination, let host else { return false }
         if enabled {
-            interactionResponseLinks.insert(key)
-        } else {
-            interactionResponseLinks.remove(key)
-        }
-        requestMonitorProjectionRefresh(forExactObserverEndpoints: [observerEndpoint])
-        return true
-    }
-
-    private static func interactionResponseKey(for target: AuthorizedTarget) -> AutoApprovalLink {
-        AutoApprovalLink(
-            observer: target.lease.observer,
-            target: target.lease.target,
-            reference: DomainAgentSessionLinkReference(
-                linkID: target.lease.linkID,
-                generation: target.lease.linkGeneration
+            let key = AutoApprovalLink(
+                observer: observerEndpoint,
+                target: targetEndpoint,
+                reference: expectedReference
             )
-        )
+            guard autoApprovalEndpointsAreEligible(key, host: host) else { return false }
+        }
+        switch await authority.setManagement(
+            enabled,
+            reference: expectedReference,
+            observer: observerEndpoint,
+            target: targetEndpoint
+        ) {
+        case .changed:
+            // Inline rather than left to the change feed alone: the feed is lossy by design, and the
+            // observer's prompt inventory must never keep describing the authority it no longer has.
+            await requestProjectionRefresh(.sessions([
+                observerEndpoint.sessionID,
+                targetEndpoint.sessionID
+            ]))
+            return true
+        case .unchanged:
+            return true
+        case .notFound, .shuttingDown:
+            return false
+        }
     }
 
-    /// Whether the exact grant behind an already-authorized target carries Answer prompts.
-    func interactionResponseIsEnabled(for target: AuthorizedTarget) -> Bool {
-        interactionResponseLinks.contains(Self.interactionResponseKey(for: target))
+    /// Grants management on the link an Add just created or found, addressed by its link ID.
+    ///
+    /// The exact generation and target incarnation come from the authority's current projection for
+    /// this exact observer endpoint, never from the UI, so a link that was replaced in between is
+    /// simply not found and nothing is granted.
+    func grantManagement(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        linkID: UUID
+    ) async -> Bool {
+        guard !isFrozenForTermination else { return false }
+        let inputs = await authority.projectionInputs(forEndpoint: observerEndpoint)
+        guard let item = inputs.outbound.items.first(where: { $0.linkID == linkID }),
+              let targetEndpoint = inputs.outboundTargetEndpoints[linkID]
+        else { return false }
+        return await setManagement(
+            true,
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint,
+            expectedReference: DomainAgentSessionLinkReference(linkID: linkID, generation: item.generation)
+        )
     }
 
     /// Read-only inspection of the target's current pending interaction.
     ///
-    /// The payload is withheld entirely unless the exact link carries Answer prompts: without the
-    /// delegation the observer has no use for prompt text, commands, or paths, and poll already
-    /// reports the interaction kind.
+    /// `target` was authorized for `.monitorGetInteraction`, so its lease already proves the exact
+    /// grant carries management; a watch-only link never reaches here and never sees prompt text,
+    /// commands, or paths.
     func pendingInteraction(target: AuthorizedTarget) -> AgentSessionLinkInteractionDisposition {
         guard !isFrozenForTermination else { return .shuttingDown }
-        guard interactionResponseIsEnabled(for: target) else { return .notEnabled }
         guard let host,
               host.agentSessionLinkCandidates().contains(where: {
                   $0.domainEndpoint == target.candidate.domainEndpoint
@@ -4464,42 +4524,41 @@ final class AgentSessionLinkRuntimeBridge {
     /// Submits one explicit observer answer to the target's exact current interaction.
     ///
     /// The host validates the answer and compares the interaction ID, then calls `authorize` as the
-    /// last suspension point, re-compares, and submits synchronously. `authorize` re-proves the
-    /// exact grant, the delegation, and both live endpoints after the authority hop, so an unlink,
-    /// relink, toggle-off, or endpoint replacement that lands mid-call applies nothing.
+    /// last suspension point, re-compares, and submits synchronously. `authorize` re-validates the
+    /// management lease inside the authority plus both live endpoints, so an unlink, relink,
+    /// withdrawn management, or endpoint replacement that lands mid-call applies nothing.
     func respondToInteraction(
         target: AuthorizedTarget,
         request: AgentSessionLinkInteractionResponseRequest
     ) async -> AgentSessionLinkInteractionDisposition {
         guard !isFrozenForTermination else { return .shuttingDown }
-        let key = Self.interactionResponseKey(for: target)
-        guard interactionResponseLinks.contains(key) else { return .notEnabled }
         guard let host else { return .denied }
+        let lease = target.lease
         let outcome = await host.agentSessionLinkRespondToPendingInteraction(
             for: target.candidate,
             request: request,
             authorize: { [weak self] in
                 guard let self else { return false }
-                return await interactionResponseIsStillAuthorized(key)
+                return await managementLeaseIsStillAuthorized(lease)
             }
         )
         return .responded(outcome)
     }
 
-    /// Final fence for one respond: exact grant, delegation, deletion state, and live endpoints.
-    private func interactionResponseIsStillAuthorized(_ key: AutoApprovalLink) async -> Bool {
+    /// Final fence for one management operation: the lease re-validated inside the authority (exact
+    /// generation, both endpoints, and the `.manage` capability still on the grant), then deletion
+    /// state and both live endpoints' eligibility.
+    private func managementLeaseIsStillAuthorized(_ lease: DomainAgentSessionLinkLease) async -> Bool {
         guard !isFrozenForTermination,
-              interactionResponseLinks.contains(key),
-              let grant = await authority.activeGrant(for: key.reference),
-              grant.observer == key.observer,
-              grant.target == key.target,
+              lease.capability == .manage,
+              await authority.validate(lease: lease) == nil,
               !isFrozenForTermination,
-              interactionResponseLinks.contains(key),
-              let host,
-              autoApprovalEndpointsAreEligible(key, host: host)
+              let host
         else { return false }
+        let key = AutoApprovalLink(observer: lease.observer, target: lease.target, reference: lease.reference)
+        guard autoApprovalEndpointsAreEligible(key, host: host) else { return false }
         let registry = AgentSessionDeletionRegistry.shared
-        for sessionID in [key.observer.sessionID, key.target.sessionID] {
+        for sessionID in [lease.observer.sessionID, lease.target.sessionID] {
             if registry.isPermanentlyDeleted(sessionID: sessionID)
                 || registry.isDeletionInProgress(sessionID: sessionID)
             {
@@ -4508,12 +4567,6 @@ final class AgentSessionLinkRuntimeBridge {
         }
         return true
     }
-
-    #if DEBUG
-        func test_interactionResponseLinkCount() -> Int {
-            interactionResponseLinks.count
-        }
-    #endif
 
     // MARK: Routine wake interval and Wake now routing
 
@@ -4814,6 +4867,11 @@ final class AgentSessionLinkRuntimeBridge {
         /// Indistinguishable denial. Never reveals whether an ungranted UUID exists.
         case denied
         case shuttingDown
+        /// The caller is the exact observer of a live grant to this target, but the user has not
+        /// delegated management over it. Only a management operation can produce this, and only
+        /// after a watch operation on the same target was authorized, so it discloses nothing about a
+        /// session the caller does not already oversee.
+        case managementNotGranted
 
         init(_ error: DomainAgentSessionLinkError) {
             self = error == .runtimeShuttingDown ? .shuttingDown : .denied
@@ -5035,12 +5093,37 @@ final class AgentSessionLinkRuntimeBridge {
         case let .success(value):
             lease = value
         case let .failure(error):
+            if error == .capabilityDenied, operation.requiredMonitorCapability == .manage {
+                return await managementNotGrantedOrDenied(
+                    observerEndpoint: observerEndpoint,
+                    targetSessionID: targetSessionID
+                )
+            }
             return .failure(AuthorizationFailure(error))
         }
         guard let candidate = await revalidateEndpoints(for: lease) else {
             return .failure(.denied)
         }
         return .success(AuthorizedTarget(lease: lease, candidate: candidate))
+    }
+
+    /// Tells "linked, but management was not granted" apart from "not linked" for one management
+    /// operation, by proving the plain watch grant through the ordinary path. A link that is gone or
+    /// drifted keeps the indistinguishable denial.
+    private func managementNotGrantedOrDenied(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID
+    ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
+        switch await authorizeTarget(
+            operation: .monitorPoll,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        ) {
+        case .success:
+            .failure(.managementNotGranted)
+        case let .failure(failure):
+            .failure(failure)
+        }
     }
 
     /// All-or-nothing authorization for a multi-target request.
@@ -5227,6 +5310,19 @@ final class AgentSessionLinkRuntimeBridge {
     }
 
     /// Current sanitized target state plus a freshly minted successor wait cursor.
+    /// Whether the exact grant behind `lease` currently carries the user's management delegation.
+    ///
+    /// Presentation for the observer's own results only; every management operation still proves
+    /// management through its own lease and fence. A stale generation or drifted endpoint answers
+    /// `false`, never another grant's state.
+    func managementIsGranted(for lease: DomainAgentSessionLinkLease) async -> Bool {
+        guard let grant = await authority.activeGrant(for: lease.reference),
+              grant.observer == lease.observer,
+              grant.target == lease.target
+        else { return false }
+        return grant.capabilities.contains(.manage)
+    }
+
     func targetState(
         for lease: DomainAgentSessionLinkLease
     ) async -> DomainAgentSessionLinkTargetState? {
@@ -5340,6 +5436,15 @@ final class AgentSessionLinkRuntimeBridge {
         case resolved(AgentWorkflowDefinition?)
     }
 
+    /// Which delivery one ledger-backed call performs.
+    private enum DeliveryKind {
+        /// Ordinary attributed coordination (`send`): idle-only, coordination framing.
+        case attributedSend
+        /// The user-delegated `steer`: management framing, active or idle target, and a commit fence
+        /// that also re-proves the management delegation.
+        case managedSteer
+    }
+
     /// Main-actor hooks a queued drain installs around the authority commit fence.
     ///
     /// Immediate sends pass none: there is no pending entry to invalidate, so the fence is the
@@ -5380,7 +5485,31 @@ final class AgentSessionLinkRuntimeBridge {
         )
     }
 
-    /// The single delivery path both an immediate `send` and a queued drain run through.
+    /// One managed steer: the user's management delegation, the shared exactly-once ledger, and the
+    /// target's own provider routing.
+    ///
+    /// `target` must have been authorized for `.monitorSteer`; its `.manage` lease is what the ledger
+    /// reserves under, and the commit fence re-proves management at the linearization point, so a
+    /// withdrawal that wins the race delivers nothing. A retry with the same key replays the stored
+    /// receipt instead of steering twice.
+    func steer(
+        target: AuthorizedTarget,
+        message: String,
+        idempotencyKey: String
+    ) async -> SendOutcome {
+        await performSend(
+            target: target,
+            message: message,
+            idempotencyKey: idempotencyKey,
+            messageDigest: AgentSessionLinkMessageDigest.steerDigest(message: message),
+            workflow: .resolved(nil),
+            commitFence: nil,
+            delivery: .managedSteer
+        )
+    }
+
+    /// The single delivery path an immediate `send`, a queued drain, and a managed `steer` run
+    /// through.
     ///
     /// - Parameters:
     ///   - messageDigest: the caller's canonical request identity. Passed in rather than derived so a
@@ -5392,7 +5521,8 @@ final class AgentSessionLinkRuntimeBridge {
         idempotencyKey: String,
         messageDigest: String,
         workflow workflowInput: SendWorkflowInput,
-        commitFence: SendCommitFence?
+        commitFence: SendCommitFence?,
+        delivery: DeliveryKind = .attributedSend
     ) async -> SendOutcome {
         guard let host else { return .rejected(.denied) }
         // The observer's own live candidate supplies the attribution name. Requiring an exact
@@ -5469,7 +5599,8 @@ final class AgentSessionLinkRuntimeBridge {
             observerEndpoint: target.lease.observer,
             observerDisplayName: observer.resolvedDisplayName,
             message: message,
-            workflow: workflow
+            workflow: workflow,
+            framing: delivery == .managedSteer ? .management : .coordination
         )
         // Re-read at every fence the transaction crosses. It is deliberately pure endpoint/window
         // liveness and never consults the authority: after the commit fence, manual revocation is
@@ -5482,30 +5613,43 @@ final class AgentSessionLinkRuntimeBridge {
             )
         }
         let authority = authority
-        let outcome = await host.agentSessionLinkPerformSend(
-            to: target.candidate,
-            request: request,
-            liveness: liveness,
-            commitAuthorization: {
-                // A queued drain's cancellation cutoff, taken synchronously on the bridge's main
-                // actor immediately before the authority hop. Refusing here is indistinguishable
-                // from losing the authority race: nothing is staged yet, so the delivery unwinds
-                // with no transcript mutation at all.
-                if let commitFence, !commitFence.willCommit() {
-                    return .linkRevoked
-                }
-                let outcome = await AgentSessionLinkSendCommitOutcome(
-                    authority.commitSendAuthorization(
-                        reservation: reservation,
-                        linkGeneration: reservation.linkGeneration
-                    )
-                )
-                if outcome == .committed {
-                    commitFence?.didCommit()
-                }
-                return outcome
+        let requiresManagement = delivery == .managedSteer
+        let commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome = {
+            // A queued drain's cancellation cutoff, taken synchronously on the bridge's main
+            // actor immediately before the authority hop. Refusing here is indistinguishable
+            // from losing the authority race: nothing is staged yet, so the delivery unwinds
+            // with no transcript mutation at all.
+            if let commitFence, !commitFence.willCommit() {
+                return .linkRevoked
             }
-        )
+            let outcome = await AgentSessionLinkSendCommitOutcome(
+                authority.commitSendAuthorization(
+                    reservation: reservation,
+                    linkGeneration: reservation.linkGeneration,
+                    requiresManagement: requiresManagement
+                )
+            )
+            if outcome == .committed {
+                commitFence?.didCommit()
+            }
+            return outcome
+        }
+        let outcome: AgentSessionLinkSendTransactionOutcome = switch delivery {
+        case .attributedSend:
+            await host.agentSessionLinkPerformSend(
+                to: target.candidate,
+                request: request,
+                liveness: liveness,
+                commitAuthorization: commitAuthorization
+            )
+        case .managedSteer:
+            await host.agentSessionLinkPerformSteer(
+                to: target.candidate,
+                request: request,
+                liveness: liveness,
+                commitAuthorization: commitAuthorization
+            )
+        }
 
         switch outcome {
         case let .delivered(delivery):
@@ -5932,6 +6076,10 @@ final class AgentSessionLinkRuntimeBridge {
             case .persistenceFailed, .persistenceIndeterminate:
                 // Terminal for this entry. `persistence_failed` is retryable by the caller, but only
                 // by explicitly queuing again — never by a background loop over failing storage.
+                clear(.failed(failure))
+            case .managementRevoked, .targetAwaitingInteraction, .targetBusy, .steerUnavailable,
+                 .steerNotAccepted, .steerUnconfirmed:
+                // Steer-only outcomes: a queued `send` never produces them. Settle rather than loop.
                 clear(.failed(failure))
             case .endpointInvalidated, .linkRevoked, .shuttingDown:
                 // The link, an endpoint, or the process is gone, so there is no surviving `poll` a

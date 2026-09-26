@@ -176,10 +176,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     // MARK: - Guidance revision
 
-    /// A provider context that physically accepted revision 5 is re-owed revision 6 in full. Merely
-    /// rendering or abandoning revision 6 does not advance the acknowledgement; only physical
+    /// A provider context that physically accepted an earlier revision is re-owed revision 7 in full.
+    /// Merely rendering or abandoning revision 7 does not advance the acknowledgement; only physical
     /// acceptance earns the reminder, and a rebuilt context owes the full block again.
-    func testRevisionSixReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
+    func testRevisionSevenReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
         let observerSessionID = UUID()
         let epoch = Self.epoch(observerSessionID: observerSessionID)
         let inventory = Self.inventory(observerSessionID: observerSessionID, revision: 1)
@@ -208,7 +208,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 observerEndpoint: passive.observerEndpoint,
                 receipt: passive.receipt,
                 includesUnattributedOverflow: passive.includesUnattributedOverflow,
-                guidanceRevision: 5,
+                guidanceRevision: 6,
                 displayAttribution: passive.displayAttribution
             ),
             laneGuidanceMode: first.laneGuidanceMode,
@@ -217,7 +217,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         store.accept(priorRevisionClaim)
         XCTAssertEqual(
             store.test_lastAcceptedLaneGuidanceRevision(observerSessionID: observerSessionID),
-            5
+            6
         )
 
         let reOwed = try XCTUnwrap(store.claim(
@@ -228,10 +228,13 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 6 supersedes"))
-        // The one rule revision 6 changes: a context taught never to answer is told what replaced it.
-        XCTAssertTrue(reOwed.fragment.contains("blanket ban on answering another session&apos;s prompt is replaced"))
-        XCTAssertTrue(reOwed.fragment.contains("enabled Answer prompts"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 7 supersedes"))
+        // The rule revision 7 changes: a context taught it may only observe — and that may have
+        // refused its own user on that basis — is told outright what replaced it.
+        XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))
+        XCTAssertTrue(reOwed.fragment.contains("by RepoPrompt or by you"))
+        XCTAssertTrue(reOwed.fragment.contains("being unable to steer it"))
+        XCTAssertTrue(reOwed.fragment.contains("direct it with `steer`"))
         XCTAssertTrue(reOwed.fragment.contains("attributed attention request"))
         XCTAssertTrue(reOwed.fragment.contains("master Auto-wake"))
         XCTAssertTrue(reOwed.fragment.contains("lane&apos;s own toggle"))
@@ -272,7 +275,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertTrue(later.fragment.contains("still-applicable standing instruction"))
         XCTAssertTrue(later.fragment.contains("attention supplies no task"))
         XCTAssertTrue(later.fragment.contains("Never invent work"))
-        XCTAssertTrue(later.fragment.contains("bypass another session&apos;s prompt (answer only via enabled `respond`)"))
+        XCTAssertTrue(later.fragment.contains("bypass a prompt (answer or steer only where `manage` is granted)"))
         XCTAssertTrue(later.fragment.contains("Surface ambiguity or surprises"))
         XCTAssertFalse(later.fragment.contains("idle_for_send` describes readiness at `observed_at`"))
 

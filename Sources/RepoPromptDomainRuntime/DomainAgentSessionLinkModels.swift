@@ -45,6 +45,13 @@ package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable, S
     case wait
     case read
     case sendWhenIdle = "send_when_idle"
+    /// The user's explicit delegation of *management* over one exact target: inspecting and
+    /// answering its pending prompts and steering its runs on the user's behalf.
+    ///
+    /// Never part of `version1`, never inferred from role, parentage, or another grant, and never
+    /// carried across a relink, fork, or restart. Only an explicit user action on one exact link
+    /// generation adds or removes it (`DomainAgentSessionLinkAuthority.setManagement`).
+    case manage
 
     /// V1 capabilities are fixed and never inferred from role or parentage.
     package static let version1: Set<DomainAgentSessionLinkCapability> = [
@@ -53,6 +60,9 @@ package enum DomainAgentSessionLinkCapability: String, CaseIterable, Hashable, S
         .read,
         .sendWhenIdle,
     ]
+
+    /// A watch grant plus the user's explicit management delegation.
+    package static let managed: Set<DomainAgentSessionLinkCapability> = version1.union([.manage])
 }
 
 package struct DomainAgentSessionLinkGrant: Identifiable, Hashable, Sendable {
@@ -290,7 +300,8 @@ package struct DomainAgentSessionLinkInventoryItem: Hashable, Sendable {
 /// Deterministically ordered inventory for one endpoint.
 package struct DomainAgentSessionLinkInventory: Hashable, Sendable {
     package let sessionID: UUID
-    /// Advances only when this observer's grant membership changes.
+    /// Advances only when this observer's grant membership changes, or when the user changes the
+    /// management delegation of one of its grants (the capabilities this observer is told about).
     package let linkSetRevision: UInt64
     package let authorityRevision: UInt64
     package let items: [DomainAgentSessionLinkInventoryItem]
@@ -778,6 +789,16 @@ package enum DomainAgentSessionLinkDeliveryState: String, CaseIterable, Hashable
     case persisted
     case runStarted = "run_started"
     case runStartFailed = "run_start_failed"
+    /// A managed `steer` the provider confirmed it accepted into the target's active turn.
+    case steered
+    /// A managed `steer` accepted into the target's interrupt-steering queue. The provider receives
+    /// it at the next safe interruption point of the active turn.
+    case queuedInterrupt = "queued_interrupt"
+    /// A managed `steer` accepted into the target's follow-up queue. It is delivered when the active
+    /// turn reaches its next boundary.
+    case queuedFollowUp = "queued_follow_up"
+    /// A managed `steer` delivered as the answer to the target's own wait for its next instruction.
+    case deliveredToWaitingInstruction = "delivered_to_waiting_instruction"
 }
 
 package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
@@ -869,7 +890,27 @@ package enum DomainAgentSessionLinkSendCommitDisposition: Equatable, Sendable {
     /// The authorization linearization fence was won before manual revocation.
     case committed
     case linkRevoked
+    /// The delivery required the user's management delegation, and the user withdrew it before the
+    /// fence. The link itself may still be active; nothing was delivered.
+    case managementRevoked
     case unknownReservation
+    case shuttingDown
+}
+
+// MARK: - Management delegation
+
+/// Outcome of one explicit user change to a link's management delegation.
+package enum DomainAgentSessionLinkManagementDisposition: Equatable, Sendable {
+    /// The capability set changed. `observerInventory` is read in the same actor turn as the write,
+    /// for the same reason activation returns one: the caller can republish without a race.
+    case changed(
+        DomainAgentSessionLinkGrant,
+        observerInventory: DomainAgentSessionLinkInventory
+    )
+    /// The exact grant already had the requested state.
+    case unchanged(DomainAgentSessionLinkGrant)
+    /// The exact link generation is gone, or its recorded endpoints no longer match.
+    case notFound
     case shuttingDown
 }
 
@@ -880,6 +921,9 @@ package struct DomainAgentSessionLinkChangeEvent: Hashable, Sendable {
     package enum Kind: String, CaseIterable, Hashable, Sendable {
         case activated
         case revoked
+        /// One exact grant's capability set changed in place (the user's management delegation).
+        /// Membership is unchanged, but the observer's advertised capabilities are not.
+        case capabilitiesChanged = "capabilities_changed"
         case targetStateChanged = "target_state_changed"
         case draining
         case shutdown

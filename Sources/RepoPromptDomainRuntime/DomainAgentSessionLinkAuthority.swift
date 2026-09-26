@@ -13,7 +13,9 @@ import Foundation
 /// - At most one active link per `(observer session incarnation, target session incarnation)` pair.
 /// - Multiple independent observers may oversee one target; there is no artificial link-count cap.
 /// - A revoked link ID/generation never resurrects; re-adding creates a new ID and generation.
-/// - Grant capabilities are fixed for v1 and never inferred from role or parentage.
+/// - Grant capabilities are fixed at creation and never inferred from role or parentage. The one
+///   in-place change is the user's explicit management delegation on one exact link generation
+///   (`setManagement`); nothing inherits it, and a relink starts without it.
 /// - No date-based expiry: only explicit/lifecycle revocation and runtime shutdown end a link.
 package actor DomainAgentSessionLinkAuthority {
     // MARK: - Bounds
@@ -431,6 +433,61 @@ package actor DomainAgentSessionLinkAuthority {
     /// Rolls back a reservation whose seeding failed or whose endpoints drifted before activation.
     package func abandonReservation(_ reservation: DomainAgentSessionLinkPendingReservation) {
         pendingReservations.removeValue(forKey: reservation.linkID)
+    }
+
+    // MARK: - Management delegation
+
+    /// Adds or removes the user's management delegation on one exact link generation, in place.
+    ///
+    /// The link keeps its ID and generation, so its cursors, waiters, queued send, and Auto-wake lane
+    /// survive. What changes is authority: every lease already issued for `.manage` fails
+    /// `validate(lease:)` the moment the capability is gone, and every management commit fence
+    /// re-reads the grant, so revocation takes effect at the next fence rather than at the next call.
+    ///
+    /// The observer's link-set revision advances because the advertised capability set is part of
+    /// what that observer is told about its links: the next accepted dispatch must carry a fresh
+    /// inventory instead of the one that described the old authority. The target's inbound revision
+    /// is left alone, because its inbound grant set did not change and it fences the inverse
+    /// attention path.
+    package func setManagement(
+        _ enabled: Bool,
+        reference: DomainAgentSessionLinkReference,
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        target: DomainAgentSessionLinkEndpointIdentity
+    ) -> DomainAgentSessionLinkManagementDisposition {
+        guard !isDraining, !isShutDown else { return .shuttingDown }
+        guard var record = links[reference.linkID],
+              record.grant.generation == reference.generation,
+              record.grant.observer == observer,
+              record.grant.target == target
+        else {
+            return .notFound
+        }
+        let current = record.grant.capabilities
+        let next = enabled ? current.union([.manage]) : current.subtracting([.manage])
+        guard next != current else { return .unchanged(record.grant) }
+        let grant = DomainAgentSessionLinkGrant(
+            id: record.grant.id,
+            generation: record.grant.generation,
+            observer: record.grant.observer,
+            target: record.grant.target,
+            createdAt: record.grant.createdAt,
+            capabilities: next
+        )
+        record.grant = grant
+        links[grant.id] = record
+        let revision = advanceAuthorityRevision()
+        let linkSetRevision = advanceObserverLinkSetRevision(grant.observer.sessionID)
+        publish(DomainAgentSessionLinkChangeEvent(
+            kind: .capabilitiesChanged,
+            authorityRevision: revision,
+            linkID: grant.id,
+            linkGeneration: grant.generation,
+            observerSessionID: grant.observer.sessionID,
+            targetSessionID: grant.target.sessionID,
+            observerLinkSetRevision: linkSetRevision
+        ))
+        return .changed(grant, observerInventory: links(forObserverEndpoint: grant.observer))
     }
 
     private func allocateChangeSequence(for sessionID: UUID) -> UInt64 {
@@ -1307,7 +1364,7 @@ package actor DomainAgentSessionLinkAuthority {
     ) -> DomainAgentSessionLinkSendReservationDisposition {
         guard !isDraining, !isShutDown else { return .rejected(.runtimeShuttingDown) }
         if let error = validate(lease: lease) { return .rejected(error) }
-        guard lease.capability == .sendWhenIdle else { return .rejected(.capabilityDenied) }
+        guard Self.leaseMayUseSendLedger(lease) else { return .rejected(.capabilityDenied) }
         let trimmedKey = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty,
               trimmedKey.utf8.count <= DomainAgentSessionLinkTextBudget.idempotencyKeyMaxBytes,
@@ -1365,7 +1422,7 @@ package actor DomainAgentSessionLinkAuthority {
     ) -> DomainAgentSessionLinkSendLedgerProbe {
         guard !isDraining, !isShutDown else { return .rejected(.runtimeShuttingDown) }
         if let error = validate(lease: lease) { return .rejected(error) }
-        guard lease.capability == .sendWhenIdle else { return .rejected(.capabilityDenied) }
+        guard Self.leaseMayUseSendLedger(lease) else { return .rejected(.capabilityDenied) }
         let trimmedKey = idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty,
               trimmedKey.utf8.count <= DomainAgentSessionLinkTextBudget.idempotencyKeyMaxBytes,
@@ -1389,14 +1446,25 @@ package actor DomainAgentSessionLinkAuthority {
         return .inProgress
     }
 
+    /// Only a send lease or a management lease may reserve in the shared idempotency ledger: a steer
+    /// is a managed delivery and shares the same exactly-once bookkeeping as a send.
+    private static func leaseMayUseSendLedger(_ lease: DomainAgentSessionLinkLease) -> Bool {
+        lease.capability == .sendWhenIdle || lease.capability == .manage
+    }
+
     /// The authorization linearization fence.
     ///
     /// A manual revocation that wins this race cancels the send with no transcript mutation. A commit
     /// that wins first is allowed to settle even if manual Stop follows; lifecycle invalidation may
     /// still abort it later because the endpoint no longer exists.
+    ///
+    /// `requiresManagement` makes the user's management delegation part of the same fence: a managed
+    /// delivery whose delegation was withdrawn before this point is refused with nothing delivered,
+    /// and its uncommitted reservation is released so the key may be retried.
     package func commitSendAuthorization(
         reservation: DomainAgentSessionLinkSendReservation,
-        linkGeneration: UInt64
+        linkGeneration: UInt64,
+        requiresManagement: Bool = false
     ) -> DomainAgentSessionLinkSendCommitDisposition {
         guard !isShutDown else { return .shuttingDown }
         let key = ledgerKey(for: reservation)
@@ -1412,6 +1480,13 @@ package actor DomainAgentSessionLinkAuthority {
                 sendLedgerOrder.removeAll { $0 == key }
             }
             return .linkRevoked
+        }
+        if requiresManagement, !record.grant.capabilities.contains(.manage) {
+            if let entry = sendLedger[key], entry.reservation.id == reservation.id, !entry.isCommitted {
+                sendLedger.removeValue(forKey: key)
+                sendLedgerOrder.removeAll { $0 == key }
+            }
+            return .managementRevoked
         }
         guard var entry = sendLedger[key], entry.reservation.id == reservation.id else {
             return .unknownReservation

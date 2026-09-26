@@ -16461,9 +16461,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
         stagedCodexComputerUseActivationID: UUID?,
+        managedTurn: AgentSessionLinkManagedTurn? = nil,
         message: String
     ) {
-        guard sessions[tabID] === session else { return }
+        guard sessions[tabID] === session else {
+            managedTurn?.sink.resolve(.unconfirmed(message: message))
+            return
+        }
         removeUnconfirmedOptimisticCodexUserItem(
             session: session,
             tabID: tabID,
@@ -16475,6 +16479,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session: session,
             activationID: stagedCodexComputerUseActivationID
         )
+        // A managed steer reports the withdrawal to its overseer and leaves the target user's
+        // composer exactly as it was.
+        if let managedTurn {
+            managedTurn.sink.resolve(.notAccepted(message: message))
+            return
+        }
         restoreRejectedManualSubmissionComposerState(
             tabID: tabID,
             session: session,
@@ -16498,7 +16508,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         draftText: String,
         selectedWorkflow: AgentWorkflowDefinition?,
         selectedWorkflowMutationGeneration: UInt64?,
-        stagedCodexComputerUseActivationID: UUID?
+        stagedCodexComputerUseActivationID: UUID?,
+        managedTurn: AgentSessionLinkManagedTurn? = nil
     ) {
         let expectedWaitID = session.instructionWaitID
         let expectedControllerID = session.codexController.map(ObjectIdentifier.init)
@@ -16509,9 +16520,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         Task { @MainActor [weak self, weak session] in
             guard let self, let session else {
                 session?.codexDispatchSerialGate.cancel(dispatchTicket)
+                managedTurn?.sink.resolve(.unconfirmed(
+                    message: "The overseen session closed before its waiting instruction was delivered."
+                ))
                 return
             }
-            guard await session.codexDispatchSerialGate.awaitTurn(dispatchTicket) else { return }
+            guard await session.codexDispatchSerialGate.awaitTurn(dispatchTicket) else {
+                managedTurn?.sink.resolve(.unconfirmed(
+                    message: "The overseen session stopped dispatching before its waiting instruction was delivered."
+                ))
+                return
+            }
             defer { session.codexDispatchSerialGate.finish(dispatchTicket) }
 
             let stillOwnsContinuation = {
@@ -16532,6 +16551,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
                 return
@@ -16556,6 +16576,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
                 return
@@ -16575,6 +16596,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    managedTurn: managedTurn,
                     message: waitingInstructionReadinessErrorMessage(readiness)
                 )
                 return
@@ -16592,6 +16614,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    managedTurn: managedTurn,
                     message: "RepoPrompt MCP catalog routing changed before provider dispatch. Your instruction was restored."
                 )
                 return
@@ -16609,6 +16632,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
                 return
@@ -16632,6 +16656,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    managedTurn: managedTurn,
                     message: "RepoPrompt MCP catalog input was unavailable. Your instruction was restored."
                 )
                 return
@@ -16642,6 +16667,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 claim: monitoring.claim,
                 origin: .user
             ) else {
+                // (A managed steer's rollback below settles its sink and skips the composer.)
                 agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
                 rollbackWaitingInstructionSubmission(
                     tabID: tabID,
@@ -16654,11 +16680,141 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     selectedWorkflow: selectedWorkflow,
                     selectedWorkflowMutationGeneration: selectedWorkflowMutationGeneration,
                     stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    managedTurn: managedTurn,
                     message: "The waiting request changed before dispatch. Your instruction was restored."
                 )
                 return
             }
             session.deferredActiveAgentRunTimerRollback = nil
+            managedTurn?.sink.resolve(.delivered(.deliveredToWaitingInstruction))
+        }
+    }
+
+    // MARK: - Managed cross-session steer
+
+    /// The provider route a managed cross-session steer would take right now, following
+    /// `submitPreparedUserTurn`'s own branch order, or `nil` when no managed route exists.
+    ///
+    /// It lives beside the submission path because classification happens before the attributed row
+    /// exists, so the two have to agree branch for branch. The shared follow-up queue is deliberately
+    /// not a managed route: a queued instruction can later be restored into the target user's
+    /// composer (on an execution-location change, for example), and an overseer's words must never
+    /// reappear there as the user's own draft.
+    ///
+    /// An idle target has no route here either: it is delivered only through the durable,
+    /// exact-endpoint send transaction. ACP live steering is not a managed route because a refused
+    /// ACP steer is requeued into that same follow-up queue and an interrupted ACP prompt is replayed
+    /// from transcript text, neither of which is aware of managed framing yet.
+    func agentSessionLinkManagedSteerRoute(for session: TabSession) -> AgentSessionLinkManagedSteerRoute? {
+        if session.runState == .waitingForUser, session.instructionContinuation != nil {
+            return .waitingInstruction
+        }
+        guard session.runState.isActive else { return nil }
+        if session.selectedAgent == .codexExec {
+            return .codex
+        }
+        switch activeProviderSteeringRoute(for: session) {
+        case .claudeNativeInterrupt:
+            return .claudeInterrupt
+        case .acpPrompt, nil:
+            return nil
+        }
+    }
+
+    /// Withdraws a managed turn whose live state no longer matches the route it was classified onto.
+    ///
+    /// Classification and submission share one main-actor pass, so this is a drift guard rather than
+    /// an expected path. It never starts a run, never queues a follow-up, and never restores a
+    /// composer draft: it removes the attributed row it just appended and reports `notAccepted`.
+    private func withdrawAgentSessionLinkManagedTurn(
+        _ managedTurn: AgentSessionLinkManagedTurn,
+        userItemID: UUID,
+        session: TabSession,
+        tabID: UUID,
+        anchorRollback: AgentTurnUserAnchorRollbackState
+    ) {
+        if let index = session.items.firstIndex(where: { $0.id == userItemID }) {
+            _ = session.removeItem(at: index)
+        }
+        rollbackAgentTurnUserAnchor(anchorRollback, session: session)
+        updateBindingsFromSession(session)
+        requestUIRefresh(tabID: tabID, urgent: true)
+        scheduleSave(for: tabID)
+        managedTurn.sink.resolve(.notAccepted(
+            message: "The session changed state before the steer could be routed. Nothing was delivered."
+        ))
+    }
+
+    /// Appends one attributed managed-steer row and hands its framed text to the provider route,
+    /// synchronously, exactly as a local composer submission would — minus every piece of composer
+    /// state. The caller has already won the authority fence and classified `route` in this same
+    /// main-actor pass; the provider-level outcome arrives on `turn.sink`.
+    ///
+    /// - Returns: `false` when the submission path refused before appending anything.
+    @discardableResult
+    func submitAgentSessionLinkManagedSteer(
+        tabID: UUID,
+        session: TabSession,
+        displayText: String,
+        turn: AgentSessionLinkManagedTurn,
+        route: AgentSessionLinkManagedSteerRoute
+    ) -> Bool {
+        // Codex reports its terminal state through the acknowledgement tracker `agent_run` uses. The
+        // `.mcp` fallback origin that an attempt ID selects is the programmatic-dispatch origin,
+        // which never restores a composer draft on failure.
+        let codexAttemptID = route == .codex ? session.codexSteerAckTracker.beginAttempt() : nil
+        let submission = submitPreparedUserTurn(
+            tabID: tabID,
+            session: session,
+            trimmedText: displayText,
+            attachmentsToSend: [],
+            taggedFilesToSend: [],
+            activeWorkflow: nil,
+            codexAttemptID: codexAttemptID,
+            managedTurn: turn
+        )
+        guard case .submitted = submission else {
+            if let codexAttemptID {
+                session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
+            }
+            return false
+        }
+        if let codexAttemptID {
+            session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
+            let sink = turn.sink
+            // A separate task on purpose: the tracker cancels an attempt whose awaiting task is
+            // cancelled, and a committed steer must settle on its own terms rather than on whether
+            // the observer's tool call is still listening.
+            Task { @MainActor [weak session] in
+                guard let session else {
+                    sink.resolve(.unconfirmed(message: "The overseen session closed before Codex confirmed the steer."))
+                    return
+                }
+                let state = await session.codexSteerAckTracker.awaitTerminalState(attemptID: codexAttemptID)
+                sink.resolve(Self.agentSessionLinkManagedSteerOutcome(for: state))
+            }
+        }
+        return true
+    }
+
+    static func agentSessionLinkManagedSteerOutcome(
+        for state: CodexSteerAckTracker.TerminalState
+    ) -> AgentSessionLinkManagedSteerOutcome {
+        switch state {
+        case .steerAccepted, .controlAccepted:
+            .delivered(.steered)
+        case .startAccepted:
+            .delivered(.runStarted)
+        case .durablyQueued:
+            .delivered(.queuedFollowUp)
+        case let .failed(message):
+            .notAccepted(message: message)
+        case .cancelled:
+            .notAccepted(message: "Codex cancelled the steer before it reached the session.")
+        case let .stale(reason):
+            .notAccepted(message: reason)
+        case .timedOut:
+            .unconfirmed(message: "Codex did not confirm the steer in time.")
         }
     }
 
@@ -16675,11 +16831,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         rawDraftText: String? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
-        restorationSelectedWorkflowMutationGeneration: UInt64? = nil
+        restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
+        managedTurn: AgentSessionLinkManagedTurn? = nil
     ) -> UserTurnSubmissionResult {
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
         // Composer claims preserve the exact raw snapshot separately from provider-normalized text.
-        let restorationDraftText = rawDraftText ?? trimmedText
+        // A managed cross-session steer has no composer draft and must never restore one: an empty
+        // restoration draft keeps every rollback path from writing the overseer's words into the
+        // target user's composer.
+        let restorationDraftText = managedTurn == nil ? (rawDraftText ?? trimmedText) : ""
 
         let bubbleText: String
         if !trimmedText.isEmpty {
@@ -16711,9 +16871,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let stagedCodexComputerUseActivationID = session.pendingCodexComputerUseActivation?.id
 
-        // Prepend interview instruction to the user message if enabled (first message only)
-        var effectiveUserText = nativePreparedTurn?.providerText ?? trimmedText
-        if interviewFirst, session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant }) {
+        // Prepend interview instruction to the user message if enabled (first message only).
+        // A managed steer carries its own RepoPrompt-framed provider text and never consumes the
+        // target user's interview preference.
+        var effectiveUserText = managedTurn?.providerText ?? nativePreparedTurn?.providerText ?? trimmedText
+        if managedTurn == nil,
+           interviewFirst,
+           session.items.isEmpty || !session.items.contains(where: { $0.kind == .assistant })
+        {
             effectiveUserText = """
             <interview_first>
             Before starting this task, interview me to make sure you fully understand what I need. Follow these rules exactly:
@@ -16744,11 +16909,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let codexCompactionInFlight = session.selectedAgent == .codexExec
             && codexCoordinator.isCodexCompactionInFlight(session: session)
 
-        autoSelectTaggedFilesForTurn(
-            tabID: tabID,
-            text: trimmedText,
-            taggedFileAttachments: taggedFilesToSend
-        )
+        // Mentions in an overseer's words must not change the target user's file selection.
+        if managedTurn == nil {
+            autoSelectTaggedFilesForTurn(
+                tabID: tabID,
+                text: trimmedText,
+                taggedFileAttachments: taggedFilesToSend
+            )
+        }
 
         if session.runState.isActive,
            session.runState != .waitingForUser
@@ -16761,10 +16929,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             attachments: attachmentsToSend,
             taggedFileAttachments: taggedFilesToSend,
             sequenceIndex: session.nextSequenceIndex,
-            workflow: activeWorkflow
+            workflow: activeWorkflow,
+            crossSessionAttribution: managedTurn?.attribution
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
+        managedTurn?.sink.noteAppended(itemID: userItem.id)
         agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
         // This is the single acceptance point for every local user turn, including waiting-instruction
         // continuations, and deliberately so: it is where the local user takes the submission gate.
@@ -16836,7 +17006,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 draftText: restorationDraftText,
                 selectedWorkflow: restorationSelectedWorkflow,
                 selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID
+                stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                managedTurn: managedTurn
             )
             return UserTurnSubmissionResult.submitted
         }
@@ -16853,6 +17024,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 origin: codexAttemptID.map(TabSession.CodexFallbackOrigin.mcp) ?? .manual,
                 dispatchTicket: dispatchTicket
             )
+            // The exact run a managed steer was classified to steer. If it settles before dispatch,
+            // the steer is withdrawn rather than becoming a new turn outside the durable idle path.
+            let managedSteerRunID = session.runID
+            let managedSteerAttemptID = session.activeRunAttemptID
             Task {
                 var handedOffToSerialDispatch = false
                 defer {
@@ -16880,7 +17055,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 defer {
                     session.codexDispatchSerialGate.finish(dispatchTicket)
                 }
-                let sendOutcome: CodexAgentModeCoordinator.NativeSendOutcome? = if self.sessions[tabID] === session {
+                // A managed steer additionally re-proves its exact endpoint and the exact active run
+                // at dispatch: this task runs after the serial gate, an in-place rebind in between
+                // must not receive direction the grant never covered, and a run that settled in
+                // between must not be restarted from here. Either refusal withdraws the row below.
+                let dispatchIsCurrent = self.sessions[tabID] === session
+                    && managedTurn.map { turn in
+                        self.agentSessionLinkLiveSession(matching: turn.candidate) === session
+                            && session.runState.isActive
+                            && session.runID == managedSteerRunID
+                            && session.activeRunAttemptID == managedSteerAttemptID
+                    } ?? true
+                let sendOutcome: CodexAgentModeCoordinator.NativeSendOutcome? = if dispatchIsCurrent {
                     await self.startAgentRun(
                         tabID: tabID,
                         initialMessage: wrappedText,
@@ -17011,7 +17197,27 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     draftText: restorationDraftText,
                     selectedWorkflow: restorationSelectedWorkflow,
                     selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID
+                    stagedCodexComputerUseActivationID: stagedCodexComputerUseActivationID,
+                    managedTurn: managedTurn
+                )
+                return UserTurnSubmissionResult.submitted
+            }
+        }
+
+        // A managed steer never starts a run, uses ACP live steering, or enters the shared follow-up
+        // queue from here (see `agentSessionLinkManagedSteerRoute`). Reaching any of them means the
+        // state drifted from its classification, so the turn is withdrawn instead.
+        if let managedTurn {
+            let steeringRoute = session.runState.isActive
+                ? activeProviderSteeringRoute(for: session, attachments: attachmentsToSend)
+                : nil
+            guard steeringRoute == .claudeNativeInterrupt else {
+                withdrawAgentSessionLinkManagedTurn(
+                    managedTurn,
+                    userItemID: userItem.id,
+                    session: session,
+                    tabID: tabID,
+                    anchorRollback: turnRuntimeAnchorRollback
                 )
                 return UserTurnSubmissionResult.submitted
             }
@@ -17037,7 +17243,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 taggedFilesToSend: taggedFilesToSend,
                 trimmedText: trimmedText,
                 userItem: userItem,
-                userInputTokenEstimate: userInputTokenEstimate
+                userInputTokenEstimate: userInputTokenEstimate,
+                managedTurn: managedTurn
             )
         } else {
             // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
@@ -17052,6 +17259,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }) else {
             return nil
         }
+        // A cross-session row stores only the sender's raw words; its RepoPrompt framing was
+        // provider-only. Replaying those words would present another session's text as this
+        // session's own user prompt, so an interrupted cross-session turn is not replayed.
+        guard interruptedUserItem.crossSessionAttribution == nil else { return nil }
         let rendered = renderProviderMessage(
             text: interruptedUserItem.text,
             attachments: interruptedUserItem.attachments,
@@ -17109,8 +17320,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         taggedFilesToSend: [AgentTaggedFileAttachment],
         trimmedText: String,
         userItem: AgentChatItem,
-        userInputTokenEstimate: Int
+        userInputTokenEstimate: Int,
+        managedTurn: AgentSessionLinkManagedTurn? = nil
     ) {
+        // Steering recovery restores a queued instruction's draft into the composer. A managed
+        // steer carries none, so a withdrawn one can never reappear as the target user's draft.
+        let restorableDraftText = managedTurn == nil ? trimmedText : ""
         switch route {
         case .acpPrompt:
             // ACP live steering uses the same serialized queued-flush shape as
@@ -17126,7 +17341,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 interruptedPromptProviderText: interruptedPromptProviderText,
                 attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
-                draftText: trimmedText,
+                draftText: restorableDraftText,
                 optimisticUserItemID: userItem.id,
                 createdAt: Date()
             )
@@ -17169,12 +17384,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 providerText: wrappedText,
                 attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
-                draftText: trimmedText,
+                draftText: restorableDraftText,
                 optimisticUserItemID: userItem.id,
                 createdAt: Date(),
                 supersedingProtectedTurnIDs: []
             )
             session.pendingClaudeSteeringInstructions.append(steering)
+            managedTurn?.sink.resolve(.delivered(.queuedInterrupt))
             runService.protectCurrentClaudeTurnForAcceptedSteeringIfNeeded(session: session, steeringID: steering.id)
             Self.steeringDebugLog("[AgentRunSteeringWake] Claude steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID)) queue=\(session.pendingClaudeSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
             guard !session.isMCPInstructionDispatchInProgress else {

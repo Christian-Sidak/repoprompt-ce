@@ -332,7 +332,27 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         )
     }
 
-    // MARK: - Answer prompts delegation
+    // MARK: - Management delegation
+
+    /// Routes one managed steer to the exact owning window, refusing during teardown before any
+    /// target state is touched. Nothing here focuses or activates the window.
+    func agentSessionLinkPerformSteer(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkSendRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+            return .blocked(.endpointInvalidated)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformSteer(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            commitAuthorization: commitAuthorization
+        )
+    }
 
     /// Routes a read-only interaction inspection to the exact owning window. Never focuses it.
     func agentSessionLinkPendingInteraction(
