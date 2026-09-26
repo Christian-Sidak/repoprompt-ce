@@ -640,4 +640,19 @@ enum ACPPermissionOptionPolicy {
         guard let normalized = normalizedOptionValue(optionID) else { return false }
         return !denylistedAutoSelectOptionIDs(for: providerID).contains(normalized)
     }
+
+    /// Overseer approval is strictly per request. ACP's `allow_once` kind is authoritative
+    /// only when the option ID does not advertise a wider scope (some providers mislabel it).
+    static func overseerOneTimeAllowOptionID(
+        options: [(optionID: String, kind: String)],
+        providerID: ACPProviderID
+    ) -> String? {
+        options.first { option in
+            guard let id = normalizedOptionValue(option.optionID),
+                  normalizedOptionValue(option.kind) == "allow_once",
+                  isAutoSelectable(optionID: id, for: providerID)
+            else { return false }
+            return !id.contains("always") && !id.contains("session") && !id.contains("persist")
+        }?.optionID
+    }
 }

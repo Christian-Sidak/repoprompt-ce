@@ -195,10 +195,14 @@ endpoint, and generation-qualified link reference. It is not an Auto-wake prefer
 permission mode, or a durable session-UUID selection. Unlink, relink, endpoint replacement, and app
 restart return to manual approval; bulk selection never opts in a future link.
 
-At a provider prompt, the target checks the selected link against the current authority grant and
-both live endpoint candidates, then checks its own exact session incarnation and pending request
-again after the authority hop. The response accepts only that one provider request. The ordinary
-manual path remains in place when no exact link is selected. User questions, MCP elicitation, Codex
+At a newly observed provider prompt, the target checks the selected link against the current authority
+grant and both live endpoint candidates, then checks its own exact session incarnation and pending
+request again after the authority hop. The listener tracks only newly presented request IDs, not the
+whole pending inventory, and survives MCP-control teardown such as managed Codex logout while the
+target session remains live. The response accepts only that one provider request. ACP additionally
+requires a genuine one-time allow option; if none exists, its prompt stays manual without changing
+the ordinary manual option-selection path. The ordinary manual path remains in place when no exact
+link is selected. User questions, MCP elicitation, Codex
 hook reviews, app-owned apply-edits and worktree-merge reviews, GitHub/destructive approvals, and
 unrelated app permission controls never call this gate. A permission request already pending when the
 choice is enabled remains manual; the setting applies to new prompts. This deliberately narrow

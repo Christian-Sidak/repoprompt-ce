@@ -4324,6 +4324,13 @@ final class AgentSessionLinkRuntimeBridge {
         return true
     }
 
+    /// Observation-time filter only: a prompt seen while selection is off must not become
+    /// retroactively eligible if the user enables the link before its queued task runs.
+    /// This does not replace the authority-backed admission check at response time.
+    func hasAutoApprovalSelection(for targetEndpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        autoApprovalLinks.contains { $0.target == targetEndpoint }
+    }
+
     /// Admission check for a provider permission request on one exact target incarnation. The
     /// caller must re-check its pending request and endpoint after this suspension, then submit
     /// synchronously. Questions and app-owned reviews never call this gate.

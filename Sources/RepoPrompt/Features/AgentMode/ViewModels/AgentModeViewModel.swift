@@ -4199,6 +4199,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
+        session.permissionAutoApprovalCancellable?.cancel()
+        session.permissionAutoApprovalCancellable = nil
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
         // cancelEphemeralRuntimeState() cancels and nils agentTask before the
@@ -6039,12 +6041,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         .map { Set([$0, $1].compactMap(\.self)) }
         .removeDuplicates()
-        // Subscribing while a prompt is already waiting must not retroactively accept it.
-        .dropFirst()
+        // The first observation is a baseline; later changes emit only newly presented IDs.
+        .scan(OverseerPermissionRequestDelta()) { previous, requestIDs in
+            var next = previous
+            next.observe(requestIDs)
+            return next
+        }
+        .map(\.newRequestIDs)
+        .filter { [weak self, weak session] requestIDs in
+            guard !requestIDs.isEmpty,
+                  let self, let session,
+                  let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID)
+            else { return false }
+            return AgentSessionLinkRuntimeBridge.shared.hasAutoApprovalSelection(for: endpoint)
+        }
         // @Published sends before storage changes; evaluate only after the settled value is visible.
         .receive(on: DispatchQueue.main)
         .sink { [weak self, weak session] requestIDs in
-            guard let self, let session, !requestIDs.isEmpty else { return }
+            guard let self, let session else { return }
             Task { @MainActor [weak self, weak session] in
                 guard let self, let session else { return }
                 await autoApproveOverseenProviderPermissions(for: session, requestIDs: requestIDs)
@@ -6101,8 +6115,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         session.mcpStateObservationCancellable?.cancel()
         session.mcpStateObservationCancellable = nil
-        session.permissionAutoApprovalCancellable?.cancel()
-        session.permissionAutoApprovalCancellable = nil
+        // The provider-permission listener belongs to the live target session, not MCP control.
+        // Managed Codex logout tears MCP control down without removing the watched target.
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlCleanupTask = nil
         session.mcpFollowUpRunPending = false

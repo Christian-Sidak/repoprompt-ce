@@ -1190,6 +1190,29 @@ actor ACPAgentSessionController {
         )
     }
 
+    /// Auto-approval never falls back to a session-wide or arbitrary ACP option.
+    /// A missing genuine one-time option leaves the request pending for the manual path.
+    func respondToPermissionRequestOnceForOverseer(
+        id: String,
+        authorize: @MainActor @Sendable () async -> Bool
+    ) async -> Bool {
+        guard await authorize(),
+              let pending = pendingPermissionRequests[id],
+              let optionID = ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                  options: pending.options.map { (optionID: $0.optionID, kind: $0.kind) },
+                  providerID: provider.providerID
+              )
+        else { return false }
+        do {
+            try sendPermissionSelectionResponse(id: pending.rpcID, optionID: optionID)
+            pendingPermissionRequests.removeValue(forKey: id)
+            return true
+        } catch {
+            log("Failed to submit Overseer ACP one-time approval: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     func respondToPermissionRequest(
         id: String,
         decision: AgentApprovalDecision

@@ -452,6 +452,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         else { return XCTFail("Expected an active link") }
         let observer = fixture.observer.domainEndpoint
         let target = fixture.target.domainEndpoint
+        XCTAssertFalse(fixture.bridge.hasAutoApprovalSelection(for: target))
         let initiallyAuthorized = await fixture.bridge.autoApprovalIsAuthorized(for: target)
         XCTAssertFalse(initiallyAuthorized)
         let applied = await fixture.bridge.setAutoApproval(
@@ -461,6 +462,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             expectedReference: reference
         )
         XCTAssertTrue(applied)
+        XCTAssertTrue(fixture.bridge.hasAutoApprovalSelection(for: target))
         let selectedAuthorized = await fixture.bridge.autoApprovalIsAuthorized(for: target)
         XCTAssertTrue(selectedAuthorized)
         let replacementCandidate = makeCandidate(
@@ -482,6 +484,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             expectedReference: reference
         )
         XCTAssertEqual(stopped, .stopped)
+        XCTAssertFalse(fixture.bridge.hasAutoApprovalSelection(for: target))
         let afterStop = await fixture.bridge.autoApprovalIsAuthorized(for: target)
         XCTAssertFalse(afterStop)
         guard case .added = await addLink(fixture),
