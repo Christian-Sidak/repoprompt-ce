@@ -1422,17 +1422,24 @@ struct AgentMonitorPopoverView: View {
         let rowKey = beginRowAction(row.rowKey)
         let reference = DomainAgentSessionLinkReference(linkID: row.linkID, generation: row.generation)
         Task {
-            let applied = await AgentSessionLinkRuntimeBridge.shared.setManagement(
+            let report = await AgentSessionLinkRuntimeBridge.shared.setManagementReporting(
                 enabled,
                 observerEndpoint: observerEndpoint,
                 targetEndpoint: row.targetEndpoint,
                 expectedReference: reference
             )
             busyRowKeys.remove(rowKey)
-            setRowFeedback(
-                rowKey,
-                applied ? nil : .failure(AgentMonitorManagementCopy.unavailableMessage)
-            )
+            // Authority already changed when this returns; the notice line says only how the running
+            // overseer learns about it, and never claims awareness a provider did not confirm.
+            let feedback: AgentMonitorRowFeedback? = switch report {
+            case .failed:
+                .failure(AgentMonitorManagementCopy.unavailableMessage)
+            case .unchanged:
+                nil
+            case let .changed(notice):
+                .notice(notice.dashboardMessage)
+            }
+            setRowFeedback(rowKey, feedback)
         }
     }
 

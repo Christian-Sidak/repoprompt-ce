@@ -347,6 +347,26 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         authorize: @escaping @MainActor @Sendable () async -> Bool
     ) async -> AgentSessionLinkInteractionResponseOutcome
 
+    // MARK: Mid-session capability notices
+
+    /// Whether the exact live observer can take a RepoPrompt-authored capability notice inside its
+    /// running turn right now. Pure classification: reading it changes nothing.
+    func agentSessionLinkCapabilityNoticeRoute(
+        for observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkCapabilityNoticeRoute
+
+    /// Steers one RepoPrompt-authored capability notice into the exact observer's running turn.
+    ///
+    /// A conforming host never starts a turn, never uses a follow-up queue, never touches composer
+    /// state, awaits `isCurrent` as its last suspension before the provider call, and returns `true`
+    /// only when the provider accepted the notice into that turn.
+    func agentSessionLinkDeliverCapabilityNotice(
+        to observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        providerText: String,
+        notices: [DomainAgentSessionLinkCapabilityNotice],
+        isCurrent: @escaping @MainActor () async -> Bool
+    ) async -> Bool
+
     // MARK: Launch restoration inputs
 
     /// Identity-only descriptors for every compose-tab binding in every active workspace.
@@ -402,6 +422,23 @@ extension AgentSessionLinkEndpointHost {
         authorize _: @escaping @MainActor @Sendable () async -> Bool
     ) async -> AgentSessionLinkInteractionResponseOutcome {
         .unavailable
+    }
+
+    /// Fail-safe defaults: a host that does not model running turns pushes nothing, and the notice
+    /// stays owed to the next oversight result or accepted turn.
+    func agentSessionLinkCapabilityNoticeRoute(
+        for _: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkCapabilityNoticeRoute {
+        .unavailable(.observerUnavailable)
+    }
+
+    func agentSessionLinkDeliverCapabilityNotice(
+        to _: DomainAgentSessionLinkEndpointIdentity,
+        providerText _: String,
+        notices _: [DomainAgentSessionLinkCapabilityNotice],
+        isCurrent _: @escaping @MainActor () async -> Bool
+    ) async -> Bool {
+        false
     }
 
     func agentSessionLinkSetWaitingOn(
@@ -827,6 +864,9 @@ final class AgentSessionLinkRuntimeBridge {
     /// Termination freeze. Set synchronously, before any async shutdown work, and never cleared:
     /// after it, no Add/Stop/cleanup is admitted and no teardown callback may delete durable intent.
     private var isFrozenForTermination = false
+    /// How long a Manage change waits for a running-turn push before reporting it as in progress.
+    /// The push itself is never cancelled by this bound.
+    var capabilityNoticePushReportTimeoutSeconds: TimeInterval = 3
     /// Bridge-registered pre-freeze transactions. Bounded settlement waits only for these.
     private var registeredTransactionIDs: Set<UUID> = []
     /// Resumed by whichever of "last transaction finished" and "deadline elapsed" happens first.
@@ -4454,14 +4494,33 @@ final class AgentSessionLinkRuntimeBridge {
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
         expectedReference: DomainAgentSessionLinkReference
     ) async -> Bool {
-        guard !isFrozenForTermination, let host else { return false }
+        await setManagementReporting(
+            enabled,
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint,
+            expectedReference: expectedReference
+        ) != .failed
+    }
+
+    /// `setManagement`, reporting how the running overseer learns about the change.
+    ///
+    /// Authority changes first and unconditionally: by the time this pushes anything, every
+    /// management fence already reads the new grant. The push is awareness only, and its failure is
+    /// reported rather than hidden — the notice then stays owed to the next oversight result or turn.
+    func setManagementReporting(
+        _ enabled: Bool,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedReference: DomainAgentSessionLinkReference
+    ) async -> AgentSessionLinkManagementChangeReport {
+        guard !isFrozenForTermination, let host else { return .failed }
         if enabled {
             let key = AutoApprovalLink(
                 observer: observerEndpoint,
                 target: targetEndpoint,
                 reference: expectedReference
             )
-            guard autoApprovalEndpointsAreEligible(key, host: host) else { return false }
+            guard autoApprovalEndpointsAreEligible(key, host: host) else { return .failed }
         }
         switch await authority.setManagement(
             enabled,
@@ -4476,11 +4535,101 @@ final class AgentSessionLinkRuntimeBridge {
                 observerEndpoint.sessionID,
                 targetEndpoint.sessionID
             ]))
-            return true
+            return await .changed(notice: pushCapabilityNotices(to: observerEndpoint))
         case .unchanged:
-            return true
+            return .unchanged
         case .notFound, .shuttingDown:
-            return false
+            return .failed
+        }
+    }
+
+    // MARK: Mid-session capability notices
+
+    /// Claims every capability-change notice owed to this exact observer endpoint.
+    ///
+    /// Used by the `agent_session_link` result path: whatever is returned is delivered with that
+    /// result, so it is not owed again.
+    func takeCapabilityNotices(
+        forObserverEndpoint observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> [DomainAgentSessionLinkCapabilityNotice] {
+        guard !isFrozenForTermination else { return [] }
+        return await authority.takeCapabilityNotices(for: observerEndpoint)
+    }
+
+    /// Settles notices an accepted inventory block already stated.
+    func acknowledgeCapabilityNotices(
+        forObserverEndpoint observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        throughObserverLinkSetRevision revision: UInt64
+    ) async {
+        await authority.acknowledgeCapabilityNotices(
+            for: observerEndpoint,
+            throughObserverLinkSetRevision: revision
+        )
+    }
+
+    /// Tells a *running* overseer about its changed capabilities now, where its provider allows it.
+    ///
+    /// Only a steerable Codex user turn takes a pushed notice. Every other state defers, and says
+    /// why: an idle overseer has no model running to tell, and a Claude or ACP turn has no
+    /// non-interrupting mid-turn input path. A wait the overseer had parked was already woken by the
+    /// authority in the same actor turn as the change, and its result claims the notice itself.
+    ///
+    /// The claim is atomic, so a notice is pushed at most once; a push the provider did not accept
+    /// hands the notice back, where a newer change on the same link still wins.
+    private func pushCapabilityNotices(
+        to observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) async -> AgentSessionLinkCapabilityNoticeDelivery {
+        guard !isFrozenForTermination, let host else { return .deferred(.observerUnavailable) }
+        switch host.agentSessionLinkCapabilityNoticeRoute(for: observerEndpoint) {
+        case let .unavailable(reason):
+            let owed = await authority.pendingCapabilityNotices(for: observerEndpoint)
+            return owed.isEmpty ? .alreadyDelivered : .deferred(reason)
+        case .codexRunningTurn:
+            break
+        }
+        let notices = await authority.takeCapabilityNotices(for: observerEndpoint)
+        guard !notices.isEmpty else { return .alreadyDelivered }
+        // The provider call runs in its own task and settles itself — restoring the notice if the
+        // turn did not take it — so the dashboard can report after a bound without cancelling a
+        // steer that is already holding the Codex dispatch gate.
+        let authority = authority
+        let delivery = Task { @MainActor [weak self] () -> Bool in
+            let delivered = await host.agentSessionLinkDeliverCapabilityNotice(
+                to: observerEndpoint,
+                providerText: AgentSessionLinkPrompts.capabilityChangeNotice(notices),
+                notices: notices,
+                isCurrent: { [weak self] in
+                    guard let self, !self.isFrozenForTermination else { return false }
+                    return await authority.capabilityNoticesAreCurrent(notices, for: observerEndpoint)
+                }
+            )
+            if !delivered {
+                await authority.restoreCapabilityNotices(notices, for: observerEndpoint)
+            }
+            return delivered
+        }
+        // Not a task group: a group waits for every child before returning, which would hold the
+        // dashboard for exactly the slow provider call this bound exists to report around.
+        let timeout = capabilityNoticePushReportTimeoutSeconds
+        let settled: Bool? = await withCheckedContinuation { continuation in
+            let first = AgentSessionLinkFirstOutcome(continuation)
+            let timer = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                first.resolve(nil)
+            }
+            Task { @MainActor in
+                let delivered = await delivery.value
+                timer.cancel()
+                first.resolve(delivered)
+            }
+        }
+        switch settled {
+        case true?:
+            return .toldRunningTurn
+        case false?:
+            return .deferred(.steerNotAccepted)
+        case nil:
+            return .deferred(.pushInProgress)
         }
     }
 
@@ -6470,5 +6619,21 @@ private extension Result {
     var success: Success? {
         guard case let .success(value) = self else { return nil }
         return value
+    }
+}
+
+/// Resumes one continuation with whichever outcome arrives first; later outcomes are ignored.
+@MainActor
+private final class AgentSessionLinkFirstOutcome {
+    private var continuation: CheckedContinuation<Bool?, Never>?
+
+    init(_ continuation: CheckedContinuation<Bool?, Never>) {
+        self.continuation = continuation
+    }
+
+    func resolve(_ value: Bool?) {
+        guard let continuation else { return }
+        self.continuation = nil
+        continuation.resume(returning: value)
     }
 }

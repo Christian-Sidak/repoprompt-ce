@@ -365,6 +365,36 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         return window.agentModeViewModel.agentSessionLinkPendingInteraction(for: candidate)
     }
 
+    /// Classifies the exact observer's window-owned session; refuses during teardown.
+    func agentSessionLinkCapabilityNoticeRoute(
+        for observerEndpoint: DomainAgentSessionLinkEndpointIdentity
+    ) -> AgentSessionLinkCapabilityNoticeRoute {
+        guard !isTerminating,
+              let window = window(withID: observerEndpoint.windowID),
+              !window.isClosing
+        else { return .unavailable(.observerUnavailable) }
+        return window.agentModeViewModel.agentSessionLinkCapabilityNoticeRoute(for: observerEndpoint)
+    }
+
+    /// Routes one capability notice to the exact observer's owning window, refusing during teardown.
+    func agentSessionLinkDeliverCapabilityNotice(
+        to observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        providerText: String,
+        notices: [DomainAgentSessionLinkCapabilityNotice],
+        isCurrent: @escaping @MainActor () async -> Bool
+    ) async -> Bool {
+        guard !isTerminating,
+              let window = window(withID: observerEndpoint.windowID),
+              !window.isClosing
+        else { return false }
+        return await window.agentModeViewModel.agentSessionLinkDeliverCapabilityNotice(
+            to: observerEndpoint,
+            providerText: providerText,
+            notices: notices,
+            isCurrent: isCurrent
+        )
+    }
+
     /// Routes one observer answer to the exact owning window, refusing during teardown.
     func agentSessionLinkRespondToPendingInteraction(
         for candidate: AgentSessionLinkEndpointCandidate,

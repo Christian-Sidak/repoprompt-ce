@@ -6789,6 +6789,57 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return .steer(identity)
     }
 
+    /// Whether a RepoPrompt oversight notice can be steered into this session's exact active user
+    /// turn right now. Pure: the same plan `sendCodexNativeMessage` would compute for a steer.
+    func canSteerOversightNotice(session: AgentTabSession) -> Bool {
+        guard session.selectedAgent == .codexExec,
+              session.runState == .running,
+              session.codexController != nil,
+              case .steer = codexTurnDispatchPlan(wasRunAlreadyActive: true, session: session)
+        else { return false }
+        return true
+    }
+
+    /// Steers one RepoPrompt-authored oversight notice into the exact active Codex user turn.
+    ///
+    /// Deliberately not `sendCodexNativeMessage`: that path owns run lifecycle (running status, auth
+    /// retry, fallback queueing, first-turn start) that a notice must never touch. This is one
+    /// `turn/steer` against the turn identity classified in the same main-actor pass, with no retry
+    /// onto a different turn and no fallback — a turn that ended or changed simply does not take it,
+    /// and the caller keeps the notice owed. No transcript row, oversight claim, or composer state is
+    /// read or written here.
+    ///
+    /// - Returns: `true` only when Codex accepted the notice into a live turn of this thread.
+    func steerOversightNotice(session: AgentTabSession, text: String) async -> Bool {
+        guard session.selectedAgent == .codexExec,
+              session.runState == .running,
+              let controller = session.codexController,
+              case let .steer(identity) = codexTurnDispatchPlan(wasRunAlreadyActive: true, session: session)
+        else { return false }
+        do {
+            let receipt = try await controller.steerUserTurn(
+                text: text,
+                images: [],
+                expectedTurnID: identity.turnID
+            )
+            if receipt.acceptedTurnID != identity.turnID {
+                // Accepted by the thread's current turn rather than the one classified: the model
+                // still received it, and lifecycle bookkeeping is reconciled exactly as for a user
+                // steer that landed on a successor turn.
+                await reconcileAcceptedCodexSteerMismatch(
+                    from: identity,
+                    acceptedTurnID: receipt.acceptedTurnID,
+                    controller: controller,
+                    session: session
+                )
+            }
+            return true
+        } catch {
+            logCodex("[AgentModeVM] steerOversightNotice: not accepted: \(error)")
+            return false
+        }
+    }
+
     @discardableResult
     func sendCodexNativeMessage(
         session: AgentTabSession,

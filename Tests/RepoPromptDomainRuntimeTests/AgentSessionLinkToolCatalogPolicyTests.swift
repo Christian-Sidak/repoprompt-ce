@@ -145,6 +145,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         for invariant in [
             "`get_interaction`, `respond`, and `steer` require the `manage` capability",
             "the newest inventory and each result’s `managed` field are current and replace anything said earlier",
+            "arrives as `capability_notice` on your next result or as a `wait` that returns `capabilities_changed`",
             "Without `manage` it returns `management_not_granted` and no payload",
             "exactly the current `interaction_id`",
             "`accept` (this request only)",

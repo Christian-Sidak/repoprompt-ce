@@ -277,6 +277,177 @@ final class DomainAgentSessionLinkManagementTests: XCTestCase {
         let draining = await authority.setManagement(true, reference: reference(relinked), observer: observer, target: target)
         XCTAssertEqual(draining, .shuttingDown)
     }
+
+    // MARK: - Mid-session capability notices
+
+    private func waitUntilParked(_ authority: DomainAgentSessionLinkAuthority, count: Int) async throws {
+        for _ in 0 ..< 400 {
+            if await authority.snapshot().parkedWaiterCount >= count { return }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTFail("Waiter never parked")
+    }
+
+    /// A running overseer blocked in `wait` must learn of a Manage change now, not at its next turn:
+    /// the change ends every wait that exact observer endpoint has parked — even one on another
+    /// target — and records one notice for it alone.
+    func testManagementChangeWakesTheObserversParkedWaitAndOwesItExactlyOneNotice() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint(windowID: 1)
+        let unrelatedObserver = makeEndpoint(windowID: 4)
+        let target = makeEndpoint(windowID: 2)
+        let otherTarget = makeEndpoint(windowID: 3)
+        let grant = try await activateLink(authority, observer: observer, target: target)
+        _ = try await activateLink(authority, observer: observer, target: otherTarget)
+        _ = try await activateLink(authority, observer: unrelatedObserver, target: target)
+
+        // The observer waits on the *other* target; an unrelated observer waits on the same target.
+        let waitLease = try await authority.authorize(
+            operation: .monitorWait,
+            observerEndpoint: observer,
+            targetSessionID: otherTarget.sessionID
+        ).get()
+        let baseline = await authority.targetState(for: waitLease)
+        let cursor = try XCTUnwrap(baseline?.waitCursor)
+        let unrelatedLease = try await authority.authorize(
+            operation: .monitorWait,
+            observerEndpoint: unrelatedObserver,
+            targetSessionID: target.sessionID
+        ).get()
+        let unrelatedBaseline = await authority.targetState(for: unrelatedLease)
+        let unrelatedCursor = try XCTUnwrap(unrelatedBaseline?.waitCursor)
+        let parked = Task {
+            await authority.wait(
+                requests: [DomainAgentSessionLinkWaitRequest(lease: waitLease, cursor: cursor)],
+                until: .change,
+                timeoutSeconds: 30
+            )
+        }
+        let unrelated = Task {
+            await authority.wait(
+                requests: [DomainAgentSessionLinkWaitRequest(lease: unrelatedLease, cursor: unrelatedCursor)],
+                until: .change,
+                timeoutSeconds: 30
+            )
+        }
+        try await waitUntilParked(authority, count: 2)
+
+        _ = await authority.setManagement(true, reference: reference(grant), observer: observer, target: target)
+        let revision = await authority.observerLinkSetRevision(observer.sessionID)
+
+        let woken = await parked.value
+        XCTAssertEqual(woken.outcome, .capabilitiesChanged(sessionID: target.sessionID))
+        let successor = try XCTUnwrap(woken.targets.first?.waitCursor)
+        let again = await authority.wait(
+            requests: [DomainAgentSessionLinkWaitRequest(lease: waitLease, cursor: successor)],
+            until: .change,
+            timeoutSeconds: 0
+        )
+        XCTAssertEqual(again.outcome, .timedOut, "the capability wake consumed no target change")
+        let stillParked = await authority.snapshot().parkedWaiterCount
+        XCTAssertEqual(stillParked, 1, "another observer's wait on the same target is not woken")
+
+        let unrelatedNotices = await authority.pendingCapabilityNotices(for: unrelatedObserver)
+        XCTAssertTrue(unrelatedNotices.isEmpty, "a notice never reaches another observer")
+        // The woken wait claimed the notice in the same actor turn that woke it, so no other channel
+        // can take it first and leave the wake without the notice it was for.
+        let owed = woken.capabilityNotices
+        XCTAssertEqual(owed.count, 1)
+        XCTAssertEqual(owed.first?.targetSessionID, target.sessionID)
+        XCTAssertEqual(owed.first?.linkGeneration, grant.generation)
+        XCTAssertEqual(owed.first?.managed, true)
+        XCTAssertEqual(owed.first?.observerLinkSetRevision, revision)
+        let leftOver = await authority.takeCapabilityNotices(for: observer)
+        XCTAssertTrue(leftOver.isEmpty, "claimed at most once")
+
+        // With no wait parked, the notice stays owed until one channel claims it.
+        _ = await authority.setManagement(false, reference: reference(grant), observer: observer, target: target)
+        let taken = await authority.takeCapabilityNotices(for: observer)
+        XCTAssertEqual(taken.map(\.managed), [false])
+        let takenAgain = await authority.takeCapabilityNotices(for: observer)
+        XCTAssertTrue(takenAgain.isEmpty, "claimed at most once")
+
+        // A no-op change owes nothing.
+        _ = await authority.setManagement(false, reference: reference(grant), observer: observer, target: target)
+        let afterNoOp = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertTrue(afterNoOp.isEmpty)
+        unrelated.cancel()
+        _ = await unrelated.value
+    }
+
+    /// Only the newest change per link is owed, a failed push never overwrites a newer change, an
+    /// accepted inventory at the change's revision settles it, and revocation drops it.
+    func testNoticesKeepTheNewestChangeSettleByRevisionAndDieWithTheLink() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint(windowID: 1)
+        let target = makeEndpoint(windowID: 2)
+        let grant = try await activateLink(authority, observer: observer, target: target)
+
+        _ = await authority.setManagement(true, reference: reference(grant), observer: observer, target: target)
+        let granted = await authority.takeCapabilityNotices(for: observer)
+        XCTAssertEqual(granted.map(\.managed), [true])
+        let grantedIsCurrent = await authority.capabilityNoticesAreCurrent(granted, for: observer)
+        XCTAssertTrue(grantedIsCurrent)
+
+        // Withdrawn while the "granted" push was in flight.
+        _ = await authority.setManagement(false, reference: reference(grant), observer: observer, target: target)
+        let staleIsCurrent = await authority.capabilityNoticesAreCurrent(granted, for: observer)
+        XCTAssertFalse(staleIsCurrent, "a push must not tell the model about authority that moved")
+        await authority.restoreCapabilityNotices(granted, for: observer)
+        let owed = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertEqual(owed.map(\.managed), [false], "the newer withdrawal wins over a restored grant")
+        let withdrawnIsCurrent = await authority.capabilityNoticesAreCurrent(owed, for: observer)
+        XCTAssertTrue(withdrawnIsCurrent)
+
+        // Claimed elsewhere, then re-granted: the grant reads `true` again, yet the first `true`
+        // notice is older than the newest change and may never be restored or pushed.
+        let withdrawal = await authority.takeCapabilityNotices(for: observer)
+        _ = await authority.setManagement(true, reference: reference(grant), observer: observer, target: target)
+        let regrant = await authority.takeCapabilityNotices(for: observer)
+        let firstGrantIsCurrent = await authority.capabilityNoticesAreCurrent(granted, for: observer)
+        XCTAssertFalse(firstGrantIsCurrent, "an older notice is stale even when the state matches again")
+        let regrantIsCurrent = await authority.capabilityNoticesAreCurrent(regrant, for: observer)
+        XCTAssertTrue(regrantIsCurrent)
+        await authority.restoreCapabilityNotices(granted, for: observer)
+        let afterOlderRestore = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertTrue(afterOlderRestore.isEmpty, "an older notice never comes back after a newer change")
+        let regrantRevision = try XCTUnwrap(regrant.first?.observerLinkSetRevision)
+        await authority.acknowledgeCapabilityNotices(for: observer, throughObserverLinkSetRevision: regrantRevision)
+        await authority.restoreCapabilityNotices(regrant, for: observer)
+        let afterStatedRestore = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertTrue(afterStatedRestore.isEmpty, "a failed push never restores what an accepted inventory stated")
+        _ = await authority.setManagement(false, reference: reference(grant), observer: observer, target: target)
+        let owedWithdrawal = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertEqual(owedWithdrawal.map(\.managed), [false])
+        XCTAssertEqual(withdrawal.map(\.managed), [false])
+
+        let withdrawalRevision = try XCTUnwrap(owedWithdrawal.first?.observerLinkSetRevision)
+        await authority.acknowledgeCapabilityNotices(
+            for: observer,
+            throughObserverLinkSetRevision: withdrawalRevision - 1
+        )
+        let afterOlderInventory = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertEqual(afterOlderInventory.count, 1, "an older inventory never settles a newer change")
+        await authority.acknowledgeCapabilityNotices(for: observer, throughObserverLinkSetRevision: withdrawalRevision)
+        let afterInventory = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertTrue(afterInventory.isEmpty)
+
+        _ = await authority.setManagement(true, reference: reference(grant), observer: observer, target: target)
+        let regranted = await authority.pendingCapabilityNotices(for: observer)
+        _ = await authority.revoke(linkID: grant.id, generation: grant.generation, reason: .userRequested)
+        let afterRevoke = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertTrue(afterRevoke.isEmpty, "a revoked link's notice describes authority that no longer exists")
+        await authority.restoreCapabilityNotices(regranted, for: observer)
+        let afterRestore = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertTrue(afterRestore.isEmpty, "restoring cannot resurrect a revoked link's notice")
+        let revokedIsCurrent = await authority.capabilityNoticesAreCurrent(regranted, for: observer)
+        XCTAssertFalse(revokedIsCurrent)
+
+        let relinked = try await activateLink(authority, observer: observer, target: target)
+        XCTAssertFalse(relinked.capabilities.contains(.manage))
+        let afterRelink = await authority.pendingCapabilityNotices(for: observer)
+        XCTAssertTrue(afterRelink.isEmpty, "a relink starts watch-only and owes nothing")
+    }
 }
 
 private extension Result where Failure == DomainAgentSessionLinkError {

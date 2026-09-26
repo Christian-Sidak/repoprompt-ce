@@ -115,6 +115,10 @@ package actor DomainAgentSessionLinkAuthority {
         var waitCursorOrder: [String] = []
         /// At most one active waiter per link generation.
         var activeWaiterID: UUID?
+        /// Sequence of the newest capability-change notice ever recorded for this generation. A
+        /// claimed notice is current only while it is still this one, whichever channel took the
+        /// newer ones, so an older notice can never be restored or pushed after a newer change.
+        var latestCapabilityNoticeSequence: UInt64 = 0
     }
 
     private enum RequestAttentionSelection {
@@ -194,6 +198,14 @@ package actor DomainAgentSessionLinkAuthority {
     private var recentRevocationNoticeOrder: [DomainAgentSessionLinkEndpointIdentity] = []
 
     private var waiters: [UUID: Waiter] = [:]
+    /// Undelivered capability-change notices, latest per link, keyed by the exact observer endpoint
+    /// the changed grant names. Process-local like the capability itself.
+    private var capabilityNotices:
+        [DomainAgentSessionLinkEndpointIdentity: [UUID: DomainAgentSessionLinkCapabilityNotice]] = [:]
+    private var nextCapabilityNoticeSequence: UInt64 = 1
+    /// Highest observer link-set revision an accepted inventory block has stated, per exact observer
+    /// endpoint. A notice at or below it is already known to the model and is never restored.
+    private var capabilityNoticeAcknowledgedRevisions: [DomainAgentSessionLinkEndpointIdentity: UInt64] = [:]
     private var sendLedger: [SendLedgerKey: SendLedgerEntry] = [:]
     private var sendLedgerOrder: [SendLedgerKey] = []
     private var subscribers: [UUID: AsyncStream<DomainAgentSessionLinkChangeEvent>.Continuation] = [:]
@@ -474,10 +486,25 @@ package actor DomainAgentSessionLinkAuthority {
             createdAt: record.grant.createdAt,
             capabilities: next
         )
-        record.grant = grant
-        links[grant.id] = record
         let revision = advanceAuthorityRevision()
         let linkSetRevision = advanceObserverLinkSetRevision(grant.observer.sessionID)
+        // Recorded in the same actor turn as the grant change and before any waiter resumes, so the
+        // woken `wait` claims the notice it was woken for.
+        let notice = DomainAgentSessionLinkCapabilityNotice(
+            linkID: grant.id,
+            linkGeneration: grant.generation,
+            targetSessionID: grant.target.sessionID,
+            managed: enabled,
+            observerLinkSetRevision: linkSetRevision,
+            sequence: nextCapabilityNoticeSequence,
+            changedAt: now()
+        )
+        nextCapabilityNoticeSequence &+= 1
+        record.grant = grant
+        record.latestCapabilityNoticeSequence = notice.sequence
+        links[grant.id] = record
+        capabilityNotices[grant.observer, default: [:]][grant.id] = notice
+        wakeWaitersForCapabilityChange(observer: grant.observer, targetSessionID: grant.target.sessionID)
         publish(DomainAgentSessionLinkChangeEvent(
             kind: .capabilitiesChanged,
             authorityRevision: revision,
@@ -488,6 +515,117 @@ package actor DomainAgentSessionLinkAuthority {
             observerLinkSetRevision: linkSetRevision
         ))
         return .changed(grant, observerInventory: links(forObserverEndpoint: grant.observer))
+    }
+
+    // MARK: - Capability-change notices
+
+    /// Ends every wait this exact observer endpoint has parked, on any of its links.
+    ///
+    /// A wait on a *different* target is woken too: the model blocked in it is the running model that
+    /// must learn what it may now do, and the notice it returns names only a session this observer
+    /// holds a grant for. Successor cursors consume no target change.
+    private func wakeWaitersForCapabilityChange(
+        observer: DomainAgentSessionLinkEndpointIdentity,
+        targetSessionID: UUID
+    ) {
+        let candidates = waiters.values.filter { waiter in
+            waiter.registrations.contains { links[$0.reference.linkID]?.grant.observer == observer }
+        }
+        // The first woken wait claims every owed notice in this same actor turn, so no other channel
+        // can take it in between and leave a `capabilities_changed` result without its notice. Any
+        // sibling wait of the same observer reports the wake; the notice is delivered once.
+        var claimed = candidates.isEmpty ? [] : takeCapabilityNotices(for: observer)
+        for waiter in candidates.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
+            resumeWaiter(
+                waiter.id,
+                outcome: .capabilitiesChanged(sessionID: targetSessionID),
+                includeTargets: true,
+                capabilityNotices: claimed
+            )
+            claimed = []
+        }
+    }
+
+    /// Notices still owed to this exact observer endpoint, without claiming them.
+    package func pendingCapabilityNotices(
+        for observer: DomainAgentSessionLinkEndpointIdentity
+    ) -> [DomainAgentSessionLinkCapabilityNotice] {
+        pruneCapabilityNotices(for: observer)
+        return (capabilityNotices[observer] ?? [:]).values.sorted { $0.sequence < $1.sequence }
+    }
+
+    /// Claims every notice owed to this exact observer endpoint, atomically.
+    ///
+    /// A notice is returned only while its exact link generation is live, still names this observer,
+    /// and still has the management state the notice reports. Everything else is dropped rather than
+    /// delivered: a revoked or relinked link's notice would describe authority that no longer exists.
+    /// The caller either delivers what it took or hands it back through `restoreCapabilityNotices`.
+    package func takeCapabilityNotices(
+        for observer: DomainAgentSessionLinkEndpointIdentity
+    ) -> [DomainAgentSessionLinkCapabilityNotice] {
+        let taken = pendingCapabilityNotices(for: observer)
+        capabilityNotices.removeValue(forKey: observer)
+        return taken
+    }
+
+    /// Returns notices whose delivery failed, unless a newer change on the same link superseded them
+    /// (whether or not that newer notice is still pending), an accepted inventory already stated
+    /// them, or the link generation they describe is gone.
+    package func restoreCapabilityNotices(
+        _ notices: [DomainAgentSessionLinkCapabilityNotice],
+        for observer: DomainAgentSessionLinkEndpointIdentity
+    ) {
+        let acknowledged = capabilityNoticeAcknowledgedRevisions[observer] ?? 0
+        for notice in notices where notice.observerLinkSetRevision > acknowledged {
+            guard noticeIsLatest(notice, for: observer) else { continue }
+            capabilityNotices[observer, default: [:]][notice.linkID] = notice
+        }
+        pruneCapabilityNotices(for: observer)
+    }
+
+    /// Exact-generation, exact-observer, newest-change, and matching-state check for one notice.
+    private func noticeIsLatest(
+        _ notice: DomainAgentSessionLinkCapabilityNotice,
+        for observer: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard let record = links[notice.linkID] else { return false }
+        return record.grant.generation == notice.linkGeneration
+            && record.grant.observer == observer
+            && record.latestCapabilityNoticeSequence == notice.sequence
+            && record.grant.capabilities.contains(.manage) == notice.managed
+    }
+
+    /// Whether claimed notices still describe exactly the current grants: each link generation is
+    /// live for this observer with the reported management state, and no newer change on the same
+    /// link has been recorded since the claim. A push re-checks this as its last step before the
+    /// provider call, so it never tells a model about authority that moved in between.
+    package func capabilityNoticesAreCurrent(
+        _ notices: [DomainAgentSessionLinkCapabilityNotice],
+        for observer: DomainAgentSessionLinkEndpointIdentity
+    ) -> Bool {
+        guard !isDraining, !isShutDown else { return false }
+        return notices.allSatisfy { noticeIsLatest($0, for: observer) }
+    }
+
+    /// Settles notices an accepted inventory block has already stated: that block described every
+    /// link at `observerLinkSetRevision` or later, so the same fact need not be pushed again.
+    package func acknowledgeCapabilityNotices(
+        for observer: DomainAgentSessionLinkEndpointIdentity,
+        throughObserverLinkSetRevision revision: UInt64
+    ) {
+        capabilityNoticeAcknowledgedRevisions[observer] = max(
+            capabilityNoticeAcknowledgedRevisions[observer] ?? 0,
+            revision
+        )
+        guard var notices = capabilityNotices[observer] else { return }
+        notices = notices.filter { $0.value.observerLinkSetRevision > revision }
+        capabilityNotices[observer] = notices.isEmpty ? nil : notices
+    }
+
+    private func pruneCapabilityNotices(for observer: DomainAgentSessionLinkEndpointIdentity) {
+        guard var notices = capabilityNotices[observer] else { return }
+        notices = notices.filter { _, notice in noticeIsLatest(notice, for: observer) }
+        capabilityNotices[observer] = notices.isEmpty ? nil : notices
     }
 
     private func allocateChangeSequence(for sessionID: UUID) -> UInt64 {
@@ -1283,7 +1421,8 @@ package actor DomainAgentSessionLinkAuthority {
     private func resumeWaiter(
         _ waiterID: UUID,
         outcome: DomainAgentSessionLinkWaitOutcome,
-        includeTargets: Bool
+        includeTargets: Bool,
+        capabilityNotices notices: [DomainAgentSessionLinkCapabilityNotice] = []
     ) {
         guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
         for registration in waiter.registrations
@@ -1292,9 +1431,14 @@ package actor DomainAgentSessionLinkAuthority {
             links[registration.reference.linkID]?.activeWaiterID = nil
         }
         waiter.timeoutTask?.cancel()
-        let result = includeTargets
+        let base = includeTargets
             ? waitResult(outcome: outcome, registrations: waiter.registrations)
             : DomainAgentSessionLinkWaitResult(outcome: outcome, targets: [])
+        let result = notices.isEmpty ? base : DomainAgentSessionLinkWaitResult(
+            outcome: base.outcome,
+            targets: base.targets,
+            capabilityNotices: notices
+        )
         waiter.continuation.resume(returning: result)
     }
 
@@ -1709,6 +1853,15 @@ package actor DomainAgentSessionLinkAuthority {
             // Read cursors die with the record; uncommitted reservations and retained outcomes for
             // this generation are released here.
             releaseSendLedger(forLinkID: linkID, generation: grant.generation)
+            // A capability notice for a revoked link describes authority that no longer exists; the
+            // revocation reaches the observer through its own wait result and closing inventory.
+            capabilityNotices[grant.observer]?.removeValue(forKey: linkID)
+            if capabilityNotices[grant.observer]?.isEmpty == true {
+                capabilityNotices.removeValue(forKey: grant.observer)
+            }
+            if !links.values.contains(where: { $0.grant.observer == grant.observer }) {
+                capabilityNoticeAcknowledgedRevisions.removeValue(forKey: grant.observer)
+            }
 
             let notice = DomainAgentSessionLinkRevocationNotice(
                 linkID: grant.id,

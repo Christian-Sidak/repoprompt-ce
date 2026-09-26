@@ -298,14 +298,49 @@ ordinary cross-session attribution badge.
 
 ### Mid-session changes reach the running overseer
 
-Granting or withdrawing management advances the observer's link-set revision and publishes
-`capabilitiesChanged`. The bridge refreshes both endpoints' projections inline (the change feed is
-lossy), so the dashboard row, the target's "Manages this session" disclosure, and the observer's
-prompt inventory update together, and the next accepted dispatch is owed a fresh inventory
-block. That block is additive per-turn context — the base system prompt is never replaced — and
-opens with a "Current capabilities" line that supersedes anything said earlier, including the
-overseer's own refusals. Lane guidance revision 7 says the same in the full block. Within a turn
-already running, every `poll`, `list`, and management result carries the current `managed` state.
+Authority and awareness are separate, and only authority is synchronous. Granting or withdrawing
+management changes the grant inside `DomainAgentSessionLinkAuthority.setManagement`; every
+management fence reads that grant, so a withdrawal is effective at the next fence of an operation
+already in flight and nothing waits for the model to find out. The same actor turn advances the
+observer's link-set revision, publishes `capabilitiesChanged`, and records one
+`DomainAgentSessionLinkCapabilityNotice` for the exact observer endpoint and link generation. The
+bridge refreshes both endpoints' projections inline (the change feed is lossy), so the dashboard row,
+the target's "Manages this session" disclosure, and the observer's prompt inventory update together.
+
+The notice is then owed to the running model and is delivered by the first channel that reaches it,
+at most once per claim:
+
+| Channel | Providers | Behavior |
+| --- | --- | --- |
+| Parked `wait` | All | Every wait the exact observer endpoint has parked — on any of its links — ends in the same actor turn with `capabilities_changed` and successor cursors that consume no target change; the first woken wait claims the notice in that same actor turn, so no other channel can take it first |
+| Any `agent_session_link` result | All | The next structured result for that endpoint carries `capability_notice`, including refusals such as `management_not_granted`; a thrown error carries nothing and leaves it owed |
+| Running-turn push | Codex only | One native `turn/steer` into the exact authoritative user turn, carrying the RepoPrompt-authored `<repoprompt_session_oversight_capability_change authored_by="RepoPrompt" from_user="false">` notice, after the Codex dispatch gate and a final authority currency check. No fallback queue, no retry onto another turn, no run-state, auth-retry, claim, or composer change. Acceptance appends a `.system` provenance row that names no session |
+| Next accepted dispatch | All | The re-owed inventory block states current capabilities; accepting a claim whose inventory revision is at or past the notice's settles it |
+
+A Claude-native overseer is not pushed to: its only mid-turn input path interrupts the turn and
+replays it as a new prompt, which is exactly the unintended new turn this must not create. ACP has
+no non-interrupting input path either. An idle overseer has no model running to tell, and one waiting
+on a prompt or on its next instruction is never steered. Those states **defer explicitly**: the
+dashboard row reports how the overseer will learn ("told in its running turn", "told at its next
+oversight call or turn", "starts its next turn with the new capabilities") and never claims awareness
+a provider did not confirm. A push the provider refuses hands the notice back, but only if it is still
+the newest change recorded for that exact link generation (each link keeps a latest-sequence
+watermark, so an older notice stays dead even after a newer one was claimed elsewhere and the grant
+reads the same again) and no accepted inventory has already stated it (a per-endpoint
+acknowledged-revision watermark). A revoked or relinked link's notice is dropped rather than
+delivered. The dashboard waits at most a short bound for a push; a slower provider call is reported
+as in progress and settles on its own, restoring the notice if the turn does not take it. A steer
+that Codex accepts into the thread's successor turn is still delivery to the running model, and its
+lifecycle bookkeeping is reconciled exactly as for a user steer that lands on a successor turn. The notice names only the target of that exact grant, reaches only that observer
+endpoint, and never reaches the target, so it cannot chain.
+
+Every channel carries the same text (`AgentSessionLinkPrompts.capabilityChangeNoticeText`): it
+says it is RepoPrompt's and not the user's, that it replaces anything said earlier including the
+overseer's own refusals, and that it is not a task. The inventory block is additive per-turn
+context — the base system prompt is never replaced — and opens with a "Current capabilities" line;
+its guidance also explains the three mid-turn channels. Lane guidance revision 7 is unchanged.
+Within a turn already running, every `poll`, `list`, and management result also carries the current
+`managed` state.
 
 The audit trail is the observer's persisted tool call and result (`answered_by_session_id`,
 `steered_by_session_id`) plus, for steer, the attributed transcript row on the target. A

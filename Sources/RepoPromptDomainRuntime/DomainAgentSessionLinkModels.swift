@@ -678,10 +678,14 @@ package enum DomainAgentSessionLinkWaitOutcome: Equatable, Sendable {
     case linkUnavailable(sessionID: UUID)
     case cursorExpired(sessionID: UUID)
     case invalidRequest
+    /// The user changed the observer's management delegation on the named link while this wait was
+    /// parked. The wait ends early so the running model learns its new capabilities now; the
+    /// successor cursors consume no target change and may be passed straight back to another wait.
+    case capabilitiesChanged(sessionID: UUID)
 
     package var triggeredSessionID: UUID? {
         switch self {
-        case let .changed(sessionID), let .idle(sessionID):
+        case let .changed(sessionID), let .idle(sessionID), let .capabilitiesChanged(sessionID):
             sessionID
         case let .revoked(notice):
             notice.targetSessionID
@@ -696,10 +700,18 @@ package struct DomainAgentSessionLinkWaitResult: Equatable, Sendable {
     package let outcome: DomainAgentSessionLinkWaitOutcome
     /// Successor cursors for every authorized target, in request order.
     package let targets: [DomainAgentSessionLinkTargetState]
+    /// Capability-change notices claimed for this result in the same actor turn that woke it, so a
+    /// `capabilities_changed` wake always carries what it was woken for. Empty for other outcomes.
+    package let capabilityNotices: [DomainAgentSessionLinkCapabilityNotice]
 
-    package init(outcome: DomainAgentSessionLinkWaitOutcome, targets: [DomainAgentSessionLinkTargetState]) {
+    package init(
+        outcome: DomainAgentSessionLinkWaitOutcome,
+        targets: [DomainAgentSessionLinkTargetState],
+        capabilityNotices: [DomainAgentSessionLinkCapabilityNotice] = []
+    ) {
         self.outcome = outcome
         self.targets = targets
+        self.capabilityNotices = capabilityNotices
     }
 }
 
@@ -912,6 +924,50 @@ package enum DomainAgentSessionLinkManagementDisposition: Equatable, Sendable {
     /// The exact link generation is gone, or its recorded endpoints no longer match.
     case notFound
     case shuttingDown
+}
+
+/// One pending, observer-facing statement that the user changed what the observer may do on one
+/// exact link generation, owed to that observer's **running** model until some channel delivers it.
+///
+/// Authority changes are immediate and never wait for this: the grant's capability set is the only
+/// authorization input. The notice exists so a model already mid-turn stops reasoning from the
+/// capabilities it was told about earlier — including its own earlier refusals — rather than
+/// discovering the change only at its next turn.
+///
+/// Scoped to the exact observer endpoint and link generation that changed. A notice never names a
+/// session the observer was not granted, never reaches the target, and never transfers to another
+/// incarnation, a relinked generation, or a session the target itself oversees.
+package struct DomainAgentSessionLinkCapabilityNotice: Equatable, Hashable, Sendable {
+    package let linkID: UUID
+    package let linkGeneration: UInt64
+    package let targetSessionID: UUID
+    /// The management state the user just set. Always equal to the grant's state when delivered:
+    /// every later change replaces this notice rather than queueing behind it.
+    package let managed: Bool
+    /// The observer's link-set revision the change produced. An accepted inventory block at or past
+    /// this revision already told the model the same fact.
+    package let observerLinkSetRevision: UInt64
+    /// Per-observer-endpoint order of changes, so a restored notice never overwrites a newer one.
+    package let sequence: UInt64
+    package let changedAt: Date
+
+    package init(
+        linkID: UUID,
+        linkGeneration: UInt64,
+        targetSessionID: UUID,
+        managed: Bool,
+        observerLinkSetRevision: UInt64,
+        sequence: UInt64,
+        changedAt: Date
+    ) {
+        self.linkID = linkID
+        self.linkGeneration = linkGeneration
+        self.targetSessionID = targetSessionID
+        self.managed = managed
+        self.observerLinkSetRevision = observerLinkSetRevision
+        self.sequence = sequence
+        self.changedAt = changedAt
+    }
 }
 
 // MARK: - Change events

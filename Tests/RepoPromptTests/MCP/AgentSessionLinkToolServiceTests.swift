@@ -1080,6 +1080,85 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    /// A running overseer parked in `wait` learns about a Manage change at once, and the correction
+    /// rides exactly one result — including a structured refusal, which is where a model still
+    /// reasoning from older capabilities most needs it.
+    func testManageChangeWakesAParkedWaitWithTheNoticeAndRidesExactlyOneResult() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        let sessionID = Value.string(fixture.target.sessionID.uuidString)
+        let polled = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertNil(polled["capability_notice"], "nothing is owed before a change")
+        let cursor = try XCTUnwrap(polled["wait_cursor"])
+
+        let service = fixture.service
+        let waiting = Task { @MainActor in
+            try await Self.executeObject(service, args: [
+                "op": .string("wait"),
+                "session_id": sessionID,
+                "cursor": cursor,
+                "timeout_seconds": .int(30)
+            ])
+        }
+        for _ in 0 ..< 400 {
+            if await fixture.authority.snapshot().parkedWaiterCount == 1 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let parked = await fixture.authority.snapshot().parkedWaiterCount
+        XCTAssertEqual(parked, 1)
+
+        let report = await fixture.bridge.setManagementReporting(
+            true,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+        guard case .changed = report else { return XCTFail("expected a change, got \(report)") }
+        let woken = try await waiting.value
+        XCTAssertEqual(woken["result"]?.stringValue, "capabilities_changed")
+        XCTAssertEqual(woken["triggered_session_id"], sessionID)
+        XCTAssertNotNil(woken["wait_cursor"]?.stringValue, "the model may wait again from the returned cursor")
+        XCTAssertTrue(woken["detail"]?.stringValue?.contains("capability_notice") ?? false)
+        let notice = try XCTUnwrap(woken["capability_notice"]?.objectValue)
+        XCTAssertEqual(notice["notice"]?.stringValue, AgentSessionLinkPrompts.capabilityChangeNoticeText)
+        let change = try XCTUnwrap(notice["changes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(change["session_id"], sessionID)
+        XCTAssertEqual(change["managed"], .bool(true))
+        XCTAssertEqual(change["management_operations"]?.stringValue, "available")
+
+        let next = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertNil(next["capability_notice"], "a delivered notice is not repeated")
+        XCTAssertEqual(next["managed"], .bool(true))
+
+        // Withdrawn with no wait parked: the very next result carries it, even a refusal.
+        _ = await fixture.bridge.setManagement(
+            false,
+            observerEndpoint: fixture.observer.domainEndpoint,
+            targetEndpoint: fixture.target.domainEndpoint,
+            expectedReference: reference
+        )
+        let refused = try await Self.executeObject(fixture.service, args: [
+            "op": .string("steer"),
+            "session_id": sessionID,
+            "message": .string("continue"),
+            "idempotency_key": .string("after-withdrawal")
+        ])
+        XCTAssertEqual(refused["result"]?.stringValue, "management_not_granted")
+        let withdrawal = try XCTUnwrap(refused["capability_notice"]?.objectValue?["changes"]?.arrayValue?.first?.objectValue)
+        XCTAssertEqual(withdrawal["managed"], .bool(false))
+        XCTAssertEqual(withdrawal["management_operations"]?.stringValue, "withdrawn")
+        let afterRefusal = try await Self.executeObject(fixture.service, args: [
+            "op": .string("poll"), "session_id": sessionID
+        ])
+        XCTAssertNil(afterRefusal["capability_notice"])
+    }
+
     func testManagedLinkInspectsAnswersAndSteersAndReportsTheGrant() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
