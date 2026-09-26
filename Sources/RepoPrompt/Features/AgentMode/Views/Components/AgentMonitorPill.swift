@@ -120,6 +120,8 @@ struct AgentMonitorPopoverView: View {
     /// outbound link at once, so gating it on a row would disable an unrelated row's actions.
     @State private var isChangingAutoWake = false
     @State private var autoWakeFailureMessage: String?
+    @State private var isChangingAutoApproval = false
+    @State private var autoApprovalFailureMessage: String?
     /// Local disclosure state for the pending-updates detail list. Presentation only: collapsing it
     /// acknowledges nothing, and reopening the popover starts collapsed again.
     @State private var showPendingUpdateDetails = false
@@ -379,6 +381,15 @@ struct AgentMonitorPopoverView: View {
                 snoozeRow(row, now: now, isBusy: isBusy)
                     .layoutPriority(1)
             }
+            Toggle(AgentMonitorAutoApprovalCopy.laneLabel, isOn: Binding(
+                get: { row.autoApprovalEnabled },
+                set: { setLaneAutoApproval(row, enabled: $0) }
+            ))
+            .toggleStyle(.checkbox)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+            .disabled(isBusy || isChangingAutoApproval)
+            .hoverTooltip(AgentMonitorAutoApprovalCopy.tooltip, .top)
+            .accessibilityLabel("Auto-approve provider permissions for \(row.displayName)")
             if let feedback = rowFeedbackByRowKey[row.rowKey] {
                 messageText(feedback.message)
             }
@@ -539,6 +550,22 @@ struct AgentMonitorPopoverView: View {
                     .disabled(isChangingAutoWake || props.autoWakeUnavailableReason != nil)
                 }
             }
+            HStack(spacing: 8) {
+                Text(AgentMonitorAutoApprovalCopy.bulkLabel)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .hoverTooltip(AgentMonitorAutoApprovalCopy.tooltip, .top)
+                Button(
+                    currentOutboundLinksAreAllAutoApproved
+                        ? AgentMonitorAutoApprovalCopy.deselectAll
+                        : AgentMonitorAutoApprovalCopy.selectAll
+                ) {
+                    setAllCurrentAutoApproval(enabled: !currentOutboundLinksAreAllAutoApproved)
+                }
+                .buttonStyle(.plain)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                .foregroundStyle(Color.accentColor)
+                .disabled(isChangingAutoApproval)
+            }
             routineWakeIntervalRow(now: now)
             periodicIdleWakeRow
             if let reason = props.autoWakeUnavailableReason {
@@ -546,6 +573,9 @@ struct AgentMonitorPopoverView: View {
             }
             if let autoWakeFailureMessage {
                 messageText(autoWakeFailureMessage)
+            }
+            if let autoApprovalFailureMessage {
+                messageText(autoApprovalFailureMessage)
             }
         }
     }
@@ -555,6 +585,10 @@ struct AgentMonitorPopoverView: View {
     /// value the session had refused to take.
     private var currentOutboundTargetsAreAllSelected: Bool {
         props.outbound.allSatisfy { props.autoWakeTargetSessionIDs.contains($0.targetSessionID) }
+    }
+
+    private var currentOutboundLinksAreAllAutoApproved: Bool {
+        !props.outbound.isEmpty && props.outbound.allSatisfy(\.autoApprovalEnabled)
     }
 
     private func laneAutoWakeToggle(
@@ -1331,6 +1365,40 @@ struct AgentMonitorPopoverView: View {
         let outcome = AgentSessionLinkRuntimeBridge.shared
             .wakeNowForPendingOversightUpdates(observerEndpoint: observerEndpoint)
         autoWakeFailureMessage = outcome.refusal?.message
+    }
+
+    private func setLaneAutoApproval(_ row: AgentMonitorPillProps.Outbound, enabled: Bool) {
+        guard !isChangingAutoApproval,
+              let observerEndpoint = props.endpoint
+        else { return }
+        let rowKey = beginRowAction(row.rowKey)
+        let reference = DomainAgentSessionLinkReference(linkID: row.linkID, generation: row.generation)
+        Task {
+            let applied = await AgentSessionLinkRuntimeBridge.shared.setAutoApproval(
+                enabled,
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: row.targetEndpoint,
+                expectedReference: reference
+            )
+            busyRowKeys.remove(rowKey)
+            setRowFeedback(rowKey, applied ? nil : .failure(AgentMonitorAutoApprovalCopy.unavailableMessage))
+        }
+    }
+
+    private func setAllCurrentAutoApproval(enabled: Bool) {
+        guard !isChangingAutoApproval,
+              let observerEndpoint = props.endpoint
+        else { return }
+        isChangingAutoApproval = true
+        autoApprovalFailureMessage = nil
+        Task {
+            let applied = await AgentSessionLinkRuntimeBridge.shared.setAutoApprovalForCurrentLinks(
+                enabled,
+                observerEndpoint: observerEndpoint
+            )
+            isChangingAutoApproval = false
+            autoApprovalFailureMessage = applied ? nil : AgentMonitorAutoApprovalCopy.unavailableMessage
+        }
     }
 
     private func setLaneAutoWake(_ row: AgentMonitorPillProps.Outbound, enabled: Bool) {

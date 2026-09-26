@@ -6032,6 +6032,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func configureMCPStateObservation(for session: TabSession) {
         session.mcpStateObservationCancellable?.cancel()
+        session.permissionAutoApprovalCancellable?.cancel()
+        session.permissionAutoApprovalCancellable = Publishers.CombineLatest(
+            session.$pendingApproval.map { $0?.id },
+            session.$pendingPermissionsRequest.map { $0?.id }
+        )
+        .map { Set([$0, $1].compactMap(\.self)) }
+        .removeDuplicates()
+        // Subscribing while a prompt is already waiting must not retroactively accept it.
+        .dropFirst()
+        // @Published sends before storage changes; evaluate only after the settled value is visible.
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self, weak session] requestIDs in
+            guard let self, let session, !requestIDs.isEmpty else { return }
+            Task { @MainActor [weak self, weak session] in
+                guard let self, let session else { return }
+                await autoApproveOverseenProviderPermissions(for: session, requestIDs: requestIDs)
+            }
+        }
         let publishers: [AnyPublisher<Void, Never>] = [
             session.$runState.map { _ in () }.eraseToAnyPublisher(),
             session.$runningStatusText.map { _ in () }.eraseToAnyPublisher(),
@@ -6083,6 +6101,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         session.mcpStateObservationCancellable?.cancel()
         session.mcpStateObservationCancellable = nil
+        session.permissionAutoApprovalCancellable?.cancel()
+        session.permissionAutoApprovalCancellable = nil
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlCleanupTask = nil
         session.mcpFollowUpRunPending = false

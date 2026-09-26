@@ -445,6 +445,95 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         return DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
     }
 
+    func testAutoApprovalDefaultsOffAndRetiresWithExactGrant() async {
+        let fixture = makeFixture()
+        guard case .added = await addLink(fixture),
+              let reference = await linkReference(fixture)
+        else { return XCTFail("Expected an active link") }
+        let observer = fixture.observer.domainEndpoint
+        let target = fixture.target.domainEndpoint
+        let initiallyAuthorized = await fixture.bridge.autoApprovalIsAuthorized(for: target)
+        XCTAssertFalse(initiallyAuthorized)
+        let applied = await fixture.bridge.setAutoApproval(
+            true,
+            observerEndpoint: observer,
+            targetEndpoint: target,
+            expectedReference: reference
+        )
+        XCTAssertTrue(applied)
+        let selectedAuthorized = await fixture.bridge.autoApprovalIsAuthorized(for: target)
+        XCTAssertTrue(selectedAuthorized)
+        let replacementCandidate = makeCandidate(
+            windowID: fixture.target.windowID,
+            sessionID: fixture.target.sessionID,
+            workspaceID: fixture.target.workspaceID,
+            tabID: fixture.target.tabID,
+            persistentBindingGeneration: fixture.target.persistentBindingGeneration,
+            bindingTransitionGeneration: fixture.target.bindingTransitionGeneration + 1
+        )
+        fixture.host.candidates = [fixture.observer, replacementCandidate]
+        let afterIdentityDrift = await fixture.bridge.autoApprovalIsAuthorized(for: replacementCandidate.domainEndpoint)
+        XCTAssertFalse(afterIdentityDrift)
+        fixture.host.candidates = [fixture.observer, fixture.target]
+
+        let stopped = await fixture.bridge.stopMonitorLink(
+            observerEndpoint: observer,
+            targetEndpoint: target,
+            expectedReference: reference
+        )
+        XCTAssertEqual(stopped, .stopped)
+        let afterStop = await fixture.bridge.autoApprovalIsAuthorized(for: target)
+        XCTAssertFalse(afterStop)
+        guard case .added = await addLink(fixture),
+              let replacement = await linkReference(fixture)
+        else { return XCTFail("Expected a replacement link") }
+        XCTAssertNotEqual(replacement, reference)
+        let afterRelink = await fixture.bridge.autoApprovalIsAuthorized(for: target)
+        XCTAssertFalse(afterRelink)
+        let staleSelectionApplied = await fixture.bridge.setAutoApproval(
+            true,
+            observerEndpoint: observer,
+            targetEndpoint: target,
+            expectedReference: reference
+        )
+        XCTAssertFalse(staleSelectionApplied)
+    }
+
+    func testAutoApprovalBulkSelectsOnlyCurrentLinks() async {
+        let fixture = makeFixture()
+        let second = makeCandidate(windowID: 3, displayName: "Second target")
+        fixture.host.candidates.append(second)
+        guard case .added = await addLink(fixture),
+              case .added = await fixture.bridge.addMonitorLink(
+                  observerSessionID: fixture.observer.sessionID,
+                  rawTargetSessionID: second.sessionID.uuidString
+              )
+        else { return XCTFail("Expected two active links") }
+        let observer = fixture.observer.domainEndpoint
+        let enabled = await fixture.bridge.setAutoApprovalForCurrentLinks(true, observerEndpoint: observer)
+        XCTAssertTrue(enabled)
+        let firstAuthorized = await fixture.bridge.autoApprovalIsAuthorized(for: fixture.target.domainEndpoint)
+        let secondAuthorized = await fixture.bridge.autoApprovalIsAuthorized(for: second.domainEndpoint)
+        XCTAssertTrue(firstAuthorized)
+        XCTAssertTrue(secondAuthorized)
+
+        let third = makeCandidate(windowID: 4, displayName: "Later target")
+        fixture.host.candidates.append(third)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: third.sessionID.uuidString
+        ) else { return XCTFail("Expected a later link") }
+        let laterAuthorized = await fixture.bridge.autoApprovalIsAuthorized(for: third.domainEndpoint)
+        XCTAssertFalse(laterAuthorized, "Bulk selection must not opt future links in")
+
+        let disabled = await fixture.bridge.setAutoApprovalForCurrentLinks(false, observerEndpoint: observer)
+        XCTAssertTrue(disabled)
+        let firstAfterDisable = await fixture.bridge.autoApprovalIsAuthorized(for: fixture.target.domainEndpoint)
+        let secondAfterDisable = await fixture.bridge.autoApprovalIsAuthorized(for: second.domainEndpoint)
+        XCTAssertFalse(firstAfterDisable)
+        XCTAssertFalse(secondAfterDisable)
+    }
+
     private func pollState(
         _ fixture: Fixture,
         observer: AgentSessionLinkEndpointCandidate? = nil,

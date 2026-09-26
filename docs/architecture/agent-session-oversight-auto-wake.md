@@ -186,6 +186,24 @@ eligible observer to add nor an existing relationship to unlink. A row may legit
 sidebar eyes at once; their fill, color, placement, interaction, tooltip, and directional
 accessibility wording must remain distinct.
 
+## Auto-approval is an exact, process-local link choice
+
+The observer dashboard can opt an individual outbound link into automatic acceptance of the target's
+**provider permission prompts**, or select/deselect all links that are active at the instant of the
+bulk action. Every link starts off. The selection is keyed by the exact observer endpoint, target
+endpoint, and generation-qualified link reference. It is not an Auto-wake preference, a provider-wide
+permission mode, or a durable session-UUID selection. Unlink, relink, endpoint replacement, and app
+restart return to manual approval; bulk selection never opts in a future link.
+
+At a provider prompt, the target checks the selected link against the current authority grant and
+both live endpoint candidates, then checks its own exact session incarnation and pending request
+again after the authority hop. The response accepts only that one provider request. The ordinary
+manual path remains in place when no exact link is selected. User questions, MCP elicitation, Codex
+hook reviews, app-owned apply-edits and worktree-merge reviews, GitHub/destructive approvals, and
+unrelated app permission controls never call this gate. A permission request already pending when the
+choice is enabled remains manual; the setting applies to new prompts. This deliberately narrow
+process-local policy avoids promoting UUID-keyed saved Auto-wake state into permission authority.
+
 ## Target-centric sidebar management stays exact
 
 A target menu is a UI-only projection over one exact target endpoint. It carries independent
