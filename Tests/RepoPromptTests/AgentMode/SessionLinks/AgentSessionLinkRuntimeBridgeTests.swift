@@ -310,6 +310,20 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
     // MARK: - Tool advertisement recorder
 
+    private final class ApprovalRecordingCodexController: CodexSessionControllerPassiveStubDefaults {
+        let recorder = LifecycleRecorder()
+
+        var events: AsyncStream<CodexNativeSessionController.Event> {
+            AsyncStream { $0.finish() }
+        }
+
+        func shutdown() async {}
+
+        func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
+            recorder.record("\(id.displayValue):\(result["decision"] as? String ?? "unknown")")
+        }
+    }
+
     /// Records every session the bridge asks to re-advertise `agent_session_link` for.
     ///
     /// An actor because the bridge's invalidator is `@Sendable` and is awaited off the test's
@@ -443,6 +457,106 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             $0.targetSessionID == (target ?? fixture.target.sessionID)
         }) else { return nil }
         return DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+    }
+
+    func testTargetRespondsOnlyToNewPromptObservedUnderEnabledExactLink() async throws {
+        let tabID = UUID()
+        let controller = ApprovalRecordingCodexController()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 92,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel,
+            tabID: tabID,
+            name: "Overseer response target"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .codexExec
+        session.hasLoadedPersistedState = true
+        session.codexController = controller
+        let sessionID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(session))
+        let target = try XCTUnwrap(viewModel.agentSessionLinkCandidate(
+            tabID: tabID,
+            sessionID: sessionID,
+            tabName: "Target",
+            isWindowClosing: false
+        ))
+        let observer = makeCandidate(windowID: 91, displayName: "Overseer")
+        let host = FakeEndpointHost()
+        host.candidates = [observer, target]
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        bridge.attach(host: host)
+        defer { WindowStatesManager.shared.attachAgentSessionLinkBridge() }
+        guard case .added = await bridge.addMonitorLink(
+            observerSessionID: observer.sessionID,
+            rawTargetSessionID: target.sessionID.uuidString
+        ) else { return XCTFail("Expected an exact live link") }
+        let authority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
+        let inventory = await authority.links(forObserver: observer.sessionID)
+        guard let item = inventory.items.first(where: { $0.targetSessionID == target.sessionID }) else {
+            return XCTFail("Expected the active link reference")
+        }
+        let reference = DomainAgentSessionLinkReference(linkID: item.linkID, generation: item.generation)
+        let targetEndpoint = target.domainEndpoint
+        XCTAssertFalse(bridge.hasAutoApprovalSelection(for: targetEndpoint))
+
+        let earlier = AgentApprovalRequest(
+            requestID: .codex(.int(101)),
+            method: "item/commandExecution/requestApproval",
+            kind: .commandExecution,
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "earlier"
+        )
+        session.pendingApproval = earlier
+        let enabled = await bridge.setAutoApproval(
+            true,
+            observerEndpoint: observer.domainEndpoint,
+            targetEndpoint: targetEndpoint,
+            expectedReference: reference
+        )
+        XCTAssertTrue(enabled)
+        XCTAssertTrue(bridge.hasAutoApprovalSelection(for: targetEndpoint))
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        await Task.yield()
+        XCTAssertEqual(session.pendingApproval, earlier, "a request observed while opt-in was off stays manual")
+        XCTAssertTrue(controller.recorder.events.isEmpty)
+
+        let fresh = AgentApprovalRequest(
+            requestID: .codex(.int(102)),
+            method: "item/commandExecution/requestApproval",
+            kind: .commandExecution,
+            threadID: "thread",
+            turnID: "turn",
+            itemID: "fresh"
+        )
+        session.pendingApproval = fresh
+        let responseObserved = try? await AsyncTestWait.waitUntil("one exact-link provider response") {
+            controller.recorder.events.count == 1
+        }
+        XCTAssertNotNil(responseObserved)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        await Task.yield()
+        XCTAssertEqual(controller.recorder.events, ["102:accept"], "one request-scoped accept, never session-wide")
+        XCTAssertNil(session.pendingApproval)
+
+        let stopped = await bridge.stopMonitorLink(
+            observerEndpoint: observer.domainEndpoint,
+            targetEndpoint: targetEndpoint,
+            expectedReference: reference
+        )
+        XCTAssertEqual(stopped, .stopped)
     }
 
     func testAutoApprovalDefaultsOffAndRetiresWithExactGrant() async {
