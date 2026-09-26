@@ -477,6 +477,10 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         var deliveryIsSuspended = true
         defer { if deliveryIsSuspended { permissionDeliveryQueue.resume() } }
         viewModel.test_permissionAutoApprovalDeliveryQueue = permissionDeliveryQueue
+        let deliveryRecorder = LifecycleRecorder()
+        viewModel.test_permissionAutoApprovalDidDeliver = { requestIDs in
+            deliveryRecorder.record(requestIDs.map(\.uuidString).sorted().joined(separator: ","))
+        }
         let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
             on: viewModel,
             tabID: tabID,
@@ -536,7 +540,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await withCheckedContinuation { continuation in
             permissionDeliveryQueue.async { continuation.resume() }
         }
-        await Task.yield()
+        XCTAssertTrue(deliveryRecorder.events.isEmpty, "the off-time request must never reach the sink")
         XCTAssertEqual(session.pendingApproval, earlier, "a request observed while opt-in was off stays manual")
         XCTAssertTrue(controller.recorder.events.isEmpty)
 
@@ -556,7 +560,7 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         await withCheckedContinuation { continuation in
             permissionDeliveryQueue.async { continuation.resume() }
         }
-        await Task.yield()
+        XCTAssertEqual(deliveryRecorder.events, [fresh.id.uuidString], "only the enabled exact-link request reaches the sink")
         XCTAssertEqual(controller.recorder.events, ["102:accept"], "one request-scoped accept, never session-wide")
         XCTAssertNil(session.pendingApproval)
 
