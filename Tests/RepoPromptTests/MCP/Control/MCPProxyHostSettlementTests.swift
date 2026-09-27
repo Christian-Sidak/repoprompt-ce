@@ -416,6 +416,92 @@ final class MCPProxyHostSettlementTests: XCTestCase {
         XCTAssertNil(snapshot.terminalReason)
     }
 
+    // MARK: - Disconnected replayable requests (M8F)
+
+    func testDisconnectedReplayableRequestsAreAnsweredOnceAndBridgeStaysReconnectable() async throws {
+        let ledger = JSONRPCBridgeLedger(connectionID: "settlement-disconnected")
+        let replayState = MCPOutstandingRequestReplayState()
+        _ = try await ledger.beginConnection()
+        let frames = [
+            #"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"host"}}}"#,
+            #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a"}}}"#,
+            #"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#
+        ]
+        for json in frames {
+            let prepared = try await ledger.prepare(frame: line(json), direction: .clientToServer)
+            try await ledger.commit(prepared)
+            await replayState.recordForwardedClientFrame(line(json), prepared: prepared)
+        }
+        let protocolActive = await ledger.recordConnectionFailure("app_socket_closed")
+        XCTAssertFalse(protocolActive)
+
+        let hostOutput = try makePipe()
+        defer {
+            Darwin.close(hostOutput.read)
+            Darwin.close(hostOutput.write)
+        }
+        let answered = await MCPProxyHostSettlement.settleReplayableRequestsWhileDisconnected(
+            ledger: ledger,
+            replayState: replayState,
+            stdoutFD: hostOutput.write
+        )
+        XCTAssertEqual(answered, 2, "initialize stays owned by the initialize replay plan")
+
+        let answers = try readLines(from: hostOutput.read).map(errorObject)
+        XCTAssertEqual(answers.map { $0.id as? Int }, [1, 2])
+        for answer in answers {
+            XCTAssertEqual(answer.data["code"] as? String, "transport_lost")
+            XCTAssertEqual(answer.data["retryability"] as? String, "retryable")
+            XCTAssertEqual(answer.data["reason"] as? String, "app_unavailable_while_reconnecting")
+        }
+        let replayFrames = await replayState.replayFrames()
+        XCTAssertEqual(replayFrames, [], "answered requests are never replayed")
+
+        let snapshot = await ledger.snapshot()
+        XCTAssertNil(snapshot.terminalReason)
+        XCTAssertEqual(snapshot.activeRequestCount, 1, "only initialize remains")
+        let generation = try await ledger.beginConnection()
+        XCTAssertEqual(generation, 2, "reconnect is still legal")
+        try await forward(ledger, #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"b"}}}"#)
+
+        let repeated = await MCPProxyHostSettlement.settleReplayableRequestsWhileDisconnected(
+            ledger: ledger,
+            replayState: replayState,
+            stdoutFD: hostOutput.write
+        )
+        XCTAssertEqual(repeated, 1, "only the newly forwarded request is claimed")
+    }
+
+    func testDisconnectedSettlementLeavesUnreplayableWorkToTerminalSettlement() async throws {
+        let ledger = JSONRPCBridgeLedger(connectionID: "settlement-disconnected-unreplayable")
+        _ = try await ledger.beginConnection()
+        try await forward(ledger, #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a"}}}"#)
+        try await forward(ledger, #"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"apply_edits","arguments":{"path":"a"}}}"#)
+
+        let claimed = await ledger.claimReplayableHostRequestsWhileDisconnected()
+        XCTAssertEqual(claimed, [])
+        let snapshot = await ledger.snapshot()
+        XCTAssertEqual(snapshot.activeRequestCount, 2)
+    }
+
+    func testReconnectPolicyParsesEnvironment() {
+        let key = MCPProxyReconnectPolicy.environmentKey
+        XCTAssertEqual(MCPProxyReconnectPolicy.fromEnvironment([:]).requestTimeoutSeconds, 30)
+        XCTAssertNil(MCPProxyReconnectPolicy.fromEnvironment([key: "0"]).requestTimeoutSeconds)
+        XCTAssertEqual(MCPProxyReconnectPolicy.fromEnvironment([key: "45"]).requestTimeoutSeconds, 45)
+        XCTAssertEqual(MCPProxyReconnectPolicy.fromEnvironment([key: "nope"]).requestTimeoutSeconds, 30)
+
+        let policy = MCPProxyReconnectPolicy(requestTimeoutSeconds: 30)
+        XCTAssertFalse(policy.shouldAnswerOutstandingRequests(disconnectedSeconds: 29.9))
+        XCTAssertTrue(policy.shouldAnswerOutstandingRequests(disconnectedSeconds: 30))
+        XCTAssertEqual(policy.cappedRetryDelay(0.5, disconnectedSeconds: 29.8), 0.2, accuracy: 0.0001)
+        XCTAssertEqual(policy.cappedRetryDelay(8, disconnectedSeconds: 31), 8, "no cap after the deadline")
+        XCTAssertFalse(
+            MCPProxyReconnectPolicy(requestTimeoutSeconds: nil)
+                .shouldAnswerOutstandingRequests(disconnectedSeconds: 1e9)
+        )
+    }
+
     // MARK: - Terminal record
 
     func testTerminalRecordCarriesSettlementCountsAndDecodesLegacyRecords() async throws {

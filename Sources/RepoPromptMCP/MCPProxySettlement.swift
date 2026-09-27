@@ -47,6 +47,42 @@ struct MCPProxyStartupPolicy: Equatable {
     }
 }
 
+/// Bounds how long replayable host requests wait for the app after an initialized session loses
+/// its app connection. Reconnection itself continues; only those requests are answered.
+struct MCPProxyReconnectPolicy: Equatable {
+    static let environmentKey = "REPOPROMPT_MCP_DISCONNECTED_REQUEST_TIMEOUT_SECONDS"
+    static let defaultTimeoutSeconds: TimeInterval = 30
+    static let maximumTimeoutSeconds: TimeInterval = 3600
+
+    /// `nil` keeps replayable requests waiting for replay indefinitely (legacy behavior).
+    let requestTimeoutSeconds: TimeInterval?
+
+    static func fromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> MCPProxyReconnectPolicy {
+        guard let raw = environment[environmentKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty,
+              let seconds = TimeInterval(raw), seconds.isFinite, seconds >= 0
+        else {
+            return MCPProxyReconnectPolicy(requestTimeoutSeconds: defaultTimeoutSeconds)
+        }
+        if seconds == 0 {
+            return MCPProxyReconnectPolicy(requestTimeoutSeconds: nil)
+        }
+        return MCPProxyReconnectPolicy(requestTimeoutSeconds: min(seconds, maximumTimeoutSeconds))
+    }
+
+    func shouldAnswerOutstandingRequests(disconnectedSeconds: TimeInterval) -> Bool {
+        guard let requestTimeoutSeconds else { return false }
+        return disconnectedSeconds >= requestTimeoutSeconds
+    }
+
+    func cappedRetryDelay(_ delay: TimeInterval, disconnectedSeconds: TimeInterval) -> TimeInterval {
+        guard let requestTimeoutSeconds, disconnectedSeconds < requestTimeoutSeconds else { return delay }
+        return max(0, min(delay, requestTimeoutSeconds - disconnectedSeconds))
+    }
+}
+
 /// Terminal error raised when no bootstrap session was accepted within the startup budget.
 struct MCPProxyStartupBudgetExceeded: Swift.Error, Equatable, LocalizedError {
     static let terminalReason = "startup_budget_exceeded"
@@ -284,6 +320,26 @@ enum MCPProxyHostSettlement {
             }
             return written
         }.value
+    }
+
+    static let disconnectedRequestReason = "app_unavailable_while_reconnecting"
+
+    /// Answers replayable host requests that have waited out the disconnected-request timeout,
+    /// then removes them from replay. Runs only between bridge runs, when nothing else writes to
+    /// the host's stdout. The bridge stays reconnectable.
+    static func settleReplayableRequestsWhileDisconnected(
+        ledger: JSONRPCBridgeLedger,
+        replayState: MCPOutstandingRequestReplayState,
+        stdoutFD: Int32 = STDOUT_FILENO
+    ) async -> Int {
+        let claimed = await ledger.claimReplayableHostRequestsWhileDisconnected()
+        guard !claimed.isEmpty else { return 0 }
+        await replayState.discardRequests(withIDs: claimed.map(\.id))
+        let frames = frames(
+            for: JSONRPCBridgeHostSettlementClaim(requests: claimed, responseInDeliveryCount: 0),
+            decision: Decision(code: .transportLost, reason: disconnectedRequestReason)
+        )
+        return await write(frames, to: stdoutFD)
     }
 
     /// Claims and answers every unanswered host request for a terminal proxy error.

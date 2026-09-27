@@ -141,11 +141,23 @@ Evidence: conductor ticket `49833be6-c0b5-4d5f-96cd-57a48db9aaa2` —
 `PersistedMCPRoutingIdentityTests` 3/3; `conductor lint` passed. No live latency measurement
 was taken; the benefit claimed is the removed queueing dependency, not a measured speedup.
 
+### M8F — bounded answers for replayable requests while disconnected (I1)
+
+After the first accepted session the proxy reconnects indefinitely, which is right for app
+updates and restarts, but a replayable request in flight during a long absence was never
+answered. Once the current disconnection exceeds
+`REPOPROMPT_MCP_DISCONNECTED_REQUEST_TIMEOUT_SECONDS` (default 30, `0` = legacy), the proxy
+claims forwarded replay-allowlisted requests other than `initialize`, answers each with a
+retryable `transport_lost` error, and drops them from the replay cache. This runs only between
+bridge runs, so the host's stdout has no other writer. The ledger claim is non-terminal, is
+refused whenever reconnect is illegal (unreplayable work, pending transaction, response in
+delivery), and records no tombstone, so the host may reuse the ids. `initialize` is excluded
+because the initialize replay plan may still forward its response.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
 - Cross-backend app-versus-headless parity and latency harness.
-- Post-initialize bounded answering of replayable requests while disconnected.
 - Live chaos matrix (app killed mid-request, restart during `initialize`), which
   requires explicit approval to stop or relaunch the visible app.
 

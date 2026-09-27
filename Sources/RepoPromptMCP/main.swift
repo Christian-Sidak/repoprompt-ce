@@ -2043,6 +2043,11 @@ actor MCPService: Service {
     private let startupPolicy: MCPProxyStartupPolicy
     private let startupUptime = ProcessInfo.processInfo.systemUptime
     private var hasAcceptedBootstrapSession = false
+    /// Bound on how long replayable host requests wait for the app after an initialized session
+    /// disconnects; reconnection continues regardless.
+    private let reconnectPolicy: MCPProxyReconnectPolicy
+    /// Uptime at which the current app disconnection began, after an accepted session.
+    private var disconnectedSinceUptime: TimeInterval?
     private let socketURL: URL
     private let hostInputFD: Int32
     private let hostOutputFD: Int32
@@ -2054,6 +2059,7 @@ actor MCPService: Service {
 
     init(
         startupPolicy: MCPProxyStartupPolicy = .fromEnvironment(),
+        reconnectPolicy: MCPProxyReconnectPolicy = .fromEnvironment(),
         socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(),
         hostInputFD: Int32 = STDIN_FILENO,
         hostOutputFD: Int32 = STDOUT_FILENO
@@ -2061,6 +2067,7 @@ actor MCPService: Service {
         let sessionToken = UUID().uuidString
         self.sessionToken = sessionToken
         self.startupPolicy = startupPolicy
+        self.reconnectPolicy = reconnectPolicy
         self.socketURL = socketURL
         self.hostInputFD = hostInputFD
         self.hostOutputFD = hostOutputFD
@@ -2290,6 +2297,7 @@ actor MCPService: Service {
 
     private func markBootstrapSessionAccepted() {
         hasAcceptedBootstrapSession = true
+        disconnectedSinceUptime = nil
     }
 
     private func persistProxyTerminalRecord(
@@ -2458,6 +2466,20 @@ actor MCPService: Service {
                 }
                 if awaitingFirstSession {
                     delay = startupPolicy.cappedRetryDelay(delay, elapsedSeconds: startupElapsed)
+                } else {
+                    // No bridge is running here, so the host's stdout has no other writer.
+                    let uptime = ProcessInfo.processInfo.systemUptime
+                    let disconnectedSince = disconnectedSinceUptime ?? uptime
+                    disconnectedSinceUptime = disconnectedSince
+                    let disconnectedSeconds = uptime - disconnectedSince
+                    if reconnectPolicy.shouldAnswerOutstandingRequests(disconnectedSeconds: disconnectedSeconds) {
+                        _ = await MCPProxyHostSettlement.settleReplayableRequestsWhileDisconnected(
+                            ledger: bridgeLedger,
+                            replayState: outstandingRequestReplayState,
+                            stdoutFD: hostOutputFD
+                        )
+                    }
+                    delay = reconnectPolicy.cappedRetryDelay(delay, disconnectedSeconds: disconnectedSeconds)
                 }
 
                 log.warning("Bootstrap connection lost (\(err)). Retrying in \(String(format: "%.1f", delay))s (attempt \(attempt), elapsed \(String(format: "%.0f", elapsedSinceFirstFailure))s)")

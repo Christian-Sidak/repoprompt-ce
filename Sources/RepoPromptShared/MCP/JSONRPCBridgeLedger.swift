@@ -1258,6 +1258,49 @@ public actor JSONRPCBridgeLedger {
         )
     }
 
+    /// While disconnected and still reconnectable, claims forwarded, replay-allowlisted host
+    /// requests other than `initialize` so the proxy can answer them instead of holding them
+    /// indefinitely. The bridge stays non-terminal and no tombstone is recorded, so the host may
+    /// reuse the ids. Returns nothing when reconnect is not legal (terminal, pending transaction,
+    /// response in delivery, or unreplayable work), which leaves that state to terminal settlement.
+    public func claimReplayableHostRequestsWhileDisconnected() -> [JSONRPCBridgeUnansweredHostRequest] {
+        guard terminalReason == nil,
+              pendingTransactions.isEmpty,
+              !active.values.contains(where: \.isResponseInDelivery),
+              Self.unreplayableActiveRequestCount(in: active) == 0
+        else {
+            return []
+        }
+        var claimed: [(ordinal: UInt64, request: JSONRPCBridgeUnansweredHostRequest)] = []
+        for (key, state) in active where key.direction == .clientToServer {
+            guard case let .forwarded(metadata) = state,
+                  metadata.isReplayable,
+                  metadata.method != "initialize"
+            else { continue }
+            active.removeValue(forKey: key)
+            claimed.append((
+                metadata.ordinal,
+                JSONRPCBridgeUnansweredHostRequest(
+                    id: key.id,
+                    method: metadata.method,
+                    tool: metadata.tool,
+                    isReplayable: true,
+                    requestState: .forwarded
+                )
+            ))
+        }
+        guard !claimed.isEmpty else { return [] }
+        claimed.sort { $0.ordinal < $1.ordinal }
+        emit(
+            phase: "disconnected_replayable_requests_claimed",
+            direction: .clientToServer,
+            messages: [],
+            prepared: nil,
+            terminalReason: nil
+        )
+        return claimed.map(\.request)
+    }
+
     private func abandonServerOriginatedRequests(now: TimeInterval) {
         guard !active.isEmpty else { return }
         let abandoned = active.filter { key, _ in key.direction == .serverToClient }
