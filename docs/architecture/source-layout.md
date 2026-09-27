@@ -9,7 +9,6 @@ Sources/
   RepoPromptExecutable/          # thin shipped RepoPrompt executable target; sole @main and delegation only
     RepoPromptExecutable.swift
   RepoPrompt/                    # internal RepoPromptApp implementation library target (not a package product)
-    Support/                     # Obj-C bridging header / bridging-header-sensitive support owned by RepoPromptApp
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
       Notifications/
       Sparkle/
@@ -97,7 +96,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - Reusable PCRE2 wrapper/JIT construction belongs under `Sources/RepoPromptRegexCore`; app search policy, limits, repair, and presentation remain app-owned.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
-- Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support`, owned by `RepoPromptApp`, unless `Package.swift` is updated in the same change.
+- Do not add an Objective-C bridging header to any target. Declare C APIs in a C target's public headers (for example `Sources/RepoPromptC/include`) and `import` that module from the Swift files that use it; `Sources/RepoPrompt/Support` is retired.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
 - Provider-neutral workflow IDs, catalog metadata, and prompt renderers go under `Sources/RepoPromptShared/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
@@ -168,6 +167,7 @@ The guardrail script verifies:
 - `Package.swift` keeps the `RepoPrompt` executable as a thin dependency on the internal `RepoPromptApp` target at `Sources/RepoPrompt`;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
+- no target uses an Objective-C bridging header (`-import-objc-header`), and the retired `Sources/RepoPrompt/Support` directory stays absent;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
 - the RepoPrompt `SwiftTreeSitter` fork revision, exact runtime, and complete grammar requirement/resolved-revision set remain pinned in `Package.swift` and `Package.resolved`, `RepoPromptCodeMapCore` imports the grammar modules directly, `SyntaxManager` retains direct `SwiftTreeSitter` linkage for query compilation and validation, retired local grammar directories remain absent, and the narrow `TreeSitterScannerSupport` target contains only its approved exact-snapshot files with matching checksums;

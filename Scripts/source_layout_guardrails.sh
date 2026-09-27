@@ -343,9 +343,15 @@ required_core_imports = {
 for module in sorted(required_core_imports):
     if f"import {module}\n" not in core_syntax_source:
         errors.append(f"CodeMapSyntaxEngine missing direct grammar/wrapper module import: {module}")
-bridging_header = Path("Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h").read_text()
-if "tree_sitter_" in bridging_header or "TSLanguage" in bridging_header:
-    errors.append("bridging header must not redeclare Tree-sitter grammar APIs")
+if "-import-objc-header" in Path("Package.swift").read_text():
+    errors.append("first-party targets must not use an Objective-C bridging header; import a C target module instead")
+repo_prompt_c_include = Path("Sources/RepoPromptC/include")
+repo_prompt_c_umbrella = (repo_prompt_c_include / "RepoPromptC.h").read_text()
+for header in sorted(repo_prompt_c_include.glob("*.h")):
+    if header.name != "RepoPromptC.h" and f'#include "{header.name}"' not in repo_prompt_c_umbrella:
+        errors.append(f"RepoPromptC umbrella header must include {header.name} (umbrella directories leave warm module caches stale)")
+if Path("Sources/RepoPrompt/Support").exists():
+    errors.append("Sources/RepoPrompt/Support was retired with the bridging header; C declarations belong in Sources/RepoPromptC")
 
 if errors:
     raise SystemExit("\n".join(errors))
