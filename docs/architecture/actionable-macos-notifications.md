@@ -132,6 +132,8 @@ Key principles:
 
 `interaction` covers all blocking states, including instruction waits. The existing `notifyAgentWaitingForUser` becomes one input to the reconciler instead of a separate path.
 
+`chat_complete` and `context_builder_complete` content comes from the pure `ComposeNotificationContent` builder (`App/Notifications/ComposeNotificationContent.swift`). Placeholder chat names (`ChatSession.isPlaceholderName`: empty, "New Chat", "Untitled Chat", "Untitled") are never shown. Oracle chats created by an Agent Mode session over MCP (`ChatNotificationAgentLink`, from `ChatSession.agentModeSessionID`/`agentModeRunID` and `composeTabID`) are titled "Oracle reply ready", with the owning session's name as the subtitle. While that session incarnation is still live in its tab (`AgentNotificationCoordinator.liveState(tabID:)`), the notification carries its route and joins its thread, so a click opens the agent session.
+
 ### 4.2 Interaction kinds and their classification
 
 `AgentPendingInteractionKind` is a new pure enum that mirrors the in-app card priority in `AgentModeView`, so the notification always matches the card the user will see:

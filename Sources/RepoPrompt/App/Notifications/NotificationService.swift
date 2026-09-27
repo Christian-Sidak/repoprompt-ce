@@ -128,20 +128,33 @@ final class NotificationService: NSObject {
     // MARK: Chat / Context Builder
 
     /// Send a notification when a chat completes.
-    func notifyChatComplete(chatName: String?, groupID: UUID? = nil, fallbackToDockBounce: Bool = true) {
+    ///
+    /// Placeholder chat names ("Untitled Chat", "New Chat") are never shown. Chats owned by an Agent
+    /// Mode session (`agentLink`) are labelled with that session's name and deep-link to it while it
+    /// is live.
+    func notifyChatComplete(
+        chatName: String?,
+        groupID: UUID? = nil,
+        agentLink: ChatNotificationAgentLink? = nil,
+        fallbackToDockBounce: Bool = true
+    ) {
         let preferences = GlobalSettingsStore.shared.notificationPreferences()
         guard preferences.enabled, preferences.chatComplete, NSApp?.isActive != true else { return }
-        let body: String = if preferences.showDetails, let name = chatName, !name.isEmpty, name != "New Chat" {
-            name
-        } else {
-            "Your AI response is ready"
+        let agentState = agentLink.flatMap { link in
+            link.matchingState(link.tabID.flatMap { agentNotifications.liveState(tabID: $0) })
         }
+        let content = ComposeNotificationContent.chatComplete(
+            chatName: chatName,
+            isAgentLinked: agentLink != nil,
+            agentSessionName: agentState?.sessionName,
+            showDetails: preferences.showDetails
+        )
         postComposeNotification(
             identifier: AppNotificationIdentifier.chatComplete(tabID: groupID),
             kind: .chatComplete,
-            title: "Chat Complete",
-            body: body,
+            content: content,
             groupID: groupID,
+            route: agentState?.route.withInteractionID(nil),
             fallbackToDockBounce: fallbackToDockBounce
         )
     }
@@ -153,8 +166,10 @@ final class NotificationService: NSObject {
         postComposeNotification(
             identifier: AppNotificationIdentifier.contextBuilderComplete(tabID: tabID),
             kind: .contextBuilderComplete,
-            title: "Context Builder Complete",
-            body: preferences.showDetails ? tabName : "Your context is ready",
+            content: ComposeNotificationContent.contextBuilderComplete(
+                tabName: tabName,
+                showDetails: preferences.showDetails
+            ),
             groupID: tabID,
             fallbackToDockBounce: fallbackToDockBounce
         )
@@ -163,9 +178,9 @@ final class NotificationService: NSObject {
     private func postComposeNotification(
         identifier: String,
         kind: AppNotificationKind,
-        title: String,
-        body: String,
+        content: ComposeNotificationContent,
         groupID: UUID?,
+        route: AgentSessionDeepLinkRoute? = nil,
         fallbackToDockBounce: Bool
     ) {
         guard client.isAvailable, authorizationStatus.allowsDelivery else {
@@ -176,11 +191,14 @@ final class NotificationService: NSObject {
         }
         let request = NotificationRequestSpec(
             identifier: identifier,
-            title: title,
-            body: body,
-            threadIdentifier: AppNotificationIdentifier.composeThread(tabID: groupID),
+            title: content.title,
+            subtitle: content.subtitle,
+            body: content.body,
+            threadIdentifier: route.map {
+                AppNotificationIdentifier.sessionThread(tabID: $0.tabID, sessionID: $0.sessionID)
+            } ?? AppNotificationIdentifier.composeThread(tabID: groupID),
             relevanceScore: 0.3,
-            payload: AppNotificationPayload(kind: kind, route: nil)
+            payload: AppNotificationPayload(kind: kind, route: route)
         )
         Task { @MainActor [client] in
             do {
