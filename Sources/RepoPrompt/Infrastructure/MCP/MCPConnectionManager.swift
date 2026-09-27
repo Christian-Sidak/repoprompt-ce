@@ -12826,22 +12826,22 @@ actor ServerNetworkManager {
             // Tool definitions and handlers are resolved exactly once from the domain registry
             // after window routing chooses the canonical application/window scope.
             let bypassWindowRoutingForSnapshot = Self.shouldBypassWindowRouting(for: toolName)
-            connectionLog("tools/call \(toolName): reading MainActor routing state")
+            connectionLog("tools/call \(toolName): reading routing count snapshot")
             if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                 return await finishRequestProgress(admissionTimeout)
             }
+            // The count/mode pair comes from a nonisolated mirror published with every window-list
+            // change, so ordinary calls do not queue behind MainActor/UI work here. Window MCP
+            // authority is still checked live on the MainActor during routing below.
             let routingSnapshot: (Int, Bool) = await EditFlowPerf.measure(
                 EditFlowPerf.Stage.MCPToolCall.routingSnapshot,
                 EditFlowPerf.Dimensions(toolName: toolName)
             ) {
-                await MainActor.run {
-                    guard !bypassWindowRoutingForSnapshot else {
-                        return (0, false)
-                    }
-                    let windows = WindowStatesManager.shared.allWindows
-                    let effectiveMode = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
-                    return (windows.count, effectiveMode)
+                guard !bypassWindowRoutingForSnapshot else {
+                    return (0, false)
                 }
+                let snapshot = WindowStatesManager.routingCountMirror.snapshot()
+                return (snapshot.count, snapshot.isMultiWindowActive)
             }
             if let admissionTimeout = promptExportAdmissionTimeoutResultIfExpired() {
                 return await finishRequestProgress(admissionTimeout)

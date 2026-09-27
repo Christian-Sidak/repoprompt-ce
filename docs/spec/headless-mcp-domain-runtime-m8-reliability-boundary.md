@@ -133,7 +133,13 @@ window count and multi-window mode, including routing-bypass tools that only ret
 constants. A lock-protected nonisolated mirror published synchronously from
 `WindowStatesManager.allWindows` replaces that hop. The mirror is updated inside the
 same main-actor mutation that changes the window list, so it is never older than the
-last completed window change.
+last completed window change. Only the process-wide manager publishes it. The live MCP-enabled
+window authority checks later in routing (and connection binding) stay on the MainActor.
+
+Evidence: conductor ticket `49833be6-c0b5-4d5f-96cd-57a48db9aaa2` —
+`WindowRoutingCountMirrorTests` 2/2, `BindContextRoutingAuthorityTests` 4/4,
+`PersistedMCPRoutingIdentityTests` 3/3; `conductor lint` passed. No live latency measurement
+was taken; the benefit claimed is the removed queueing dependency, not a measured speedup.
 
 ### Later milestones (not started in this pass)
 
