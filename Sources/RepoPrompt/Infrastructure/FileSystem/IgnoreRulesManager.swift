@@ -94,6 +94,41 @@ enum IgnoreSettingsDefaults {
         return upgraded
     }
 
+    /// One-time marker for carrying a customized legacy value into `globalSettings.json`.
+    static let settingsAuthorityMigrationKey = "globalIgnoreDefaultsSettingsAuthorityMigration"
+    static let currentSettingsAuthorityMigration = 1
+
+    /// Before `globalSettings.json` became the authority, the crawl read the legacy
+    /// `UserDefaults` value while `app_settings` wrote JSON, which startup seeded with the
+    /// canonical list. Returns the legacy effective value when it must replace the JSON value:
+    /// only when the legacy value was customized and the JSON value was not. An explicitly
+    /// customized JSON value always wins. Callers record completion with
+    /// `markSettingsAuthorityMigrated(defaults:)` once the result can be persisted.
+    static func legacyValueToMigrate(jsonValue: String?, defaults: UserDefaults) -> String? {
+        guard !isSettingsAuthorityMigrated(defaults: defaults),
+              defaults.object(forKey: globalIgnoreDefaultsKey) != nil
+        else {
+            return nil
+        }
+        // The value the crawl was actually using, including its version upgrade.
+        let legacyEffective = resolvedGlobalIgnoreDefaults(defaults: defaults)
+        let canonical = normalizedPatterns(canonicalGlobalIgnoreDefaults)
+        guard normalizedPatterns(legacyEffective) != canonical,
+              normalizedPatterns(jsonValue ?? canonicalGlobalIgnoreDefaults) == canonical
+        else {
+            return nil
+        }
+        return legacyEffective
+    }
+
+    static func isSettingsAuthorityMigrated(defaults: UserDefaults) -> Bool {
+        defaults.integer(forKey: settingsAuthorityMigrationKey) >= currentSettingsAuthorityMigration
+    }
+
+    static func markSettingsAuthorityMigrated(defaults: UserDefaults) {
+        defaults.set(currentSettingsAuthorityMigration, forKey: settingsAuthorityMigrationKey)
+    }
+
     private static func normalizedPatterns(_ text: String) -> Set<String> {
         Set(
             text
@@ -175,6 +210,25 @@ extension IgnoreRulePolicy {
 }
 
 /// A lightweight manager that builds `IgnoreRules` on demand, with no caching.
+/// Lock-protected effective global ignore defaults published by the settings authority
+/// (`GlobalSettingsStore`, backed by `globalSettings.json`), readable from the ignore actor without
+/// a MainActor hop.
+final class GlobalIgnoreDefaultsAuthority: @unchecked Sendable {
+    /// Published by the process-wide `GlobalSettingsStore` only.
+    static let processWide = GlobalIgnoreDefaultsAuthority()
+
+    private let lock = NSLock()
+    private var value: String?
+
+    func publish(_ content: String) {
+        lock.withLock { value = content }
+    }
+
+    func current() -> String? {
+        lock.withLock { value }
+    }
+}
+
 actor IgnoreRulesManager {
     struct CompiledRootAuthority {
         let gitignore: CompiledIgnoreRules?
@@ -196,6 +250,13 @@ actor IgnoreRulesManager {
 
         func setFileManagerOverride(_ fm: (any FileSystemProviding)?) {
             fileManagerOverride = fm
+        }
+
+        private var globalDefaultsAuthorityOverride: GlobalIgnoreDefaultsAuthority?
+
+        /// Test seam: resolve global defaults from `authority` instead of the canonical test value.
+        func setGlobalDefaultsAuthorityOverride(_ authority: GlobalIgnoreDefaultsAuthority?) {
+            globalDefaultsAuthorityOverride = authority
         }
 
         private var fm: any FileSystemProviding {
@@ -510,6 +571,10 @@ actor IgnoreRulesManager {
 
     private func fetchGlobalDefaults() -> String {
         #if DEBUG
+            if let globalDefaultsAuthorityOverride {
+                return globalDefaultsAuthorityOverride.current()
+                    ?? IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults
+            }
             // In test runs, always return canonical defaults to ensure deterministic behavior.
             // This prevents user-customized patterns from leaking into tests.
             if Self.isRunningTests {
@@ -517,7 +582,10 @@ actor IgnoreRulesManager {
             }
         #endif
 
-        return IgnoreSettingsDefaults.resolvedGlobalIgnoreDefaults(defaults: .standard)
+        // `globalSettings.json` (via GlobalSettingsStore) is the authority `app_settings` writes.
+        // The legacy defaults read remains only for a crawl that starts before the store loads.
+        return GlobalIgnoreDefaultsAuthority.processWide.current()
+            ?? IgnoreSettingsDefaults.resolvedGlobalIgnoreDefaults(defaults: .standard)
     }
 
     /// Asynchronously compile a `.gitignore` / `.repo_ignore` file.

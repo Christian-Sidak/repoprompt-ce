@@ -189,6 +189,17 @@ Seven selection-dependent app tools (`manage_selection`, `ask_oracle`, `oracle_s
 `mutation_state` `not_applied` (each drain runs before any mutation or export write). A drain that
 ends `cancelled` still throws `CancellationError`.
 
+### M8K — one authority for app global ignore defaults
+
+Before headless ignore parity can follow a single source, the app itself had two: `app_settings`
+wrote `fileSystem.globalIgnoreDefaults` in `globalSettings.json` (seeded with the canonical list),
+while the crawl read the legacy `UserDefaults` value, so an `app_settings` change never reached
+crawl or search. The crawl now reads the JSON value through `GlobalIgnoreDefaultsAuthority`,
+published by `GlobalSettingsStore.shared` on load and on every write. A one-time migration carries
+a customized legacy value into an uncustomized JSON value; an explicit JSON value always wins; the
+legacy keys stay in place. Headless parity (shared matcher and a read-only view of this authority)
+remains a separate, unstarted slice.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).

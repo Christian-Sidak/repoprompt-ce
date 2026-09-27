@@ -10,6 +10,10 @@ RepoPrompt CE stores app settings in the versioned JSON document at:
 ~/Library/Application Support/RepoPrompt CE/Settings/globalSettings.json
 ```
 
+### Global ignore defaults
+
+`fileSystem.globalIgnoreDefaults` in this file is the authority for app-wide ignore patterns: `app_settings` writes it and the workspace crawl reads it. `GlobalSettingsStore.shared` publishes the effective value to `GlobalIgnoreDefaultsAuthority.processWide`, which `IgnoreRulesManager` reads without a MainActor hop. The legacy `UserDefaults` keys `globalIgnoreDefaults` / `globalIgnoreDefaultsVersion` are no longer the crawl's source; they are read only by a one-time startup migration (marker `globalIgnoreDefaultsSettingsAuthorityMigration`) that copies a customized legacy value into an uncustomized JSON value, and as a fallback for a crawl that starts before the store loads. An explicitly customized JSON value always wins, and the legacy keys are left in place for downgrade safety.
+
 The file is identified by two fields, not one:
 
 - `schemaLineage` answers **who wrote this settings family**.
