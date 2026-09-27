@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import RepoPromptCodeMapCore
 
 /// Inert orchestration for Git-only, artifact-backed workspace codemap bindings.
@@ -447,7 +448,37 @@ actor WorkspaceCodemapBindingEngine {
         var workerFinishedUptimeNanoseconds: UInt64?
         var lastProjectedSupportedCandidateTotal: UInt64?
         var manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate
+        var batchTiming = WorkspaceCodemapGraphIndexBatchTiming.zero
+        var currentBatchPublishedSlotCount: UInt64 = 0
+        var currentBatchPublishNanoseconds: UInt64 = 0
+
+        mutating func recordBatch(durationNanoseconds: UInt64) {
+            batchTiming.batchCount &+= 1
+            batchTiming.lastBatchDurationNanoseconds = durationNanoseconds
+            batchTiming.maximumBatchDurationNanoseconds = max(
+                batchTiming.maximumBatchDurationNanoseconds,
+                durationNanoseconds
+            )
+            batchTiming.totalBatchDurationNanoseconds &+= durationNanoseconds
+            batchTiming.lastBatchPublishedSlotCount = currentBatchPublishedSlotCount
+            batchTiming.publishedSlotCount &+= currentBatchPublishedSlotCount
+            batchTiming.lastBatchPublishDurationNanoseconds = currentBatchPublishNanoseconds
+            batchTiming.totalPublishDurationNanoseconds &+= currentBatchPublishNanoseconds
+            currentBatchPublishedSlotCount = 0
+            currentBatchPublishNanoseconds = 0
+        }
     }
+
+    private static let graphIndexLogger = Logger(
+        subsystem: "com.repoprompt.workspace",
+        category: "CodemapGraphIndex"
+    )
+
+    /// After a committed graph diff the pull loop pauses for this multiple of the apply time.
+    /// Commits copy the immutable snapshot, so bounding their duty cycle keeps bulk indexing
+    /// from spending a core on back-to-back commits while still coalescing pending changes.
+    private static let graphPullCoalescingFactor: UInt64 = 2
+    private static let maximumGraphPullCoalescingNanoseconds: UInt64 = 250_000_000
 
     private enum GraphIndexCandidateResolution {
         case entry(WorkspaceCodemapGraphIndexEntry, manifestRecord: CodeMapRootManifestRecord?)
@@ -874,6 +905,12 @@ actor WorkspaceCodemapBindingEngine {
         while !Task.isCancelled {
             if shouldPull {
                 let accounting = await graph.incrementalAccounting()
+                // The graph is this root's only change consumer; acknowledging its applied
+                // generation lets the overlay prune the changed set instead of forcing a resync.
+                await overlay.acknowledgeGraphChanges(
+                    rootEpoch: rootEpoch,
+                    through: accounting.appliedGeneration
+                )
                 let changes = await overlay.graphChanges(
                     rootEpoch: rootEpoch,
                     since: accounting.appliedGeneration
@@ -887,11 +924,16 @@ actor WorkspaceCodemapBindingEngine {
                     return
                 case let .diff(_, _, _, generation):
                     await graph.observe(generation: generation)
+                    let applyStarted = DispatchTime.now().uptimeNanoseconds
                     let disposition = await graph.apply(changes)
                     switch disposition {
-                    case .committed, .unchanged:
-                        // Pull again immediately. The overlay answers from current state, so a
-                        // wakeup arriving during a non-preemptive apply cannot be lost.
+                    case .committed:
+                        // Pull again after a bounded pause. The overlay answers from current
+                        // state, so a wakeup arriving during the apply or the pause cannot be
+                        // lost; the pause only coalesces more changes into the next commit.
+                        await pauseGraphPullAfterCommit(applyStartedUptimeNanoseconds: applyStarted)
+                        shouldPull = true
+                    case .unchanged:
                         shouldPull = true
                     case .cancelled, .revoked:
                         return
@@ -951,6 +993,20 @@ actor WorkspaceCodemapBindingEngine {
                 return
             }
         }
+    }
+
+    private func pauseGraphPullAfterCommit(applyStartedUptimeNanoseconds started: UInt64) async {
+        // Wall-clock on purpose: this bounds real CPU duty cycle, not injected test time.
+        let finished = DispatchTime.now().uptimeNanoseconds
+        guard finished > started else { return }
+        let (scaled, overflow) = (finished - started).multipliedReportingOverflow(
+            by: Self.graphPullCoalescingFactor
+        )
+        let pause = overflow ? Self.maximumGraphPullCoalescingNanoseconds
+            : min(scaled, Self.maximumGraphPullCoalescingNanoseconds)
+        // Sub-millisecond commits are cheap; do not add scheduling latency for them.
+        guard pause >= 1_000_000, !Task.isCancelled else { return }
+        try? await Task.sleep(nanoseconds: pause)
     }
 
     private func revokeGraphAfterOverlayTermination(
@@ -1800,7 +1856,8 @@ actor WorkspaceCodemapBindingEngine {
                 inBatchCandidateCount: job.inBatchProgress?.candidateCount,
                 inBatchResolvedCandidateCount: job.inBatchProgress?.resolvedCandidateCount,
                 checkpointPresent: job.checkpoint != nil,
-                manifestMeasurements: job.manifestMeasurements
+                manifestMeasurements: job.manifestMeasurements,
+                batchTiming: job.batchTiming
             )
         }
         let liveGraphIndexResources = graphIndexJobs.values.reduce(
@@ -2282,7 +2339,13 @@ actor WorkspaceCodemapBindingEngine {
                     )
                 return
             }
+            let batchStarted = DispatchTime.now().uptimeNanoseconds
             let result = await processGraphIndexBatch(jobID: jobID, rootEpoch: rootEpoch)
+            recordGraphIndexBatchTiming(
+                jobID: jobID,
+                rootEpoch: rootEpoch,
+                startedUptimeNanoseconds: batchStarted
+            )
             releaseGraphIndexAdmission(jobID: jobID, rootEpoch: rootEpoch)
             switch result {
             case .checkpointed:
@@ -2326,6 +2389,7 @@ actor WorkspaceCodemapBindingEngine {
                 }
             case .complete:
                 await persistGraphIndexManifestSeal(jobID: jobID, rootEpoch: rootEpoch)
+                logGraphIndexCompletion(jobID: jobID, rootEpoch: rootEpoch)
                 completionReason = .complete
                 return
             case .budgetLimited:
@@ -2353,6 +2417,40 @@ actor WorkspaceCodemapBindingEngine {
             }
         }
         completionReason = .cancelled
+    }
+
+    /// Folds one batch's wall time and published-slot count into the job's diagnostics.
+    private func recordGraphIndexBatchTiming(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        startedUptimeNanoseconds started: UInt64
+    ) {
+        let finished = DispatchTime.now().uptimeNanoseconds
+        let duration = finished >= started ? finished - started : 0
+        addToCounter(\.graphIndexBatchNanoseconds, duration)
+        guard graphIndexJobs[rootEpoch]?.id == jobID else { return }
+        graphIndexJobs[rootEpoch]?.recordBatch(durationNanoseconds: duration)
+    }
+
+    private func logGraphIndexCompletion(jobID: UUID, rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard let job = graphIndexJobs[rootEpoch], job.id == jobID else { return }
+        let timing = job.batchTiming
+        let now = DispatchTime.now().uptimeNanoseconds
+        let elapsedMilliseconds = now >= job.scheduledUptimeNanoseconds
+            ? (now - job.scheduledUptimeNanoseconds) / 1_000_000
+            : 0
+        Self.graphIndexLogger.info(
+            """
+            graph index complete: candidates=\(job.progress.counts.processedCandidateCount, privacy: .public) \
+            batches=\(timing.batchCount, privacy: .public) \
+            published_slots=\(timing.publishedSlotCount, privacy: .public) \
+            batch_total_ms=\(timing.totalBatchDurationNanoseconds / 1_000_000, privacy: .public) \
+            batch_max_ms=\(timing.maximumBatchDurationNanoseconds / 1_000_000, privacy: .public) \
+            batch_last_ms=\(timing.lastBatchDurationNanoseconds / 1_000_000, privacy: .public) \
+            publish_total_ms=\(timing.totalPublishDurationNanoseconds / 1_000_000, privacy: .public) \
+            elapsed_ms=\(elapsedMilliseconds, privacy: .public)
+            """
+        )
     }
 
     private func awaitGraphIndexAdmission(
@@ -3689,18 +3787,22 @@ actor WorkspaceCodemapBindingEngine {
         pipelineIdentity: CodeMapPipelineIdentity,
         records: [CodeMapRootManifestRecord]
     ) -> Bool {
-        guard var job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
-              var stage = job.manifestStages[pipelineIdentity],
-              case let .eligible(session)? = roots[rootEpoch],
-              let pipeline = session.pipelines[pipelineIdentity],
-              stage.namespace == pipeline.namespace,
-              stage.pipelineSessionID == pipeline.id
-        else { return false }
+        guard graphIndexManifestStageIsCurrent(
+            jobID: jobID,
+            rootEpoch: rootEpoch,
+            pipelineIdentity: pipelineIdentity
+        ) else { return false }
+        // Runs once per page. Move the job and its stage out of their containers so the
+        // root-sized cached/staged record tables are updated in place instead of copied.
+        guard var job = graphIndexJobs.removeValue(forKey: rootEpoch) else { return false }
+        defer { graphIndexJobs[rootEpoch] = job }
+        guard var stage = job.manifestStages.removeValue(forKey: pipelineIdentity) else { return false }
+        defer { job.manifestStages[pipelineIdentity] = stage }
         guard !stage.isDegraded else { return true }
 
         var projectedStageBytes = stage.stagedByteCount
         var projectedGlobalBytes = graphIndexManifestStagedByteCount
-        var projectedCachedCount = job.manifestStages.values.reduce(0) {
+        var projectedCachedCount = job.manifestStages.values.reduce(stage.cachedRecordsByPath.count) {
             addingSaturating($0, $1.cachedRecordsByPath.count)
         }
         for record in records {
@@ -3732,9 +3834,7 @@ actor WorkspaceCodemapBindingEngine {
                 stage.stagedRecordsByPath.removeAll(keepingCapacity: false)
                 stage.stagedByteCount = 0
                 stage.isDegraded = true
-                job.manifestStages[pipelineIdentity] = stage
                 job.manifestSealState = .degraded
-                graphIndexJobs[rootEpoch] = job
                 return true
             }
             stage.cachedRecordsByPath[record.repositoryRelativePath] = record
@@ -3750,9 +3850,20 @@ actor WorkspaceCodemapBindingEngine {
             projectedStageBytes
         )
         graphIndexManifestStagedByteCount = projectedGlobalBytes
-        job.manifestStages[pipelineIdentity] = stage
-        graphIndexJobs[rootEpoch] = job
         return true
+    }
+
+    private func graphIndexManifestStageIsCurrent(
+        jobID: UUID,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity
+    ) -> Bool {
+        guard let job = currentGraphIndexJob(jobID: jobID, rootEpoch: rootEpoch),
+              let stage = job.manifestStages[pipelineIdentity],
+              case let .eligible(session)? = roots[rootEpoch],
+              let pipeline = session.pipelines[pipelineIdentity]
+        else { return false }
+        return stage.namespace == pipeline.namespace && stage.pipelineSessionID == pipeline.id
     }
 
     private func graphIndexEntry(
@@ -3818,24 +3929,40 @@ actor WorkspaceCodemapBindingEngine {
         )
     }
 
+    private func graphIndexAutomaticSelectionRecordIsRetainable(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        pipelineIdentity: CodeMapPipelineIdentity,
+        repositoryRelativePath: String
+    ) -> Bool {
+        guard case let .eligible(session)? = roots[rootEpoch],
+              let pipeline = session.pipelines[pipelineIdentity]
+        else { return false }
+        guard pipeline.automaticSelectionCandidateRecords[repositoryRelativePath] == nil else { return true }
+        let retainedCount = session.pipelines.values.reduce(0) {
+            addingSaturating($0, $1.automaticSelectionCandidateRecords.count)
+        }
+        return retainedCount < policy.maximumRetainedManifestRecordCountPerRoot
+    }
+
     private func retainGraphIndexAutomaticSelectionRecord(
         rootEpoch: WorkspaceCodemapRootEpoch,
         pipelineIdentity: CodeMapPipelineIdentity,
         record: CodeMapRootManifestRecord
     ) {
         guard record.contributionEnvelope != nil,
-              case var .eligible(session)? = roots[rootEpoch],
-              var pipeline = session.pipelines[pipelineIdentity]
+              graphIndexAutomaticSelectionRecordIsRetainable(
+                  rootEpoch: rootEpoch,
+                  pipelineIdentity: pipelineIdentity,
+                  repositoryRelativePath: record.repositoryRelativePath
+              )
         else { return }
-        if pipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] == nil {
-            let retainedCount = session.pipelines.values.reduce(0) {
-                addingSaturating($0, $1.automaticSelectionCandidateRecords.count)
-            }
-            guard retainedCount < policy.maximumRetainedManifestRecordCountPerRoot else { return }
-        }
+        // Runs once per warm graph-index candidate: move the session and pipeline out of their
+        // containers so the retained-record table is updated in place instead of copied.
+        guard case var .eligible(session)? = roots.removeValue(forKey: rootEpoch) else { return }
+        defer { roots[rootEpoch] = .eligible(session) }
+        guard var pipeline = session.pipelines.removeValue(forKey: pipelineIdentity) else { return }
         pipeline.automaticSelectionCandidateRecords[record.repositoryRelativePath] = record
         session.pipelines[pipelineIdentity] = pipeline
-        roots[rootEpoch] = .eligible(session)
     }
 
     private func resolveGraphIndexCandidate(
@@ -4362,7 +4489,8 @@ actor WorkspaceCodemapBindingEngine {
         enumerationFinished: Bool
     ) async -> Bool {
         guard let graph = selectionGraphsByRootEpoch[rootEpoch] else { return false }
-        return await overlay.publishGraphIndexSlots(
+        let started = DispatchTime.now().uptimeNanoseconds
+        let published = await overlay.publishGraphIndexSlots(
             rootEpoch: rootEpoch,
             catalogToken: catalogToken,
             slots: slots,
@@ -4373,6 +4501,14 @@ actor WorkspaceCodemapBindingEngine {
                 await graph.fenceFiles(fileIDs: fileIDs, reason: reason)
             }
         )
+        let finished = DispatchTime.now().uptimeNanoseconds
+        let duration = finished >= started ? finished - started : 0
+        let slotCount = UInt64(slots.count)
+        addToCounter(\.graphIndexPublishedSlots, slotCount)
+        addToCounter(\.graphIndexPublishNanoseconds, duration)
+        graphIndexJobs[rootEpoch]?.currentBatchPublishedSlotCount &+= slotCount
+        graphIndexJobs[rootEpoch]?.currentBatchPublishNanoseconds &+= duration
+        return published
     }
 
     private func publishGraphIndexEntries(

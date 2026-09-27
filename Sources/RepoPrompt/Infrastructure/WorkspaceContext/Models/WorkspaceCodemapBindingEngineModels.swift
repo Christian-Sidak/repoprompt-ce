@@ -706,6 +706,12 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     var graphIndexExplicitOvertakes: UInt64 = 0
     var graphIndexBudgetRejections: UInt64 = 0
     var graphIndexCancelledBatches: UInt64 = 0
+    /// Wall-clock nanoseconds spent processing graph-index batches, summed across roots.
+    var graphIndexBatchNanoseconds: UInt64 = 0
+    /// Graph slots published to the overlay by graph-index batches (pending and classified).
+    var graphIndexPublishedSlots: UInt64 = 0
+    /// Nanoseconds spent inside overlay graph-slot publications.
+    var graphIndexPublishNanoseconds: UInt64 = 0
 
     init(initialValue: UInt64 = 0) {
         capabilityResolutions = initialValue
@@ -789,6 +795,9 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
         graphIndexExplicitOvertakes = initialValue
         graphIndexBudgetRejections = initialValue
         graphIndexCancelledBatches = initialValue
+        graphIndexBatchNanoseconds = initialValue
+        graphIndexPublishedSlots = initialValue
+        graphIndexPublishNanoseconds = initialValue
     }
 }
 
@@ -829,6 +838,21 @@ enum WorkspaceCodemapGraphIndexPrioritizeDisposition: Hashable {
     case unavailable
 }
 
+/// Per-root graph-index batch timing and slot counts. Per-batch cost should stay flat as a root
+/// grows; a rising `lastBatchDurationNanoseconds` at constant batch size signals superlinear work.
+struct WorkspaceCodemapGraphIndexBatchTiming: Hashable {
+    static let zero = Self()
+
+    var batchCount: UInt64 = 0
+    var lastBatchDurationNanoseconds: UInt64 = 0
+    var maximumBatchDurationNanoseconds: UInt64 = 0
+    var totalBatchDurationNanoseconds: UInt64 = 0
+    var lastBatchPublishedSlotCount: UInt64 = 0
+    var publishedSlotCount: UInt64 = 0
+    var lastBatchPublishDurationNanoseconds: UInt64 = 0
+    var totalPublishDurationNanoseconds: UInt64 = 0
+}
+
 struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let jobID: UUID
@@ -862,6 +886,7 @@ struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
     let inBatchResolvedCandidateCount: UInt64?
     let checkpointPresent: Bool
     let manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate
+    let batchTiming: WorkspaceCodemapGraphIndexBatchTiming
 }
 
 struct WorkspaceCodemapBindingEngineAccounting: Equatable {

@@ -166,5 +166,13 @@ struct WorkspaceCodemapGraphIncrementalAccounting: Hashable {
     var lastApplyDurationMilliseconds: UInt64?
     var maximumApplyDurationMilliseconds: UInt64?
     var highFanoutApplyCount: UInt64 = 0
+    /// Ordering comparisons and visited items of the last candidate build. Diff builds stay
+    /// proportional to the diff and the postings/edges it reaches, not to the resident graph.
+    var lastCandidateComparisonCount: UInt64 = 0
+    var lastCandidateVisitCount: UInt64 = 0
+    var maximumDiffCandidateVisitCount: UInt64 = 0
+    var totalCandidateComparisonCount: UInt64 = 0
+    var totalCandidateVisitCount: UInt64 = 0
+    var totalApplyDurationMilliseconds: UInt64 = 0
     var observedToAppliedGenerationLag: UInt64 = 0
 }

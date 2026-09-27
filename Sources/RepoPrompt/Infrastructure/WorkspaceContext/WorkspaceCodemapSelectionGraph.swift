@@ -9,6 +9,10 @@ actor WorkspaceCodemapSelectionGraph {
         let changedFileCount: Int
         let affectedSourceCount: Int
         let resync: Bool
+        /// Ordering comparisons performed while building the candidate.
+        let comparisonCount: UInt64
+        /// Items visited while building the candidate (IDs, postings, references, and scans).
+        let visitCount: UInt64
     }
 
     private enum CandidateBuildOutcome {
@@ -73,6 +77,12 @@ actor WorkspaceCodemapSelectionGraph {
     private var lastApplyDurationMilliseconds: UInt64?
     private var maximumApplyDurationMilliseconds: UInt64?
     private var highFanoutApplyCount: UInt64 = 0
+    private var lastCandidateComparisonCount: UInt64 = 0
+    private var lastCandidateVisitCount: UInt64 = 0
+    private var maximumDiffCandidateVisitCount: UInt64 = 0
+    private var totalCandidateComparisonCount: UInt64 = 0
+    private var totalCandidateVisitCount: UInt64 = 0
+    private var totalApplyDurationMilliseconds: UInt64 = 0
     private var reconciliationExpiryHandler: (@Sendable () async -> Void)?
 
     init(
@@ -291,6 +301,13 @@ actor WorkspaceCodemapSelectionGraph {
             lastAffectedSourceCount = candidate.affectedSourceCount
             totalChangedFileCount &+= UInt64(candidate.changedFileCount)
             totalAffectedSourceCount &+= UInt64(candidate.affectedSourceCount)
+            lastCandidateComparisonCount = candidate.comparisonCount
+            lastCandidateVisitCount = candidate.visitCount
+            totalCandidateComparisonCount &+= candidate.comparisonCount
+            totalCandidateVisitCount &+= candidate.visitCount
+            if !resync {
+                maximumDiffCandidateVisitCount = max(maximumDiffCandidateVisitCount, candidate.visitCount)
+            }
             if candidate.affectedSourceCount >= graphPolicy.candidateOverflowThreshold {
                 highFanoutApplyCount &+= 1
             }
@@ -1034,6 +1051,12 @@ actor WorkspaceCodemapSelectionGraph {
             lastApplyDurationMilliseconds: lastApplyDurationMilliseconds,
             maximumApplyDurationMilliseconds: maximumApplyDurationMilliseconds,
             highFanoutApplyCount: highFanoutApplyCount,
+            lastCandidateComparisonCount: lastCandidateComparisonCount,
+            lastCandidateVisitCount: lastCandidateVisitCount,
+            maximumDiffCandidateVisitCount: maximumDiffCandidateVisitCount,
+            totalCandidateComparisonCount: totalCandidateComparisonCount,
+            totalCandidateVisitCount: totalCandidateVisitCount,
+            totalApplyDurationMilliseconds: totalApplyDurationMilliseconds,
             observedToAppliedGenerationLag: observedGeneration.rawValue >= appliedGeneration.rawValue
                 ? observedGeneration.rawValue - appliedGeneration.rawValue
                 : 0
@@ -1120,6 +1143,7 @@ actor WorkspaceCodemapSelectionGraph {
         let duration = finished >= started ? (finished - started) / 1_000_000 : 0
         lastApplyDurationMilliseconds = duration
         maximumApplyDurationMilliseconds = max(maximumApplyDurationMilliseconds ?? 0, duration)
+        totalApplyDurationMilliseconds &+= duration
         applyStartedUptimeNanoseconds = nil
     }
 
@@ -1152,6 +1176,40 @@ actor WorkspaceCodemapSelectionGraph {
 
     // MARK: - Candidate construction
 
+    /// Accumulates the retained-size delta of a diff. The size model is additive per retained
+    /// item, so a diff only prices the items it removes and inserts.
+    private struct CandidateSizeDelta {
+        var removedBytes: UInt64 = 0
+        var addedBytes: UInt64 = 0
+        var removedPostings: UInt64 = 0
+        var addedPostings: UInt64 = 0
+        var removedEdges: UInt64 = 0
+        var addedEdges: UInt64 = 0
+        var overflow = false
+
+        mutating func remove(bytes: UInt64?) {
+            guard let next = WorkspaceCodemapSelectionGraph.checkedAdd(removedBytes, bytes) else {
+                overflow = true
+                return
+            }
+            removedBytes = next
+        }
+
+        mutating func add(bytes: UInt64?) {
+            guard let next = WorkspaceCodemapSelectionGraph.checkedAdd(addedBytes, bytes) else {
+                overflow = true
+                return
+            }
+            addedBytes = next
+        }
+    }
+
+    private enum CandidateSizeOutcome {
+        case size(WorkspaceCodemapGraphSizeAccounting)
+        case overflow
+        case cancelled
+    }
+
     private static func makeCandidate(
         base: WorkspaceCodemapGraphCommittedSnapshot?,
         changedSlots: [WorkspaceCodemapGraphSlot],
@@ -1168,97 +1226,183 @@ actor WorkspaceCodemapSelectionGraph {
         resync: Bool
     ) -> CandidateBuildOutcome {
         guard !Task.isCancelled else { return .cancelled }
-        var slots = base?.slotsByFileID ?? [:]
-        let oldSlots = slots
-        if resync { slots.removeAll(keepingCapacity: true) }
+        // A resync rebuilds from the checkpoint alone. A diff only touches the file IDs it names,
+        // so every step below is bounded by the diff and the postings/edges it reaches.
+        let incrementalBase = resync ? nil : base
+        let oldSlots = incrementalBase?.slotsByFileID ?? [:]
+        var slots = oldSlots
+        var comparisons: UInt64 = 0
+        var visits: UInt64 = 0
+        var candidateIDs = Set<UUID>()
+        candidateIDs.reserveCapacity(removed.count + changedSlots.count)
         for removal in removed {
             guard !Task.isCancelled else { return .cancelled }
             slots.removeValue(forKey: removal.fileID)
+            candidateIDs.insert(removal.fileID)
         }
         for slot in changedSlots {
             guard !Task.isCancelled else { return .cancelled }
             slots[slot.fileID] = slot
+            candidateIDs.insert(slot.fileID)
         }
+        visits &+= UInt64(candidateIDs.count)
+        let changedIDs = candidateIDs.filter { oldSlots[$0] != slots[$0] }
 
-        let changedIDs = Set(oldSlots.keys).union(slots.keys).filter { oldSlots[$0] != slots[$0] }
-        var nodes = base?.nodesByFileID ?? [:]
-        var definitions = base?.definitionPostings ?? [:]
-        var references = base?.referencePostings ?? [:]
-        var outgoing = base?.outgoingEdgesBySource ?? [:]
-        var reverse = base?.reverseEdgesByTarget ?? [:]
-        var unresolved = base?.unresolvedBySource ?? [:]
+        let baseNodes = incrementalBase?.nodesByFileID ?? [:]
+        let baseDefinitions = incrementalBase?.definitionPostings ?? [:]
+        let baseReferences = incrementalBase?.referencePostings ?? [:]
+        var nodes = baseNodes
+        var definitions = baseDefinitions
+        var references = baseReferences
+        var outgoing = incrementalBase?.outgoingEdgesBySource ?? [:]
+        var reverse = incrementalBase?.reverseEdgesByTarget ?? [:]
+        var unresolved = incrementalBase?.unresolvedBySource ?? [:]
 
-        // Update the two posting tables only for changed nodes. Their definition deltas identify
-        // every source whose edge or unresolved evidence can change.
+        // Remove every changed node before installing replacements so posting-list positions are
+        // always computed against final node paths.
         var changedDefinitionNames = Set<String>()
+        var changedReferenceNames = Set<String>()
+        var removedDefinitionIDsByName: [String: Set<UUID>] = [:]
+        var removedReferenceIDsByName: [String: Set<UUID>] = [:]
         for fileID in changedIDs {
             guard !Task.isCancelled else { return .cancelled }
-            if let oldNode = nodes.removeValue(forKey: fileID) {
-                changedDefinitionNames.formUnion(oldNode.contribution.sortedUniqueDefinitions)
-                for name in oldNode.contribution.sortedUniqueDefinitions {
-                    definitions[name]?.removeAll { $0 == fileID }
-                    if definitions[name]?.isEmpty == true { definitions.removeValue(forKey: name) }
-                }
-                for name in oldNode.contribution.sortedUniqueReferences {
-                    references[name]?.removeAll { $0 == fileID }
-                    if references[name]?.isEmpty == true { references.removeValue(forKey: name) }
-                }
+            guard let oldNode = nodes.removeValue(forKey: fileID) else { continue }
+            for name in oldNode.contribution.sortedUniqueDefinitions {
+                changedDefinitionNames.insert(name)
+                removedDefinitionIDsByName[name, default: []].insert(fileID)
             }
+            for name in oldNode.contribution.sortedUniqueReferences {
+                changedReferenceNames.insert(name)
+                removedReferenceIDsByName[name, default: []].insert(fileID)
+            }
+        }
+        var insertedDefinitionIDsByName: [String: [UUID]] = [:]
+        var insertedReferenceIDsByName: [String: [UUID]] = [:]
+        for fileID in changedIDs {
+            guard !Task.isCancelled else { return .cancelled }
             guard let slot = slots[fileID], let node = snapshotNode(from: slot) else { continue }
             nodes[fileID] = node
-            changedDefinitionNames.formUnion(node.contribution.sortedUniqueDefinitions)
             for name in node.contribution.sortedUniqueDefinitions {
-                definitions[name, default: []].append(fileID)
+                changedDefinitionNames.insert(name)
+                insertedDefinitionIDsByName[name, default: []].append(fileID)
             }
             for name in node.contribution.sortedUniqueReferences {
-                references[name, default: []].append(fileID)
+                changedReferenceNames.insert(name)
+                insertedReferenceIDsByName[name, default: []].append(fileID)
             }
         }
-        for name in changedDefinitionNames {
-            definitions[name]?.sort { fileIDPrecedes($0, $1, nodes: nodes) }
-        }
-        let changedReferenceNames = changedIDs.reduce(into: Set<String>()) { names, fileID in
-            if let old = base?.nodesByFileID[fileID] {
-                names.formUnion(old.contribution.sortedUniqueReferences)
+        let finalNodes = nodes
+        let fileIDOrder: (UUID, UUID) -> Bool = { fileIDPrecedes($0, $1, nodes: finalNodes) }
+        // Base lists are ordered by base node paths, so removals binary-search under that order.
+        let baseFileIDOrder: (UUID, UUID) -> Bool = { fileIDPrecedes($0, $1, nodes: baseNodes) }
+
+        /// Posting lists stay sorted: drop removed IDs, then merge the (few) inserted IDs in place
+        /// of re-sorting every list the diff touches.
+        func updatePostings(
+            _ postings: inout [String: [UUID]],
+            names: Set<String>,
+            removedIDsByName: [String: Set<UUID>],
+            insertedIDsByName: [String: [UUID]]
+        ) -> Bool {
+            for name in names {
+                guard !Task.isCancelled else { return false }
+                var list = postings.removeValue(forKey: name) ?? []
+                if let removedIDs = removedIDsByName[name] {
+                    let removal = WorkspaceCodemapGraphOrdering.removeSorted(
+                        from: &list,
+                        removing: removedIDs,
+                        by: baseFileIDOrder
+                    )
+                    comparisons &+= UInt64(removal.comparisons)
+                    visits &+= UInt64(removedIDs.count + removal.scanned)
+                }
+                if let insertedIDs = insertedIDsByName[name] {
+                    visits &+= UInt64(insertedIDs.count)
+                    comparisons &+= UInt64(WorkspaceCodemapGraphOrdering.mergeSortedInsertion(
+                        into: &list,
+                        inserting: insertedIDs,
+                        by: fileIDOrder
+                    ))
+                }
+                if !list.isEmpty { postings[name] = list }
             }
-            if let new = nodes[fileID] { names.formUnion(new.contribution.sortedUniqueReferences) }
+            return true
         }
-        for name in changedReferenceNames {
-            references[name]?.sort { fileIDPrecedes($0, $1, nodes: nodes) }
-        }
+        guard updatePostings(
+            &definitions,
+            names: changedDefinitionNames,
+            removedIDsByName: removedDefinitionIDsByName,
+            insertedIDsByName: insertedDefinitionIDsByName
+        ), updatePostings(
+            &references,
+            names: changedReferenceNames,
+            removedIDsByName: removedReferenceIDsByName,
+            insertedIDsByName: insertedReferenceIDsByName
+        ) else { return .cancelled }
 
         var affectedSources = changedIDs
         for name in changedDefinitionNames {
-            affectedSources.formUnion(base?.referencePostings[name] ?? [])
+            affectedSources.formUnion(incrementalBase?.referencePostings[name] ?? [])
             affectedSources.formUnion(references[name] ?? [])
         }
-        if base?.coverage.isComplete != coverage.isComplete {
+        if incrementalBase?.coverage.isComplete != coverage.isComplete {
             // A completeness transition changes missing/not-indexed-yet evidence globally.
             affectedSources.formUnion(nodes.keys)
         }
+        visits &+= UInt64(affectedSources.count)
 
         // Remove old evidence only for affected sources, including its reverse adjacency entries.
+        var delta = CandidateSizeDelta()
+        var removedEvidenceByTarget: [UUID: [WorkspaceCodemapGraphEdgeEvidence]] = [:]
         for source in affectedSources {
             guard !Task.isCancelled else { return .cancelled }
-            for evidence in outgoing.removeValue(forKey: source) ?? [] {
-                reverse[evidence.targetFileID]?.removeAll { $0.sourceFileID == source }
-                if reverse[evidence.targetFileID]?.isEmpty == true {
-                    reverse.removeValue(forKey: evidence.targetFileID)
+            if let evidenceList = outgoing.removeValue(forKey: source) {
+                delta.removedEdges &+= UInt64(evidenceList.count)
+                for evidence in evidenceList {
+                    removedEvidenceByTarget[evidence.targetFileID, default: []].append(evidence)
+                    // Each evidence value is retained by both adjacency directions.
+                    delta.remove(bytes: evidenceBytes(evidence))
+                    delta.remove(bytes: evidenceBytes(evidence))
                 }
             }
-            unresolved.removeValue(forKey: source)
+            for record in unresolved.removeValue(forKey: source) ?? [] {
+                delta.remove(bytes: unresolvedBytes(record))
+            }
+        }
+        let baseEdgeOrder: (WorkspaceCodemapGraphEdgeEvidence, WorkspaceCodemapGraphEdgeEvidence) -> Bool = {
+            edgePrecedes($0, $1, nodes: baseNodes)
+        }
+        for (target, removedEvidence) in removedEvidenceByTarget {
+            guard !Task.isCancelled else { return .cancelled }
+            guard var list = reverse.removeValue(forKey: target) else { continue }
+            // Hub targets can have one reverse entry per source; locate the removed entries by
+            // binary search instead of filtering the whole list.
+            let removal = WorkspaceCodemapGraphOrdering.removeSorted(
+                from: &list,
+                removing: removedEvidence,
+                by: baseEdgeOrder
+            )
+            comparisons &+= UInt64(removal.comparisons)
+            visits &+= UInt64(removedEvidence.count + removal.scanned)
+            if !list.isEmpty { reverse[target] = list }
         }
 
         // Re-resolve only sources whose own contribution or referenced definition candidates changed.
+        let edgeOrder: (WorkspaceCodemapGraphEdgeEvidence, WorkspaceCodemapGraphEdgeEvidence) -> Bool = {
+            edgePrecedes($0, $1, nodes: finalNodes)
+        }
+        var insertedEvidenceByTarget: [UUID: [WorkspaceCodemapGraphEdgeEvidence]] = [:]
         for source in affectedSources {
             guard !Task.isCancelled else { return .cancelled }
             guard let node = nodes[source] else { continue }
             var namesByTarget: [UUID: Set<String>] = [:]
             var candidateCountByTarget: [UUID: UInt64] = [:]
+            var sourceUnresolved: [WorkspaceCodemapGraphUnresolvedRecord] = []
+            visits &+= UInt64(node.contribution.sortedUniqueReferences.count)
             for name in node.contribution.sortedUniqueReferences {
                 let candidates = definitions[name] ?? []
                 guard !candidates.isEmpty else {
-                    unresolved[source, default: []].append(.init(
+                    sourceUnresolved.append(.init(
                         sourceFileID: source,
                         referencedName: name,
                         reason: coverage.isComplete ? .missing : .notIndexedYet
@@ -1266,116 +1410,116 @@ actor WorkspaceCodemapSelectionGraph {
                     continue
                 }
                 guard candidates.count <= graphPolicy.candidateOverflowThreshold else {
-                    unresolved[source, default: []].append(.init(
+                    sourceUnresolved.append(.init(
                         sourceFileID: source,
                         referencedName: name,
                         reason: .tooCommon
                     ))
                     continue
                 }
+                visits &+= UInt64(candidates.count)
                 for target in candidates {
                     namesByTarget[target, default: []].insert(name)
                     candidateCountByTarget[target] = UInt64(candidates.count)
                 }
             }
-            for target in namesByTarget.keys {
+            var sourceEvidence: [WorkspaceCodemapGraphEdgeEvidence] = []
+            sourceEvidence.reserveCapacity(namesByTarget.count)
+            for (target, names) in namesByTarget {
                 let count = candidateCountByTarget[target] ?? 0
                 let evidence = WorkspaceCodemapGraphEdgeEvidence(
                     sourceFileID: source,
                     targetFileID: target,
-                    matchedNames: (namesByTarget[target] ?? []).sorted(by: utf8Precedes),
+                    matchedNames: names.sorted { lhs, rhs in
+                        comparisons &+= 1
+                        return utf8Precedes(lhs, rhs)
+                    },
                     candidateCount: count,
                     ambiguous: count > 1
                 )
-                outgoing[source, default: []].append(evidence)
-                reverse[target, default: []].append(evidence)
+                sourceEvidence.append(evidence)
+                insertedEvidenceByTarget[target, default: []].append(evidence)
+                delta.addedEdges &+= 1
+                delta.add(bytes: evidenceBytes(evidence))
+                delta.add(bytes: evidenceBytes(evidence))
             }
-            outgoing[source]?.sort { edgePrecedes($0, $1, nodes: nodes) }
-            unresolved[source]?.sort {
-                if $0.referencedName != $1.referencedName {
-                    return utf8Precedes($0.referencedName, $1.referencedName)
+            if !sourceEvidence.isEmpty {
+                sourceEvidence.sort { lhs, rhs in
+                    comparisons &+= 1
+                    return edgeOrder(lhs, rhs)
                 }
-                return String(describing: $0.reason) < String(describing: $1.reason)
+                outgoing[source] = sourceEvidence
+            }
+            if !sourceUnresolved.isEmpty {
+                // Referenced names are unique per source, so the name alone is a total order here;
+                // the reason tie-break is retained for parity with historical snapshots.
+                sourceUnresolved.sort {
+                    comparisons &+= 1
+                    if $0.referencedName != $1.referencedName {
+                        return utf8Precedes($0.referencedName, $1.referencedName)
+                    }
+                    return String(describing: $0.reason) < String(describing: $1.reason)
+                }
+                for record in sourceUnresolved {
+                    delta.add(bytes: unresolvedBytes(record))
+                }
+                unresolved[source] = sourceUnresolved
             }
         }
-        let affectedTargets = Set(affectedSources.flatMap { outgoing[$0]?.map(\.targetFileID) ?? [] })
-        for target in affectedTargets {
-            reverse[target]?.sort { edgePrecedes($0, $1, nodes: nodes) }
+        for (target, insertedEvidence) in insertedEvidenceByTarget {
+            guard !Task.isCancelled else { return .cancelled }
+            var list = reverse.removeValue(forKey: target) ?? []
+            visits &+= UInt64(insertedEvidence.count)
+            comparisons &+= UInt64(WorkspaceCodemapGraphOrdering.mergeSortedInsertion(
+                into: &list,
+                inserting: insertedEvidence,
+                by: edgeOrder
+            ))
+            reverse[target] = list
         }
 
-        guard let postingCount = checkedAdd(checkedCount(definitions.values), checkedCount(references.values)),
-              let edgeCount = checkedCount(outgoing.values)
-        else { return .failure(.accountingOverflow) }
-        var byteCount: UInt64 = 0
-        for node in nodes.values {
-            guard !Task.isCancelled else { return .cancelled }
-            guard let pathBytes = UInt64(exactly: node.standardizedRelativePath.utf8.count),
-                  let definitionBytes = checkedStringBytes(node.contribution.sortedUniqueDefinitions),
-                  let referenceBytes = checkedStringBytes(node.contribution.sortedUniqueReferences),
-                  let withNode = checkedAdd(byteCount, 192),
-                  let withPath = checkedAdd(withNode, pathBytes),
-                  let withDefinitions = checkedAdd(withPath, definitionBytes),
-                  let withReferences = checkedAdd(withDefinitions, referenceBytes)
-            else { return .failure(.accountingOverflow) }
-            byteCount = withReferences
+        // Price the diff. Node, slot, and posting deltas come from the changed IDs and names only.
+        for fileID in changedIDs {
+            if let old = baseNodes[fileID] { delta.remove(bytes: nodeBytes(old)) }
+            if let new = nodes[fileID] { delta.add(bytes: nodeBytes(new)) }
+            if let old = oldSlots[fileID] { delta.remove(bytes: slotBytes(old)) }
+            if let new = slots[fileID] { delta.add(bytes: slotBytes(new)) }
         }
-        // Account conservatively for every retained immutable collection. Contributions appear
-        // in both slots and nodes by design, and both adjacency directions retain edge evidence.
-        for slot in slots.values {
-            guard !Task.isCancelled else { return .cancelled }
-            let contribution: CodeMapSelectionGraphContribution? = switch slot.state {
-            case let .contributed(value), let .empty(value): value
-            case .pending, .terminalArtifact, .terminalExcluded: nil
+        for name in changedDefinitionNames.union(changedReferenceNames) {
+            let oldCount = (baseDefinitions[name]?.count ?? 0) + (baseReferences[name]?.count ?? 0)
+            let newCount = (definitions[name]?.count ?? 0) + (references[name]?.count ?? 0)
+            if oldCount > 0 {
+                delta.removedPostings &+= UInt64(oldCount)
+                delta.remove(bytes: postingBytes(name: name, fileIDCount: oldCount))
             }
-            guard let pathBytes = UInt64(exactly: slot.standardizedRelativePath.utf8.count),
-                  let definitionBytes = checkedStringBytes(contribution?.sortedUniqueDefinitions ?? []),
-                  let referenceBytes = checkedStringBytes(contribution?.sortedUniqueReferences ?? []),
-                  let withSlot = checkedAdd(byteCount, 192),
-                  let withPath = checkedAdd(withSlot, pathBytes),
-                  let withDefinitions = checkedAdd(withPath, definitionBytes),
-                  let withReferences = checkedAdd(withDefinitions, referenceBytes)
-            else { return .failure(.accountingOverflow) }
-            byteCount = withReferences
+            if newCount > 0 {
+                delta.addedPostings &+= UInt64(newCount)
+                delta.add(bytes: postingBytes(name: name, fileIDCount: newCount))
+            }
         }
-        for (name, fileIDs) in definitions.merging(references, uniquingKeysWith: +) {
-            guard !Task.isCancelled else { return .cancelled }
-            guard let nameBytes = UInt64(exactly: name.utf8.count),
-                  let fileIDBytes = checkedMultiply(UInt64(fileIDs.count), 16),
-                  let withPosting = checkedAdd(byteCount, 64),
-                  let withName = checkedAdd(withPosting, nameBytes),
-                  let withFileIDs = checkedAdd(withName, fileIDBytes)
-            else { return .failure(.accountingOverflow) }
-            byteCount = withFileIDs
+
+        let size: WorkspaceCodemapGraphSizeAccounting
+        if let baseSize = incrementalBase?.sizeAccounting,
+           let incremental = applying(delta, to: baseSize, nodeCount: nodes.count)
+        {
+            size = incremental
+        } else {
+            // Resyncs (and any inconsistent delta) recount the whole candidate conservatively.
+            visits &+= UInt64(nodes.count + slots.count + definitions.count + references.count)
+            switch fullSize(
+                slots: slots,
+                nodes: nodes,
+                definitions: definitions,
+                references: references,
+                outgoing: outgoing,
+                reverse: reverse,
+                unresolved: unresolved
+            ) {
+            case let .size(value): size = value
+            case .overflow: return .failure(.accountingOverflow)
+            case .cancelled: return .cancelled
+            }
         }
-        for evidence in outgoing.values.flatMap(\.self) + reverse.values.flatMap(\.self) {
-            guard !Task.isCancelled else { return .cancelled }
-            guard let nameBytes = checkedStringBytes(evidence.matchedNames),
-                  let withEvidence = checkedAdd(byteCount, 128),
-                  let withNames = checkedAdd(withEvidence, nameBytes)
-            else { return .failure(.accountingOverflow) }
-            byteCount = withNames
-        }
-        for record in unresolved.values.flatMap(\.self) {
-            guard !Task.isCancelled else { return .cancelled }
-            guard let nameBytes = UInt64(exactly: record.referencedName.utf8.count),
-                  let withRecord = checkedAdd(byteCount, 96),
-                  let withName = checkedAdd(withRecord, nameBytes)
-            else { return .failure(.accountingOverflow) }
-            byteCount = withName
-        }
-        guard let edgeBytes = checkedMultiply(edgeCount, 96),
-              let postingBytes = checkedMultiply(postingCount, 24),
-              let withEdges = checkedAdd(byteCount, edgeBytes),
-              let totalBytes = checkedAdd(withEdges, postingBytes),
-              let nodeCount = UInt64(exactly: nodes.count)
-        else { return .failure(.accountingOverflow) }
-        byteCount = totalBytes
-        let size = WorkspaceCodemapGraphSizeAccounting(
-            nodes: nodeCount,
-            postings: postingCount,
-            edges: edgeCount,
-            bytes: byteCount
-        )
         let limits = graphPolicy.graphSizePolicy
         if size.nodes > limits.maxNodes { return .failure(.graphSize(.limitExceeded(dimension: .nodes, attempted: size.nodes, limit: limits.maxNodes))) }
         if size.postings > limits.maxPostings { return .failure(.graphSize(.limitExceeded(dimension: .postings, attempted: size.postings, limit: limits.maxPostings))) }
@@ -1405,8 +1549,132 @@ actor WorkspaceCodemapSelectionGraph {
             snapshot: snapshot,
             changedFileCount: changedIDs.count,
             affectedSourceCount: affectedSources.count,
-            resync: resync
+            resync: resync,
+            comparisonCount: comparisons,
+            visitCount: visits
         ))
+    }
+
+    private static func applying(
+        _ delta: CandidateSizeDelta,
+        to base: WorkspaceCodemapGraphSizeAccounting,
+        nodeCount: Int
+    ) -> WorkspaceCodemapGraphSizeAccounting? {
+        guard !delta.overflow,
+              base.postings >= delta.removedPostings,
+              base.edges >= delta.removedEdges,
+              let postings = checkedAdd(base.postings - delta.removedPostings, delta.addedPostings),
+              let edges = checkedAdd(base.edges - delta.removedEdges, delta.addedEdges),
+              let removedEdgeBytes = checkedMultiply(delta.removedEdges, 96),
+              let removedPostingBytes = checkedMultiply(delta.removedPostings, 24),
+              let removedTotal = checkedAdd(checkedAdd(delta.removedBytes, removedEdgeBytes), removedPostingBytes),
+              base.bytes >= removedTotal,
+              let addedEdgeBytes = checkedMultiply(delta.addedEdges, 96),
+              let addedPostingBytes = checkedMultiply(delta.addedPostings, 24),
+              let addedTotal = checkedAdd(checkedAdd(delta.addedBytes, addedEdgeBytes), addedPostingBytes),
+              let bytes = checkedAdd(base.bytes - removedTotal, addedTotal),
+              let nodes = UInt64(exactly: nodeCount)
+        else { return nil }
+        return WorkspaceCodemapGraphSizeAccounting(nodes: nodes, postings: postings, edges: edges, bytes: bytes)
+    }
+
+    /// Conservative accounting for every retained immutable collection. Contributions appear in
+    /// both slots and nodes by design, and both adjacency directions retain edge evidence.
+    private static func fullSize(
+        slots: [UUID: WorkspaceCodemapGraphSlot],
+        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode],
+        definitions: [String: [UUID]],
+        references: [String: [UUID]],
+        outgoing: [UUID: [WorkspaceCodemapGraphEdgeEvidence]],
+        reverse: [UUID: [WorkspaceCodemapGraphEdgeEvidence]],
+        unresolved: [UUID: [WorkspaceCodemapGraphUnresolvedRecord]]
+    ) -> CandidateSizeOutcome {
+        guard let postingCount = checkedAdd(checkedCount(definitions.values), checkedCount(references.values)),
+              let edgeCount = checkedCount(outgoing.values)
+        else { return .overflow }
+        var byteCount: UInt64 = 0
+        func charge(_ bytes: UInt64?) -> Bool {
+            guard let next = checkedAdd(byteCount, bytes) else { return false }
+            byteCount = next
+            return true
+        }
+        for node in nodes.values {
+            guard !Task.isCancelled else { return .cancelled }
+            guard charge(nodeBytes(node)) else { return .overflow }
+        }
+        for slot in slots.values {
+            guard !Task.isCancelled else { return .cancelled }
+            guard charge(slotBytes(slot)) else { return .overflow }
+        }
+        for (name, fileIDs) in definitions {
+            guard !Task.isCancelled else { return .cancelled }
+            let count = fileIDs.count + (references[name]?.count ?? 0)
+            guard charge(postingBytes(name: name, fileIDCount: count)) else { return .overflow }
+        }
+        for (name, fileIDs) in references where definitions[name] == nil {
+            guard !Task.isCancelled else { return .cancelled }
+            guard charge(postingBytes(name: name, fileIDCount: fileIDs.count)) else { return .overflow }
+        }
+        for evidenceList in outgoing.values {
+            guard !Task.isCancelled else { return .cancelled }
+            for evidence in evidenceList {
+                guard charge(evidenceBytes(evidence)) else { return .overflow }
+            }
+        }
+        for evidenceList in reverse.values {
+            guard !Task.isCancelled else { return .cancelled }
+            for evidence in evidenceList {
+                guard charge(evidenceBytes(evidence)) else { return .overflow }
+            }
+        }
+        for records in unresolved.values {
+            guard !Task.isCancelled else { return .cancelled }
+            for record in records {
+                guard charge(unresolvedBytes(record)) else { return .overflow }
+            }
+        }
+        guard charge(checkedMultiply(edgeCount, 96)),
+              charge(checkedMultiply(postingCount, 24)),
+              let nodeCount = UInt64(exactly: nodes.count)
+        else { return .overflow }
+        return .size(WorkspaceCodemapGraphSizeAccounting(
+            nodes: nodeCount,
+            postings: postingCount,
+            edges: edgeCount,
+            bytes: byteCount
+        ))
+    }
+
+    private static func nodeBytes(_ node: WorkspaceCodemapGraphSnapshotNode) -> UInt64? {
+        guard let pathBytes = UInt64(exactly: node.standardizedRelativePath.utf8.count),
+              let definitionBytes = checkedStringBytes(node.contribution.sortedUniqueDefinitions),
+              let referenceBytes = checkedStringBytes(node.contribution.sortedUniqueReferences)
+        else { return nil }
+        return checkedAdd(checkedAdd(checkedAdd(192, pathBytes), definitionBytes), referenceBytes)
+    }
+
+    private static func slotBytes(_ slot: WorkspaceCodemapGraphSlot) -> UInt64? {
+        let contribution = slot.state.contribution
+        guard let pathBytes = UInt64(exactly: slot.standardizedRelativePath.utf8.count),
+              let definitionBytes = checkedStringBytes(contribution?.sortedUniqueDefinitions ?? []),
+              let referenceBytes = checkedStringBytes(contribution?.sortedUniqueReferences ?? [])
+        else { return nil }
+        return checkedAdd(checkedAdd(checkedAdd(192, pathBytes), definitionBytes), referenceBytes)
+    }
+
+    private static func postingBytes(name: String, fileIDCount: Int) -> UInt64? {
+        guard let nameBytes = UInt64(exactly: name.utf8.count),
+              let count = UInt64(exactly: fileIDCount)
+        else { return nil }
+        return checkedAdd(checkedAdd(64, nameBytes), checkedMultiply(count, 16))
+    }
+
+    private static func evidenceBytes(_ evidence: WorkspaceCodemapGraphEdgeEvidence) -> UInt64? {
+        checkedAdd(128, checkedStringBytes(evidence.matchedNames))
+    }
+
+    private static func unresolvedBytes(_ record: WorkspaceCodemapGraphUnresolvedRecord) -> UInt64? {
+        checkedAdd(96, UInt64(exactly: record.referencedName.utf8.count))
     }
 
     private static func snapshotNode(
@@ -1472,7 +1740,7 @@ actor WorkspaceCodemapSelectionGraph {
         let left = nodes[lhs]?.standardizedRelativePath ?? ""
         let right = nodes[rhs]?.standardizedRelativePath ?? ""
         if left != right { return utf8Precedes(left, right) }
-        return lhs.uuidString < rhs.uuidString
+        return WorkspaceCodemapGraphOrdering.uuidPrecedes(lhs, rhs)
     }
 
     private static func edgePrecedes(
@@ -1486,7 +1754,7 @@ actor WorkspaceCodemapSelectionGraph {
     }
 
     private static func utf8Precedes(_ lhs: String, _ rhs: String) -> Bool {
-        lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
+        WorkspaceCodemapGraphOrdering.utf8Precedes(lhs, rhs)
     }
 }
 
