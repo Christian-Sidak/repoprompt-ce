@@ -2648,6 +2648,7 @@ enum CLIMode {
     case interactive(InteractiveOptions)
     case exec(ExecOptions)
     case policyAdministration([String])
+    case diagnostics([String])
 }
 
 private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
@@ -2663,6 +2664,9 @@ func parseCLIMode(arguments: [String] = CommandLine.arguments) -> CLIMode {
     var hasNonBackendUserArgs = false
     if args.first == "policy" {
         return .policyAdministration(Array(args.dropFirst()))
+    }
+    if args.first == "diagnostics" {
+        return .diagnostics(Array(args.dropFirst()))
     }
     var interactiveOptions = InteractiveOptions()
     var execOptions = ExecOptions()
@@ -3708,6 +3712,10 @@ if case let .policyAdministration(arguments) = mode {
     await exit(RuntimePolicyAdministration.run(arguments: arguments))
 }
 
+if case let .diagnostics(arguments) = mode {
+    exit(MCPDiagnosticsCommand.run(arguments: arguments))
+}
+
 if DirectHeadlessChildBridge.isRequested() {
     do {
         try await DirectHeadlessChildBridge.run()
@@ -3813,6 +3821,8 @@ case let .exec(options):
     service = ExecMCPService(options: options, logger: log)
 case .policyAdministration:
     fatalError("Policy administration exits before service composition")
+case .diagnostics:
+    fatalError("Diagnostics exit before service composition")
 }
 
 /// Use a quiet logger for ServiceLifecycle to suppress internal debug output

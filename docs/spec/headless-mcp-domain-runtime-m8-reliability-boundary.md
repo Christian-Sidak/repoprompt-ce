@@ -154,6 +154,17 @@ refused whenever reconnect is illegal (unreplayable work, pending transaction, r
 delivery), and records no tombstone, so the host may reuse the ids. `initialize` is excluded
 because the initialize replay plan may still forward its response.
 
+### M8G — local field-failure taxonomy
+
+Proxy and app terminal records were written to the events directory but nothing read them, so
+the split between app-unavailable, restart, host, and transport exits could not be measured.
+`repoprompt-mcp diagnostics terminal-summary [--since-hours N]` prints a JSON summary with
+record and undecodable counts, the time window, counts by layer, initiator and reason, records
+with active or in-delivery requests, and host settlement totals. Reasons outside a short
+`[a-z0-9_.-]` token set collapse to `other`; error descriptions, session fingerprints, process
+identifiers, tool names, and paths are never emitted. The command is read-only and dispatches
+before any app connection or service composition.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
