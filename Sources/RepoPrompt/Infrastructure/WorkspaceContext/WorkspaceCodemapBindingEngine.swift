@@ -474,11 +474,16 @@ actor WorkspaceCodemapBindingEngine {
         category: "CodemapGraphIndex"
     )
 
-    /// During bulk indexing the pull loop pauses after a committed diff for this multiple of the
-    /// apply time, bounding the commit duty cycle so pending publications coalesce into fewer,
-    /// larger diffs. Not applied once coverage is complete, so interactive updates stay prompt.
-    private static let graphPullCoalescingFactor: UInt64 = 2
-    private static let maximumGraphPullCoalescingNanoseconds: UInt64 = 250_000_000
+    private struct GraphPullPauseState {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Never>
+        let timer: Task<Void, Never>
+    }
+
+    private struct GraphFlushWaiter {
+        let target: WorkspaceCodemapSelectionGraphContributionGeneration
+        let continuation: CheckedContinuation<Bool, Never>
+    }
 
     private enum GraphIndexCandidateResolution {
         case entry(WorkspaceCodemapGraphIndexEntry, manifestRecord: CodeMapRootManifestRecord?)
@@ -597,6 +602,9 @@ actor WorkspaceCodemapBindingEngine {
     private let selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory
     private let policy: WorkspaceCodemapBindingEnginePolicy
     private let hooks: WorkspaceCodemapBindingEngineHooks
+    private let graphPullPause: WorkspaceCodemapGraphPullPause
+    private var graphPullPauses: [WorkspaceCodemapRootEpoch: GraphPullPauseState] = [:]
+    private var graphFlushWaiters: [WorkspaceCodemapRootEpoch: [GraphFlushWaiter]] = [:]
     private let manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter
     private let uptimeNanoseconds: @Sendable () -> UInt64
     private let accessEpochSeconds: @Sendable () -> UInt64
@@ -712,6 +720,7 @@ actor WorkspaceCodemapBindingEngine {
         selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
         policy: WorkspaceCodemapBindingEnginePolicy = .default,
         hooks: WorkspaceCodemapBindingEngineHooks = .none,
+        graphPullPause: WorkspaceCodemapGraphPullPause = .production,
         manifestWriterRetryWaiter: WorkspaceCodemapManifestWriterRetryWaiter = .production,
         initialQueueOrdinal: UInt64 = 1,
         initialAdmissionOrdinal: UInt64 = 1,
@@ -733,6 +742,7 @@ actor WorkspaceCodemapBindingEngine {
         self.selectionGraphFactory = selectionGraphFactory
         self.policy = policy
         self.hooks = hooks
+        self.graphPullPause = graphPullPause
         self.manifestWriterRetryWaiter = manifestWriterRetryWaiter
         nextQueueOrdinal = max(1, initialQueueOrdinal)
         nextAdmissionOrdinal = max(1, initialAdmissionOrdinal)
@@ -918,6 +928,7 @@ actor WorkspaceCodemapBindingEngine {
                 switch changes {
                 case let .unchanged(generation):
                     await graph.observe(generation: generation)
+                    await settleGraphFlushWaiters(rootEpoch: rootEpoch, graph: graph)
                     shouldPull = false
                 case let .revoked(reason):
                     await graph.shutdown(reason: reason)
@@ -928,16 +939,23 @@ actor WorkspaceCodemapBindingEngine {
                     let disposition = await graph.apply(changes)
                     switch disposition {
                     case .committed:
+                        await settleGraphFlushWaiters(rootEpoch: rootEpoch, graph: graph)
                         // While coverage is incomplete (bulk indexing), pull again after a
                         // bounded pause so more changes coalesce into the next commit. The
                         // overlay answers from current state, so a wakeup arriving during the
                         // apply or the pause cannot be lost. Interactive updates after indexing
-                        // completes are pulled immediately.
+                        // completes are pulled immediately, and a flush request (for example
+                        // before graph-index completion is reported) ends the pause at once.
                         if await graph.incrementalAccounting().coverage?.isComplete != true {
-                            await pauseGraphPullAfterCommit(applyStartedUptimeNanoseconds: applyStarted)
+                            let finished = DispatchTime.now().uptimeNanoseconds
+                            await pauseGraphPull(
+                                rootEpoch: rootEpoch,
+                                applyNanoseconds: finished >= applyStarted ? finished - applyStarted : 0
+                            )
                         }
                         shouldPull = true
                     case .unchanged:
+                        await settleGraphFlushWaiters(rootEpoch: rootEpoch, graph: graph)
                         shouldPull = true
                     case .cancelled, .revoked:
                         return
@@ -949,14 +967,23 @@ actor WorkspaceCodemapBindingEngine {
                     }
                 case let .resync(_, generation):
                     await graph.observe(generation: generation)
+                    let applyStarted = DispatchTime.now().uptimeNanoseconds
                     let disposition = await graph.apply(changes)
                     switch disposition {
                     case let .committed(_, _, _, _, resync):
+                        await settleGraphFlushWaiters(rootEpoch: rootEpoch, graph: graph)
                         shouldPull = true
                         if resync {
                             await scheduleFollowingWatcherReconciliationIfNeeded(
                                 rootEpoch: rootEpoch,
                                 graph: graph
+                            )
+                        }
+                        if await graph.incrementalAccounting().coverage?.isComplete != true {
+                            let finished = DispatchTime.now().uptimeNanoseconds
+                            await pauseGraphPull(
+                                rootEpoch: rootEpoch,
+                                applyNanoseconds: finished >= applyStarted ? finished - applyStarted : 0
                             )
                         }
                     case .unchanged:
@@ -999,18 +1026,81 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
-    private func pauseGraphPullAfterCommit(applyStartedUptimeNanoseconds started: UInt64) async {
-        // Wall-clock on purpose: this bounds real CPU duty cycle, not injected test time.
-        let finished = DispatchTime.now().uptimeNanoseconds
-        guard finished > started else { return }
-        let (scaled, overflow) = (finished - started).multipliedReportingOverflow(
-            by: Self.graphPullCoalescingFactor
-        )
-        let pause = overflow ? Self.maximumGraphPullCoalescingNanoseconds
-            : min(scaled, Self.maximumGraphPullCoalescingNanoseconds)
-        // Sub-millisecond commits are cheap; do not add scheduling latency for them.
-        guard pause >= 1_000_000, !Task.isCancelled else { return }
-        try? await Task.sleep(nanoseconds: pause)
+    /// Pauses the pull loop through the injected policy. The pause ends early when a flush is
+    /// requested for the root or the pull task is cancelled, so it can delay coalescing only.
+    private func pauseGraphPull(rootEpoch: WorkspaceCodemapRootEpoch, applyNanoseconds: UInt64) async {
+        guard graphFlushWaiters[rootEpoch]?.isEmpty ?? true, !Task.isCancelled else { return }
+        let pauseID = UUID()
+        let policy = graphPullPause
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                guard !Task.isCancelled else {
+                    continuation.resume()
+                    return
+                }
+                let timer = Task {
+                    await policy.pause(applyNanoseconds)
+                    self.endGraphPullPause(rootEpoch: rootEpoch, id: pauseID)
+                }
+                graphPullPauses[rootEpoch] = GraphPullPauseState(
+                    id: pauseID,
+                    continuation: continuation,
+                    timer: timer
+                )
+            }
+        } onCancel: {
+            Task { await self.endGraphPullPause(rootEpoch: rootEpoch, id: pauseID) }
+        }
+    }
+
+    private func endGraphPullPause(rootEpoch: WorkspaceCodemapRootEpoch, id: UUID? = nil) {
+        guard let state = graphPullPauses[rootEpoch], id == nil || state.id == id else { return }
+        graphPullPauses.removeValue(forKey: rootEpoch)
+        state.timer.cancel()
+        state.continuation.resume()
+    }
+
+    /// Waits until the root's selection graph has applied at least the overlay's current
+    /// contribution generation. Returns false if the graph or its pull loop went away first.
+    private func flushSelectionGraph(rootEpoch: WorkspaceCodemapRootEpoch) async -> Bool {
+        guard let graph = selectionGraphsByRootEpoch[rootEpoch],
+              graphPullTasksByRootEpoch[rootEpoch] != nil,
+              let target = await overlay.graphContributionGeneration(rootEpoch: rootEpoch)
+        else { return false }
+        if await graph.incrementalAccounting().appliedGeneration >= target { return true }
+        guard graphPullTasksByRootEpoch[rootEpoch] != nil else { return false }
+        return await withCheckedContinuation { continuation in
+            graphFlushWaiters[rootEpoch, default: []].append(
+                GraphFlushWaiter(target: target, continuation: continuation)
+            )
+            // Wake a paused loop now, and a loop idle on notifications through a fresh wakeup;
+            // either way it pulls and settles this waiter after the flush was registered.
+            endGraphPullPause(rootEpoch: rootEpoch)
+            let overlay = overlay
+            Task { await overlay.requestGraphChangeNotification(rootEpoch: rootEpoch) }
+        }
+    }
+
+    private func settleGraphFlushWaiters(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        graph: WorkspaceCodemapSelectionGraph
+    ) async {
+        guard graphFlushWaiters[rootEpoch]?.isEmpty == false else { return }
+        let applied = await graph.incrementalAccounting().appliedGeneration
+        guard let waiters = graphFlushWaiters[rootEpoch] else { return }
+        let settled = waiters.filter { $0.target <= applied }
+        let remaining = waiters.filter { $0.target > applied }
+        graphFlushWaiters[rootEpoch] = remaining.isEmpty ? nil : remaining
+        for waiter in settled {
+            waiter.continuation.resume(returning: true)
+        }
+    }
+
+    private func abandonGraphFlushWaiters(rootEpoch: WorkspaceCodemapRootEpoch) {
+        endGraphPullPause(rootEpoch: rootEpoch)
+        for waiter in graphFlushWaiters.removeValue(forKey: rootEpoch) ?? [] {
+            waiter.continuation.resume(returning: false)
+        }
     }
 
     private func revokeGraphAfterOverlayTermination(
@@ -1062,6 +1152,7 @@ actor WorkspaceCodemapBindingEngine {
         rootEpoch: WorkspaceCodemapRootEpoch,
         taskID: UUID
     ) {
+        abandonGraphFlushWaiters(rootEpoch: rootEpoch)
         guard graphPullTasksByRootEpoch[rootEpoch]?.id == taskID else { return }
         graphPullTasksByRootEpoch.removeValue(forKey: rootEpoch)
     }
@@ -1080,6 +1171,7 @@ actor WorkspaceCodemapBindingEngine {
             pull.task.cancel()
             await pull.task.value
         }
+        abandonGraphFlushWaiters(rootEpoch: rootEpoch)
     }
 
     #if DEBUG
@@ -3327,6 +3419,15 @@ actor WorkspaceCodemapBindingEngine {
             jobID: jobID,
             rootEpoch: rootEpoch
         )
+        switch finalDisposition {
+        case .accepted, .exactDuplicate:
+            // The graph applies publications on its own pull loop. Completion is observable, so
+            // it is only reported once the graph has applied the completing publication: a
+            // caller that sees `.complete` then reads a snapshot with full coverage.
+            _ = await flushSelectionGraph(rootEpoch: rootEpoch)
+        case .stale, .superseded, .budget, .unavailable, .busy:
+            break
+        }
         guard var completedJob = graphIndexJobs[rootEpoch], completedJob.id == jobID else {
             return .cancelled
         }

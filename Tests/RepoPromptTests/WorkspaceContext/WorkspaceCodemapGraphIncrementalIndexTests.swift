@@ -680,7 +680,90 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         )
     }
 
+    /// Completion is observable: once the engine reports a root complete, the selection graph must
+    /// already expose full coverage, even while the pull loop is paused between commits (#1085).
+    func testGraphIndexCompletionImpliesGraphCoverageWhilePullLoopIsPaused() async throws {
+        let fileCount = 6
+        var sources: [String: String] = [:]
+        for index in 0 ..< fileCount {
+            sources["Sources/File\(index).swift"] = "struct File\(index) { let next: File\((index + 1) % fileCount) }\n"
+        }
+        let repository = try ReviewGitRepositoryFixture(name: #function)
+        let rootURL = try repository.makeRepository(named: "root", files: sources)
+        // The gate never opens on its own: a pause ends only through a flush or cancellation.
+        let gate = CodemapGraphIndexGate()
+        await gate.close()
+        let pauses = CodemapLockedValues<UInt64>()
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            enginePolicy: WorkspaceCodemapBindingEnginePolicy(
+                maximumGraphIndexCatalogPageEntryCount: 1,
+                maximumGraphIndexBatchCandidateCount: 1
+            ),
+            graphPullPause: WorkspaceCodemapGraphPullPause { applyNanoseconds in
+                pauses.append(applyNanoseconds)
+                await gate.pass()
+            }
+        )
+        let store = fixture.makeStore()
+        addTeardownBlock {
+            await gate.open()
+            await fixture.shutdown()
+            repository.cleanup()
+        }
+
+        let loaded = try await store.loadRoot(path: rootURL.path)
+        addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+        let engine = try fixture.runtime().bindingEngine()
+        let rootEpoch = try await waitForGraphIndexRoot(engine: engine, rootID: loaded.id)
+
+        // Hold further pages until the pull loop has committed and entered the gated pause, so
+        // the completing publication provably arrives while the loop is paused.
+        let hold = await engine.debugAcquireGraphIndexAdmissionHold(
+            rootEpoch: rootEpoch,
+            expiresAfterMilliseconds: 600_000
+        )
+        let holdID = try XCTUnwrap(hold?.holdID)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        while pauses.values.isEmpty, clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(pauses.values.isEmpty, "The pull loop must be paused before indexing completes")
+        let completedBeforePause = await engine.accounting().graphIndexRoots
+            .first { $0.rootEpoch == rootEpoch }?.phase == .complete
+        XCTAssertFalse(completedBeforePause, "The admission hold must keep indexing incomplete")
+        _ = await engine.debugReleaseGraphIndexAdmissionHold(holdID, rootEpoch: rootEpoch)
+
+        let completed = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        XCTAssertEqual(completed.progress.counts.processedCandidateCount, UInt64(fileCount))
+        let maybeGraph = await engine.selectionGraph(rootEpoch: rootEpoch)
+        let graph = try XCTUnwrap(maybeGraph)
+        guard case let .ready(pinned) = await graph.latestSnapshot() else {
+            return XCTFail("A completed root must publish a graph snapshot")
+        }
+        XCTAssertTrue(pinned.snapshot.coverage.isComplete)
+        XCTAssertEqual(pinned.snapshot.coverage.pendingCount, 0)
+        XCTAssertEqual(pinned.snapshot.nodesByFileID.count, fileCount)
+    }
+
     // MARK: - Helpers
+
+    private func waitForGraphIndexRoot(
+        engine: WorkspaceCodemapBindingEngine,
+        rootID: UUID
+    ) async throws -> WorkspaceCodemapRootEpoch {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        while clock.now < deadline {
+            let accounting = await engine.accounting()
+            if let root = accounting.graphIndexRoots.first(where: { $0.rootEpoch.rootID == rootID }) {
+                return root.rootEpoch
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        throw CodemapGraphIndexHarnessError.timedOut
+    }
 
     private func waitForGraphCompletion(
         engine: WorkspaceCodemapBindingEngine,

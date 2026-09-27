@@ -955,3 +955,22 @@ struct WorkspaceCodemapBindingEngineAccounting: Equatable {
         self.graphIndexRoots = graphIndexRoots
     }
 }
+
+/// How the engine's graph pull loop pauses after a committed diff while indexing is in progress.
+///
+/// The pause only coalesces pending publications into fewer commits; the engine interrupts it
+/// whenever a caller needs the graph caught up (for example before reporting graph-index
+/// completion) and when the pull task is cancelled. Tests inject a gated pause to force the path.
+struct WorkspaceCodemapGraphPullPause {
+    /// Receives the wall-clock nanoseconds the preceding apply took.
+    let pause: @Sendable (_ applyNanoseconds: UInt64) async -> Void
+
+    /// Pauses for twice the apply time, capped at 250 ms; sub-millisecond commits do not pause.
+    static let production = WorkspaceCodemapGraphPullPause { applyNanoseconds in
+        let (scaled, overflow) = applyNanoseconds.multipliedReportingOverflow(by: 2)
+        let maximum: UInt64 = 250_000_000
+        let pause = overflow ? maximum : min(scaled, maximum)
+        guard pause >= 1_000_000 else { return }
+        try? await Task.sleep(nanoseconds: pause)
+    }
+}

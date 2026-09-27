@@ -1475,6 +1475,24 @@ actor WorkspaceCodemapLiveOverlay {
         return true
     }
 
+    /// Current contribution generation of a live root, without touching entry recency.
+    func graphContributionGeneration(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapSelectionGraphContributionGeneration? {
+        guard let root = roots[rootEpoch], root.authorityIsCurrent, root.graphRevocationReason == nil else {
+            return nil
+        }
+        return root.contributionGeneration
+    }
+
+    /// Wakes graph-change subscribers without a ledger change, so a consumer re-pulls and can
+    /// confirm it is current. Pulls answer from current state, so an extra wakeup is harmless.
+    func requestGraphChangeNotification(rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard var root = roots.removeValue(forKey: rootEpoch) else { return }
+        yieldGraphChange(&root)
+        roots[rootEpoch] = root
+    }
+
     func graphLedgerAccounting(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> WorkspaceCodemapGraphLedgerAccounting? {
