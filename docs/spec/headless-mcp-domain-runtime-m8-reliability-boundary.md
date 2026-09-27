@@ -178,6 +178,17 @@ use a fixed table. A pre-existing legacy `retryable` flag stays authoritative, s
 contradicts values existing clients already read. Codes without a classification keep the
 legacy single-line text.
 
+### M8I — typed selection prerequisites (#1071)
+
+Seven selection-dependent app tools (`manage_selection`, `ask_oracle`, `oracle_send`,
+`workspace_context` snapshot and export, `prompt` export, `get_code_structure` without paths, and
+`get_file_tree` `selected`) threw `CancellationError` when the automatic-selection drain ended
+`deferred` or `invalidated`, so hosts saw a generic cancellation. They now throw
+`MCPSelectionPrerequisiteError`, rendered through the execution-contract path as
+`tool_prerequisite_selection_deferred` or `tool_prerequisite_selection_invalidated`, retryable,
+`mutation_state` `not_applied` (each drain runs before any mutation or export write). A drain that
+ends `cancelled` still throws `CancellationError`.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).

@@ -1357,7 +1357,9 @@ actor ServerNetworkManager {
         switch code {
         case "tool_execution_connection_terminal",
              "tool_execution_window_terminal",
-             "tool_execution_admission_timeout":
+             "tool_execution_admission_timeout",
+             "tool_prerequisite_selection_deferred",
+             "tool_prerequisite_selection_invalidated":
             return .retryable
         case "tool_card_ownership_conflict",
              "tool_execution_admission_unclassified",
@@ -14382,6 +14384,18 @@ actor ServerNetworkManager {
                                             promptExportMutationObservation?.errorMetadata(toolName: toolName) ?? [:],
                                             uniquingKeysWith: { _, authorityValue in authorityValue }
                                         )
+                                    case let prerequisite as MCPSelectionPrerequisiteError:
+                                        // #1071: an unmet selection prerequisite is a typed, retryable
+                                        // failure that ran before any mutation, not a cancellation.
+                                        code = prerequisite.code
+                                        message = prerequisite.localizedDescription
+                                        outcome = "selectionPrerequisiteUnavailable"
+                                        shouldForceDisconnect = false
+                                        errorMetadata = [
+                                            "retryable": .bool(true),
+                                            "mutation_state": .string(DomainProtectedMutationState.notApplied.rawValue),
+                                            "prerequisite": .string(prerequisite.requirement.rawValue)
+                                        ]
                                     case let protectedError as DomainProtectedMutationError
                                         where promptExportMutationObservation != nil:
                                         let settlement = protectedError.settlement

@@ -398,12 +398,10 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     )
                 } else {
                     if !authority.isRunlessOneShotHint {
-                        guard try await dependencies.files.drainReadFileAutoSelection(
-                            metadata,
+                        try await MCPSelectionPrerequisiteError.require(
+                            dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection),
                             .canonicalSelection
-                        ) == .completed else {
-                            throw CancellationError()
-                        }
+                        )
                     }
                     files = try await dependencies.context.resolveSelectedFilesForCodeStructure(
                         metadata,
@@ -490,9 +488,10 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 await MCPToolExecutionHandlerPhaseContext.report(.getFileTreeConstruction)
                 if mode.lowercased() == "selected" {
                     if !authority.isRunlessOneShotHint {
-                        guard try await dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
-                            throw CancellationError()
-                        }
+                        try await MCPSelectionPrerequisiteError.require(
+                            dependencies.files.drainReadFileAutoSelection(metadata, .canonicalSelection),
+                            .canonicalSelection
+                        )
                     }
                 }
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)

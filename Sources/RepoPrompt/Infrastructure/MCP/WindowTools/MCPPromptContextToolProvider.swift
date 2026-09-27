@@ -68,9 +68,10 @@ final class MCPPromptContextToolProvider {
             metadata = await dependencies.context.captureRequestMetadata()
             lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
         }
-        guard try await dependencies.files.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
-            throw CancellationError()
-        }
+        try await MCPSelectionPrerequisiteError.require(
+            dependencies.files.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics),
+            .mirroredSelectionAndMetrics
+        )
         if includeArr.contains("files") {
             _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
         }
@@ -122,9 +123,10 @@ final class MCPPromptContextToolProvider {
         }
         let resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot = if operation == .export {
             try await withPromptExportPhase(.promptExportSelectionDrain) {
-                guard try await dependencies.files.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
-                    throw CancellationError()
-                }
+                try await MCPSelectionPrerequisiteError.require(
+                    dependencies.files.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics),
+                    .mirroredSelectionAndMetrics
+                )
                 return if let appContext {
                     selectionRefreshedContext(appContext.resolvedTabContext)
                 } else {

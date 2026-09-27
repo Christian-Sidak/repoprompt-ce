@@ -1409,19 +1409,19 @@ final class MCPServerViewModel: ObservableObject {
         executeAskOracle: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing ask_oracle") }
             let metadata = await captureRequestMetadata()
-            guard try await drainReadFileAutoSelection(
-                metadata: metadata,
-                requirement: .mirroredSelectionAndMetrics
-            ) == .completed else { throw CancellationError() }
+            try await MCPSelectionPrerequisiteError.require(
+                drainReadFileAutoSelection(metadata: metadata, requirement: .mirroredSelectionAndMetrics),
+                .mirroredSelectionAndMetrics
+            )
             return try await oracleToolService.executeAskOracle(args: args)
         },
         executeOracleSend: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_send") }
             let metadata = await captureRequestMetadata()
-            guard try await drainReadFileAutoSelection(
-                metadata: metadata,
-                requirement: .mirroredSelectionAndMetrics
-            ) == .completed else { throw CancellationError() }
+            try await MCPSelectionPrerequisiteError.require(
+                drainReadFileAutoSelection(metadata: metadata, requirement: .mirroredSelectionAndMetrics),
+                .mirroredSelectionAndMetrics
+            )
             return try await oracleToolService.executeOracleSend(args: args)
         },
         executeOracleChatLog: { [weak self] args in
