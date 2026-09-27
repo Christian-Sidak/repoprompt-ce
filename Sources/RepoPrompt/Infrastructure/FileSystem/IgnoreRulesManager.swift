@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptDomainRuntime
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     import Darwin // for stat()
 #else

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 extension FileSystemService {
     // MARK: - Ignore rules change consumption

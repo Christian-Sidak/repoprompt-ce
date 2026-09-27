@@ -200,6 +200,18 @@ a customized legacy value into an uncustomized JSON value; an explicit JSON valu
 legacy keys stay in place. Headless parity (shared matcher and a read-only view of this authority)
 remains a separate, unstarted slice.
 
+### M8L — shared gitignore compiler (no behavior change)
+
+`GitignoreCompiler`, `PatternPool`, and the DEBUG-only `IgnoreDebugMetricsRecorder` it reports to
+moved from the app into `RepoPromptDomainRuntime` (`package` access; the recorder keeps its
+lock-guarded state and environment/defaults switches), and the gitignore C API (`repo_gitignore_match_anchored`,
+`repo_gitignore_match_anywhere`, `repo_normalize_pattern`, `repo_parse_gitignore_line`,
+`repo_gitignore_pattern`) is now declared once in the public `RepoPromptC/include/repo_gitignore.h`,
+included by `wildmatch.h` (an existing module input, so warm clang module caches rebuild) and by
+the C implementation and the app bridging header. The app keeps `IgnoreRules`,
+`IgnoreRulePolicy`, and git-topology resolution. Headless enumeration does not apply any ignore
+layer yet: explicit parity contract and the read-only authority view are the next slices.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).

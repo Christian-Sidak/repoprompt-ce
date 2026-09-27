@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptDomainRuntime
 
 extension FileSystemService {
     // MARK: - Parallel scanning support

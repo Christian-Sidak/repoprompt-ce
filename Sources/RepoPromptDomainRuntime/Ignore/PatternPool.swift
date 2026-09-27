@@ -8,8 +8,8 @@ import Foundation
 /// Thread-safety: `intern(_:)` uses an `NSLock`, which is perfectly adequate
 /// here because pattern compilation happens far less frequently than pattern
 /// matching.
-final class PatternPool {
-    static let shared = PatternPool()
+package final class PatternPool: @unchecked Sendable {
+    package static let shared = PatternPool()
 
     private var set = Set<String>()
     private let lock = NSLock()
@@ -25,7 +25,7 @@ final class PatternPool {
     /// pool reaches its maximum unique-string count, it is cleared before
     /// inserting the next new string. Clearing only reduces future deduplication;
     /// compiled rules already hold independent `String` values.
-    func intern(_ pattern: String) -> String {
+    package func intern(_ pattern: String) -> String {
         lock.lock()
         defer { lock.unlock() }
 
@@ -42,17 +42,17 @@ final class PatternPool {
     }
 
     #if DEBUG
-        var countForTesting: Int {
+        package var countForTesting: Int {
             lock.lock()
             defer { lock.unlock() }
             return set.count
         }
 
-        var capacityForTesting: Int {
+        package var capacityForTesting: Int {
             maxEntries
         }
 
-        func resetForTesting() {
+        package func resetForTesting() {
             lock.lock()
             defer { lock.unlock() }
             set.removeAll(keepingCapacity: false)

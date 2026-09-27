@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptC
 
 // Wildmatch bit-flags (duplicated from wildmatch.h)
 private let WM_NOESCAPE: UInt32 = 0x01
@@ -22,26 +23,26 @@ private func isMatch(_ result: Int32) -> Bool {
 
 /// Represents a single line of a `.gitignore`-style file, parsed and
 /// normalized for matching logic.
-public struct GitPattern: Sendable {
+package struct GitPattern {
     /// The original pattern text, with leading/trailing slash removed if necessary.
-    let pattern: String
+    package let pattern: String
 
     /// If true, this pattern is `!something`, meaning it *unignores* matching paths.
-    let isNegation: Bool
+    package let isNegation: Bool
 
     /// If true, pattern must match only directories (like trailing slash in Git).
-    let directoryOnly: Bool
+    package let directoryOnly: Bool
 
     /// If true, pattern is anchored to the ignore-file directory.
     /// Leading-slash patterns and slash-containing patterns match from that scoped root.
-    let absolute: Bool
+    package let absolute: Bool
 
     /// Conservative metadata used to avoid full wildcard matching when a path
     /// cannot possibly match this pattern.
-    let prefilter: GitPatternPrefilter
+    package let prefilter: GitPatternPrefilter
 }
 
-enum GitPatternPrefilter: Equatable {
+package enum GitPatternPrefilter: Equatable {
     case always
     case basenameLiteral(String)
     case directoryBasenameLiteral(String)
@@ -49,7 +50,7 @@ enum GitPatternPrefilter: Equatable {
     case anchoredDirectoryPrefix(String)
     case basenameSuffix(String)
 
-    var requiresCheck: Bool {
+    package var requiresCheck: Bool {
         if case .always = self {
             return false
         }
@@ -57,20 +58,33 @@ enum GitPatternPrefilter: Equatable {
     }
 }
 
-struct NegationTraversalDiagnostics: Equatable {
-    let exactPrefixCount: Int
-    let patternHintCount: Int
-    let broadPatternHintCount: Int
-    let basenameOnlyNegationCount: Int
+package struct NegationTraversalDiagnostics: Equatable {
+    package let exactPrefixCount: Int
+    package let patternHintCount: Int
+    package let broadPatternHintCount: Int
+    package let basenameOnlyNegationCount: Int
 
-    static let empty = NegationTraversalDiagnostics(
+    /// Explicit because the app's hierarchical `IgnoreRules` aggregates diagnostics across layers.
+    package init(
+        exactPrefixCount: Int,
+        patternHintCount: Int,
+        broadPatternHintCount: Int,
+        basenameOnlyNegationCount: Int
+    ) {
+        self.exactPrefixCount = exactPrefixCount
+        self.patternHintCount = patternHintCount
+        self.broadPatternHintCount = broadPatternHintCount
+        self.basenameOnlyNegationCount = basenameOnlyNegationCount
+    }
+
+    package static let empty = NegationTraversalDiagnostics(
         exactPrefixCount: 0,
         patternHintCount: 0,
         broadPatternHintCount: 0,
         basenameOnlyNegationCount: 0
     )
 
-    func adding(_ other: NegationTraversalDiagnostics) -> NegationTraversalDiagnostics {
+    package func adding(_ other: NegationTraversalDiagnostics) -> NegationTraversalDiagnostics {
         NegationTraversalDiagnostics(
             exactPrefixCount: exactPrefixCount + other.exactPrefixCount,
             patternHintCount: patternHintCount + other.patternHintCount,
@@ -80,12 +94,12 @@ struct NegationTraversalDiagnostics: Equatable {
     }
 }
 
-struct NegationTraversalPattern: Hashable {
-    let pattern: String
-    let absolute: Bool
-    let isBroad: Bool
+package struct NegationTraversalPattern: Hashable {
+    package let pattern: String
+    package let absolute: Bool
+    package let isBroad: Bool
 
-    func matches(directoryPath: String) -> Bool {
+    package func matches(directoryPath: String) -> Bool {
         if pattern == "**" {
             return true
         }
@@ -114,21 +128,21 @@ struct NegationTraversalPattern: Hashable {
 }
 
 /// Holds the final compiled set of patterns for one file’s `.gitignore` content.
-public struct CompiledIgnoreRules: Sendable {
+package struct CompiledIgnoreRules {
     /// Each entry is one pattern line, in order of appearance in file.
     /// (Later lines have higher precedence when we do the final check.)
     private let patterns: [GitPattern]
-    let negationTraversalPrefixes: Set<String>
-    let negationTraversalPatterns: Set<NegationTraversalPattern>
-    let traversalDiagnostics: NegationTraversalDiagnostics
+    package let negationTraversalPrefixes: Set<String>
+    package let negationTraversalPatterns: Set<NegationTraversalPattern>
+    package let traversalDiagnostics: NegationTraversalDiagnostics
 
     /// Quick check for "do we have any negative pattern?"
-    public var hasAnyNegativePattern: Bool {
+    package var hasAnyNegativePattern: Bool {
         patterns.contains { $0.isNegation }
     }
 
     /// Result of evaluating this layer against a single path.
-    public enum MatchOutcome {
+    package enum MatchOutcome {
         /// A positive pattern matched – the path must be ignored.
         case ignore
         /// A negative pattern matched – the path must be kept.
@@ -137,7 +151,7 @@ public struct CompiledIgnoreRules: Sendable {
         case noMatch
     }
 
-    init(
+    package init(
         patterns: [GitPattern],
         negationTraversalPrefixes: Set<String> = [],
         negationTraversalPatterns: Set<NegationTraversalPattern> = [],
@@ -156,7 +170,7 @@ public struct CompiledIgnoreRules: Sendable {
     ///   - path: The path to test, relative to the repository root.
     ///   - isDirectory: Whether the path represents a directory.
     /// Primary implementation - components-based to avoid repeated splits
-    public func outcome(for components: [Substring], isDirectory: Bool) -> MatchOutcome {
+    package func outcome(for components: [Substring], isDirectory: Bool) -> MatchOutcome {
         let path = components.joined(separator: "/")
         #if DEBUG
             var patternVisits = 0
@@ -202,7 +216,7 @@ public struct CompiledIgnoreRules: Sendable {
     }
 
     /// String-based convenience wrapper
-    public func outcome(for path: String, isDirectory: Bool) -> MatchOutcome {
+    package func outcome(for path: String, isDirectory: Bool) -> MatchOutcome {
         // Handle empty path - gitignore semantics: only ** matches empty path
         guard !path.isEmpty else {
             #if DEBUG
@@ -238,13 +252,13 @@ public struct CompiledIgnoreRules: Sendable {
     /// If the matched pattern is negative => unignored => return false
     /// Else => ignored => return true.
     /// If no pattern matches => return false (not ignored).
-    public func denies(_ path: String, isDirectory: Bool) -> Bool {
+    package func denies(_ path: String, isDirectory: Bool) -> Bool {
         outcome(for: path, isDirectory: isDirectory) == .ignore
     }
 
     /// Returns true if any negation rule requires us to keep traversing the
     /// directory at `path` even if other patterns would ignore it.
-    func requiresTraversal(for path: String) -> Bool {
+    package func requiresTraversal(for path: String) -> Bool {
         #if DEBUG
             IgnoreDebugMetricsRecorder.recordTraversalRequiresCheck()
         #endif
@@ -370,10 +384,10 @@ public struct CompiledIgnoreRules: Sendable {
 
 // MARK: - The Compiler
 
-public enum GitignoreCompiler {
+package enum GitignoreCompiler {
     /// Given the raw text of a `.gitignore` (or similar) file, parse out lines
     /// into a `CompiledIgnoreRules` object with full negative/positive pattern logic.
-    public static func compile(content: String, directoryPath: String = "") -> CompiledIgnoreRules {
+    package static func compile(content: String, directoryPath: String = "") -> CompiledIgnoreRules {
         let lines = content.components(separatedBy: .newlines)
         var patterns = [GitPattern]()
         var traversalPrefixes = Set<String>()

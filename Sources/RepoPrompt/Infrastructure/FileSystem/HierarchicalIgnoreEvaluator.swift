@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Evaluates paths against a hierarchy of ignore rules, checking each prefix
 /// to ensure parent directories that are ignored also ignore their children.

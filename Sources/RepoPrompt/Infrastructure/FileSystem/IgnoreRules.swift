@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 // Holds multiple "layers" of compiled patterns (from .gitignore, .repo_ignore, etc.), combined.
 
