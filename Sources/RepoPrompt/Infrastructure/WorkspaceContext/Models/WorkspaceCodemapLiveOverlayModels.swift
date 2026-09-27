@@ -563,4 +563,6 @@ struct WorkspaceCodemapGraphLedgerAccounting: Hashable {
     let lastDiffSlotCount: Int
     let floorResetCount: UInt64
     let acknowledgedPruneCount: UInt64
+    /// Whether path-scoped reconciliation may resolve live state through the path index.
+    let liveEntriesIndexedByPath: Bool
 }

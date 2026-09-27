@@ -13,6 +13,8 @@ actor WorkspaceCodemapSelectionGraph {
         let comparisonCount: UInt64
         /// Items visited while building the candidate (IDs, postings, references, and scans).
         let visitCount: UInt64
+        /// Entries copied or shifted to derive the candidate's storage from its base.
+        let copiedEntryCount: UInt64
     }
 
     private enum CandidateBuildOutcome {
@@ -80,6 +82,9 @@ actor WorkspaceCodemapSelectionGraph {
     private var lastCandidateComparisonCount: UInt64 = 0
     private var lastCandidateVisitCount: UInt64 = 0
     private var maximumDiffCandidateVisitCount: UInt64 = 0
+    private var lastCandidateCopiedEntryCount: UInt64 = 0
+    private var maximumDiffCandidateCopiedEntryCount: UInt64 = 0
+    private var totalCandidateCopiedEntryCount: UInt64 = 0
     private var totalCandidateComparisonCount: UInt64 = 0
     private var totalCandidateVisitCount: UInt64 = 0
     private var totalApplyDurationMilliseconds: UInt64 = 0
@@ -303,10 +308,16 @@ actor WorkspaceCodemapSelectionGraph {
             totalAffectedSourceCount &+= UInt64(candidate.affectedSourceCount)
             lastCandidateComparisonCount = candidate.comparisonCount
             lastCandidateVisitCount = candidate.visitCount
+            lastCandidateCopiedEntryCount = candidate.copiedEntryCount
+            totalCandidateCopiedEntryCount &+= candidate.copiedEntryCount
             totalCandidateComparisonCount &+= candidate.comparisonCount
             totalCandidateVisitCount &+= candidate.visitCount
             if !resync {
                 maximumDiffCandidateVisitCount = max(maximumDiffCandidateVisitCount, candidate.visitCount)
+                maximumDiffCandidateCopiedEntryCount = max(
+                    maximumDiffCandidateCopiedEntryCount,
+                    candidate.copiedEntryCount
+                )
             }
             if candidate.affectedSourceCount >= graphPolicy.candidateOverflowThreshold {
                 highFanoutApplyCount &+= 1
@@ -717,13 +728,13 @@ actor WorkspaceCodemapSelectionGraph {
                     ($0, $0.targetFileID, .referencedDefinitions)
                 }
             case .referrers:
-                neighbors = (snapshot.reverseEdgesByTarget[currentID] ?? []).map {
+                neighbors = snapshot.reverseEdges(target: currentID).map {
                     ($0, $0.sourceFileID, .referrers)
                 }
             case .both:
                 neighbors = (snapshot.outgoingEdgesBySource[currentID] ?? []).map {
                     ($0, $0.targetFileID, .referencedDefinitions)
-                } + (snapshot.reverseEdgesByTarget[currentID] ?? []).map {
+                } + snapshot.reverseEdges(target: currentID).map {
                     ($0, $0.sourceFileID, .referrers)
                 }
             }
@@ -1054,6 +1065,9 @@ actor WorkspaceCodemapSelectionGraph {
             lastCandidateComparisonCount: lastCandidateComparisonCount,
             lastCandidateVisitCount: lastCandidateVisitCount,
             maximumDiffCandidateVisitCount: maximumDiffCandidateVisitCount,
+            lastCandidateCopiedEntryCount: lastCandidateCopiedEntryCount,
+            maximumDiffCandidateCopiedEntryCount: maximumDiffCandidateCopiedEntryCount,
+            totalCandidateCopiedEntryCount: totalCandidateCopiedEntryCount,
             totalCandidateComparisonCount: totalCandidateComparisonCount,
             totalCandidateVisitCount: totalCandidateVisitCount,
             totalApplyDurationMilliseconds: totalApplyDurationMilliseconds,
@@ -1226,13 +1240,16 @@ actor WorkspaceCodemapSelectionGraph {
         resync: Bool
     ) -> CandidateBuildOutcome {
         guard !Task.isCancelled else { return .cancelled }
-        // A resync rebuilds from the checkpoint alone. A diff only touches the file IDs it names,
-        // so every step below is bounded by the diff and the postings/edges it reaches.
+        // A resync rebuilds from the checkpoint alone. A diff derives the next snapshot from the
+        // base through persistent storage: every map update copies only its trie path, and every
+        // step below is bounded by the diff and the postings/edges it reaches. The base snapshot
+        // (possibly pinned by readers) is never mutated.
         let incrementalBase = resync ? nil : base
-        let oldSlots = incrementalBase?.slotsByFileID ?? [:]
+        let oldSlots = incrementalBase?.slotsByFileID ?? PersistentHashMap()
         var slots = oldSlots
         var comparisons: UInt64 = 0
         var visits: UInt64 = 0
+        var copies: UInt64 = 0
         var candidateIDs = Set<UUID>()
         candidateIDs.reserveCapacity(removed.count + changedSlots.count)
         for removal in removed {
@@ -1248,38 +1265,34 @@ actor WorkspaceCodemapSelectionGraph {
         visits &+= UInt64(candidateIDs.count)
         let changedIDs = candidateIDs.filter { oldSlots[$0] != slots[$0] }
 
-        let baseNodes = incrementalBase?.nodesByFileID ?? [:]
-        let baseDefinitions = incrementalBase?.definitionPostings ?? [:]
-        let baseReferences = incrementalBase?.referencePostings ?? [:]
+        let baseNodes = incrementalBase?.nodesByFileID ?? PersistentHashMap()
+        let baseDefinitions = incrementalBase?.definitionPostings ?? PersistentHashMap()
+        let baseReferences = incrementalBase?.referencePostings ?? PersistentHashMap()
         var nodes = baseNodes
         var definitions = baseDefinitions
         var references = baseReferences
-        var outgoing = incrementalBase?.outgoingEdgesBySource ?? [:]
-        var reverse = incrementalBase?.reverseEdgesByTarget ?? [:]
-        var unresolved = incrementalBase?.unresolvedBySource ?? [:]
+        var outgoing = incrementalBase?.outgoingEdgesBySource ?? PersistentHashMap()
+        var reverse = incrementalBase?.reverseEdgesByTarget ?? PersistentHashMap()
+        var unresolved = incrementalBase?.unresolvedBySource ?? PersistentHashMap()
 
-        // Remove every changed node before installing replacements so posting-list positions are
-        // always computed against final node paths.
         var changedDefinitionNames = Set<String>()
         var changedReferenceNames = Set<String>()
-        var removedDefinitionIDsByName: [String: Set<UUID>] = [:]
-        var removedReferenceIDsByName: [String: Set<UUID>] = [:]
-        for fileID in changedIDs {
-            guard !Task.isCancelled else { return .cancelled }
-            guard let oldNode = nodes.removeValue(forKey: fileID) else { continue }
-            for name in oldNode.contribution.sortedUniqueDefinitions {
-                changedDefinitionNames.insert(name)
-                removedDefinitionIDsByName[name, default: []].insert(fileID)
-            }
-            for name in oldNode.contribution.sortedUniqueReferences {
-                changedReferenceNames.insert(name)
-                removedReferenceIDsByName[name, default: []].insert(fileID)
-            }
-        }
+        var removedDefinitionIDsByName: [String: [UUID]] = [:]
+        var removedReferenceIDsByName: [String: [UUID]] = [:]
         var insertedDefinitionIDsByName: [String: [UUID]] = [:]
         var insertedReferenceIDsByName: [String: [UUID]] = [:]
         for fileID in changedIDs {
             guard !Task.isCancelled else { return .cancelled }
+            if let oldNode = nodes.removeValue(forKey: fileID) {
+                for name in oldNode.contribution.sortedUniqueDefinitions {
+                    changedDefinitionNames.insert(name)
+                    removedDefinitionIDsByName[name, default: []].append(fileID)
+                }
+                for name in oldNode.contribution.sortedUniqueReferences {
+                    changedReferenceNames.insert(name)
+                    removedReferenceIDsByName[name, default: []].append(fileID)
+                }
+            }
             guard let slot = slots[fileID], let node = snapshotNode(from: slot) else { continue }
             nodes[fileID] = node
             for name in node.contribution.sortedUniqueDefinitions {
@@ -1292,39 +1305,31 @@ actor WorkspaceCodemapSelectionGraph {
             }
         }
         let finalNodes = nodes
-        let fileIDOrder: (UUID, UUID) -> Bool = { fileIDPrecedes($0, $1, nodes: finalNodes) }
-        // Base lists are ordered by base node paths, so removals binary-search under that order.
-        let baseFileIDOrder: (UUID, UUID) -> Bool = { fileIDPrecedes($0, $1, nodes: baseNodes) }
 
-        /// Posting lists stay sorted: drop removed IDs, then merge the (few) inserted IDs in place
-        /// of re-sorting every list the diff touches.
+        /// Posting sets are updated per changed ID; a hub name's set is never walked or copied whole.
         func updatePostings(
-            _ postings: inout [String: [UUID]],
+            _ postings: inout PersistentHashMap<String, PersistentHashSet<UUID>>,
             names: Set<String>,
-            removedIDsByName: [String: Set<UUID>],
+            removedIDsByName: [String: [UUID]],
             insertedIDsByName: [String: [UUID]]
         ) -> Bool {
             for name in names {
                 guard !Task.isCancelled else { return false }
-                var list = postings.removeValue(forKey: name) ?? []
-                if let removedIDs = removedIDsByName[name] {
-                    let removal = WorkspaceCodemapGraphOrdering.removeSorted(
-                        from: &list,
-                        removing: removedIDs,
-                        by: baseFileIDOrder
-                    )
-                    comparisons &+= UInt64(removal.comparisons)
-                    visits &+= UInt64(removedIDs.count + removal.scanned)
+                var set = postings[name] ?? []
+                for fileID in removedIDsByName[name] ?? [] {
+                    set.remove(fileID)
+                    visits &+= 1
                 }
-                if let insertedIDs = insertedIDsByName[name] {
-                    visits &+= UInt64(insertedIDs.count)
-                    comparisons &+= UInt64(WorkspaceCodemapGraphOrdering.mergeSortedInsertion(
-                        into: &list,
-                        inserting: insertedIDs,
-                        by: fileIDOrder
-                    ))
+                for fileID in insertedIDsByName[name] ?? [] {
+                    set.insert(fileID)
+                    visits &+= 1
                 }
-                if !list.isEmpty { postings[name] = list }
+                copies &+= UInt64(set.takeCopiedEntryCount())
+                if set.isEmpty {
+                    postings.removeValue(forKey: name)
+                } else {
+                    postings[name] = set
+                }
             }
             return true
         }
@@ -1340,51 +1345,60 @@ actor WorkspaceCodemapSelectionGraph {
             insertedIDsByName: insertedReferenceIDsByName
         ) else { return .cancelled }
 
+        // A source's evidence can change only when its own contribution changed or a definition
+        // candidate set it references changed. Referrers are enumerated from the postings, which is
+        // inherent: a new definer of a name gains an edge from every referrer of that name.
         var affectedSources = changedIDs
         for name in changedDefinitionNames {
-            affectedSources.formUnion(incrementalBase?.referencePostings[name] ?? [])
-            affectedSources.formUnion(references[name] ?? [])
+            for fileID in incrementalBase?.referencePostings[name] ?? [] {
+                affectedSources.insert(fileID)
+            }
+            for fileID in references[name] ?? [] {
+                affectedSources.insert(fileID)
+            }
         }
         if incrementalBase?.coverage.isComplete != coverage.isComplete {
             // A completeness transition changes missing/not-indexed-yet evidence globally.
-            affectedSources.formUnion(nodes.keys)
+            for fileID in nodes.keys {
+                affectedSources.insert(fileID)
+            }
         }
         visits &+= UInt64(affectedSources.count)
 
         // Remove old evidence only for affected sources, including its reverse adjacency entries.
         var delta = CandidateSizeDelta()
-        var removedEvidenceByTarget: [UUID: [WorkspaceCodemapGraphEdgeEvidence]] = [:]
+        var removedSourcesByTarget: [UUID: [UUID]] = [:]
         for source in affectedSources {
             guard !Task.isCancelled else { return .cancelled }
             if let evidenceList = outgoing.removeValue(forKey: source) {
                 delta.removedEdges &+= UInt64(evidenceList.count)
+                visits &+= UInt64(evidenceList.count)
                 for evidence in evidenceList {
-                    removedEvidenceByTarget[evidence.targetFileID, default: []].append(evidence)
+                    removedSourcesByTarget[evidence.targetFileID, default: []].append(source)
                     // Each evidence value is retained by both adjacency directions.
                     delta.remove(bytes: evidenceBytes(evidence))
                     delta.remove(bytes: evidenceBytes(evidence))
                 }
             }
-            for record in unresolved.removeValue(forKey: source) ?? [] {
-                delta.remove(bytes: unresolvedBytes(record))
+            if let records = unresolved.removeValue(forKey: source) {
+                visits &+= UInt64(records.count)
+                for record in records {
+                    delta.remove(bytes: unresolvedBytes(record))
+                }
             }
         }
-        let baseEdgeOrder: (WorkspaceCodemapGraphEdgeEvidence, WorkspaceCodemapGraphEdgeEvidence) -> Bool = {
-            edgePrecedes($0, $1, nodes: baseNodes)
-        }
-        for (target, removedEvidence) in removedEvidenceByTarget {
+        for (target, sources) in removedSourcesByTarget {
             guard !Task.isCancelled else { return .cancelled }
-            guard var list = reverse.removeValue(forKey: target) else { continue }
-            // Hub targets can have one reverse entry per source; locate the removed entries by
-            // binary search instead of filtering the whole list.
-            let removal = WorkspaceCodemapGraphOrdering.removeSorted(
-                from: &list,
-                removing: removedEvidence,
-                by: baseEdgeOrder
-            )
-            comparisons &+= UInt64(removal.comparisons)
-            visits &+= UInt64(removedEvidence.count + removal.scanned)
-            if !list.isEmpty { reverse[target] = list }
+            guard var bySource = reverse[target] else { continue }
+            for source in sources {
+                bySource.removeValue(forKey: source)
+            }
+            copies &+= UInt64(bySource.takeCopiedEntryCount())
+            if bySource.isEmpty {
+                reverse.removeValue(forKey: target)
+            } else {
+                reverse[target] = bySource
+            }
         }
 
         // Re-resolve only sources whose own contribution or referenced definition candidates changed.
@@ -1448,6 +1462,7 @@ actor WorkspaceCodemapSelectionGraph {
                     comparisons &+= 1
                     return edgeOrder(lhs, rhs)
                 }
+                copies &+= UInt64(sourceEvidence.count)
                 outgoing[source] = sourceEvidence
             }
             if !sourceUnresolved.isEmpty {
@@ -1463,19 +1478,19 @@ actor WorkspaceCodemapSelectionGraph {
                 for record in sourceUnresolved {
                     delta.add(bytes: unresolvedBytes(record))
                 }
+                copies &+= UInt64(sourceUnresolved.count)
                 unresolved[source] = sourceUnresolved
             }
         }
         for (target, insertedEvidence) in insertedEvidenceByTarget {
             guard !Task.isCancelled else { return .cancelled }
-            var list = reverse.removeValue(forKey: target) ?? []
+            var bySource = reverse[target] ?? PersistentHashMap()
+            for evidence in insertedEvidence {
+                bySource[evidence.sourceFileID] = evidence
+            }
             visits &+= UInt64(insertedEvidence.count)
-            comparisons &+= UInt64(WorkspaceCodemapGraphOrdering.mergeSortedInsertion(
-                into: &list,
-                inserting: insertedEvidence,
-                by: edgeOrder
-            ))
-            reverse[target] = list
+            copies &+= UInt64(bySource.takeCopiedEntryCount())
+            reverse[target] = bySource
         }
 
         // Price the diff. Node, slot, and posting deltas come from the changed IDs and names only.
@@ -1526,6 +1541,15 @@ actor WorkspaceCodemapSelectionGraph {
         if size.edges > limits.maxEdges { return .failure(.graphSize(.limitExceeded(dimension: .edges, attempted: size.edges, limit: limits.maxEdges))) }
         if size.bytes > limits.maxBytes { return .failure(.graphSize(.limitExceeded(dimension: .bytes, attempted: size.bytes, limit: limits.maxBytes))) }
 
+        // Account every trie entry the persistent maps copied or shifted for this candidate.
+        copies &+= UInt64(slots.takeCopiedEntryCount())
+        copies &+= UInt64(nodes.takeCopiedEntryCount())
+        copies &+= UInt64(definitions.takeCopiedEntryCount())
+        copies &+= UInt64(references.takeCopiedEntryCount())
+        copies &+= UInt64(outgoing.takeCopiedEntryCount())
+        copies &+= UInt64(reverse.takeCopiedEntryCount())
+        copies &+= UInt64(unresolved.takeCopiedEntryCount())
+
         let snapshot = WorkspaceCodemapGraphCommittedSnapshot(
             snapshotID: UUID(),
             graphRevision: nextRevision,
@@ -1551,7 +1575,8 @@ actor WorkspaceCodemapSelectionGraph {
             affectedSourceCount: affectedSources.count,
             resync: resync,
             comparisonCount: comparisons,
-            visitCount: visits
+            visitCount: visits,
+            copiedEntryCount: copies
         ))
     }
 
@@ -1581,21 +1606,25 @@ actor WorkspaceCodemapSelectionGraph {
     /// Conservative accounting for every retained immutable collection. Contributions appear in
     /// both slots and nodes by design, and both adjacency directions retain edge evidence.
     private static func fullSize(
-        slots: [UUID: WorkspaceCodemapGraphSlot],
-        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode],
-        definitions: [String: [UUID]],
-        references: [String: [UUID]],
-        outgoing: [UUID: [WorkspaceCodemapGraphEdgeEvidence]],
-        reverse: [UUID: [WorkspaceCodemapGraphEdgeEvidence]],
-        unresolved: [UUID: [WorkspaceCodemapGraphUnresolvedRecord]]
+        slots: PersistentHashMap<UUID, WorkspaceCodemapGraphSlot>,
+        nodes: PersistentHashMap<UUID, WorkspaceCodemapGraphSnapshotNode>,
+        definitions: PersistentHashMap<String, PersistentHashSet<UUID>>,
+        references: PersistentHashMap<String, PersistentHashSet<UUID>>,
+        outgoing: PersistentHashMap<UUID, [WorkspaceCodemapGraphEdgeEvidence]>,
+        reverse: PersistentHashMap<UUID, PersistentHashMap<UUID, WorkspaceCodemapGraphEdgeEvidence>>,
+        unresolved: PersistentHashMap<UUID, [WorkspaceCodemapGraphUnresolvedRecord]>
     ) -> CandidateSizeOutcome {
-        guard let postingCount = checkedAdd(checkedCount(definitions.values), checkedCount(references.values)),
-              let edgeCount = checkedCount(outgoing.values)
-        else { return .overflow }
+        var postingCount: UInt64 = 0
+        var edgeCount: UInt64 = 0
         var byteCount: UInt64 = 0
         func charge(_ bytes: UInt64?) -> Bool {
             guard let next = checkedAdd(byteCount, bytes) else { return false }
             byteCount = next
+            return true
+        }
+        func count(_ value: Int, into total: inout UInt64) -> Bool {
+            guard let next = checkedAdd(total, UInt64(exactly: value)) else { return false }
+            total = next
             return true
         }
         for node in nodes.values {
@@ -1608,22 +1637,27 @@ actor WorkspaceCodemapSelectionGraph {
         }
         for (name, fileIDs) in definitions {
             guard !Task.isCancelled else { return .cancelled }
-            let count = fileIDs.count + (references[name]?.count ?? 0)
-            guard charge(postingBytes(name: name, fileIDCount: count)) else { return .overflow }
+            let postingTotal = fileIDs.count + (references[name]?.count ?? 0)
+            guard count(fileIDs.count, into: &postingCount),
+                  charge(postingBytes(name: name, fileIDCount: postingTotal))
+            else { return .overflow }
         }
-        for (name, fileIDs) in references where definitions[name] == nil {
+        for (name, fileIDs) in references {
             guard !Task.isCancelled else { return .cancelled }
+            guard count(fileIDs.count, into: &postingCount) else { return .overflow }
+            guard definitions[name] == nil else { continue }
             guard charge(postingBytes(name: name, fileIDCount: fileIDs.count)) else { return .overflow }
         }
         for evidenceList in outgoing.values {
             guard !Task.isCancelled else { return .cancelled }
+            guard count(evidenceList.count, into: &edgeCount) else { return .overflow }
             for evidence in evidenceList {
                 guard charge(evidenceBytes(evidence)) else { return .overflow }
             }
         }
-        for evidenceList in reverse.values {
+        for bySource in reverse.values {
             guard !Task.isCancelled else { return .cancelled }
-            for evidence in evidenceList {
+            for evidence in bySource.values {
                 guard charge(evidenceBytes(evidence)) else { return .overflow }
             }
         }
@@ -1701,17 +1735,6 @@ actor WorkspaceCodemapSelectionGraph {
         return overflow ? nil : result
     }
 
-    private static func checkedCount<S: Sequence>(_ values: S) -> UInt64?
-        where S.Element: Collection
-    {
-        var result: UInt64 = 0
-        for value in values {
-            guard let count = UInt64(exactly: value.count), let next = checkedAdd(result, count) else { return nil }
-            result = next
-        }
-        return result
-    }
-
     private static func checkedStringBytes(_ strings: [String]) -> UInt64? {
         var result: UInt64 = 0
         for string in strings {
@@ -1735,7 +1758,7 @@ actor WorkspaceCodemapSelectionGraph {
     private static func fileIDPrecedes(
         _ lhs: UUID,
         _ rhs: UUID,
-        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode]
+        nodes: PersistentHashMap<UUID, WorkspaceCodemapGraphSnapshotNode>
     ) -> Bool {
         let left = nodes[lhs]?.standardizedRelativePath ?? ""
         let right = nodes[rhs]?.standardizedRelativePath ?? ""
@@ -1746,7 +1769,7 @@ actor WorkspaceCodemapSelectionGraph {
     private static func edgePrecedes(
         _ lhs: WorkspaceCodemapGraphEdgeEvidence,
         _ rhs: WorkspaceCodemapGraphEdgeEvidence,
-        nodes: [UUID: WorkspaceCodemapGraphSnapshotNode]
+        nodes: PersistentHashMap<UUID, WorkspaceCodemapGraphSnapshotNode>
     ) -> Bool {
         if lhs.sourceFileID != rhs.sourceFileID { return fileIDPrecedes(lhs.sourceFileID, rhs.sourceFileID, nodes: nodes) }
         if lhs.targetFileID != rhs.targetFileID { return fileIDPrecedes(lhs.targetFileID, rhs.targetFileID, nodes: nodes) }

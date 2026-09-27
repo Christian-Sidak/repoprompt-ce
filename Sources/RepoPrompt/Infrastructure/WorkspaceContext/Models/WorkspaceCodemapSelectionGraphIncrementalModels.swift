@@ -43,14 +43,25 @@ struct WorkspaceCodemapGraphCommittedSnapshot: Hashable {
     let appliedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
     let schemaVersion: UInt32
     let policyVersion: UInt32
-    let slotsByFileID: [UUID: WorkspaceCodemapGraphSlot]
-    let nodesByFileID: [UUID: WorkspaceCodemapGraphSnapshotNode]
-    let definitionPostings: [String: [UUID]]
-    let referencePostings: [String: [UUID]]
-    let outgoingEdgesBySource: [UUID: [WorkspaceCodemapGraphEdgeEvidence]]
-    let reverseEdgesByTarget: [UUID: [WorkspaceCodemapGraphEdgeEvidence]]
-    let unresolvedBySource: [UUID: [WorkspaceCodemapGraphUnresolvedRecord]]
+    // Persistent (structurally shared) storage: a commit derives the next snapshot by copying
+    // only the trie paths its diff touches, while readers keep pinning earlier snapshots.
+    // Posting sets and reverse adjacency are unordered; every reader imposes its own order.
+    let slotsByFileID: PersistentHashMap<UUID, WorkspaceCodemapGraphSlot>
+    let nodesByFileID: PersistentHashMap<UUID, WorkspaceCodemapGraphSnapshotNode>
+    let definitionPostings: PersistentHashMap<String, PersistentHashSet<UUID>>
+    let referencePostings: PersistentHashMap<String, PersistentHashSet<UUID>>
+    /// Per-source evidence, sorted by target path (small, rebuilt only for affected sources).
+    let outgoingEdgesBySource: PersistentHashMap<UUID, [WorkspaceCodemapGraphEdgeEvidence]>
+    /// Target file ID -> source file ID -> evidence.
+    let reverseEdgesByTarget: PersistentHashMap<UUID, PersistentHashMap<UUID, WorkspaceCodemapGraphEdgeEvidence>>
+    let unresolvedBySource: PersistentHashMap<UUID, [WorkspaceCodemapGraphUnresolvedRecord]>
     let sizeAccounting: WorkspaceCodemapGraphSizeAccounting
+
+    /// Incoming evidence for `target`, in unspecified order.
+    func reverseEdges(target: UUID) -> [WorkspaceCodemapGraphEdgeEvidence] {
+        guard let bySource = reverseEdgesByTarget[target] else { return [] }
+        return Array(bySource.values)
+    }
 }
 
 enum WorkspaceCodemapGraphApplyRejection: Error, Hashable {
@@ -171,6 +182,11 @@ struct WorkspaceCodemapGraphIncrementalAccounting: Hashable {
     var lastCandidateComparisonCount: UInt64 = 0
     var lastCandidateVisitCount: UInt64 = 0
     var maximumDiffCandidateVisitCount: UInt64 = 0
+    /// Storage entries copied or shifted per candidate. Persistent storage keeps this bounded by
+    /// the diff (times the trie depth), not by the resident graph.
+    var lastCandidateCopiedEntryCount: UInt64 = 0
+    var maximumDiffCandidateCopiedEntryCount: UInt64 = 0
+    var totalCandidateCopiedEntryCount: UInt64 = 0
     var totalCandidateComparisonCount: UInt64 = 0
     var totalCandidateVisitCount: UInt64 = 0
     var totalApplyDurationMilliseconds: UInt64 = 0

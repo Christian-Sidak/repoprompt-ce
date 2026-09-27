@@ -222,6 +222,12 @@ actor WorkspaceCodemapLiveOverlay {
         /// True when the last full reconciliation mapped one file ID to several paths. Path-scoped
         /// reconciliation is only exact for a one-to-one ledger, so it is disabled until repaired.
         var graphSlotsHaveCollisions: Bool
+        /// True when every live entry is the `liveFileIDByRelativePath` entry for its own path,
+        /// verified by the last full reconciliation. Every live-entry mutation that can add an
+        /// entry or change its path runs a full reconciliation in the same actor turn; the others
+        /// (joins, touches, exact duplicates) keep file ID and path. Path-scoped reconciliation
+        /// relies on this to resolve live state per dirty path without scanning the live layer.
+        var graphLiveEntriesIndexedByPath: Bool
         var graphIndexSlotsByFileID: GraphSlotLayer
         var retainedGraphSlotsByFileID: GraphSlotLayer
         var manifestGraphSlotsByRelativePath: [String: WorkspaceCodemapGraphSlot]
@@ -367,6 +373,7 @@ actor WorkspaceCodemapLiveOverlay {
             graphSlotsByFileID: [:],
             graphFileIDByRelativePath: [:],
             graphSlotsHaveCollisions: false,
+            graphLiveEntriesIndexedByPath: true,
             graphIndexSlotsByFileID: GraphSlotLayer(),
             retainedGraphSlotsByFileID: GraphSlotLayer(),
             manifestGraphSlotsByRelativePath: [:],
@@ -1404,6 +1411,7 @@ actor WorkspaceCodemapLiveOverlay {
         root.graphSlotsByFileID.removeAll()
         root.graphFileIDByRelativePath.removeAll()
         root.graphSlotsHaveCollisions = false
+        root.graphLiveEntriesIndexedByPath = true
         root.graphCoverageTally = GraphCoverageTally()
         revokeGraph(&root, rootEpoch: rootEpoch, reason: .repositoryAuthorityChanged)
         roots[rootEpoch] = root
@@ -1486,7 +1494,8 @@ actor WorkspaceCodemapLiveOverlay {
             totalReconcileVisitCount: counters.totalReconcileVisitCount,
             lastDiffSlotCount: counters.lastDiffSlotCount,
             floorResetCount: counters.floorResetCount,
-            acknowledgedPruneCount: counters.acknowledgedPruneCount
+            acknowledgedPruneCount: counters.acknowledgedPruneCount,
+            liveEntriesIndexedByPath: root.graphLiveEntriesIndexedByPath
         )
     }
 
@@ -1551,33 +1560,14 @@ actor WorkspaceCodemapLiveOverlay {
             WorkspaceCodemapGraphFenceReason
         ) async -> WorkspaceCodemapGraphFenceDisposition)? = nil
     ) async -> Bool {
-        guard let current = roots[rootEpoch], current.authorityIsCurrent,
-              catalogToken.rootEpoch == rootEpoch,
-              catalogToken.catalogGeneration == current.registration.catalogGeneration,
-              slots.allSatisfy({ $0.rootEpoch == rootEpoch })
-        else { return false }
-        var retainedProjectedTotal = current.graphProjectedSupportedCandidateTotal
-        if let currentToken = current.graphCatalogToken, currentToken != catalogToken {
-            let isSyntheticBootstrap = currentToken.catalogGeneration == catalogToken.catalogGeneration &&
-                currentToken.topologyGeneration == 0 &&
-                currentToken.appliedIndexGeneration == 0 &&
-                currentToken.ingressGeneration == 0 &&
-                currentToken.graphIndexInvalidationGeneration == 0
-            let isMonotonicReplacement = currentToken.rootEpoch == catalogToken.rootEpoch &&
-                currentToken.catalogGeneration == catalogToken.catalogGeneration &&
-                catalogToken.topologyGeneration >= currentToken.topologyGeneration &&
-                catalogToken.appliedIndexGeneration >= currentToken.appliedIndexGeneration &&
-                catalogToken.ingressGeneration >= currentToken.ingressGeneration &&
-                catalogToken.graphIndexInvalidationGeneration > currentToken.graphIndexInvalidationGeneration
-            guard isSyntheticBootstrap || isMonotonicReplacement else { return false }
-            retainedProjectedTotal = nil
-        }
-        if let projectedSupportedCandidateTotal {
-            guard projectedSupportedCandidateTotal >= UInt64(slots.count),
-                  retainedProjectedTotal == nil ||
-                  retainedProjectedTotal == projectedSupportedCandidateTotal
-            else { return false }
-        }
+        // Validate through a helper so no copy of the root outlives the check: a live copy would
+        // share every root table with the in-place mutation below and force whole-table copies.
+        guard graphIndexPublicationIsAdmissible(
+            rootEpoch: rootEpoch,
+            catalogToken: catalogToken,
+            slots: slots,
+            projectedSupportedCandidateTotal: projectedSupportedCandidateTotal
+        ) else { return false }
 
         guard var root = roots.removeValue(forKey: rootEpoch) else { return false }
         let publication = applyGraphIndexPublication(
@@ -1607,10 +1597,11 @@ actor WorkspaceCodemapLiveOverlay {
                     return false
                 }
             }
-            guard let resumed = roots[rootEpoch], resumed.authorityIsCurrent,
-                  resumed.graphCatalogToken == catalogToken,
-                  resumed.contributionGeneration == publication.contributionGeneration
-            else {
+            guard graphIndexPublicationResumed(
+                rootEpoch: rootEpoch,
+                catalogToken: catalogToken,
+                contributionGeneration: publication.contributionGeneration
+            ) else {
                 revokeGraphInPlace(rootEpoch: rootEpoch, reason: .reconciliationFailed)
                 return false
             }
@@ -1634,6 +1625,53 @@ actor WorkspaceCodemapLiveOverlay {
         }
         roots[rootEpoch] = finished
         return finished.authorityIsCurrent
+    }
+
+    private func graphIndexPublicationIsAdmissible(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        catalogToken: WorkspaceCodemapGraphIndexCatalogToken,
+        slots: [WorkspaceCodemapGraphSlot],
+        projectedSupportedCandidateTotal: UInt64?
+    ) -> Bool {
+        guard let current = roots[rootEpoch], current.authorityIsCurrent,
+              catalogToken.rootEpoch == rootEpoch,
+              catalogToken.catalogGeneration == current.registration.catalogGeneration,
+              slots.allSatisfy({ $0.rootEpoch == rootEpoch })
+        else { return false }
+        var retainedProjectedTotal = current.graphProjectedSupportedCandidateTotal
+        if let currentToken = current.graphCatalogToken, currentToken != catalogToken {
+            let isSyntheticBootstrap = currentToken.catalogGeneration == catalogToken.catalogGeneration &&
+                currentToken.topologyGeneration == 0 &&
+                currentToken.appliedIndexGeneration == 0 &&
+                currentToken.ingressGeneration == 0 &&
+                currentToken.graphIndexInvalidationGeneration == 0
+            let isMonotonicReplacement = currentToken.rootEpoch == catalogToken.rootEpoch &&
+                currentToken.catalogGeneration == catalogToken.catalogGeneration &&
+                catalogToken.topologyGeneration >= currentToken.topologyGeneration &&
+                catalogToken.appliedIndexGeneration >= currentToken.appliedIndexGeneration &&
+                catalogToken.ingressGeneration >= currentToken.ingressGeneration &&
+                catalogToken.graphIndexInvalidationGeneration > currentToken.graphIndexInvalidationGeneration
+            guard isSyntheticBootstrap || isMonotonicReplacement else { return false }
+            retainedProjectedTotal = nil
+        }
+        if let projectedSupportedCandidateTotal {
+            guard projectedSupportedCandidateTotal >= UInt64(slots.count),
+                  retainedProjectedTotal == nil ||
+                  retainedProjectedTotal == projectedSupportedCandidateTotal
+            else { return false }
+        }
+        return true
+    }
+
+    private func graphIndexPublicationResumed(
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        catalogToken: WorkspaceCodemapGraphIndexCatalogToken,
+        contributionGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
+    ) -> Bool {
+        guard let resumed = roots[rootEpoch] else { return false }
+        return resumed.authorityIsCurrent &&
+            resumed.graphCatalogToken == catalogToken &&
+            resumed.contributionGeneration == contributionGeneration
     }
 
     private struct GraphIndexPublication {
@@ -2534,9 +2572,13 @@ actor WorkspaceCodemapLiveOverlay {
 
         // Live state is the highest-precedence layer.
         var liveSlotsByPath: [String: WorkspaceCodemapGraphSlot] = [:]
-        for entry in root.liveByFileID.values {
-            guard let slot = liveGraphSlot(rootEpoch: rootEpoch, entry: entry) else { continue }
+        var liveEntriesIndexedByPath = true
+        for (fileID, entry) in root.liveByFileID {
             visits &+= 1
+            if root.liveFileIDByRelativePath[entry.identity.standardizedRelativePath] != fileID {
+                liveEntriesIndexedByPath = false
+            }
+            guard let slot = liveGraphSlot(rootEpoch: rootEpoch, entry: entry) else { continue }
             if let current = liveSlotsByPath[slot.standardizedRelativePath],
                !Self.graphLayerSlot(slot, supersedes: current)
             {
@@ -2572,6 +2614,7 @@ actor WorkspaceCodemapLiveOverlay {
         root.graphSlotsByFileID = slots
         root.graphFileIDByRelativePath = fileIDByPath
         root.graphSlotsHaveCollisions = collisions
+        root.graphLiveEntriesIndexedByPath = liveEntriesIndexedByPath
         root.graphLedgerCounters.fullReconcileCount &+= 1
         root.graphLedgerCounters.lastReconcileVisitCount = visits
         root.graphLedgerCounters.totalReconcileVisitCount &+= visits
@@ -2587,23 +2630,12 @@ actor WorkspaceCodemapLiveOverlay {
         rootEpoch: WorkspaceCodemapRootEpoch,
         scope: GraphIncrementalScope
     ) -> [UUID: WorkspaceCodemapGraphSlot?]? {
-        guard var tally = root.graphCoverageTally, !root.graphSlotsHaveCollisions else { return nil }
+        guard var tally = root.graphCoverageTally,
+              !root.graphSlotsHaveCollisions,
+              root.graphLiveEntriesIndexedByPath
+        else { return nil }
         let dirtyPaths = scope.dirtyRelativePaths
         var visits: UInt64 = 0
-
-        var liveSlotsByPath: [String: WorkspaceCodemapGraphSlot] = [:]
-        for entry in root.liveByFileID.values {
-            visits &+= 1
-            guard dirtyPaths.contains(entry.identity.standardizedRelativePath),
-                  let slot = liveGraphSlot(rootEpoch: rootEpoch, entry: entry)
-            else { continue }
-            if let current = liveSlotsByPath[slot.standardizedRelativePath],
-               !Self.graphLayerSlot(slot, supersedes: current)
-            {
-                continue
-            }
-            liveSlotsByPath[slot.standardizedRelativePath] = slot
-        }
 
         var winnersByPath: [String: WorkspaceCodemapGraphSlot] = [:]
         for path in dirtyPaths {
@@ -2629,7 +2661,14 @@ actor WorkspaceCodemapLiveOverlay {
             {
                 merge([cleanSlot])
             }
-            if let liveSlot = liveSlotsByPath[path] {
+            // With every live entry indexed by its own path, the path index names the only live
+            // entry that can exist at this path.
+            if let liveFileID = root.liveFileIDByRelativePath[path],
+               let entry = root.liveByFileID[liveFileID],
+               entry.identity.standardizedRelativePath == path,
+               let liveSlot = liveGraphSlot(rootEpoch: rootEpoch, entry: entry)
+            {
+                visits &+= 1
                 winner = liveSlot
             }
             guard var resolved = winner else { continue }

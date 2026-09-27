@@ -474,9 +474,9 @@ actor WorkspaceCodemapBindingEngine {
         category: "CodemapGraphIndex"
     )
 
-    /// After a committed graph diff the pull loop pauses for this multiple of the apply time.
-    /// Commits copy the immutable snapshot, so bounding their duty cycle keeps bulk indexing
-    /// from spending a core on back-to-back commits while still coalescing pending changes.
+    /// During bulk indexing the pull loop pauses after a committed diff for this multiple of the
+    /// apply time, bounding the commit duty cycle so pending publications coalesce into fewer,
+    /// larger diffs. Not applied once coverage is complete, so interactive updates stay prompt.
     private static let graphPullCoalescingFactor: UInt64 = 2
     private static let maximumGraphPullCoalescingNanoseconds: UInt64 = 250_000_000
 
@@ -928,10 +928,14 @@ actor WorkspaceCodemapBindingEngine {
                     let disposition = await graph.apply(changes)
                     switch disposition {
                     case .committed:
-                        // Pull again after a bounded pause. The overlay answers from current
-                        // state, so a wakeup arriving during the apply or the pause cannot be
-                        // lost; the pause only coalesces more changes into the next commit.
-                        await pauseGraphPullAfterCommit(applyStartedUptimeNanoseconds: applyStarted)
+                        // While coverage is incomplete (bulk indexing), pull again after a
+                        // bounded pause so more changes coalesce into the next commit. The
+                        // overlay answers from current state, so a wakeup arriving during the
+                        // apply or the pause cannot be lost. Interactive updates after indexing
+                        // completes are pulled immediately.
+                        if await graph.incrementalAccounting().coverage?.isComplete != true {
+                            await pauseGraphPullAfterCommit(applyStartedUptimeNanoseconds: applyStarted)
+                        }
                         shouldPull = true
                     case .unchanged:
                         shouldPull = true
