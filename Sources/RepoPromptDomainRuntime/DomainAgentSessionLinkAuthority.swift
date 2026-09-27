@@ -1109,7 +1109,8 @@ package actor DomainAgentSessionLinkAuthority {
             pendingInteractionKind: incoming.pendingInteractionKind,
             latestVisibleAssistantPreview: incoming.latestVisibleAssistantPreview,
             visibleRowCount: incoming.visibleRowCount,
-            lastActivityAt: incoming.lastActivityAt
+            lastActivityAt: incoming.lastActivityAt,
+            context: incoming.context
         )
     }
 
