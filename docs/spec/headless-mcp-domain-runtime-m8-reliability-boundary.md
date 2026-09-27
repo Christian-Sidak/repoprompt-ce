@@ -1,0 +1,173 @@
+# Headless MCP domain runtime M8 — reliability boundary for third-party consumers
+
+Date: 2026-09-28
+
+Base: `origin/main` at `dd1ca53e9c020f949615c5bf4616e70d286681e0`
+
+M8 continues the M0–M7 program. It does not introduce a new runtime, catalog,
+store, or server product. It finishes making the existing domain runtime and the
+`repoprompt-mcp` transport shell the reliability boundary that a third-party MCP
+host can depend on, and it records the evidence that gates any later change to
+the default backend.
+
+## Verified starting point
+
+The following were verified against source at the base SHA before any change.
+
+| Id | Finding | Evidence |
+|---|---|---|
+| C1 | App-backed proxy connects and handshakes before reading stdin and retries forever when the app socket is absent, refused, or `server_not_ready`. The host sees only its own startup timeout. | `BootstrapSocketProxy.start`, `MCPService.runTransport`, `CLIProxyRuntimePolicy.shouldRetry` |
+| C2 | On a terminal proxy failure with unreplayable work, the helper exits (73) without answering outstanding host requests. No response synthesis exists. | `JSONRPCBridgeLedger.recordConnectionFailure` / `beginConnection`, `handleRuntimeError` |
+| C3 | `MCPDomainHost` owns resource-admission controllers but `invoke` acquires no lease and applies no watchdog. Only the app adapter (`MCPConnectionManager`) composes lanes, leases, contracts, and `MCPToolExecutionWatchdog.execute`. Direct headless calls `domainHost.invoke` directly and renders every error as `String(describing:)`. | `MCPDomainHost.invoke`, `DirectHeadlessMCPService.installHandlers` |
+| C4 | Headless `read_file`, `file_search`, `get_file_tree`, and `get_code_structure` run synchronously on the cooperative pool with no size or file-count bounds; `get_code_structure` with an empty selection enumerates every file. | `MCPDomainCanonicalWorkspaceService` |
+| C9 | The deterministic bridge-ledger, host, watchdog, and direct-headless contract suites were removed in #908; the architecture doc still names them as validation owners. | `git show dbd9eeee` |
+
+The domain runtime already provides the primitives M8 composes: per-connection
+lane limiters (`MCPDomainConnectionCallLimiters`), resource admission
+(`MCPDomainToolResourceAdmissionController`), deadlines
+(`MCPDomainAdmissionDeadline`), execution contracts
+(`MCPToolExecutionContractCatalog`), and the watchdog
+(`MCPToolExecutionWatchdog`). M8 reuses them; it does not reimplement them.
+
+## Consumer invariants
+
+| # | Invariant |
+|---|---|
+| I1 | Every host request receives exactly one JSON-RPC response before the helper exits, unless the host's stdout is gone or a response for that id was already in delivery. |
+| I2 | `initialize` receives a response or a typed error within a bounded startup budget whether or not the app is running. |
+| I3 | Transport and execution failures carry a stable `code` and a `retryability` of `retryable`, `retry_after`, `indeterminate`, or `permanent`. |
+| I4 | No mutation is replayed or re-executed by transport recovery. A request that may have reached the app and is not on the replay allowlist is reported `indeterminate`, never `retryable`. |
+| I5 | Every direct-headless tool call is admitted through the same lanes, resource leases, and execution contracts as the app, and bounded calls settle within their declared deadline plus grace. |
+
+## Milestones
+
+Each milestone is committed only after its focused validation passes. A
+milestone that cannot be validated is left uncommitted and reported as blocked.
+
+### M8A — proxy startup budget and terminal settlement (I1, I2, I3, I4)
+
+Scope: `Sources/RepoPromptMCP`, `Sources/RepoPromptShared/MCP`.
+
+- Shared, additive failure contract: stable codes, retryability, and the JSON-RPC
+  error frame used for synthesized settlement.
+- Ledger API that claims every unanswered host-originated request exactly once at
+  terminal time, excluding ids whose response is already in delivery.
+- Terminal settlement: on any terminal proxy failure where the host's stdout is
+  still usable, write one JSON-RPC error per unanswered host request, then exit
+  with the unchanged exit code.
+- Pre-session startup budget: until the first accepted bootstrap handshake, a
+  bounded budget (default 20 s, `REPOPROMPT_MCP_STARTUP_TIMEOUT_SECONDS`, `0`
+  restores the legacy unbounded wait) ends the retry loop, answers every pending
+  host request with `app_unavailable`, and exits 73. A host that closes stdin
+  during startup ends the helper cleanly. After the first accepted handshake the
+  existing reconnect/replay policy is unchanged.
+- Terminal records gain additive settlement counts.
+
+Acceptance:
+
+- Deterministic tests: ledger claim semantics (forwarded, write-uncertain,
+  in-delivery exclusion, replayable classification, idempotence); settlement
+  frame shape; a fake-app `runBridge` chaos case where the app closes with an
+  unreplayable request and the host receives exactly one typed error; a
+  replayable-only failure still reconnects without settlement; stdout-fault
+  failures write nothing; startup budget with an absent socket answers
+  `initialize` with `app_unavailable`.
+- `repoprompt-mcp` builds; existing proxy/ledger/terminal-record tests pass.
+
+### M8B — shared host invocation pipeline for direct headless (I3, I5)
+
+Scope: `Sources/RepoPromptDomainRuntime`, `Sources/RepoPromptMCP`, the app's lane
+mapping.
+
+- Move the admission-class → connection-lane mapping into the domain runtime so
+  the app and headless share one definition.
+- Add a protocol-neutral invocation pipeline in the domain runtime that composes,
+  in order: pre-admission policy, per-connection lane permit, resource lease,
+  execution contract, watchdog for bounded contracts, and host invocation, and
+  classifies failures into the shared failure contract with the same codes the
+  app emits (`tool_execution_timeout`, `tool_execution_cleanup_unresponsive`,
+  `tool_execution_connection_terminal`, …).
+- Direct headless dispatches every call through that pipeline and renders typed
+  errors.
+
+Acceptance: deterministic domain-runtime tests prove the lane and lease bounds,
+exactly-once lease release on success, error, and cancellation, watchdog
+settlement with an injected clock, and typed classification; direct-headless
+tests prove the pipeline is used end to end.
+
+### M8C — bounded direct-headless read backends (I5, parity)
+
+Scope: `MCPDomainCanonicalWorkspaceService`.
+
+- Move blocking filesystem work off the cooperative pool (a dispatch queue) with
+  cooperative cancellation propagated from the calling task.
+- Bound reads to the app's default content-read limit (10,000,000 bytes), decode
+  UTF-8 (BOM stripped) or BOM-marked UTF-16, and fail typed for oversized,
+  undecodable, or non-regular files.
+- Enumerate lazily, bounded at 200,000 files per call; `file_search` skips file
+  content above the read limit and reports `skipped_large_files`, and reports
+  `truncated` when the enumeration bound is reached. `get_file_tree` stops at
+  20,000 lines with a truncation line.
+- `get_code_structure` with no paths and an empty selection returns an empty result
+  with a note instead of walking every root; explicit directories expand lazily up
+  to 256 supported files and report `truncated`.
+
+Acceptance: deterministic fixture tests (`MCPDomainCanonicalWorkspaceBoundsTests`)
+for the read limit, BOM/binary decoding, oversized search content, and the
+empty-selection and directory-expansion contracts.
+
+Known parity gaps kept for the parity harness: headless enumeration honors hidden
+and package-descendant skipping only, not `.gitignore` or the app's global ignore
+defaults, and headless result shapes are JSON rather than the app's formatted text.
+
+### M8D — restored deterministic contract coverage and documentation
+
+Restore the deterministic parts of the removed validation owners that M8 relies
+on, and correct `docs/architecture/headless-mcp-runtime.md` so validation owners
+and host ownership claims match source.
+
+### M8E — app tools/call hot path off the MainActor (first slice)
+
+Every app-backed `tools/call` currently performs a `MainActor.run` hop to read the
+window count and multi-window mode, including routing-bypass tools that only return
+constants. A lock-protected nonisolated mirror published synchronously from
+`WindowStatesManager.allWindows` replaces that hop. The mirror is updated inside the
+same main-actor mutation that changes the window list, so it is never older than the
+last completed window change.
+
+### Later milestones (not started in this pass)
+
+- Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
+- Cross-backend app-versus-headless parity and latency harness.
+- Post-initialize bounded answering of replayable requests while disconnected.
+- Live chaos matrix (app killed mid-request, restart during `initialize`), which
+  requires explicit approval to stop or relaunch the visible app.
+
+## Evidence (M8A–C)
+
+- Focused suites: conductor ticket `e05b3335-9c78-4841-bb60-b3b62e42fa99` —
+  `MCPDomainCanonicalWorkspaceBoundsTests` 5/5, `MCPDomainInvocationPipelineTests` 7/7,
+  `MCPProxyHostSettlementTests` 13/13.
+- Style: `conductor lint` ticket `ff57be55-0f61-49c8-91bd-fa13c8447d2b` passed (format-check
+  and strict SwiftLint).
+- `Scripts/headless_runtime_guardrails.sh` passed.
+- Not validated: `make guardrails` could not run its SwiftPM manifest dump in the sandboxed
+  environment (`sandbox_apply: Operation not permitted`); its source-layout report was
+  derivative of that failure. No full root-suite run, live MCP smoke, or app relaunch was
+  performed.
+
+Findings made while validating:
+
+- On Darwin a pipe whose writer closed reports readable-at-EOF rather than a guaranteed
+  `POLLHUP`, so the startup closed-input probe counts pending bytes (`FIONREAD`) and treats
+  readable-with-zero-pending as end of input; an ioctl failure falls back to the hang-up rule.
+- The proxy logger was a top-level global in the executable's `main.swift`. Entry-file globals
+  are initialized by top-level code, which never runs when the module is loaded in-process, so
+  the startup retry path stalled on its first log call under XCTest. The logger now lives in an
+  ordinary source file and initializes lazily in every host; production behavior is unchanged.
+
+## Cutover gate
+
+`app` remains the default backend and `auto` remains preview. M8 does not change
+either. A default change requires the live chaos matrix, the parity and latency
+harness, and packaged-release evidence listed above.

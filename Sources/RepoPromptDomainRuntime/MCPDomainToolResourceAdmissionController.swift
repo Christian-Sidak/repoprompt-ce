@@ -29,6 +29,8 @@ package final class MCPDomainToolResourceAdmissionController: @unchecked Sendabl
         case appWide
         case window(Int)
         case repository(String)
+        /// Direct-headless registration scope. Standalone composition never invents a window.
+        case standaloneScope(UUID)
     }
 
     package final class Lease: @unchecked Sendable {

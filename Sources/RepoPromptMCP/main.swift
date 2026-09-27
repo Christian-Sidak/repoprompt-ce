@@ -15,14 +15,7 @@ let CLI_VERSION = "1.5.0"
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
 
-let log: Logger = {
-    var logger = Logger(label: "com.repoprompt.ce.mcp.cli") {
-        StreamLogHandler.standardError(label: $0)
-    }
-    // Default to warning level - --verbose will enable more output
-    logger.logLevel = .warning
-    return logger
-}()
+// The process-wide `log` lives in MCPCLILog.swift so in-process hosts can use it safely.
 
 /// File-based debug logging for socket proxy debugging
 /// Enable via: defaults write com.repoprompt.ce.mcp enableSocketDebugLog -bool true
@@ -517,6 +510,9 @@ enum CLIProxyRuntimePolicy {
             {
                 return false
             }
+            if underlying is MCPProxyStartupBudgetExceeded {
+                return false
+            }
             guard let socketError = underlying as? SocketProxyError else {
                 return true
             }
@@ -578,6 +574,9 @@ enum CLIProxyRuntimePolicy {
             if underlying is JSONRPCBridgeLedgerError {
                 return "jsonrpc_bridge_terminal"
             }
+            if underlying is MCPProxyStartupBudgetExceeded {
+                return MCPProxyStartupBudgetExceeded.terminalReason
+            }
             if let socketError = underlying as? SocketProxyError {
                 switch socketError {
                 case .socketCreationFailed: return "socket_creation_failed"
@@ -619,7 +618,8 @@ enum CLIProxyRuntimePolicy {
         ledgerSnapshot: JSONRPCBridgeLedgerSnapshot,
         runtimeError: CLIRuntimeError?,
         fallbackReason: String,
-        unexpectedError: Swift.Error? = nil
+        unexpectedError: Swift.Error? = nil,
+        hostSettlement: MCPProxyHostSettlement.Outcome? = nil
     ) -> MCPTerminalRecord {
         let reason = terminalReason(
             runtimeError: runtimeError,
@@ -646,7 +646,9 @@ enum CLIProxyRuntimePolicy {
             bridgeCancellationTombstoneCount: ledgerSnapshot.cancellationTombstoneCount,
             bridgeRecentCompletionCount: ledgerSnapshot.recentCompletionCount,
             bridgePendingTransactionCount: ledgerSnapshot.pendingTransactionCount,
-            bridgeHasForwardedProtocolFrame: ledgerSnapshot.hasForwardedProtocolFrame
+            bridgeHasForwardedProtocolFrame: ledgerSnapshot.hasForwardedProtocolFrame,
+            hostSettledRequestCount: hostSettlement?.settledRequestCount,
+            hostUnsettledRequestCount: hostSettlement?.unsettledRequestCount
         )
     }
 
@@ -838,9 +840,15 @@ actor BootstrapSocketProxy {
     private let replayInitializationOnStart: Bool
     private let bridgeLedger: JSONRPCBridgeLedger
     private let faultRule: JSONRPCBridgeFaultRule?
+    private let onHandshakeAccepted: @Sendable () async -> Void
+    private let hostInputFD: Int32
+    private let hostOutputFD: Int32
     private var socketFD: Int32 = -1
 
     init(
+        socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(),
+        hostInputFD: Int32 = STDIN_FILENO,
+        hostOutputFD: Int32 = STDOUT_FILENO,
         sessionToken: String,
         clientName: String?,
         identityCache: ClientIdentityCache,
@@ -848,9 +856,13 @@ actor BootstrapSocketProxy {
         outstandingRequestReplayState: MCPOutstandingRequestReplayState,
         replayInitializationOnStart: Bool,
         bridgeLedger: JSONRPCBridgeLedger,
-        faultRule: JSONRPCBridgeFaultRule?
+        faultRule: JSONRPCBridgeFaultRule?,
+        onHandshakeAccepted: @escaping @Sendable () async -> Void = {}
     ) {
-        socketURL = MCPFilesystemConstants.bootstrapSocketURL()
+        self.onHandshakeAccepted = onHandshakeAccepted
+        self.socketURL = socketURL
+        self.hostInputFD = hostInputFD
+        self.hostOutputFD = hostOutputFD
         self.sessionToken = sessionToken
         self.clientName = clientName
         self.identityCache = identityCache
@@ -884,6 +896,7 @@ actor BootstrapSocketProxy {
         case "accepted":
             log.debug("BootstrapSocketProxy: Handshake accepted, starting bridge")
             debugLog("Handshake accepted, starting stdin/stdout bridge")
+            await onHandshakeAccepted()
             if replayInitializationOnStart {
                 let plan = try await Self.requireReplayPlan(from: initializeReplayState)
                 initialSocketBytes = try await Self.replayInitializedSession(plan, socketFD: socketFD)
@@ -919,6 +932,8 @@ actor BootstrapSocketProxy {
         let faultRule = faultRule
         try await Self.runBridge(
             socketFD: fd,
+            stdinFD: hostInputFD,
+            stdoutFD: hostOutputFD,
             identityCache: cache,
             initializeReplayState: replayState,
             outstandingRequestReplayState: outstandingReplayState,
@@ -2024,14 +2039,31 @@ actor MCPService: Service {
     /// so fully correlated bridge states can be resumed and ambiguous states fail closed.
     private let bridgeLedger: JSONRPCBridgeLedger
 
+    /// Pre-session startup budget. Applies only until the first accepted bootstrap handshake.
+    private let startupPolicy: MCPProxyStartupPolicy
+    private let startupUptime = ProcessInfo.processInfo.systemUptime
+    private var hasAcceptedBootstrapSession = false
+    private let socketURL: URL
+    private let hostInputFD: Int32
+    private let hostOutputFD: Int32
+
     // Kill signal watcher state
     private var killSignalFD: Int32 = -1
     private var killSignalSource: DispatchSourceFileSystemObject?
     private var killSignalContinuation: CheckedContinuation<CLIKillSignal.SignalContent?, Never>?
 
-    init() {
+    init(
+        startupPolicy: MCPProxyStartupPolicy = .fromEnvironment(),
+        socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(),
+        hostInputFD: Int32 = STDIN_FILENO,
+        hostOutputFD: Int32 = STDOUT_FILENO
+    ) {
         let sessionToken = UUID().uuidString
         self.sessionToken = sessionToken
+        self.startupPolicy = startupPolicy
+        self.socketURL = socketURL
+        self.hostInputFD = hostInputFD
+        self.hostOutputFD = hostOutputFD
         bridgeLedger = JSONRPCBridgeLedger(connectionID: sessionToken, traceSink: { event in
             MCPResponseDeliveryTracer.emit(event)
         })
@@ -2237,21 +2269,35 @@ actor MCPService: Service {
                 initialPPID: initialPPID
             )
         } catch {
+            // Every task has settled here, so nothing else writes to stdout. Answer each
+            // host request the app can no longer answer before the process exits.
+            let settlement = await MCPProxyHostSettlement.settle(
+                error: error,
+                ledger: bridgeLedger,
+                stdinFD: hostInputFD,
+                stdoutFD: hostOutputFD
+            )
             await persistProxyTerminalRecord(
                 runtimeError: CLIProxyRuntimePolicy.normalizedTerminalRuntimeError(for: error),
                 fallbackReason: "proxy_unexpected_error",
                 initialPPID: initialPPID,
-                unexpectedError: error
+                unexpectedError: error,
+                hostSettlement: settlement
             )
             throw error
         }
+    }
+
+    private func markBootstrapSessionAccepted() {
+        hasAcceptedBootstrapSession = true
     }
 
     private func persistProxyTerminalRecord(
         runtimeError: CLIRuntimeError?,
         fallbackReason: String,
         initialPPID: pid_t,
-        unexpectedError: Swift.Error? = nil
+        unexpectedError: Swift.Error? = nil,
+        hostSettlement: MCPProxyHostSettlement.Outcome? = nil
     ) async {
         let snapshot = await bridgeLedger.snapshot()
         let record = CLIProxyRuntimePolicy.makeTerminalRecord(
@@ -2261,7 +2307,8 @@ actor MCPService: Service {
             ledgerSnapshot: snapshot,
             runtimeError: runtimeError,
             fallbackReason: fallbackReason,
-            unexpectedError: unexpectedError
+            unexpectedError: unexpectedError,
+            hostSettlement: hostSettlement
         )
         _ = MCPTerminalRecordStore.writeBestEffort(
             record,
@@ -2337,7 +2384,12 @@ actor MCPService: Service {
     /// Retry strategy:
     /// - First 60 seconds: aggressive retries every 0.5s (app might just be restarting)
     /// - After 60 seconds: exponential backoff from 1s up to 30s
-    private func runTransport() async throws {
+    /// Process-lifetime bridge ledger, exposed for terminal-settlement contract tests.
+    nonisolated var ledgerForSettlement: JSONRPCBridgeLedger {
+        bridgeLedger
+    }
+
+    func runTransport() async throws {
         var attempt = 0
         var firstFailureTime: Date?
 
@@ -2366,6 +2418,24 @@ actor MCPService: Service {
                     throw err
                 }
 
+                // Before the first accepted session the host's requests are unread in stdin.
+                // Bound that wait and let a host that has shut down end the helper.
+                let awaitingFirstSession = !hasAcceptedBootstrapSession
+                let startupElapsed = ProcessInfo.processInfo.systemUptime - startupUptime
+                if awaitingFirstSession {
+                    if MCPProxyHostSettlement.hostClosedInputWithoutPendingData(fd: hostInputFD) {
+                        throw CLIRuntimeError.hostDisconnected(.stdinClosed)
+                    }
+                    if startupPolicy.isExhausted(elapsedSeconds: startupElapsed),
+                       let budgetSeconds = startupPolicy.budgetSeconds
+                    {
+                        throw CLIRuntimeError.connectionFailed(underlying: MCPProxyStartupBudgetExceeded(
+                            budgetSeconds: budgetSeconds,
+                            lastFailureReason: transportFailureReason(for: err)
+                        ))
+                    }
+                }
+
                 attempt += 1
                 let now = Date()
                 if firstFailureTime == nil {
@@ -2373,7 +2443,7 @@ actor MCPService: Service {
                 }
 
                 let elapsedSinceFirstFailure = now.timeIntervalSince(firstFailureTime!)
-                let delay: Double
+                var delay: Double
 
                 if elapsedSinceFirstFailure < aggressivePhaseDuration {
                     // Phase 1: Frequent retries - app might just be restarting
@@ -2385,6 +2455,9 @@ actor MCPService: Service {
                     let expDelay = min(maxDelay, backoffBase * pow(2.0, Double(max(0, backoffAttempt - 1))))
                     let jitter = Double.random(in: 0 ... (0.2 * expDelay))
                     delay = min(maxDelay, expDelay + jitter)
+                }
+                if awaitingFirstSession {
+                    delay = startupPolicy.cappedRetryDelay(delay, elapsedSeconds: startupElapsed)
                 }
 
                 log.warning("Bootstrap connection lost (\(err)). Retrying in \(String(format: "%.1f", delay))s (attempt \(attempt), elapsed \(String(format: "%.0f", elapsedSinceFirstFailure))s)")
@@ -2434,6 +2507,9 @@ actor MCPService: Service {
 
         // Use bootstrap socket proxy (CLI connects to app's socket server)
         let proxy = BootstrapSocketProxy(
+            socketURL: socketURL,
+            hostInputFD: hostInputFD,
+            hostOutputFD: hostOutputFD,
             sessionToken: sessionToken,
             clientName: displayName,
             identityCache: identityCache,
@@ -2441,7 +2517,10 @@ actor MCPService: Service {
             outstandingRequestReplayState: outstandingRequestReplayState,
             replayInitializationOnStart: replayInitialization,
             bridgeLedger: bridgeLedger,
-            faultRule: Self.responseDeliveryFaultRuleFromEnvironment()
+            faultRule: Self.responseDeliveryFaultRuleFromEnvironment(),
+            onHandshakeAccepted: { [weak self] in
+                await self?.markBootstrapSessionAccepted()
+            }
         )
 
         do {
@@ -2518,7 +2597,11 @@ func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
     switch err {
     case let .connectionFailed(underlying):
         log.error("Connection failed: \(underlying)")
-        fputs("RepoPrompt MCP: connection failed – \(underlying)\n", stderr)
+        if let startup = underlying as? MCPProxyStartupBudgetExceeded {
+            fputs("RepoPrompt MCP: \(startup.errorDescription ?? "startup budget exceeded")\n", stderr)
+        } else {
+            fputs("RepoPrompt MCP: connection failed – \(underlying)\n", stderr)
+        }
         exit(exitCode.rawValue)
     case .approvalDenied:
         fputs("RepoPrompt MCP: connection closed immediately. Approval was likely denied or the server is disabled. Check the RepoPrompt approval dialog or MCP settings.\n", stderr)

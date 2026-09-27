@@ -525,6 +525,44 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
     }
 }
 
+/// One host-originated request that the app can no longer answer.
+public struct JSONRPCBridgeUnansweredHostRequest: Equatable, Sendable {
+    public let id: JSONRPCBridgeID
+    public let method: String?
+    public let tool: String?
+    public let isReplayable: Bool
+    public let requestState: MCPTransportRequestState
+
+    public init(
+        id: JSONRPCBridgeID,
+        method: String?,
+        tool: String?,
+        isReplayable: Bool,
+        requestState: MCPTransportRequestState
+    ) {
+        self.id = id
+        self.method = method
+        self.tool = tool
+        self.isReplayable = isReplayable
+        self.requestState = requestState
+    }
+}
+
+/// Result of claiming unanswered host requests at terminal time. Each claimed request is
+/// removed from the ledger, so a second claim can never answer the same id twice.
+public struct JSONRPCBridgeHostSettlementClaim: Equatable, Sendable {
+    /// Claimed requests in host submission order.
+    public let requests: [JSONRPCBridgeUnansweredHostRequest]
+    /// Host request ids whose app response was already being written to the host. They are
+    /// never answered again because the host may already hold a partial or complete response.
+    public let responseInDeliveryCount: Int
+
+    public init(requests: [JSONRPCBridgeUnansweredHostRequest], responseInDeliveryCount: Int) {
+        self.requests = requests
+        self.responseInDeliveryCount = responseInDeliveryCount
+    }
+}
+
 public enum JSONRPCBridgeLedgerError: Swift.Error, Equatable, CustomStringConvertible {
     case terminal(String)
     case malformedBackendFrame
@@ -1170,6 +1208,53 @@ public actor JSONRPCBridgeLedger {
             unreplayableActiveRequestCount: Self.unreplayableActiveRequestCount(in: active),
             hasForwardedProtocolFrame: hasForwardedProtocolFrame,
             terminalReason: terminalReason
+        )
+    }
+
+    /// Terminalizes the bridge and claims every host-originated request that has not received
+    /// an app response. Requests whose response is already in delivery, and any successor that
+    /// reused such an id, are excluded and counted instead: answering them could give the host
+    /// two responses for one id. The claim is idempotent.
+    public func claimUnansweredHostRequests(terminalReason reason: String) -> JSONRPCBridgeHostSettlementClaim {
+        _ = failTerminal(reason)
+        var claimed: [(ordinal: UInt64, request: JSONRPCBridgeUnansweredHostRequest)] = []
+        var responseInDeliveryCount = 0
+        for (key, state) in active where key.direction == .clientToServer {
+            let requestState: MCPTransportRequestState
+            switch state {
+            case .forwarded:
+                requestState = .forwarded
+            case let .reserved(_, transaction):
+                pendingTransactions.removeValue(forKey: transaction)
+                requestState = .deliveryUncertain
+            case .responseInDelivery:
+                responseInDeliveryCount += 1
+                continue
+            }
+            let metadata = state.metadata
+            active.removeValue(forKey: key)
+            claimed.append((
+                metadata.ordinal,
+                JSONRPCBridgeUnansweredHostRequest(
+                    id: key.id,
+                    method: metadata.method,
+                    tool: metadata.tool,
+                    isReplayable: metadata.isReplayable,
+                    requestState: requestState
+                )
+            ))
+        }
+        claimed.sort { $0.ordinal < $1.ordinal }
+        emit(
+            phase: "host_requests_settlement_claimed",
+            direction: .clientToServer,
+            messages: [],
+            prepared: nil,
+            terminalReason: terminalReason
+        )
+        return JSONRPCBridgeHostSettlementClaim(
+            requests: claimed.map(\.request),
+            responseInDeliveryCount: responseInDeliveryCount
         )
     }
 

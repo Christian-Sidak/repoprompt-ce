@@ -5,24 +5,8 @@ import RepoPromptDomainRuntime
 typealias MCPToolAdmissionClass = RepoPromptDomainRuntime.MCPToolAdmissionClass
 typealias MCPToolOperationIdentity = RepoPromptDomainRuntime.MCPDomainToolOperationIdentity
 
-extension MCPToolAdmissionClass {
-    var connectionLane: MCPConnectionCallLane {
-        switch self {
-        case .exclusive:
-            .ordinary
-        case .control:
-            .control
-        case .smallRead:
-            .smallRead
-        case .fileRead:
-            .fileRead
-        case .gitRead:
-            .gitRead
-        case .fileSearch:
-            .fileSearch
-        }
-    }
-}
+// `MCPToolAdmissionClass.connectionLane` is defined once in the domain runtime and shared with
+// direct headless admission.
 
 enum MCPToolAdmissionPolicy {
     /// Keep app-host admission aligned with the package-level domain limits.

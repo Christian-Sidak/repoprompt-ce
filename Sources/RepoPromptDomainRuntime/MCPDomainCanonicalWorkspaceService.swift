@@ -75,6 +75,47 @@ package struct DomainCanonicalWorkspaceAdapter {
     }
 }
 
+/// Bounds for direct-headless physical reads. File-size limits match the app's default content
+/// read limit; enumeration limits keep one call from walking an unbounded tree.
+package enum MCPDomainCanonicalReadBounds {
+    package static let maximumReadFileBytes = 10_000_000
+    package static let maximumSearchFileBytes = 10_000_000
+    package static let maximumEnumeratedFiles = 200_000
+    package static let maximumTreeLines = 20000
+    package static let maximumCodeStructureFiles = 256
+}
+
+package enum MCPDomainCanonicalReadError: Error, Equatable, LocalizedError {
+    case fileTooLarge(byteCount: Int, limit: Int)
+    case undecodableText
+    case notARegularFile
+
+    package var errorDescription: String? {
+        switch self {
+        case let .fileTooLarge(byteCount, limit):
+            "File is \(byteCount) bytes, which exceeds the \(limit)-byte read limit."
+        case .undecodableText:
+            "File is not UTF-8 or UTF-16 text."
+        case .notARegularFile:
+            "Path is not a regular file."
+        }
+    }
+}
+
+/// Cooperative cancellation for blocking filesystem work that runs off the Swift concurrency pool.
+private final class BlockingCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.withLock { cancelled = true }
+    }
+
+    func check() throws {
+        if lock.withLock({ cancelled }) { throw CancellationError() }
+    }
+}
+
 /// Canonical transport-neutral implementation of the standalone workspace capability family.
 /// The executable supplies only authoritative snapshot/mutation/path adapters; argument parsing,
 /// selection semantics, file reads, search, tree rendering, codemaps, prompt/context projection,
@@ -125,31 +166,53 @@ package struct MCPDomainCanonicalWorkspaceService {
         let args = try request.request.mcpArguments()
         let snapshot = try await adapter.readSnapshot(request)
         let requested = args["paths"]?.arrayValue?.compactMap(\.stringValue) ?? snapshot.selection
-        let candidates: [URL] = if requested.isEmpty {
-            Self.files(under: snapshot.roots).filter {
-                CodeMapSyntaxEngine.supportsCodeMap(fileExtension: $0.pathExtension)
-            }
-        } else {
-            try requested.prefix(256).flatMap { raw -> [URL] in
-                let resolved = try adapter.resolvePath(raw, snapshot.roots, false)
+        // Like the app, omitted paths mean the current selection. An empty selection never
+        // expands to a whole-root walk.
+        guard !requested.isEmpty else {
+            return try .object([
+                "files": .array([]),
+                "updates_pending": .bool(false),
+                "backend": .string("headless"),
+                "note": .string("No paths were given and the selection is empty.")
+            ])
+        }
+        let limit = MCPDomainCanonicalReadBounds.maximumCodeStructureFiles
+        let resolved = try requested.prefix(limit).map { raw in
+            try adapter.resolvePath(raw, snapshot.roots, false)
+        }
+        let (files, truncated) = try await Self.runCancellableBlocking { cancellation in
+            var candidates: [URL] = []
+            var truncated = false
+            for url in resolved {
                 var isDirectory: ObjCBool = false
-                if FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                    return Self.files(under: [resolved])
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                    let scan = try Self.forEachFile(under: [url], cancellation: cancellation) { file, _ in
+                        guard CodeMapSyntaxEngine.supportsCodeMap(fileExtension: file.pathExtension) else { return true }
+                        candidates.append(file)
+                        return candidates.count < limit
+                    }
+                    truncated = truncated || scan.stoppedEarly
+                } else if CodeMapSyntaxEngine.supportsCodeMap(fileExtension: url.pathExtension) {
+                    candidates.append(url)
                 }
-                return [resolved]
+                if candidates.count >= limit {
+                    truncated = truncated || url != resolved.last
+                    break
+                }
             }
+            let files = try candidates.prefix(limit).map { file -> Value in
+                try cancellation.check()
+                return try Self.codeMapResult(file)
+            }
+            return (files, truncated || requested.count > limit)
         }
-        let limited = Array(candidates.filter {
-            CodeMapSyntaxEngine.supportsCodeMap(fileExtension: $0.pathExtension)
-        }.prefix(256))
-        let files = try await Self.runBlocking {
-            try limited.map(Self.codeMapResult)
-        }
-        return try .object([
+        var result: [String: Value] = [
             "files": .array(files),
             "updates_pending": .bool(false),
             "backend": .string("headless")
-        ])
+        ]
+        if truncated { result["truncated"] = .bool(true) }
+        return try .object(result)
     }
 
     package func renderFileTree(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
@@ -164,7 +227,23 @@ package struct MCPDomainCanonicalWorkspaceService {
         } else {
             snapshot.roots
         }
-        let lines = roots.flatMap { root in Self.treeLines(root: root, maxDepth: maxDepth) }
+        let lines = try await Self.runCancellableBlocking { cancellation in
+            var lines: [String] = []
+            for root in roots {
+                let remaining = MCPDomainCanonicalReadBounds.maximumTreeLines - lines.count
+                guard remaining > 0 else { break }
+                try lines.append(contentsOf: Self.treeLines(
+                    root: root,
+                    maxDepth: maxDepth,
+                    maximumLines: remaining,
+                    cancellation: cancellation
+                ))
+            }
+            if lines.count >= MCPDomainCanonicalReadBounds.maximumTreeLines {
+                lines.append("… truncated after \(MCPDomainCanonicalReadBounds.maximumTreeLines) lines; narrow with path or max_depth")
+            }
+            return lines
+        }
         return try .mcp(.string(lines.joined(separator: "\n")))
     }
 
@@ -175,7 +254,9 @@ package struct MCPDomainCanonicalWorkspaceService {
             throw MCPError.invalidParams("missing path")
         }
         let url = try adapter.resolvePath(rawPath, snapshot.roots, false)
-        let text = try String(contentsOf: url, encoding: .utf8)
+        let text = try await Self.runCancellableBlocking { _ in
+            try Self.readText(at: url, limit: MCPDomainCanonicalReadBounds.maximumReadFileBytes)
+        }
         let lines = text.components(separatedBy: .newlines)
         let start = args["start_line"]?.intValue
         let limit = args["limit"]?.intValue
@@ -202,7 +283,8 @@ package struct MCPDomainCanonicalWorkspaceService {
         let regexEnabled = args["regex"]?.boolValue ?? Self.looksLikeRegex(pattern)
         let wholeWord = args["whole_word"]?.boolValue ?? false
         let regexPattern = wholeWord ? "\\b(?:\(pattern))\\b" : pattern
-        let regex = regexEnabled ? try NSRegularExpression(pattern: regexPattern) : nil
+        // Validate once here; the blocking scan compiles its own instance.
+        if regexEnabled { _ = try NSRegularExpression(pattern: regexPattern) }
         let mode = (args["mode"]?.stringValue ?? "auto").lowercased()
         guard ["auto", "path", "content", "both"].contains(mode) else {
             throw MCPError.invalidParams("mode must be auto, path, content, or both")
@@ -211,37 +293,53 @@ package struct MCPDomainCanonicalWorkspaceService {
         let searchesPaths = mode == "path" || mode == "both" || (mode == "auto" && pattern.contains("*"))
         let searchesContent = mode == "content" || mode == "both" || (mode == "auto" && !searchesPaths)
         let relativeRoots = Self.relativeRoots(snapshot.roots)
-        var results: [Value] = []
-        for file in Self.files(under: snapshot.roots) {
-            try Task.checkCancellation()
-            if results.count >= maxResults { break }
-            let relative = Self.relativePath(file, roots: relativeRoots)
-            guard Self.includes(relativePath: relative, file: file, filter: filter) else {
-                continue
-            }
-            if searchesPaths,
-               Self.matches(pattern, value: relative, regex: regex, wholeWord: wholeWord)
-            {
-                results.append(.object(["path": .string(relative)]))
-                if results.count >= maxResults { break }
-            }
-            guard searchesContent else { continue }
-            guard let text = try? String(contentsOf: file, encoding: .utf8) else { continue }
-            for (index, line) in text.components(separatedBy: .newlines).enumerated() {
-                if Self.matches(pattern, value: line, regex: regex, wholeWord: wholeWord) {
+        let roots = snapshot.roots
+        let (results, enumerationTruncated, skippedLargeFiles) = try await Self.runCancellableBlocking { cancellation in
+            let regex = regexEnabled ? try NSRegularExpression(pattern: regexPattern) : nil
+            var results: [Value] = []
+            var skippedLargeFiles = 0
+            let scan = try Self.forEachFile(under: roots, cancellation: cancellation) { file, byteCount in
+                let relative = Self.relativePath(file, roots: relativeRoots)
+                guard Self.includes(relativePath: relative, file: file, filter: filter) else {
+                    return true
+                }
+                if searchesPaths,
+                   Self.matches(pattern, value: relative, regex: regex, wholeWord: wholeWord)
+                {
+                    results.append(.object(["path": .string(relative)]))
+                    if results.count >= maxResults { return false }
+                }
+                guard searchesContent else { return true }
+                if let byteCount, byteCount > MCPDomainCanonicalReadBounds.maximumSearchFileBytes {
+                    skippedLargeFiles += 1
+                    return true
+                }
+                guard let text = try? Self.readText(
+                    at: file,
+                    limit: MCPDomainCanonicalReadBounds.maximumSearchFileBytes
+                ) else { return true }
+                for (index, line) in text.components(separatedBy: .newlines).enumerated() {
+                    guard Self.matches(pattern, value: line, regex: regex, wholeWord: wholeWord) else { continue }
                     results.append(.object([
                         "path": .string(relative),
                         "line": .int(index + 1),
                         "text": .string(line)
                     ]))
-                    if results.count >= maxResults { break }
+                    if results.count >= maxResults { return false }
                 }
+                return true
             }
+            return (results, scan.enumerationLimitReached, skippedLargeFiles)
         }
+        var bounds: [String: Value] = [:]
+        if enumerationTruncated { bounds["truncated"] = .bool(true) }
+        if skippedLargeFiles > 0 { bounds["skipped_large_files"] = .int(skippedLargeFiles) }
         if args["count_only"]?.boolValue == true {
-            return try .object(["count": .int(results.count)])
+            return try .object(["count": .int(results.count)].merging(bounds) { current, _ in current })
         }
-        return try .object(["matches": .array(results), "count": .int(results.count)])
+        return try .object(
+            ["matches": .array(results), "count": .int(results.count)].merging(bounds) { current, _ in current }
+        )
     }
 
     private struct SearchFilter {
@@ -492,23 +590,87 @@ package struct MCPDomainCanonicalWorkspaceService {
         return value
     }
 
-    private static func files(under roots: [URL]) -> [URL] {
-        roots.flatMap { root -> [URL] in
-            guard let enumerator = FileManager.default.enumerator(
-                at: root,
-                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
-                options: [.skipsHiddenFiles, .skipsPackageDescendants]
-            ) else { return [] }
-            return enumerator.compactMap { item -> URL? in
-                guard let url = item as? URL,
-                      (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-                else { return nil }
-                return url
-            }
+    private static func runCancellableBlocking<T: Sendable>(
+        _ operation: @escaping @Sendable (BlockingCancellation) throws -> T
+    ) async throws -> T {
+        let cancellation = BlockingCancellation()
+        return try await withTaskCancellationHandler {
+            try await runBlocking { try operation(cancellation) }
+        } onCancel: {
+            cancellation.cancel()
         }
     }
 
-    private static func treeLines(root: URL, maxDepth: Int) -> [String] {
+    /// Reads a bounded text file as UTF-8, or UTF-16 when a byte-order mark says so.
+    private static func readText(at url: URL, limit: Int) throws -> String {
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values.isRegularFile == true else { throw MCPDomainCanonicalReadError.notARegularFile }
+        if let size = values.fileSize, size > limit {
+            throw MCPDomainCanonicalReadError.fileTooLarge(byteCount: size, limit: limit)
+        }
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        guard data.count <= limit else {
+            throw MCPDomainCanonicalReadError.fileTooLarge(byteCount: data.count, limit: limit)
+        }
+        if data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]) {
+            guard let text = String(data: data, encoding: .utf16) else {
+                throw MCPDomainCanonicalReadError.undecodableText
+            }
+            return text
+        }
+        let body = data.starts(with: [0xEF, 0xBB, 0xBF]) ? data.dropFirst(3) : data[...]
+        guard let text = String(data: Data(body), encoding: .utf8) else {
+            throw MCPDomainCanonicalReadError.undecodableText
+        }
+        return text
+    }
+
+    private struct FileScan {
+        /// The visitor asked to stop.
+        var stoppedEarly = false
+        /// The global enumeration bound was reached before the tree was exhausted.
+        var enumerationLimitReached = false
+    }
+
+    /// Lazily visits regular files under `roots`, bounded by `maximumEnumeratedFiles`.
+    /// The visitor returns false to stop.
+    private static func forEachFile(
+        under roots: [URL],
+        cancellation: BlockingCancellation,
+        _ visit: (URL, Int?) throws -> Bool
+    ) throws -> FileScan {
+        var scan = FileScan()
+        var visited = 0
+        for root in roots {
+            guard let enumerator = FileManager.default.enumerator(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else { continue }
+            for case let url as URL in enumerator {
+                try cancellation.check()
+                let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                guard values?.isRegularFile == true else { continue }
+                guard visited < MCPDomainCanonicalReadBounds.maximumEnumeratedFiles else {
+                    scan.enumerationLimitReached = true
+                    return scan
+                }
+                visited += 1
+                guard try visit(url, values?.fileSize) else {
+                    scan.stoppedEarly = true
+                    return scan
+                }
+            }
+        }
+        return scan
+    }
+
+    private static func treeLines(
+        root: URL,
+        maxDepth: Int,
+        maximumLines: Int,
+        cancellation: BlockingCancellation
+    ) throws -> [String] {
         var lines = [root.lastPathComponent + "/"]
         guard let enumerator = FileManager.default.enumerator(
             at: root,
@@ -516,6 +678,8 @@ package struct MCPDomainCanonicalWorkspaceService {
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return lines }
         for case let url as URL in enumerator {
+            try cancellation.check()
+            guard lines.count < maximumLines else { break }
             let relative = url.path.replacingOccurrences(of: root.path + "/", with: "")
             let depth = relative.split(separator: "/").count
             if depth > maxDepth {
