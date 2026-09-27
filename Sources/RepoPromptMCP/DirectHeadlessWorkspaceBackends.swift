@@ -32,17 +32,23 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             let descriptors = try DomainAppSettingsCatalog.descriptors(in: args["group"]?.stringValue)
             let values = await settingsStore.effectiveValues(for: descriptors)
             let detailed = args["detailed"]?.boolValue == true
-            let catalog = descriptors.map { descriptor in
+            var catalog: [Value] = []
+            for descriptor in descriptors {
+                let appAuthorityStatus = await settingsStore.appAuthorityStatus(for: descriptor.key)
                 var item: [String: Value] = [
                     "key": .string(descriptor.key),
                     "group": .string(descriptor.group),
                     "type": .string(descriptor.valueKind.rawValue),
                     "value": values[descriptor.key]?.mcpValue ?? .null,
-                    "writable": .bool(true)
+                    "writable": .bool(appAuthorityStatus == nil)
                 ]
+                if let appAuthorityStatus {
+                    item["authority"] = .string("app")
+                    item["authority_status"] = .string(appAuthorityStatus)
+                }
                 if descriptor.optionsAvailable { item["options_available"] = .bool(true) }
                 if detailed { item["description"] = .string(descriptor.description) }
-                return Value.object(item)
+                catalog.append(.object(item))
             }
             return try .object([
                 "settings": .array(catalog),
@@ -53,7 +59,15 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
             let selectors = [args["key"] != nil, args["keys"] != nil, args["group"] != nil].count(where: { $0 })
             guard selectors == 1 else { throw MCPError.invalidParams("get requires exactly one of key, keys, or group") }
             if let key = args["key"]?.stringValue {
-                return try await .object(["key": .string(key), "value": settingsStore.effectiveValue(for: key).mcpValue])
+                var result: [String: Value] = try await [
+                    "key": .string(key),
+                    "value": settingsStore.effectiveValue(for: key).mcpValue
+                ]
+                if let appAuthorityStatus = await settingsStore.appAuthorityStatus(for: key) {
+                    result["authority"] = .string("app")
+                    result["authority_status"] = .string(appAuthorityStatus)
+                }
+                return try .object(result)
             }
             let descriptors: [DomainSettingDescriptor] = if let keys = args["keys"]?.arrayValue?.compactMap(\.stringValue) {
                 try keys.map { key in

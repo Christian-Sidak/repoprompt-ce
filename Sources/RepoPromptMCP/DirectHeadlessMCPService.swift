@@ -198,9 +198,15 @@ actor DirectHeadlessMCPService {
                 scopeID: scopeID,
                 processRootOverlay: initialRoute.rootOverlay
             )
+            let appSettingsFileURL = DomainGlobalIgnoreDefaultsView.settingsFileURL(
+                storageDirectory: locations.storageDirectory
+            )
             let settingsStore = DomainDirectSettingsStore(
                 persistence: runtime.persistenceCoordinator,
-                profileIdentifier: runtime.configuration.profileIdentifier
+                profileIdentifier: runtime.configuration.profileIdentifier,
+                appGlobalIgnoreDefaults: {
+                    DomainGlobalIgnoreDefaultsView.resolve(settingsFileURL: appSettingsFileURL)
+                }
             )
             let workspace = DirectHeadlessWorkspaceBackend(context: context)
             let global = DirectHeadlessGlobalBackend(

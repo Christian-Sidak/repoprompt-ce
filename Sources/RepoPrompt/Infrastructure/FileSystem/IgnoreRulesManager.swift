@@ -14,47 +14,12 @@ import RepoPromptDomainRuntime
 enum IgnoreSettingsDefaults {
     static let globalIgnoreDefaultsKey = "globalIgnoreDefaults"
     static let globalIgnoreDefaultsVersionKey = "globalIgnoreDefaultsVersion"
-    /// Bump when we add new "required by default" patterns.
-    static let currentGlobalIgnoreDefaultsVersion = 2
+    /// Version and canonical list live in the domain runtime so the app crawl and headless
+    /// enumeration share one definition.
+    static let currentGlobalIgnoreDefaultsVersion = DomainGlobalIgnoreDefaults.currentVersion
 
     /// Canonical default patterns (do NOT include `.git`; that is always ignored separately).
-    /// These mirror our "big dirs" heuristic plus a few common temp files.
-    static let canonicalGlobalIgnoreDefaults: String = """
-    # RepoPrompt global ignore defaults (v\(currentGlobalIgnoreDefaultsVersion))
-    **/node_modules/
-    **/.npm/
-    **/.pnpm-store/
-    **/.yarn/
-    **/.cache/
-    **/bower_components/
-
-    **/__pycache__/
-    **/.pytest_cache/
-    **/.mypy_cache/
-
-    **/.gradle/
-    **/.m2/
-    **/.nuget/
-    **/.cargo/
-    **/.stack-work/
-    **/.ccache/
-
-    **/.idea/
-    **/.vscode/
-    **/.bundle/
-    **/.gem/
-
-    # Virtual environments
-    **/.venv/
-    **/venv/
-
-    # Common temp/junk files
-    **/*.swp
-    **/*~
-    **/*.tmp
-    **/*.temp
-    **/*.bak
-    """
+    static let canonicalGlobalIgnoreDefaults: String = DomainGlobalIgnoreDefaults.canonical
 
     static func resolvedGlobalIgnoreDefaults(defaults: UserDefaults = .standard) -> String {
         let storedObject = defaults.object(forKey: globalIgnoreDefaultsKey)

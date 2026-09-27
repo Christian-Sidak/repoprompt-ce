@@ -212,6 +212,37 @@ the C implementation and the app bridging header. The app keeps `IgnoreRules`,
 `IgnoreRulePolicy`, and git-topology resolution. Headless enumeration does not apply any ignore
 layer yet: explicit parity contract and the read-only authority view are the next slices.
 
+### M8M — read-only headless view of the app ignore authority
+
+- The `globalSettings.json` schema identity and load gate (`DomainGlobalSettingsSchema`: CE
+  lineage, current version, rejected experimental v6, frozen unlineaged v1/v2 ceiling) and the
+  canonical global ignore list (`DomainGlobalIgnoreDefaults`) moved into the domain runtime; the
+  app's `GlobalSettingsDocument` constants and `GlobalSettingsFileStore.preservationBlockReason`
+  delegate to them, so the app and headless trust exactly the same documents.
+- `DomainGlobalIgnoreDefaultsView` reads `<storage>/Settings/globalSettings.json` (the app's file
+  for the default profile; an isolated file for an explicit headless profile) and reports
+  `settings`, `value_absent`, `file_missing`, or `blocked_<reason>` (`unreadable`,
+  `incompatible_schema`, `unsupported_future_schema`, `invalid_value`). It never writes. A
+  blocked document's value is never used; like the app's blocked load, the canonical list applies.
+- Headless `app_settings` serves `file_system.global_ignore_defaults` from that view (re-read on
+  every access), marks it `writable: false` with `authority: app` and `authority_status`, and
+  rejects `set` with `appAuthorityReadOnly`. A value previously stored for this key in headless
+  `direct-settings.json` is ignored but left in place. Other headless settings are unchanged.
+
+Ignore-layer parity contract (what headless enumeration applies today versus the app):
+
+| Layer | App crawl | Headless enumeration |
+|---|---|---|
+| `.git` exclusion | always | not applied (hidden-file skip only) |
+| Root `.gitignore` | yes (mandatory floor in Git roots) | not applied |
+| Nested `.gitignore` | yes when hierarchical ignores are on (default) | not applied |
+| Global ignore defaults | `globalSettings.json` value (M8K) | value readable via M8M; not applied |
+| `.repo_ignore` / `.cursorignore` | yes when enabled (default) | not applied |
+| Symlinks | skipped by default | not governed by `skip_symlinks`; FileManager enumerator defaults (unverified) |
+
+No row is claimed as parity until headless enumeration applies it with the shared compiler (M8L)
+and a fixture test compares it with the app's result.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
