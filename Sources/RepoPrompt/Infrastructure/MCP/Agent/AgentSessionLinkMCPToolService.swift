@@ -131,7 +131,12 @@ struct AgentSessionLinkMCPToolService {
         }
         let notices = await bridge.takeCapabilityNotices(forObserverEndpoint: observerEndpoint)
         guard !notices.isEmpty else { return value }
-        payload["capability_notice"] = AgentSessionLinkResponseRenderer.capabilityNoticeValue(notices)
+        // A parked wait may already have claimed and rendered the notice that woke it. A later
+        // change can arrive while this result is being wrapped; combine rather than replace it.
+        payload["capability_notice"] = AgentSessionLinkResponseRenderer.capabilityNoticeValue(
+            notices,
+            merging: payload["capability_notice"]
+        )
         return .object(payload)
     }
 
@@ -1837,20 +1842,32 @@ enum AgentSessionLinkResponseRenderer {
 
     /// The `capability_notice` field: the shared RepoPrompt-authored correction plus one row per
     /// changed link. Names only sessions the exact caller endpoint holds a grant for.
-    static func capabilityNoticeValue(_ notices: [DomainAgentSessionLinkCapabilityNotice]) -> Value {
+    static func capabilityNoticeValue(
+        _ notices: [DomainAgentSessionLinkCapabilityNotice],
+        merging existing: Value? = nil
+    ) -> Value {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        // The wait's already-claimed notices precede any notices claimed while wrapping its result.
+        // A later toggle of the same link supersedes the earlier state; changes on other links must
+        // all survive. These rows are rendered by RepoPrompt, never parsed from a provider response.
+        let changes = (existing?.objectValue?["changes"]?.arrayValue ?? []) + notices.map { notice in
+            Value.object([
+                "session_id": .string(notice.targetSessionID.uuidString),
+                "managed": .bool(notice.managed),
+                "management_operations": .string(notice.managed ? "available" : "withdrawn"),
+                "changed_at": .string(formatter.string(from: notice.changedAt))
+            ])
+        }
+        var seenSessionIDs = Set<String>()
+        let latestChanges = Array(changes.reversed().filter { change in
+            guard let sessionID = change.objectValue?["session_id"]?.stringValue else { return false }
+            return seenSessionIDs.insert(sessionID).inserted
+        }.reversed())
         return .object([
             "notice": .string(AgentSessionLinkPrompts.capabilityChangeNoticeText),
-            "changes": .array(notices.map { notice in
-                .object([
-                    "session_id": .string(notice.targetSessionID.uuidString),
-                    "managed": .bool(notice.managed),
-                    "management_operations": .string(notice.managed ? "available" : "withdrawn"),
-                    "changed_at": .string(formatter.string(from: notice.changedAt))
-                ])
-            })
+            "changes": .array(latestChanges)
         ])
     }
 

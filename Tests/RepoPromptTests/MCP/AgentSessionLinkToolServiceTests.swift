@@ -1080,6 +1080,51 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
+    func testCapabilityNoticeMergeKeepsEveryLinkAndOnlyItsNewestState() throws {
+        let firstSession = UUID()
+        let secondSession = UUID()
+        let thirdSession = UUID()
+        func notice(_ sessionID: UUID, managed: Bool, sequence: UInt64) -> DomainAgentSessionLinkCapabilityNotice {
+            DomainAgentSessionLinkCapabilityNotice(
+                linkID: sessionID,
+                linkGeneration: 1,
+                targetSessionID: sessionID,
+                managed: managed,
+                observerLinkSetRevision: sequence,
+                sequence: sequence,
+                changedAt: Date(timeIntervalSince1970: TimeInterval(sequence))
+            )
+        }
+
+        // The parked wait claimed two links. While its result was being wrapped, a third link
+        // changed and the first link was toggled again. Neither the second nor third may disappear.
+        let alreadyRendered = AgentSessionLinkResponseRenderer.capabilityNoticeValue([
+            notice(firstSession, managed: true, sequence: 1),
+            notice(secondSession, managed: true, sequence: 2)
+        ])
+        let merged = AgentSessionLinkResponseRenderer.capabilityNoticeValue([
+            notice(thirdSession, managed: true, sequence: 3),
+            notice(firstSession, managed: false, sequence: 4)
+        ], merging: alreadyRendered)
+        let changes = try XCTUnwrap(merged.objectValue?["changes"]?.arrayValue)
+        XCTAssertEqual(changes.count, 3, "one current row per linked session")
+        func managed(_ sessionID: UUID) -> Bool? {
+            changes.first { $0.objectValue?["session_id"]?.stringValue == sessionID.uuidString }?
+                .objectValue?["managed"]?.boolValue
+        }
+        XCTAssertEqual(managed(firstSession), false, "the later withdrawal supersedes the earlier grant")
+        XCTAssertEqual(managed(secondSession), true, "the wait's other claimed notice survives")
+        XCTAssertEqual(managed(thirdSession), true, "the late notice is also delivered")
+
+        let repeatedInOneBatch = AgentSessionLinkResponseRenderer.capabilityNoticeValue([
+            notice(firstSession, managed: true, sequence: 1),
+            notice(firstSession, managed: false, sequence: 4)
+        ])
+        let repeatedChanges = try XCTUnwrap(repeatedInOneBatch.objectValue?["changes"]?.arrayValue)
+        XCTAssertEqual(repeatedChanges.count, 1)
+        XCTAssertEqual(repeatedChanges.first?.objectValue?["managed"], .bool(false))
+    }
+
     /// A running overseer parked in `wait` learns about a Manage change at once, and the correction
     /// rides exactly one result — including a structured refusal, which is where a model still
     /// reasoning from older capabilities most needs it.
