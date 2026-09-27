@@ -1273,7 +1273,14 @@ actor ServerNetworkManager {
         message: String,
         metadata: [String: Value] = [:]
     ) -> CallTool.Result {
-        guard rawJSON else { return CallTool.Result.err("\(code): \(message)") }
+        let metadata = typedRetryabilityMetadata(metadata, code: code)
+        guard rawJSON else {
+            return CallTool.Result.err(defaultModeExecutionContractErrorText(
+                code: code,
+                message: message,
+                metadata: metadata
+            ))
+        }
         var object: [String: Value] = [
             "is_error": .bool(true),
             "code": .string(code),
@@ -1284,6 +1291,90 @@ actor ServerNetworkManager {
         }
         let value: Value = .object(object)
         return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
+    }
+
+    /// Keys carried on the default-mode metadata line. The code is already on the first line and
+    /// is not repeated, so text consumers still see it exactly once.
+    private static let defaultModeMetadataKeys: Set<String> = [
+        "retryability", "retryable", "retry_after_ms", "mutation_state", "operation_id", "settlement"
+    ]
+
+    /// `<code>: <message>`, followed by one JSON line with retry guidance when it is known.
+    static func defaultModeExecutionContractErrorText(
+        code: String,
+        message: String,
+        metadata: [String: Value]
+    ) -> String {
+        let firstLine = "\(code): \(message)"
+        guard metadata["retryability"] != nil else { return firstLine }
+        let guidance = metadata.filter { defaultModeMetadataKeys.contains($0.key) }
+        return firstLine + "\n" + ToolOutputFormatter.rawJSONString(.object(guidance))
+    }
+
+    /// Adds the shared `retryability` field (and the legacy `retryable` flag when absent).
+    ///
+    /// Watchdog and protected-mutation failures use `MCPDomainToolFailureClassifier`, the same
+    /// rules direct headless uses; admission and routing codes use a fixed table. An existing
+    /// legacy `retryable` flag stays authoritative: a disagreeing derivation is reconciled to it
+    /// rather than contradicting it.
+    static func typedRetryabilityMetadata(
+        _ metadata: [String: Value],
+        code: String,
+        error: Error? = nil,
+        toolName: String? = nil,
+        contract: MCPToolExecutionContract? = nil,
+        mutation: DomainProtectedMutationSettlement? = nil
+    ) -> [String: Value] {
+        guard metadata["retryability"] == nil else { return metadata }
+        let admissionClass = toolName.flatMap { MCPDomainToolCatalog.admissionClass(for: $0) }
+        var derived = defaultRetryability(code: code, metadata: metadata)
+        if derived == nil, let error, let toolName {
+            derived = MCPDomainToolFailureClassifier.classify(
+                error,
+                toolName: toolName,
+                admissionClass: admissionClass,
+                contract: contract,
+                mutation: mutation
+            ).retryability
+        }
+        guard var retryability = derived else { return metadata }
+        if let legacy = metadata["retryable"]?.boolValue, legacy != retryability.legacyRetryableFlag {
+            let mayMutate = admissionClass == nil || admissionClass == .exclusive
+            retryability = legacy ? .retryable : (mayMutate ? .indeterminate : .permanent)
+        }
+        var typed = metadata
+        typed["retryability"] = .string(retryability.rawValue)
+        if typed["retryable"] == nil {
+            typed["retryable"] = .bool(retryability.legacyRetryableFlag)
+        }
+        return typed
+    }
+
+    private static func defaultRetryability(
+        code: String,
+        metadata: [String: Value]
+    ) -> MCPFailureRetryability? {
+        switch code {
+        case "tool_execution_connection_terminal",
+             "tool_execution_window_terminal",
+             "tool_execution_admission_timeout":
+            return .retryable
+        case "tool_card_ownership_conflict",
+             "tool_execution_admission_unclassified",
+             "tool_execution_invalid_envelope",
+             "tool_execution_mutation_resource_unresolved",
+             "tool_execution_read_resource_unresolved",
+             "tool_execution_contract_missing",
+             "tool_execution_structure_settlement_window_unresolved":
+            return .permanent
+        case "tool_execution_structure_settlement_busy":
+            guard metadata["retryable"]?.boolValue == true else { return .permanent }
+            return metadata["retry_after_ms"] == nil ? .retryable : .retryAfter
+        case "protected_mutation_indeterminate_after_commit":
+            return .indeterminate
+        default:
+            return nil
+        }
     }
 
     fileprivate final class ToolEventObserverDeliveryBarrier: @unchecked Sendable {
@@ -14310,12 +14401,20 @@ actor ServerNetworkManager {
                                     }
 
                                     log.error("MCP execution contract failure tool=\(toolName) context=\(context) code=\(code)")
+                                    let typedErrorMetadata = Self.typedRetryabilityMetadata(
+                                        errorMetadata,
+                                        code: code,
+                                        error: error,
+                                        toolName: toolName,
+                                        contract: selectedExecutionContract,
+                                        mutation: promptExportMutationObservation?.snapshot()
+                                    )
                                     var errorJSONObject: [String: Value] = [
                                         "code": .string(code),
                                         "error": .string(message),
                                         "tool": .string(toolName)
                                     ]
-                                    for (key, value) in errorMetadata {
+                                    for (key, value) in typedErrorMetadata {
                                         errorJSONObject[key] = value
                                     }
                                     let errorJSON = ToolOutputFormatter.rawJSONString(.object(errorJSONObject))
@@ -14344,7 +14443,7 @@ actor ServerNetworkManager {
                                         rawJSON: capturedRawJSON,
                                         code: code,
                                         message: message,
-                                        metadata: errorMetadata
+                                        metadata: typedErrorMetadata
                                     )
                                     if shouldForceDisconnect {
                                         let abortNow = executionWatchdogEnvironment.now()

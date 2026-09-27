@@ -165,6 +165,19 @@ with active or in-delivery requests, and host settlement totals. Reasons outside
 identifiers, tool names, and paths are never emitted. The command is read-only and dispatches
 before any app connection or service composition.
 
+### M8H — retry guidance on the default app backend (I3)
+
+App execution-contract failures rendered only `<code>: <message>` unless the client requested
+raw JSON, so ordinary hosts of the default backend received no retry guidance. Those failures
+now carry `retryability` (and the legacy `retryable` flag when it was missing). In default mode
+one JSON line follows the first line with `retryability`, `retryable`, and, when known,
+`retry_after_ms`, `mutation_state`, `operation_id`, and `settlement`; the code is not repeated.
+Watchdog and protected-mutation failures derive retryability with
+`MCPDomainToolFailureClassifier`, the same rules as direct headless; admission and routing codes
+use a fixed table. A pre-existing legacy `retryable` flag stays authoritative, so guidance never
+contradicts values existing clients already read. Codes without a classification keep the
+legacy single-line text.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
