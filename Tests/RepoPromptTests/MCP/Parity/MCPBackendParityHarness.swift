@@ -7,7 +7,8 @@ import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
-    /// M8S/M8T: in-process app-versus-headless parity and latency harness for the MCP read boundary.
+    /// M8S/M8T/M12: in-process app-versus-headless parity and latency harness for the MCP read boundary
+    /// (`read_file`, `get_code_structure`, `file_search`).
     ///
     /// Both backends run against the same fixture root, ignore defaults, and `skip_symlinks` policy:
     /// the app through the real window tools of a registered, activated `WindowState`
@@ -22,7 +23,10 @@ import XCTest
     /// are equivalent only when every seed name matches and each app text ends with the non-empty
     /// headless text. App graph expansion (`related` files) is app-only and not compared. An app reply
     /// with `unavailable` status is a terminal `unavailable(codes)`; one still `pending` after the
-    /// bounded settle wait is `unsettled`. Neither is ever a success or a refusal.
+    /// bounded settle wait is `unsettled`. Neither is ever a success or a refusal. `file_search`: the
+    /// sorted root-relative path hits and content hits (path, 1-based line, line text), or the count for
+    /// `count_only`; an app error field or a thrown error is `refused`. A `SearchExpectation` (paths that
+    /// must and must not appear, or an exact count) makes each search scenario non-vacuous.
     ///
     /// Each scenario declares an authority class per backend (`mustSucceed` / `mustRefuse` /
     /// `mustBeUnavailable`) and a relation (`equal`, or a documented `knownDivergence` that must still
@@ -46,6 +50,18 @@ import XCTest
         enum Tool: String, Encodable {
             case readFile = "read_file"
             case codeStructure = "get_code_structure"
+            case fileSearch = "file_search"
+        }
+
+        /// `file_search` expectations checked against every backend whose authority is `mustSucceed`, so
+        /// an empty or broken answer cannot satisfy a scenario just because both backends agree.
+        struct SearchExpectation {
+            /// Root-relative paths that must appear (as a path hit or a content hit).
+            var include: [String] = []
+            /// Root-relative paths that must never appear (ignored, linked, or outside-root files).
+            var exclude: [String] = []
+            /// For `count_only`: the exact count every succeeding backend must report.
+            var count: Int?
         }
 
         struct Scenario {
@@ -61,6 +77,8 @@ import XCTest
             var appAuthority: Authority?
             /// For `mustBeUnavailable`: an issue code the unavailable answer must carry.
             var unavailableCode: String?
+            /// `file_search` only.
+            var search: SearchExpectation?
 
             var effectiveAppAuthority: Authority {
                 appAuthority ?? authority
@@ -70,6 +88,32 @@ import XCTest
         struct MappedFile: Equatable {
             let name: String
             let text: String
+        }
+
+        struct ContentHit: Equatable, Comparable, CustomStringConvertible {
+            let path: String
+            let line: Int
+            let text: String
+
+            static func < (lhs: ContentHit, rhs: ContentHit) -> Bool {
+                (lhs.path, lhs.line, lhs.text) < (rhs.path, rhs.line, rhs.text)
+            }
+
+            var description: String {
+                "\(path):\(line)"
+            }
+        }
+
+        /// Normalized `file_search` answer: root-relative path hits and content hits (1-based line and
+        /// the matched line's text), each sorted; or, for `count_only`, the reported count alone.
+        struct SearchHits: Equatable {
+            var paths: [String] = []
+            var content: [ContentHit] = []
+            var count: Int?
+
+            var touchedPaths: Set<String> {
+                Set(paths).union(content.map(\.path))
+            }
         }
 
         enum Outcome: Equatable, CustomStringConvertible {
@@ -82,10 +126,12 @@ import XCTest
             case unavailable([String])
             /// Still `pending` after the bounded settle wait.
             case unsettled
+            /// `file_search`: an answered search (possibly empty; `SearchExpectation` makes it non-vacuous).
+            case search(SearchHits)
 
             var isSuccess: Bool {
                 switch self {
-                case .content: true
+                case .content, .search: true
                 case let .mapped(files): !files.isEmpty
                 case .refused, .unavailable, .unsettled: false
                 }
@@ -98,6 +144,13 @@ import XCTest
                 case .refused: "refused"
                 case let .unavailable(codes): "unavailable(\(codes.joined(separator: ",")))"
                 case .unsettled: "unsettled"
+                case let .search(hits):
+                    if let count = hits.count {
+                        "count(\(count))"
+                    } else {
+                        "search(paths=[\(hits.paths.joined(separator: ","))]"
+                            + " content=[\(hits.content.map(\.description).joined(separator: ","))])"
+                    }
                 }
             }
         }
@@ -172,7 +225,12 @@ import XCTest
             "transport, JSON-RPC envelope (isError vs protocol error), lanes, leases, and watchdog",
             "the app socket/connection-manager path (both backends are driven at the tool layer)",
             "app code-structure graph expansion (related files; headless has no graph)",
-            "file_search (not wired in the in-process fixture)",
+            "file_search worktree display projection (the in-process fixture binds no session worktree)",
+            "file_search display spelling: app paths are compared root-relative (a root-name or absolute prefix "
+                + "would be removed and reported as display=...); multi-root aliases are not exercised",
+            "file_search result order, context_lines, limit/size-cap flags, and app auto-selection side effects "
+                + "(hits are compared as sorted sets; app latency includes auto-selection)",
+            "file_search regex dialect beyond the table (app PCRE2 vs headless ICU NSRegularExpression)",
             "multi-root namespaces, cold start, and large-tree performance",
             "absolute latency comparability across machines or runs"
         ]
@@ -180,7 +238,8 @@ import XCTest
         /// App error codes that mean the workspace or its freshness was not ready: infrastructure, not an
         /// authority decision, so they can never satisfy a `mustRefuse` scenario.
         static let appInfrastructureRefusalCodes = [
-            "workspace_authority_", "workspace_freshness_timeout", "worktree_scope_unavailable"
+            "workspace_authority_", "workspace_freshness_timeout", "worktree_scope_unavailable",
+            "workspace_readiness_", "search_backpressure"
         ]
 
         /// Upper bound on the untimed wait for the app code-map index to reach quiescence.
@@ -257,6 +316,10 @@ import XCTest
                 )
                 appTools[.codeStructure] = try await InProcessMCPWindowServerFixture.tool(
                     named: MCPWindowToolName.getCodeStructure,
+                    from: window.window.mcpServer
+                )
+                appTools[.fileSearch] = try await InProcessMCPWindowServerFixture.tool(
+                    named: MCPWindowToolName.search,
                     from: window.window.mcpServer
                 )
             } catch {
@@ -414,6 +477,7 @@ import XCTest
             let digestInput: String? = switch observation.outcome {
             case let .mapped(files): files.map { "\($0.name)\u{0}\($0.text)" }.joined(separator: "\u{1}")
             case let .content(text): text
+            case let .search(hits): "\(hits)"
             case .refused, .unavailable, .unsettled: nil
             }
             let digest = digestInput.map { input in
@@ -589,6 +653,9 @@ import XCTest
             {
                 violations.append("headless refused for the wrong reason: \(headless.first?.detail ?? "-"), expected \(expected)")
             }
+            if let expectation = scenario.search {
+                violations += searchViolations(expectation, checks: checks)
+            }
 
             let agree = equivalent(app: appOutcome, headless: headlessOutcome)
             let expectedRelation: String
@@ -628,6 +695,28 @@ import XCTest
             )
         }
 
+        /// `SearchExpectation` violations for each backend that must succeed with a search answer.
+        static func searchViolations(
+            _ expectation: SearchExpectation,
+            checks: [(String, Authority, Outcome)]
+        ) -> [String] {
+            var violations: [String] = []
+            for (backend, authority, outcome) in checks where authority == .mustSucceed {
+                guard case let .search(hits) = outcome else { continue }
+                if let count = expectation.count, hits.count != count {
+                    violations.append("\(backend) count was \(hits.count.map(String.init) ?? "absent"), expected \(count)")
+                }
+                let touched = hits.touchedPaths
+                for path in expectation.include where !touched.contains(path) {
+                    violations.append("\(backend) search missed \(path)")
+                }
+                for path in expectation.exclude where touched.contains(path) {
+                    violations.append("\(backend) search leaked \(path)")
+                }
+            }
+            return violations
+        }
+
         // MARK: - Backends
 
         private func observeApp(_ scenario: Scenario) async -> Observation {
@@ -664,7 +753,81 @@ import XCTest
                     outcome: Self.classifyAppCodeStructure(status: reply.status, seeds: seeds, issueCodes: issueCodes),
                     detail: detail
                 )
+            case .fileSearch:
+                guard let reply = value.decode(ToolResultDTOs.SearchResultDTO.self) else {
+                    return Observation(outcome: .refused, detail: "undecodable file_search reply")
+                }
+                return Self.classifyAppSearch(reply, countOnly: scenario.arguments["count_only"]?.boolValue == true, root: root)
             }
+        }
+
+        /// Normalizes an app `file_search` reply. An error field (`error_code` or `error`) is a refusal
+        /// whose detail is the code or message. Otherwise path lines and content groups become
+        /// root-relative hits; `count_only` reports `total_matches`. The detail records the app's display
+        /// spelling (`display=relative|root_name|absolute`) and `limit_hit`, never compared.
+        static func classifyAppSearch(_ reply: ToolResultDTOs.SearchResultDTO, countOnly: Bool, root: URL) -> Observation {
+            if let code = reply.errorCode ?? reply.errorMessage {
+                return Observation(outcome: .refused, detail: code)
+            }
+            var spellings = Set<String>()
+            func relative(_ display: String) -> String {
+                let (path, spelling) = appRootRelativePath(display, root: root)
+                spellings.insert(spelling)
+                return path
+            }
+            var hits = SearchHits()
+            if countOnly {
+                hits.count = reply.totalMatches
+            } else {
+                hits.paths = reply.pathMatchLines.map(relative).sorted()
+                hits.content = reply.contentMatchGroups.flatMap { group in
+                    group.lines.map { ContentHit(path: relative(group.path), line: $0.lineNumber, text: $0.lineText) }
+                }.sorted()
+            }
+            let display = spellings.isEmpty ? "-" : spellings.sorted().joined(separator: ",")
+            return Observation(
+                outcome: .search(hits),
+                detail: "display=\(display) limit_hit=\(reply.limitHit)" + (reply.warning == nil ? "" : " warning")
+            )
+        }
+
+        /// An app display path as a root-relative path, with the spelling it used: `absolute` (under the
+        /// root's absolute path), `root_name` (prefixed with the root folder name), or `relative`.
+        static func appRootRelativePath(_ display: String, root: URL) -> (path: String, spelling: String) {
+            let absolutePrefix = root.standardizedFileURL.path + "/"
+            if display.hasPrefix(absolutePrefix) {
+                return (String(display.dropFirst(absolutePrefix.count)), "absolute")
+            }
+            let namePrefix = root.lastPathComponent + "/"
+            if display.hasPrefix(namePrefix) {
+                return (String(display.dropFirst(namePrefix.count)), "root_name")
+            }
+            return (display, "relative")
+        }
+
+        /// Normalizes a headless `file_search` reply: a `matches` entry with a `line` is a content hit,
+        /// one without is a path hit; `count_only` reports `count`. Bounds flags go to the detail.
+        static func classifyHeadlessSearch(_ value: Value, countOnly: Bool) -> Observation {
+            let object = value.objectValue ?? [:]
+            var hits = SearchHits()
+            if countOnly {
+                hits.count = object["count"]?.intValue
+            } else {
+                for match in object["matches"]?.arrayValue?.compactMap(\.objectValue) ?? [] {
+                    guard let path = match["path"]?.stringValue else { continue }
+                    if let line = match["line"]?.intValue {
+                        hits.content.append(ContentHit(path: path, line: line, text: match["text"]?.stringValue ?? ""))
+                    } else {
+                        hits.paths.append(path)
+                    }
+                }
+                hits.paths.sort()
+                hits.content.sort()
+            }
+            var bounds: [String] = []
+            if object["truncated"]?.boolValue == true { bounds.append("truncated") }
+            if let skipped = object["skipped_large_files"]?.intValue { bounds.append("skipped_large_files=\(skipped)") }
+            return Observation(outcome: .search(hits), detail: bounds.isEmpty ? nil : bounds.joined(separator: " "))
         }
 
         private func observeHeadless(_ scenario: Scenario) async -> Observation {
@@ -686,6 +849,7 @@ import XCTest
                 let result = switch scenario.tool {
                 case .readFile: try await headless.readFile(request)
                 case .codeStructure: try await headless.inspectCodeStructure(request)
+                case .fileSearch: try await headless.searchFiles(request)
                 }
                 value = try JSONDecoder().decode(Value.self, from: result.json)
             } catch let error as MCPDomainCanonicalReadError {
@@ -694,6 +858,8 @@ import XCTest
                 return Observation(outcome: .refused, detail: String(describing: error))
             }
             switch scenario.tool {
+            case .fileSearch:
+                return Self.classifyHeadlessSearch(value, countOnly: scenario.arguments["count_only"]?.boolValue == true)
             case .readFile:
                 return Observation(outcome: .content(Self.normalized(value.stringValue ?? "")), detail: nil)
             case .codeStructure:

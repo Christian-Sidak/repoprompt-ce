@@ -381,41 +381,56 @@ package struct MCPDomainCanonicalWorkspaceService {
     package func searchFiles(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.request.mcpArguments()
         let snapshot = try await adapter.readSnapshot(request)
-        guard let pattern = args["pattern"]?.stringValue, !pattern.isEmpty else {
+        // Trimmed like the app provider, so a whitespace-only pattern is empty.
+        let pattern = (args["pattern"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !pattern.isEmpty else {
             throw MCPError.invalidParams("pattern cannot be empty")
         }
         let maxResults = max(1, min(args["max_results"]?.intValue ?? 50, 1000))
-        let regexEnabled = args["regex"]?.boolValue ?? Self.looksLikeRegex(pattern)
+        let countOnly = args["count_only"]?.boolValue == true
+        // Regex auto-detection and `auto` mode share the app's heuristics.
+        let regexEnabled = args["regex"]?.boolValue ?? FileSearchPatternHeuristics.containsRegexSyntax(pattern)
         let wholeWord = args["whole_word"]?.boolValue ?? false
         let regexPattern = wholeWord ? "\\b(?:\(pattern))\\b" : pattern
+        // The app runs every MCP search case-insensitively, regex included.
+        let regexOptions: NSRegularExpression.Options = .caseInsensitive
         // Validate once here; the blocking scan compiles its own instance.
-        if regexEnabled { _ = try NSRegularExpression(pattern: regexPattern) }
+        if regexEnabled { _ = try NSRegularExpression(pattern: regexPattern, options: regexOptions) }
         let mode = (args["mode"]?.stringValue ?? "auto").lowercased()
         guard ["auto", "path", "content", "both"].contains(mode) else {
             throw MCPError.invalidParams("mode must be auto, path, content, or both")
         }
         let filter = Self.searchFilter(args)
-        let searchesPaths = mode == "path" || mode == "both" || (mode == "auto" && pattern.contains("*"))
-        let searchesContent = mode == "content" || mode == "both" || (mode == "auto" && !searchesPaths)
+        let inferred = mode == "auto" ? FileSearchPatternHeuristics.inferredAutoMode(pattern) : nil
+        let searchesPaths = mode == "path" || mode == "both" || inferred == .path || inferred == .both
+        let searchesContent = mode == "content" || mode == "both" || inferred == .content || inferred == .both
         let relativeRoots = Self.relativeRoots(snapshot.roots)
         let roots = snapshot.roots
         let ignoreContext = try await makeIgnoreContext(roots: roots)
-        let (results, enumerationTruncated, skippedLargeFiles) = try await Self.runCancellableBlocking { cancellation in
-            let regex = regexEnabled ? try NSRegularExpression(pattern: regexPattern) : nil
+        let (results, count, enumerationTruncated, skippedLargeFiles) = try await Self.runCancellableBlocking { cancellation in
+            let regex = regexEnabled ? try NSRegularExpression(pattern: regexPattern, options: regexOptions) : nil
             var results: [Value] = []
+            // Like the app, path and content hits are capped separately at `max_results`, and
+            // `count_only` counts every content match (path hits stay capped).
+            var pathCount = 0
+            var contentCount = 0
             var skippedLargeFiles = 0
+            func finished() -> Bool {
+                (!searchesPaths || pathCount >= maxResults)
+                    && (!searchesContent || (!countOnly && contentCount >= maxResults))
+            }
             let scan = try Self.forEachFile(under: roots, ignore: ignoreContext, cancellation: cancellation) { file, byteCount in
                 let relative = Self.relativePath(file, roots: relativeRoots)
                 guard Self.includes(relativePath: relative, file: file, filter: filter) else {
                     return true
                 }
-                if searchesPaths,
-                   Self.matches(pattern, value: relative, regex: regex, wholeWord: wholeWord)
+                if searchesPaths, pathCount < maxResults,
+                   Self.matches(pattern, value: relative, regex: regex, wholeWord: wholeWord, globs: true)
                 {
-                    results.append(.object(["path": .string(relative)]))
-                    if results.count >= maxResults { return false }
+                    pathCount += 1
+                    if !countOnly { results.append(.object(["path": .string(relative)])) }
                 }
-                guard searchesContent else { return true }
+                guard searchesContent, countOnly || contentCount < maxResults else { return !finished() }
                 if let byteCount, byteCount > MCPDomainCanonicalReadBounds.maximumSearchFileBytes {
                     skippedLargeFiles += 1
                     return true
@@ -425,26 +440,30 @@ package struct MCPDomainCanonicalWorkspaceService {
                     limit: MCPDomainCanonicalReadBounds.maximumSearchFileBytes
                 ) else { return true }
                 for (index, line) in text.components(separatedBy: .newlines).enumerated() {
-                    guard Self.matches(pattern, value: line, regex: regex, wholeWord: wholeWord) else { continue }
+                    guard Self.matches(pattern, value: line, regex: regex, wholeWord: wholeWord, globs: false) else {
+                        continue
+                    }
+                    contentCount += 1
+                    if countOnly { continue }
                     results.append(.object([
                         "path": .string(relative),
                         "line": .int(index + 1),
                         "text": .string(line)
                     ]))
-                    if results.count >= maxResults { return false }
+                    if contentCount >= maxResults { break }
                 }
-                return true
+                return !finished()
             }
-            return (results, scan.enumerationLimitReached, skippedLargeFiles)
+            return (results, pathCount + contentCount, scan.enumerationLimitReached, skippedLargeFiles)
         }
         var bounds: [String: Value] = [:]
         if enumerationTruncated { bounds["truncated"] = .bool(true) }
         if skippedLargeFiles > 0 { bounds["skipped_large_files"] = .int(skippedLargeFiles) }
-        if args["count_only"]?.boolValue == true {
-            return try .object(["count": .int(results.count)].merging(bounds) { current, _ in current })
+        if countOnly {
+            return try .object(["count": .int(count)].merging(bounds) { current, _ in current })
         }
         return try .object(
-            ["matches": .array(results), "count": .int(results.count)].merging(bounds) { current, _ in current }
+            ["matches": .array(results), "count": .int(count)].merging(bounds) { current, _ in current }
         )
     }
 
@@ -978,26 +997,25 @@ package struct MCPDomainCanonicalWorkspaceService {
         return path
     }
 
+    /// `globs`: whether a literal pattern's wildcards are glob syntax. True for paths only; like the app,
+    /// a literal content pattern matches `*`, `?`, and `[` as characters.
     private static func matches(
         _ pattern: String,
         value: String,
         regex: NSRegularExpression?,
-        wholeWord: Bool
+        wholeWord: Bool,
+        globs: Bool
     ) -> Bool {
         if let regex {
             return regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
         }
-        if containsWildcard(pattern) {
+        if globs, containsWildcard(pattern) {
             return globMatches(pattern, value)
         }
         guard wholeWord else { return value.localizedCaseInsensitiveContains(pattern) }
         let escaped = NSRegularExpression.escapedPattern(for: pattern)
         return (try? NSRegularExpression(pattern: "\\b\(escaped)\\b", options: .caseInsensitive))?
             .firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
-    }
-
-    private static func looksLikeRegex(_ pattern: String) -> Bool {
-        pattern.range(of: #"[\[\](){}|+?^$\\]"#, options: .regularExpression) != nil
     }
 }
 

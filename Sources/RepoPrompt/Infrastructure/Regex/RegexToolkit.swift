@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Umbrella protocol for all regex pattern failures
 public protocol RegexPatternFailure: LocalizedError {}
@@ -374,67 +375,10 @@ public enum RegexToolkit {
         }
     }
 
-    /// Detects if pattern uses PCRE-only features unsupported by Swift Regex
+    /// Detects if pattern uses PCRE-only features unsupported by Swift Regex (shared with headless
+    /// `file_search`).
     public static func usesPCREOnlyFeatures(_ pattern: String) -> Bool {
-        let pcreTokens = [
-            "\\w",
-            "\\d",
-            "\\s",
-            "(?=",
-            "(?<!",
-            "(?<=",
-            "(?!",
-            "(?>",
-            "\\b",
-            "[[:",
-            "\\Q",
-            "\\E",
-            "(?i)",
-            "(?m)",
-            "(?s)",
-            "(?x)"
-        ]
-        return pcreTokens.contains { pattern.contains($0) } || containsInlineOptionGroup(pattern)
-    }
-
-    private static func containsInlineOptionGroup(_ pattern: String) -> Bool {
-        var searchStart = pattern.startIndex
-        while let intro = pattern.range(of: "(?", range: searchStart ..< pattern.endIndex) {
-            var index = intro.upperBound
-            var sawFlag = false
-            var awaitingFlagAfterHyphen = false
-
-            while index < pattern.endIndex {
-                let ch = pattern[index]
-                if isInlineOptionFlag(ch) {
-                    sawFlag = true
-                    awaitingFlagAfterHyphen = false
-                    index = pattern.index(after: index)
-                    continue
-                }
-                if ch == "-" {
-                    awaitingFlagAfterHyphen = true
-                    index = pattern.index(after: index)
-                    continue
-                }
-                if ch == ")" || ch == ":", sawFlag, !awaitingFlagAfterHyphen {
-                    return true
-                }
-                break
-            }
-
-            searchStart = intro.upperBound
-        }
-        return false
-    }
-
-    private static func isInlineOptionFlag(_ ch: Character) -> Bool {
-        switch ch {
-        case "i", "m", "s", "x", "U", "J":
-            true
-        default:
-            false
-        }
+        FileSearchPatternHeuristics.usesPCREOnlyFeatures(pattern)
     }
 }
 

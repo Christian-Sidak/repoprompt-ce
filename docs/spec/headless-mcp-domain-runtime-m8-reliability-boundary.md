@@ -778,11 +778,79 @@ Evidence (scoped): in focused run `22c7e783` on frozen source,
 `CodemapGraphStatusDebugDiagnosticsTests` passed; the parity gate failed only on the iteration-stability
 check above (30 tests, 1 failure). All-products build and lint pending on this checkpoint.
 
+### M12 — `file_search` app-versus-headless parity gate
+
+The M8S harness now drives `file_search` on both backends over the Git fixture: the app through the
+registered window's real tool (its `WindowState` composition wires the production
+`StoreBackedWorkspaceSearch`; only the standalone `InProcessMCPWindowServerFixture.make` stubs search),
+headless through `MCPDomainCanonicalWorkspaceService.searchFiles`. Outcomes normalize to sorted
+root-relative path hits and content hits (path, 1-based line, line text), or the count for
+`count_only`; an app error field or any thrown error is a refusal. Each scenario carries a
+`SearchExpectation` (paths that must appear, ignored/linked/outside paths that must not, or an exact
+count), so an empty answer both backends agree on cannot pass. Latency is reported per scenario
+(p50/max, interleaved, after a warm-up), never asserted. In a single root the app's display paths were
+observed root-relative, so no path rewriting was applied; the spelling is reported per scenario.
+
+First run (all scenarios `equal`, before any fix): 16 of 22 held exact parity — literal, regex, and
+literal-case content; whole word; path glob and literal; a dotfile path; extension, path, `path`-alias,
+and exclude filters; a content limit within one file; `count_only`; an `auto` glob; the empty pattern;
+and exclusion of Git-ignored, globally ignored, directory-link, file-link, and outside-root files.
+Demonstrated drift, all headless-side:
+
+| Scenario | App (default backend) | Headless before | Resolution |
+| --- | --- | --- | --- |
+| `auto` mode, identifier pattern | paths and content (`inferredAutoMode` → `both`) | content only (`*` → path, else content) | fixed: shared heuristic |
+| regex content `PARITY[a-z]+` | case-insensitive (every MCP search) | case-sensitive | fixed: `.caseInsensitive` |
+| `count_only` with `max_results: 1` | 3 (content counted unbounded) | 1 | fixed |
+| whitespace-only pattern | rejected (`pattern cannot be empty`) | searched `"   "` | fixed: pattern trimmed |
+| literal content `done?` (`mode: "content"`) | substring match | whole-line glob, no match | fixed: glob for paths only |
+| uncompilable regex `(unclosed` | repaired (literal fallback, `warning`) | rejected with the compile error | documented divergence |
+| `mode: "fuzzy"` (outside the schema enum) | falls back to `auto` | rejected as invalid params | documented divergence |
+
+Fixes, in the narrowest owners:
+
+- `FileSearchPatternHeuristics` (new, `RepoPromptDomainRuntime/Search`) holds the app's pure
+  `inferredAutoMode`, `containsRegexSyntax`, and `usesPCREOnlyFeatures`, moved verbatim (checked
+  line-for-line against the previous app source). `FileSearchActor` and `RegexToolkit` delegate, so
+  app behavior is unchanged; headless uses the same functions for `auto` mode and for regex
+  auto-detection when `regex` is omitted (replacing its narrower `looksLikeRegex`, under which `go()`
+  would have compiled as a regex and matched `ago`; the table pins it literal).
+- That switch routed more literal patterns into headless `matches`, which applied glob semantics to
+  content lines whenever a literal contained `*`, `?`, or `[` (already true for `*` before M12). The
+  added `done?` scenario demonstrated the miss against the app before the fix; wildcards are now glob
+  syntax for path matching only, as the tool description states.
+- Headless `searchFiles` trims the pattern, compiles regexes case-insensitively, caps path hits and
+  content hits separately at `max_results` (as the app does for `mode: "both"`), and counts every
+  content match for `count_only`. The `count` of a non-`count_only` reply stays the number of
+  returned matches.
+
+Intentional incompatibilities (the table requires them to keep diverging): headless rejects an
+uncompilable regex and an out-of-enum `mode`, where the app repairs or falls back. Headless is
+stricter, never broader. Not proven (listed in the report): worktree display projection (the
+fixture binds no session worktree), multi-root display aliases, result order, `context_lines`,
+limit/size-cap flags, the app's auto-selection side effect (included in app latency), and regex
+dialect beyond the table (app PCRE2, headless ICU). The shared schema still describes `max_results`
+as "Maximum total results"; both backends now cap per stage, and the schema text is unchanged.
+
+Evidence (scoped): conductor focused run `e2255887` passed 86/86 on the final source —
+`MCPBackendParityHarnessTests` (the read and code-structure gates unchanged, plus the `file_search`
+gate: 25 scenarios, 23 at exact parity and 2 documented divergences, no violations),
+`MCPDomainCanonicalSearchSemanticsTests`, `MCPDomainCanonicalWorkspaceBoundsTests`, the headless ignore
+and symlink suites, and the app search suites that exercise the moved heuristics
+(`StoreBackedWorkspaceSearchTests`, `WorkspaceSearchServiceTests`, `PCRE2SearchFastPlansTests`,
+`MCPFileSearchDisplayPathTests`). The literal-wildcard drift was demonstrated by run `4c063db3` before
+its fix. `conductor lint` (format-check and strict SwiftLint) and
+`Scripts/headless_runtime_guardrails.sh` passed. Not run: the full suite, an all-products build
+(the focused run compiles both the app and `RepoPromptMCP` sources through the test bundle), live
+MCP smoke, the live chaos matrix, and packaged-release checks; backend defaults are unchanged.
+In that run, per-scenario p50 latency for the 21 scenarios both backends answered was 5.7–14.5 ms
+for the app (auto-selection included) and 2.4–6.0 ms for headless; it is reported, not asserted, and not comparable across machines.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
 - Cross-backend app-versus-headless parity and latency harness beyond the read boundary (M8S covers
-  `read_file` and `get_code_structure` at the tool layer).
+  `read_file` and `get_code_structure`, M12 `file_search`, at the tool layer).
 - Live chaos matrix (app killed mid-request, restart during `initialize`), which
   requires explicit approval to stop or relaunch the visible app.
 

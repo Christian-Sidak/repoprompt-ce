@@ -28,6 +28,21 @@ import XCTest
             try assertGate(report, scenarios: scenarios, attachmentName: "mcp-backend-parity-report.json")
         }
 
+        /// M12: `file_search` parity over the same Git fixture: content, regex, case folding, whole
+        /// words, path globs, filters, ignore/link/outside-root exclusion, limits, `count_only`, `auto`
+        /// mode, and invalid input.
+        func testFileSearchParityAndLatencyGate() async throws {
+            let fixture = try makeGitFixture()
+            try await pinGlobalIgnoreDefaults()
+            let harness = try await Harness.make(root: fixture.root, globalPatterns: Self.globalPatterns)
+            addTeardownBlock { @MainActor in await harness.close() }
+            let scenarios = Self.searchScenarios()
+
+            let report = await harness.run(scenarios, iterations: Self.iterations)
+
+            try assertGate(report, scenarios: scenarios, attachmentName: "mcp-backend-parity-file-search-report.json")
+        }
+
         func testNonGitRootCodeStructureIsADocumentedDivergence() async throws {
             let root = try makeNonGitFixture()
             try await pinGlobalIgnoreDefaults()
@@ -410,6 +425,91 @@ import XCTest
             XCTAssertFalse(label.contains("b.swift"), "the issue path is never recorded")
         }
 
+        func testSearchExpectationChecksOnlySucceedingBackends() {
+            let hits = Harness.SearchHits(
+                paths: ["src/a.swift"],
+                content: [Harness.ContentHit(path: "src/debug.log", line: 1, text: "log")]
+            )
+            let violations = Harness.searchViolations(
+                Harness.SearchExpectation(include: ["src/a.swift", "docs/guide.md"], exclude: ["src/debug.log"]),
+                checks: [("app", .mustSucceed, .search(hits)), ("headless", .mustRefuse, .search(hits))]
+            )
+            XCTAssertEqual(violations, ["app search missed docs/guide.md", "app search leaked src/debug.log"])
+            XCTAssertEqual(
+                Harness.searchViolations(
+                    Harness.SearchExpectation(count: 3),
+                    checks: [("headless", .mustSucceed, .search(Harness.SearchHits(count: 1)))]
+                ),
+                ["headless count was 1, expected 3"]
+            )
+        }
+
+        func testEmptyAgreeingSearchCannotSatisfyAnInclusion() {
+            let report = Harness.evaluate(
+                Harness.Scenario(
+                    name: "unit",
+                    tool: .fileSearch,
+                    arguments: [:],
+                    authority: .mustSucceed,
+                    relation: .equal,
+                    search: Harness.SearchExpectation(include: ["src/a.swift"])
+                ),
+                app: [Harness.Observation(outcome: .search(Harness.SearchHits()), detail: nil)],
+                headless: [Harness.Observation(outcome: .search(Harness.SearchHits()), detail: nil)],
+                appSamples: [1],
+                headlessSamples: [1]
+            )
+            XCTAssertEqual(report.violations, ["app search missed src/a.swift", "headless search missed src/a.swift"])
+        }
+
+        func testAppSearchClassificationNormalizesDisplayPathsAndErrors() {
+            let root = URL(fileURLWithPath: "/tmp/parity/root", isDirectory: true)
+            typealias DTO = ToolResultDTOs.SearchResultDTO
+            let reply = DTO(
+                totalMatches: 2, totalFiles: 1, contentMatches: 1, pathMatches: 1, limitHit: false, perFileCounts: [],
+                pathMatchLines: ["root/src/b.swift"],
+                contentMatchGroups: [DTO.ContentMatchGroup(
+                    path: "/tmp/parity/root/src/a.swift",
+                    lines: [DTO.ContentMatchGroup.Line(lineNumber: 2, lineText: "x", contextBefore: nil, contextAfter: nil)]
+                )]
+            )
+            let observation = Harness.classifyAppSearch(reply, countOnly: false, root: root)
+            XCTAssertEqual(observation.outcome, .search(Harness.SearchHits(
+                paths: ["src/b.swift"],
+                content: [Harness.ContentHit(path: "src/a.swift", line: 2, text: "x")]
+            )))
+            XCTAssertEqual(observation.detail, "display=absolute,root_name limit_hit=false", "spellings are reported")
+            XCTAssertEqual(Harness.classifyAppSearch(reply, countOnly: true, root: root).outcome, .search(Harness.SearchHits(count: 2)))
+            let failure = DTO(
+                totalMatches: 0, totalFiles: 0, contentMatches: 0, pathMatches: 0, limitHit: false, perFileCounts: [],
+                pathMatchLines: [], contentMatchGroups: [], errorCode: "workspace_readiness_timeout"
+            )
+            let refused = Harness.classifyAppSearch(failure, countOnly: false, root: root)
+            XCTAssertEqual(refused.outcome, .refused)
+            XCTAssertEqual(refused.detail, "workspace_readiness_timeout")
+        }
+
+        func testHeadlessSearchClassificationSeparatesPathAndContentHits() {
+            let value: Value = [
+                "matches": [
+                    ["path": "src/b.swift"],
+                    ["path": "src/a.swift", "line": 3, "text": "hit"]
+                ],
+                "count": 2,
+                "truncated": true
+            ]
+            let observation = Harness.classifyHeadlessSearch(value, countOnly: false)
+            XCTAssertEqual(observation.outcome, .search(Harness.SearchHits(
+                paths: ["src/b.swift"],
+                content: [Harness.ContentHit(path: "src/a.swift", line: 3, text: "hit")]
+            )))
+            XCTAssertEqual(observation.detail, "truncated")
+            XCTAssertEqual(
+                Harness.classifyHeadlessSearch(["count": 7], countOnly: true).outcome,
+                .search(Harness.SearchHits(count: 7))
+            )
+        }
+
         func testLatencySummaryUsesLowerMedianAndMax() {
             let summary = Harness.LatencySummary(samples: [4, 1, 3, 2])
             XCTAssertEqual(summary.p50MS, 2)
@@ -492,6 +592,186 @@ import XCTest
             ]
         }
 
+        /// The checked-in `file_search` expectation table for the Git fixture. Every succeeding scenario
+        /// names paths it must find and, where relevant, ignored/linked/outside paths it must not.
+        private static func searchScenarios() -> [Harness.Scenario] {
+            typealias Expectation = Harness.SearchExpectation
+            // Files that contain `parityMarker` but must never be reported: Git-ignored, globally
+            // ignored, reached through a directory link, or outside the root.
+            let hidden = ["src/debug.log", "node_modules/pkg/index.js", "linkdir/search_target.swift", "outside/secret.swift"]
+            func search(
+                _ name: String,
+                _ arguments: [String: Value],
+                _ expectation: Expectation?,
+                authority: Harness.Authority = .mustSucceed,
+                relation: Harness.Relation = .equal,
+                headlessRefusal: String? = nil,
+                appAuthority: Harness.Authority? = nil
+            ) -> Harness.Scenario {
+                Harness.Scenario(
+                    name: name,
+                    tool: .fileSearch,
+                    arguments: arguments,
+                    authority: authority,
+                    relation: relation,
+                    headlessRefusal: headlessRefusal,
+                    appAuthority: appAuthority,
+                    search: expectation
+                )
+            }
+            return [
+                search(
+                    "content literal excludes ignored, linked, and outside files",
+                    ["pattern": "parityMarker", "mode": "content", "regex": false],
+                    Expectation(include: ["src/search_target.swift", "docs/guide.md"], exclude: hidden)
+                ),
+                search(
+                    "content regex",
+                    ["pattern": "parity[A-Z][a-z]+", "mode": "content", "regex": true],
+                    Expectation(include: ["src/search_target.swift", "docs/guide.md"], exclude: hidden)
+                ),
+                search(
+                    "literal content is case-insensitive",
+                    ["pattern": "PARITYMARKER", "mode": "content", "regex": false],
+                    Expectation(include: ["src/search_target.swift"], exclude: hidden)
+                ),
+                search(
+                    "regex content is case-insensitive",
+                    ["pattern": "PARITY[a-z]+", "mode": "content", "regex": true],
+                    Expectation(include: ["src/search_target.swift"], exclude: hidden)
+                ),
+                search(
+                    "whole word",
+                    ["pattern": "parity", "mode": "content", "regex": false, "whole_word": true],
+                    Expectation(include: ["src/search_target.swift"], exclude: ["docs/guide.md"] + hidden)
+                ),
+                search(
+                    "path glob excludes links and outside files",
+                    ["pattern": "*.swift", "mode": "path", "regex": false],
+                    Expectation(
+                        include: ["src/a.swift", "src/search_target.swift"],
+                        exclude: ["linkfile.swift", "linkdir/a.swift", "outside/secret.swift"]
+                    )
+                ),
+                search(
+                    "path literal",
+                    ["pattern": "search_target", "mode": "path", "regex": false],
+                    Expectation(include: ["src/search_target.swift"], exclude: ["linkdir/search_target.swift"])
+                ),
+                search(
+                    "hidden dotfile path",
+                    ["pattern": ".gitignore", "mode": "path", "regex": false],
+                    Expectation(include: [".gitignore"])
+                ),
+                // Wildcards are path syntax only: a literal content pattern matches `?` as a character.
+                search(
+                    "literal content wildcard characters match literally",
+                    ["pattern": "done?", "mode": "content", "regex": false],
+                    Expectation(include: ["docs/guide.md"])
+                ),
+                search(
+                    "extension filter",
+                    ["pattern": "parityMarker", "mode": "content", "filter": ["extensions": [".md"]]],
+                    Expectation(include: ["docs/guide.md"], exclude: ["src/search_target.swift"] + hidden)
+                ),
+                search(
+                    "path filter",
+                    ["pattern": "parityMarker", "mode": "content", "filter": ["paths": ["src"]]],
+                    Expectation(include: ["src/search_target.swift"], exclude: ["docs/guide.md"] + hidden)
+                ),
+                search(
+                    "path argument alias",
+                    ["pattern": "parityMarker", "mode": "content", "path": "docs"],
+                    Expectation(include: ["docs/guide.md"], exclude: ["src/search_target.swift"] + hidden)
+                ),
+                search(
+                    "exclude filter",
+                    ["pattern": "parityMarker", "mode": "content", "filter": ["exclude": ["docs"]]],
+                    Expectation(include: ["src/search_target.swift"], exclude: ["docs/guide.md"] + hidden)
+                ),
+                search(
+                    "content limit within one file",
+                    ["pattern": "limitLine", "mode": "content", "max_results": 2],
+                    Expectation(include: ["src/limit.swift"])
+                ),
+                // `limit` matches the path src/limit.swift and its content: `max_results` caps each stage.
+                search(
+                    "both-mode limit caps path and content separately",
+                    ["pattern": "limit", "mode": "both", "max_results": 1],
+                    Expectation(include: ["src/limit.swift"])
+                ),
+                search(
+                    "count only",
+                    ["pattern": "parityMarker", "mode": "content", "count_only": true],
+                    Expectation(count: 3)
+                ),
+                search(
+                    "count only beyond max_results",
+                    ["pattern": "parityMarker", "mode": "content", "count_only": true, "max_results": 1],
+                    Expectation(count: 3)
+                ),
+                search(
+                    "auto mode glob",
+                    ["pattern": "*.md"],
+                    Expectation(include: ["docs/guide.md"])
+                ),
+                search(
+                    "auto mode identifier searches paths too",
+                    ["pattern": "search_target"],
+                    Expectation(include: ["src/search_target.swift"])
+                ),
+                search(
+                    "auto mode slash pattern searches paths",
+                    ["pattern": "src/search"],
+                    Expectation(include: ["src/search_target.swift"], exclude: ["linkdir/search_target.swift"])
+                ),
+                // Without `regex`, call parentheses stay literal: `go()` must not match the `ago` in guide.md.
+                search(
+                    "regex auto-detection keeps call parentheses literal",
+                    ["pattern": "go()", "mode": "content"],
+                    Expectation(include: ["src/b.swift"], exclude: ["docs/guide.md"])
+                ),
+                search(
+                    "empty pattern",
+                    ["pattern": ""],
+                    nil,
+                    authority: .mustRefuse,
+                    headlessRefusal: "pattern cannot be empty"
+                ),
+                search(
+                    "whitespace-only pattern",
+                    ["pattern": "   ", "mode": "content"],
+                    nil,
+                    authority: .mustRefuse,
+                    headlessRefusal: "pattern cannot be empty"
+                ),
+                search(
+                    "invalid regex",
+                    ["pattern": "(unclosed", "mode": "content", "regex": true],
+                    nil,
+                    authority: .mustRefuse,
+                    relation: .knownDivergence(
+                        "the app repairs an uncompilable regex (literal fallback) and answers; headless rejects "
+                            + "it with the compile error (stricter, never broader)"
+                    ),
+                    headlessRefusal: "Code=2048",
+                    appAuthority: .mustSucceed
+                ),
+                search(
+                    "unknown mode",
+                    ["pattern": "parityMarker", "mode": "fuzzy"],
+                    Expectation(include: ["src/search_target.swift"], exclude: hidden),
+                    authority: .mustRefuse,
+                    relation: .knownDivergence(
+                        "the app falls back to auto for a mode outside the schema enum; headless rejects it "
+                            + "as invalid params (stricter, never broader)"
+                    ),
+                    headlessRefusal: "mode must be auto, path, content, or both",
+                    appAuthority: .mustSucceed
+                )
+            ]
+        }
+
         // MARK: - Helpers
 
         private struct GitFixture {
@@ -504,20 +784,32 @@ import XCTest
         /// ```
         /// root/.gitignore            *.log
         /// root/src/a.swift, root/src/b.swift, root/src/debug.log (ignored, untracked)
+        /// root/src/search_target.swift, root/src/limit.swift, root/docs/guide.md
+        /// root/node_modules/pkg/index.js (globally ignored)
         /// root/linkfile.swift -> src/a.swift      root/linkdir -> src
         /// root/outside -> <external>              <external>/secret.swift
         /// ```
+        /// `parityMarker` appears in search_target.swift (twice), guide.md, and — never to be reported —
+        /// debug.log, node_modules, and the external secret. guide.md also contains `ago` (not `go()`).
         private func makeGitFixture() throws -> GitFixture {
             let git = try ReviewGitRepositoryFixture(name: "mcp-backend-parity", parentDirectory: canonicalTemporaryDirectory())
             addTeardownBlock { git.cleanup() }
             let root = git.sandbox.appendingPathComponent("root", isDirectory: true)
             let external = git.sandbox.appendingPathComponent("external", isDirectory: true)
             try git.initializeRepository(at: root)
-            try git.write("let secret = \"OUTSIDE_ROOT_SECRET\"\n", to: "secret.swift", at: external)
+            try git.write("let secret = \"OUTSIDE_ROOT_SECRET\"\n// parityMarker outside\n", to: "secret.swift", at: external)
             try git.write("*.log\n", to: ".gitignore", at: root)
             try git.write("struct A {\n    func run() {}\n}\nlet tail = 3\n", to: "src/a.swift", at: root)
             try git.write("struct B {\n    let a = A()\n    func go() { a.run() }\n}\n", to: "src/b.swift", at: root)
-            try git.write("log line\n", to: "src/debug.log", at: root)
+            try git.write("log line parityMarker\n", to: "src/debug.log", at: root)
+            try git.write(
+                "// parityMarker first\nlet parityMarker = 1\n// parity check\n",
+                to: "src/search_target.swift",
+                at: root
+            )
+            try git.write("let a = \"limitLine one\"\nlet b = \"limitLine two\"\nlet c = \"limitLine three\"\n", to: "src/limit.swift", at: root)
+            try git.write("parityMarker in docs\nwritten long ago\nis it done? yes\n", to: "docs/guide.md", at: root)
+            try git.write("// parityMarker in a dependency\n", to: "node_modules/pkg/index.js", at: root)
             for (link, destination) in [("linkfile.swift", "src/a.swift"), ("linkdir", "src"), ("outside", external.path)] {
                 try FileManager.default.createSymbolicLink(
                     atPath: root.appendingPathComponent(link).path,

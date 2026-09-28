@@ -5,7 +5,8 @@ import XCTest
 
 /// An in-process app `MCPServerViewModel` bound to one workspace root, exposing the real window
 /// tools (`windowMCPTools`) without a visible app, socket transport, or connection manager.
-/// `file_search` is not wired (its search closure throws).
+/// In `make`, `file_search` is not wired (its search closure throws); `makeRegisteredWindow` uses the
+/// real window composition, so `file_search` runs the production store-backed search.
 ///
 /// `make` binds a standalone server without activating the workspace (callers load roots into the
 /// store themselves); file-tool reads that need the workspace root catalog (`read_file`,
