@@ -52,8 +52,13 @@ Conductor timings (last 3,000 jobs, net of queue):
 - [x] P0.3 focused-test executor bake-off — gate holds on both slices (`RepoPromptMCPCoreTests` 77%, `RepoPromptDomainRuntimeTests` 95%); ADR-07 accepted. Not measured, not blockers: candidates (c) and (d), CI parity of module runs (CI stays on the aggregate)
 - [x] P0.4 fixed per-job overhead root cause and fix (see below)
 - [x] P0.5 link and type-check levers: type-check baselines, frontend profile, link breakdown, `-no_deduplicate` rejected, per-job peak RSS added (see P0.5 below)
-- [ ] P0.6 compatibility inventory golden tests
+- [x] P0.6 compatibility inventory: type-name, bundle, and persisted-identity inventory; goldens where missing; runtime-identity guardrail; slice checklist (see P0.6 below)
 - [x] P0.7 ratchets file and guardrail gate
+
+**Phase 0 exit gate (2026-09-29): not yet met.** Every P0 item is ticked, but the gate also requires ADR-01…09 to be decided with evidence.
+- Met: baseline recorded (Baseline, P0.1); the index graph agrees with the top offenders (P0.2); no production behavior changed. P0.6 made one access-only change.
+- Decided: ADR-01 (accepted with the plan; the §3.4 gate was exercised by P0.3) and ADR-07 (accepted with P0.3 measurements).
+- **Not yet decided (no decision record here):** ADR-02 capability graph and allowed edges, ADR-03 contract policy, ADR-04 composition root and injection, ADR-05 logic/UI split, ADR-06 test ownership and hermeticity, ADR-08 admission and caching, ADR-09 per-module concurrency. The plan states a position on each (§3.2, §3.5, §3.1 principles 3–4, §3.1 principle 6, §3.6, §5.4–5.5, §3.7), and P0.2, P0.3, and P0.5 provide partial evidence (index graph, `RepoPromptTestSupport` precedent, per-job peak RSS). None is recorded as accepted. Recording them needs a maintainer decision.
 
 ## P0.4 — fixed per-job overhead (2026-09-28)
 
@@ -674,3 +679,88 @@ These agree with P0.3's sampler: 3,856 MiB for an aggregate interface edit. For 
 - **Cleanup.**
   - The measurement scratch `.build/measure/p05-typecheck` (9.1 GB) and the throwaway scripts were deleted.
   - Two conductor job logs stay under the daemon's retention: `569c44ed` at 1.19 GB (run 1, `-debug-time-function-bodies`) and `9d37d757` at 171 MB.
+
+## P0.6 — compatibility inventory (2026-09-29)
+
+**Question.** Which runtime identities can a module move change *silently*? A move changes only what the compiler or runtime derives from the owning module or target:
+- the module prefix in reflected type names, in bridged `NSError` domains (`<Module>.<Type>`), in `#fileID`, and in Swift class runtime names (`_TtC13RepoPromptApp…`);
+- which bundle `Bundle.module` and `Bundle(for:)` resolve;
+- which process answers a `Bundle.main` or `UserDefaults.standard` lookup, once code moves into a target that `repoprompt-mcp` also links.
+
+Literal strings (raw values, Codable keys, notification names, tool names, identifiers) cannot change in a move. They change only when someone edits them, and principle 9 keeps edits out of move commits. The inventory below therefore classifies literal identities as module-invariant, and adds goldens only where an identity is derived, or is persisted or cross-process and was not yet pinned.
+
+Scan at `7f10a4f5` (first-party `Sources`, `Tests`, `Packages`; `Vendor` excluded):
+
+```bash
+grep -rn --include='*.swift' -E 'String\(reflecting:|String\(describing: *type\(of|\\\(type\(of:|#fileID' Sources
+grep -rn --include='*.swift' -E 'NSKeyed|NSStringFromClass|NSClassFromString|_typeName\(|@objc\(' Sources Tests
+grep -rn --include='*.swift' -E 'Bundle\.(main|module)|Bundle\(for:|NSImage\(named:' Sources
+```
+
+### Type-name-dependent strings
+
+| Site | Kind | Stable? | Covered by |
+| --- | --- | --- | --- |
+| `automaticSelectionIssuePrecedes` (`WorkspaceCodemapAutomaticSelectionModels.swift`), used by `WorkspaceFileContextStore`, `WorkspaceSelectionMutationService`, and the result's `issues`/coverage | `String(reflecting:)` sort key over `WorkspaceCodemapAutomaticSelectionIssue`. The order is observable in automatic-selection results; it is not persisted | **Order must be stable.** It is module-invariant by construction: both sides of every comparison carry the same type prefix at the same position, so the first difference is always a case name or a payload value | **New:** `ModularizationCompatibilityGoldenTests.testAutomaticSelectionIssueOrderIsPinned`. It also pins that integer payloads sort as text (`10` before `9`), which any explicit-comparator refactor must preserve |
+| `debugReflectionIssueSortKey` (`WorkspaceCodemapPresentationCoordinator.swift`) | Same pattern for presentation issues | Module-invariant by the same argument | Not separately pinned. Its comment says automatic-selection uses "explicit typed comparators"; that is inaccurate (it also uses reflection). Left unchanged |
+| `String(reflecting:)` of errors or error types: 15 sites in 10 files (`AppDomainRuntimeComposition`, `AppDelegate`, `RepoPromptApp`, `AppDomainRuntimeRegistration` ×2, `OracleReviewPackagingDiagnostics`, `AgentSelectedFilesModelCoordinator`, `SearchMatch`, `MCPAppToolCatalogRegistration` ×4, `MCPServerViewModel` ×2, `ACPAgentSessionController`) | Log text, diagnostic fields, `RegistrationStatus.failed` and `windowToolRegistrationFailureDescription` UI diagnostics. `SearchMatch`'s `PatternErrorInfo.errorType` is `Codable`, but `SearchResults` is never encoded and the field is never read | Diagnostics only; may change | — |
+| `String(reflecting:)` of `String` values: `AgentSessionHandoffPrompt` (title quoting), `PCRE2Error` (pattern) | Escaped string literal | No type name in the output; module-invariant | — |
+| Metatype interpolation and `String(describing: type(of:))`: 10 sites in 4 files (`MCPConnectionManager+DebugSparkleDiagnostics` ×2, `SparkleUpdateManager`, `FileSystemService+FSEvents`, `CodexNativeSessionController` ×6) | Debug logs and `assertionFailure` messages | Diagnostics only | — |
+| `#fileID`: 10 sites in 4 files (`GlobalSettingsManager` ×6, `WindowSettingsManager` ×2, `AgentTabSession`, `CodeMapPCRE2Regex`) | Settings-write diagnostic attribution and assertion locations; the value embeds the module name | Diagnostics only | — |
+| `NSClassFromString("XCTestCase")` (`AppLaunchConfiguration`) | Objective-C class lookup | Stable: Objective-C names carry no module | **New guardrail** allows only this literal |
+| `NSKeyedArchiver`/`Unarchiver`, `NSStringFromClass`, `_typeName` | — | 0 sites. The plan's "`NSKeyedArchiver` (1 file)" is not reproduced at this commit | **New guardrail** forbids them in first-party `Sources` |
+| `@objc(windowDidOrderOffScreen:)` (`InterceptingWindowDelegateProxy`, plus its test double) | Explicit selector | Module-invariant | `InterceptingWindowDelegateProxyTests` (`NSSelectorFromString` literal) |
+| Bridged `NSError` domains | A Swift error bridges with domain `<Module>.<Type>` | Compared only against `com.apple.osascript` (`CLIPathInstaller`). `DiffGenerationError` declares an explicit `RepoPrompt.DiffGenerationError` domain, which survived its earlier move into DomainRuntime. `WorkspaceManagerViewModel` builds `NSError`s with literal domains | New comparisons must use an explicit `CustomNSError.errorDomain` (checklist) |
+| Module-qualified names in code: `RepoPromptApp.Tool` (`MCPReadMutationPathContractTests`), 20+ `typealias X = RepoPromptDomainRuntime.X` forwarding aliases, two `"RepoPromptApp.init …"` log strings | Compile-time disambiguation and log text | A move breaks the build loudly; nothing silent | — |
+| Swift class runtime names in AppKit persistence | — | None. No `restorationClass`, keyed archives, `@SceneStorage`, or value-typed `WindowGroup(for:)`; `NSPrincipalClass` is `NSApplication`; the window autosave name and pasteboard types are literals. No logger category or label is derived from a type | — |
+| Sentry crash and hang grouping | Symbolicated frames carry module names | Telemetry grouping will shift after moves; accepted | — |
+
+### Bundle lookups
+
+| Site | Resource | Effect of a move | Covered by |
+| --- | --- | --- | --- |
+| `Bundle.main`: 34 references in 21 files, all under `Sources/RepoPrompt` (`RepoPromptApp`) | Info.plist keys: `WindowState`, `SparkleUpdateManager` (versions, `SUPublicEDKey`), `MCPConnectionManager+DebugSparkleDiagnostics` (`SUFeedURL`, versions), `RuntimeCodeSigningPolicy` (signing-mode and debug-storage keys), `CodexAppServerClient` and `ACPAgentSessionController` (client version), `SentryTelemetryBootstrap` (`RepoPromptSentryDSN`), `BootstrapSocketConnectionManager` (name, version). Bundle identifier: Logger subsystems in `AppCommandLifetime`, `AgentSessionLifecycleAuthority`, `WorkspaceManagerViewModel`, `WorkspaceAgentAdmissionCoordinator`, `AgentSessionLinkCatalogDiagnostics`; `NotificationSettingsView`; `BundleIdentityDefaultsMigration`. Bundle and resources URL: `AppLaunchConfiguration` (XCTest detection), `UserNotificationCenterClient`, `CodexRuntimeAuthority` (bundled Codex). Auxiliary executable `repoprompt-mcp`: `ServerController`, `CLISymlinkManager`, `CLIPathInstaller` | None while the code stays in a target statically linked into the app. Moving it into a target that the CLI links (`RepoPromptShared`, `RepoPromptDomainRuntime`, `RepoPromptMCPCore`, `RepoPromptMCP`, `RepoPromptCodeMapCore`, `RepoPromptWorkspaceCore`, `RepoPromptRegexCore`) changes which process answers | **New guardrail:** `Bundle.main` and `NSImage(named:)` only under allowlisted app-only roots (today `Sources/RepoPrompt/`) |
+| `NSImage(named: "RepoPromptLogoNoBg_Monochrome")` (`MCPBackgroundModeCoordinator`) | Implicit main-bundle image | No such asset is packaged, so the lookup returns `nil` and the code falls back. Pre-existing; unchanged | Same guardrail |
+| `Bundle.module`, `Bundle(for:)` in production | — | 0 sites. The only SwiftPM `resources:` belong to the `RepoPromptCodeMapCoreTests` test target (Fixtures, Goldens). A production `resources:` or `Bundle.module` would resolve a per-target bundle that `package_app.sh` does not ship | **New guardrail** rejects both |
+| `AppResources/` copied to `Contents/Resources` by `package_app.sh` | `AppIcon.icns` (through Info.plist); `Audio/notificationDing.mp3` (no code reference found) | Unaffected by Swift moves | `package_app.sh` |
+| KeyboardShortcuts `Bundle.module` | Third-party resources | Unaffected; patched by `patch_keyboard_shortcuts_resource_lookup.sh` | Packaging |
+
+### Persisted and cross-process identities
+
+| Identity | Stable? | Covered by |
+| --- | --- | --- |
+| MCP tool names, descriptions, input schemas, annotations | Literal; persisted by clients | `DirectHeadlessCompositionTests.testCanonicalDefinitionsMatchReadableGeneratedReviewSnapshot` byte-compares `docs/spec/mcp-domain-canonical-tool-definitions.generated.json`; `MCPDomainStandaloneCompositionTests` pins the 28-tool name set; guardrail M3 checks |
+| MCP tool and catalog fingerprints (`MCPDomainToolFingerprint`, `catalogFingerprint`) | SHA-256 over the pinned inputs above; no type names | Transitively, by the snapshot |
+| CodeMap artifact bytes | Persisted | `Tests/RepoPromptCodeMapCoreTests/Goldens`, `CodeMapSyntaxArtifactTests` |
+| Settings document: `currentSchemaVersion` 10, per-feature minimums, lineage | Persisted | `ModelRouterSettingsPersistenceTests`, `NotificationSettingsPersistenceTests` (literal 10), `GlobalSettingsSchemaRecoveryTests`, `GlobalSettingsOwnershipTests`, `AppSettingsMCPServiceAgentModeSettingsTests`, frozen v2/v4 codecs |
+| Settings document root keys and the 11 `scalarPreferences` group keys | Persisted; synthesized Codable keys are module-invariant, but S7 splits these facets across features | **New:** `testGlobalSettingsDocumentPersistedKeysArePinned`. Field keys inside groups stay spot-checked by the settings suites |
+| Darwin notification `com.repoprompt.fontScaleDidChange` (`FontScaleManager`) | Cross-process between app instances | **New:** `testFontScaleDarwinNotificationNameIsPinned`. The constant went from `private` to internal so the test can read it; the value is unchanged |
+| `Notification.Name`: 61 definitions in 12 files | Literal; in-process `NotificationCenter` only | Not pinned (neither persisted nor cross-process) |
+| `UNNotification` action and category identifiers, payload route keys | Literal; delivered notifications outlive a launch | `AppNotificationPayloadTests` (identifier formats, route v1 keys) |
+| Secure-storage account names | Persisted in Keychain | `SecureStorageAccountCatalogTests` |
+| `UserDefaults` keys: about 98 distinct literals, scattered | Literal; module-invariant | Not pinned. Three resolve against the calling process's defaults domain across the app/CLI boundary: `GlobalCustomStorageURL` (written and read by the app, also read by `DirectHeadlessRuntimeConfiguration` in MCPCore), `enableSocketDebugLog` (CLI), `enableMCPResponseDeliveryTrace` (`RepoPromptShared`, both processes). Pinning them needs a key-constant refactor; defer to S7 |
+
+### Behavior-preserving changes
+
+- `FontScaleManager.externalChangeNotificationRawName`: `private static let` → `static let`. Access only; no value or behavior change.
+- No production refactor of the reflection sort key. It is already module-invariant, and the golden pins its order.
+
+### Slice checklist (referenced by plan §7.2)
+
+For every slice that moves code, before the move PR merges:
+
+1. `make guardrails` passes, including section 9 (runtime identity): no production `resources:`, no `Bundle.module` or `Bundle(for:)`, `Bundle.main` and `NSImage(named:)` only under allowlisted app-only roots, and no runtime type-name APIs. A slice that creates an app-only target holding `Bundle.main` code adds its root to `bundle_main_allowed_roots` in the same PR. CLI-linked targets are never allowlisted.
+2. `conductor test --filter ModularizationCompatibilityGoldenTests` passes, plus the owning suites in the tables above for every moved site. Each golden moves with its type, and its literals stay unchanged.
+3. Rerun the scan commands on the moved files. Any new sort, equality, or persistence use of `String(reflecting:)`, `String(describing:)` of a type, or `#fileID` needs a golden or an explicit key.
+4. A moved Swift error whose `NSError` domain or code is compared or persisted declares an explicit `CustomNSError.errorDomain`.
+5. Moving code that reads `Bundle.main` or `UserDefaults.standard` into a CLI-linked target is a semantic change and gets its own PR.
+6. Update this inventory's rows for the moved sites.
+
+**Validation.**
+- `conductor test --filter ModularizationCompatibilityGoldenTests`: 3 tests executed, 0 failures (ticket `9e3b306e`; rerun after formatting, ticket `46e70b79`).
+- `make guardrails` passes, including the new section 9, with modularization ratchets ok.
+  - The new checks were exercised against negative inputs: a production `resources:` block, `Bundle(for:)`, and `Bundle.module`.
+  - The first draft matched `groupCarrierBundle(for:)` in `RepoPromptMCPCore`; the patterns are now anchored to an identifier boundary.
+- Tracked metrics grew (not gated): `app_target_swift_lines` 648,098 → 648,100 (the constant's doc comment) and `tests_testable_import_app_files` 319 → 320 (the new golden suite, which tests app-owned types). Baselines unchanged.
+- `make conductor-selftest`: every suite passes except `test_local_production_installer.py`, which hit the known load-sensitive flake (6 of 18 errors, each a 15 s installer subprocess timeout; this change does not touch the installer). `test_security_inventory.py`, the suite after it, passes standalone.
+- SwiftFormat `--lint` and SwiftLint `--strict` are clean on the two changed Swift files.

@@ -821,6 +821,41 @@ if [[ -n "$unexpected_tracked_docs" ]]; then
   printf '%s\n' "$unexpected_tracked_docs" >&2
 fi
 
+# 9. Runtime identity (build-modularization P0.6; inventory in
+# docs/migrations/build-modularization/ledger.md, "P0.6 compatibility inventory").
+# Production resources come only from the packaged app bundle. A SwiftPM
+# `resources:` declaration or `Bundle.module` would resolve a per-target bundle
+# that Scripts/package_app.sh does not ship.
+print_matches \
+  "production target declares SwiftPM resources (only test targets may; package_app.sh ships AppResources only)" \
+  awk '/\.(target|executableTarget|testTarget|binaryTarget)\(/ { kind = $0 } /resources:/ && kind !~ /testTarget/ { print FILENAME ":" FNR ": " $0 }' Package.swift
+print_matches \
+  "per-target bundle lookup in first-party Sources (use the app bundle via an allowlisted target)" \
+  grep -R -n -E '(^|[^A-Za-z0-9_])Bundle(\.module|\(for:)' Sources --include='*.swift'
+# `Bundle.main` and implicit main-bundle lookups resolve per process. They stay in
+# app-only targets; add a new app-only target here in the slice that creates it.
+# Targets linked into repoprompt-mcp are never allowlisted.
+bundle_main_allowed_roots=(
+  "Sources/RepoPrompt/"
+)
+bundle_main_hits="$(grep -R -n -E '(^|[^A-Za-z0-9_])(Bundle\.main|NSImage\(named:)' Sources --include='*.swift' || true)"
+for allowed_root in "${bundle_main_allowed_roots[@]}"; do
+  bundle_main_hits="$(printf '%s\n' "$bundle_main_hits" | grep -v -E "^${allowed_root}" || true)"
+done
+if [[ -n "$bundle_main_hits" ]]; then
+  fail "Bundle.main lookup outside an allowlisted app-only target"
+  printf '%s\n' "$bundle_main_hits" >&2
+fi
+# Swift class runtime names embed the module (`_TtC13RepoPromptApp...`), so these
+# APIs silently change identity when a type moves. Use explicit string identities.
+# The one allowed lookup names an Objective-C class, whose name has no module.
+runtime_type_name_hits="$(grep -R -n -E 'NSKeyedArchiver|NSKeyedUnarchiver|NSStringFromClass|NSClassFromString|_typeName\(' Sources --include='*.swift' \
+  | grep -v -F 'NSClassFromString("XCTestCase")' || true)"
+if [[ -n "$runtime_type_name_hits" ]]; then
+  fail "module-dependent runtime type-name API in first-party Sources"
+  printf '%s\n' "$runtime_type_name_hits" >&2
+fi
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'Source layout guardrails failed (%s issue%s).\n' "$failures" "$([[ "$failures" == 1 ]] && printf '' || printf 's')" >&2
   exit 1

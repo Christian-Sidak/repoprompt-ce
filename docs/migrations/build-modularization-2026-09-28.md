@@ -370,8 +370,10 @@ After a conflict, replay the codemod on current `main` instead of rebasing a mov
 ### 7.2 Compatibility checklist (per slice)
 
 - Persisted raw values and Codable keys; secure permission documents; workspace journals.
-- Type-name-dependent strings: `String(reflecting:)` (13 files, mostly diagnostics; one sort key in `WorkspaceCodemapAutomaticSelectionModels`), `NSKeyedArchiver` (1 file), `NSClassFromString` (1), `@objc(...)` selectors (1), and test code referencing `RepoPromptApp.`-qualified names (1 file).
-- `Bundle.main` lookups (21 files) and resources. A move to a target must not silently switch to `Bundle.module` or break app packaging.
+- **Runtime identity:** run the P0.6 slice checklist in the ledger ("P0.6 compatibility inventory"). It covers:
+  - type-name-dependent strings: `String(reflecting:)` (14 files, diagnostics except two module-invariant sort keys, one pinned by a golden), `#fileID`, bridged `NSError` domains, and runtime class names (the guardrail forbids keyed archivers and `NSStringFromClass`);
+  - `Bundle.main` lookups (21 files, app-only roots enforced by the guardrail) and resources (no production `resources:` or `Bundle.module`);
+  - the `ModularizationCompatibilityGoldenTests` goldens.
 - MCP tool names, schemas, and fingerprints (DomainRuntime catalog tests); CodeMap artifact bytes (goldens); notification names.
 - Sparkle linkage, conditional Sentry linkage, signing, entitlements, `Scripts/package_app.sh`.
 - Static-linkage singleton identity: no module duplicated across images.
@@ -404,7 +406,7 @@ Waves proceed bottom-up by dependency closure. P2 and later waves interleave: de
   Measure cold and warm edit→test, test discovery completeness, resources, peak RSS, disk, and CI parity. This decides ADR-07 and exercises the §3.4 packaging gate.
 - **P0.4 Fixed per-job overhead** (§5.2) — done; see ledger.
 - **P0.5 Link and type-check levers** measured (§5.6, §5.7) — done; see ledger.
-- **P0.6 Compatibility inventory** (§7.2) captured as golden tests where missing.
+- **P0.6 Compatibility inventory** (§7.2) captured as golden tests where missing — done; see ledger.
 - **P0.7 Ratchets file** with baselines, and a guardrail skeleton that fails only on regression.
 - **Exit gate:** baseline recorded; ADR-01…09 decided with evidence; the graph tool agrees with the top offenders; no production behavior changed.
 
