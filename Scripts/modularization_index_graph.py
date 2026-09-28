@@ -736,7 +736,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--output", help="dump: file to write")
     parser.add_argument("--files", nargs="+", default=[], help="readiness: candidate files or directories")
     parser.add_argument("--top", type=int, default=40)
-    args = parser.parse_args(argv)
+    # Intermixed parsing lets `edge` paths follow options on Python 3.9 as well as newer versions.
+    args = parser.parse_intermixed_args(argv)
     root = args.root.resolve()
 
     if args.command == "dump" and not args.output:
