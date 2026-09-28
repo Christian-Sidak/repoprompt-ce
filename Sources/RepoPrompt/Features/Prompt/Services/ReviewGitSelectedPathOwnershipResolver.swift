@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct ReviewGitSelectedPathCheckout: Equatable {
     let checkoutRootPath: String

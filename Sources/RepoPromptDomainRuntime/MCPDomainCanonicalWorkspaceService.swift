@@ -117,6 +117,9 @@ package enum MCPDomainCanonicalReadError: Error, Equatable, LocalizedError {
     case fileTooLarge(byteCount: Int, limit: Int)
     case undecodableText
     case notARegularFile
+    /// A root's ignore rules could not be established (ambiguous Git topology or an unreadable
+    /// mandatory `.gitignore`), so enumeration fails closed rather than apply the wrong rules.
+    case ignoreRulesUnavailable(root: String)
 
     package var errorDescription: String? {
         switch self {
@@ -126,6 +129,8 @@ package enum MCPDomainCanonicalReadError: Error, Equatable, LocalizedError {
             "File is not UTF-8 or UTF-16 text."
         case .notARegularFile:
             "Path is not a regular file."
+        case let .ignoreRulesUnavailable(root):
+            "Ignore rules for \(root) could not be resolved (ambiguous Git topology or unreadable .gitignore)."
         }
     }
 }
@@ -208,7 +213,7 @@ package struct MCPDomainCanonicalWorkspaceService {
         let resolved = try requested.prefix(limit).map { raw in
             try adapter.resolvePath(raw, snapshot.roots, false)
         }
-        let ignoreContext = await makeIgnoreContext(roots: snapshot.roots)
+        let ignoreContext = try await makeIgnoreContext(roots: snapshot.roots)
         let (files, truncated) = try await Self.runCancellableBlocking { cancellation in
             var candidates: [URL] = []
             var truncated = false
@@ -260,7 +265,7 @@ package struct MCPDomainCanonicalWorkspaceService {
         } else {
             snapshot.roots
         }
-        let ignoreContext = await makeIgnoreContext(roots: snapshot.roots)
+        let ignoreContext = try await makeIgnoreContext(roots: snapshot.roots)
         let lines = try await Self.runCancellableBlocking { cancellation in
             var lines: [String] = []
             for root in roots {
@@ -329,7 +334,7 @@ package struct MCPDomainCanonicalWorkspaceService {
         let searchesContent = mode == "content" || mode == "both" || (mode == "auto" && !searchesPaths)
         let relativeRoots = Self.relativeRoots(snapshot.roots)
         let roots = snapshot.roots
-        let ignoreContext = await makeIgnoreContext(roots: roots)
+        let ignoreContext = try await makeIgnoreContext(roots: roots)
         let (results, enumerationTruncated, skippedLargeFiles) = try await Self.runCancellableBlocking { cancellation in
             let regex = regexEnabled ? try NSRegularExpression(pattern: regexPattern) : nil
             var results: [Value] = []
@@ -661,9 +666,9 @@ package struct MCPDomainCanonicalWorkspaceService {
         return text
     }
 
-    private func makeIgnoreContext(roots: [URL]) async -> HeadlessIgnoreContext? {
+    private func makeIgnoreContext(roots: [URL]) async throws -> HeadlessIgnoreContext? {
         guard let configuration = await adapter.ignoreConfiguration?() else { return nil }
-        return HeadlessIgnoreContext(roots: roots, configuration: configuration)
+        return try HeadlessIgnoreContext(roots: roots, configuration: configuration)
     }
 
     private struct FileScan {
@@ -695,8 +700,8 @@ package struct MCPDomainCanonicalWorkspaceService {
                 let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey])
                 if let located, let relative = located.relativePath(of: url) {
                     let isDirectory = values?.isDirectory == true
-                    guard located.evaluator.admits(relative, isDirectory: isDirectory) else {
-                        if isDirectory, !located.evaluator.requiresTraversal(relative) {
+                    guard try located.evaluator.admits(relative, isDirectory: isDirectory) else {
+                        if isDirectory, try !located.evaluator.requiresTraversal(relative) {
                             enumerator.skipDescendants()
                         }
                         continue
@@ -742,8 +747,8 @@ package struct MCPDomainCanonicalWorkspaceService {
             }
             let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
             if let located, let ignoredRelative = located.relativePath(of: url) {
-                guard located.evaluator.admits(ignoredRelative, isDirectory: isDirectory) else {
-                    if isDirectory, !located.evaluator.requiresTraversal(ignoredRelative) {
+                guard try located.evaluator.admits(ignoredRelative, isDirectory: isDirectory) else {
+                    if isDirectory, try !located.evaluator.requiresTraversal(ignoredRelative) {
                         enumerator.skipDescendants()
                     }
                     continue
@@ -826,10 +831,10 @@ private final class HeadlessIgnoreContext: @unchecked Sendable {
 
     private let evaluators: [(rootPath: String, evaluator: HeadlessIgnoreEvaluator)]
 
-    init(roots: [URL], configuration: DomainIgnoreConfiguration) {
-        evaluators = roots.map { root in
+    init(roots: [URL], configuration: DomainIgnoreConfiguration) throws {
+        evaluators = try roots.map { root in
             let rootPath = root.standardizedFileURL.path
-            return (rootPath, HeadlessIgnoreEvaluator(rootPath: rootPath, configuration: configuration))
+            return try (rootPath, HeadlessIgnoreEvaluator(rootPath: rootPath, configuration: configuration))
         }
     }
 
@@ -878,8 +883,12 @@ private final class HeadlessIgnoreContext: @unchecked Sendable {
 
 /// App-equivalent ignore evaluation for one workspace root, built with `IgnoreLayerAssembly`.
 ///
-/// A root that contains `.git` is treated as a Git work-tree root (mandatory `.gitignore` floor).
-/// Roots nested inside a repository do not yet load their ancestors' `.gitignore` files.
+/// The policy comes from `IgnoreRulePolicy.resolvingLoadedRoot`, the app crawl's resolver: a root at
+/// or inside a structurally valid Git work tree is a Git root whose chain runs from the repository
+/// root down to the loaded root (ancestor `.gitignore` files are the mandatory floor), and every
+/// `.gitignore` under a Git root is read through `MandatoryGitIgnoreFile`. Ambiguous topology or an
+/// unreadable mandatory `.gitignore` fails closed with `ignoreRulesUnavailable`, as the app crawl
+/// does, rather than enumerate with the wrong rules.
 private final class HeadlessIgnoreEvaluator: @unchecked Sendable {
     private let rootPath: String
     private let configuration: DomainIgnoreConfiguration
@@ -888,31 +897,46 @@ private final class HeadlessIgnoreEvaluator: @unchecked Sendable {
     private let lock = NSLock()
     private var rulesByDirectory: [String: IgnoreRules] = [:]
 
-    init(rootPath: String, configuration: DomainIgnoreConfiguration) {
+    init(rootPath: String, configuration: DomainIgnoreConfiguration) throws {
         self.rootPath = rootPath
         self.configuration = configuration
-        let isGitRoot = FileManager.default.fileExists(atPath: rootPath + "/.git")
-        if isGitRoot, let prefix = try? IgnoreRepositoryRootPrefix("") {
-            policy = .gitRoot(repositoryRelativeRootPrefix: prefix)
-        } else {
-            policy = .nonGitRoot
+        // Root-level files are read strictly, as the app's `IgnoreRulesManager` does: a present but
+        // unreadable root layer fails the root closed instead of silently dropping exclusions.
+        do {
+            policy = try IgnoreRulePolicy.resolvingLoadedRoot(URL(fileURLWithPath: rootPath, isDirectory: true))
+            if case let .gitRoot(prefix) = policy {
+                rootRules = try IgnoreLayerAssembly.gitRootChain(
+                    loadedPath: rootPath,
+                    repositoryRelativeRootPrefix: prefix,
+                    globalIgnoreContent: configuration.globalPatterns,
+                    respectRepoIgnore: configuration.respectRepoIgnore,
+                    respectCursorignore: configuration.respectCursorignore,
+                    policy: policy,
+                    loadSecondaryIfPresent: { try Self.strictContent(at: $0) }
+                )
+            } else {
+                let authority = try IgnoreLayerAssembly.compileRootAuthority(
+                    gitignoreContent: Self.strictContent(at: rootPath + "/.gitignore"),
+                    globalIgnoreContent: configuration.globalPatterns,
+                    repoIgnoreContent: configuration.respectRepoIgnore
+                        ? Self.strictContent(at: rootPath + "/.repo_ignore") : nil,
+                    cursorignoreContent: configuration.respectCursorignore
+                        ? Self.strictContent(at: rootPath + "/.cursorignore") : nil
+                )
+                rootRules = IgnoreLayerAssembly.makeRootRules(
+                    authority: authority,
+                    respectRepoIgnore: configuration.respectRepoIgnore,
+                    respectCursorignore: configuration.respectCursorignore,
+                    policy: policy
+                )
+            }
+        } catch {
+            throw MCPDomainCanonicalReadError.ignoreRulesUnavailable(root: rootPath)
         }
-        let authority = IgnoreLayerAssembly.compileRootAuthority(
-            gitignoreContent: Self.content(at: rootPath + "/.gitignore"),
-            globalIgnoreContent: configuration.globalPatterns,
-            repoIgnoreContent: configuration.respectRepoIgnore ? Self.content(at: rootPath + "/.repo_ignore") : nil,
-            cursorignoreContent: configuration.respectCursorignore ? Self.content(at: rootPath + "/.cursorignore") : nil
-        )
-        rootRules = IgnoreLayerAssembly.makeRootRules(
-            authority: authority,
-            respectRepoIgnore: configuration.respectRepoIgnore,
-            respectCursorignore: configuration.respectCursorignore,
-            policy: policy
-        )
     }
 
-    func admits(_ relativePath: String, isDirectory: Bool) -> Bool {
-        !rules(forDirectory: Self.parent(of: relativePath)).isIgnored(
+    func admits(_ relativePath: String, isDirectory: Bool) throws -> Bool {
+        try !rules(forDirectory: Self.parent(of: relativePath)).isIgnored(
             relativePath: relativePath,
             isDirectory: isDirectory
         )
@@ -920,18 +944,18 @@ private final class HeadlessIgnoreEvaluator: @unchecked Sendable {
 
     /// Whether an ignored directory must still be traversed because a negation may re-include
     /// something beneath it.
-    func requiresTraversal(_ relativePath: String) -> Bool {
-        rules(forDirectory: Self.parent(of: relativePath)).requiresTraversal(for: relativePath)
+    func requiresTraversal(_ relativePath: String) throws -> Bool {
+        try rules(forDirectory: Self.parent(of: relativePath)).requiresTraversal(for: relativePath)
     }
 
-    private func rules(forDirectory relativeDirectory: String) -> IgnoreRules {
+    private func rules(forDirectory relativeDirectory: String) throws -> IgnoreRules {
         guard configuration.hierarchicalIgnores, !relativeDirectory.isEmpty else { return rootRules }
         if let cached = lock.withLock({ rulesByDirectory[relativeDirectory] }) {
             return cached
         }
-        let parentRules = rules(forDirectory: Self.parent(of: relativeDirectory))
+        let parentRules = try rules(forDirectory: Self.parent(of: relativeDirectory))
         let directoryPath = rootPath + "/" + relativeDirectory
-        let gitignore = Self.content(at: directoryPath + "/.gitignore")
+        let gitignore = try gitignoreContent(inDirectory: directoryPath)
         let repoIgnore = configuration.respectRepoIgnore ? Self.content(at: directoryPath + "/.repo_ignore") : nil
         let cursorignore = configuration.respectCursorignore ? Self.content(at: directoryPath + "/.cursorignore") : nil
         let resolved = gitignore == nil && repoIgnore == nil && cursorignore == nil
@@ -948,11 +972,33 @@ private final class HeadlessIgnoreEvaluator: @unchecked Sendable {
         return resolved
     }
 
+    /// A directory's `.gitignore`. Under a Git root it is Git's mandatory floor, so it is read with
+    /// the app crawl's integrity checks and an unreadable file fails closed; otherwise it is an
+    /// ordinary best-effort layer.
+    private func gitignoreContent(inDirectory directoryPath: String) throws -> String? {
+        guard policy.enforcesGitIgnoreFloor else { return Self.content(at: directoryPath + "/.gitignore") }
+        let url = URL(fileURLWithPath: directoryPath, isDirectory: true).appendingPathComponent(".gitignore")
+        do {
+            guard try MandatoryGitIgnoreFile.exists(at: url) else { return nil }
+            return try MandatoryGitIgnoreFile.load(at: url)
+        } catch {
+            throw MCPDomainCanonicalReadError.ignoreRulesUnavailable(root: rootPath)
+        }
+    }
+
     private static func parent(of relativePath: String) -> String {
         guard let slash = relativePath.lastIndex(of: "/") else { return "" }
         return String(relativePath[..<slash])
     }
 
+    /// A root-level ignore file with the app crawl's root policy: absent is nil, but anything present
+    /// (including a directory at that name) must read as UTF-8 text or the root fails closed.
+    private static func strictContent(at path: String) throws -> String? {
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        return try String(contentsOfFile: path, encoding: .utf8)
+    }
+
+    /// A nested secondary ignore file with the app crawl's per-directory policy: best effort.
     private static func content(at path: String) -> String? {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {

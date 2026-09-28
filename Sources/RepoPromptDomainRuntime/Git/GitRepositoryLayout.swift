@@ -1,6 +1,6 @@
 import Foundation
 
-enum GitRepositoryKind: Equatable {
+package enum GitRepositoryKind: Equatable, Sendable {
     case nonGit
     case bare
     case worktree
@@ -34,6 +34,16 @@ public struct GitRepositoryLayout: Sendable, Equatable {
     /// A gitfile can represent either a linked worktree or a primary checkout created with
     /// `git init --separate-git-dir`; use `isLinkedWorktree` when that distinction matters.
     public let isWorktree: Bool
+
+    /// Memberwise initializer, visible to the app and tests now that the layout lives in the
+    /// domain runtime (the synthesized one would be module-internal).
+    package init(workTreeRoot: URL, dotGitPath: URL, gitDir: URL, commonDir: URL, isWorktree: Bool) {
+        self.workTreeRoot = workTreeRoot
+        self.dotGitPath = dotGitPath
+        self.gitDir = gitDir
+        self.commonDir = commonDir
+        self.isWorktree = isWorktree
+    }
 
     /// Whether this checkout has a per-worktree git directory distinct from the shared common directory.
     public var isLinkedWorktree: Bool {

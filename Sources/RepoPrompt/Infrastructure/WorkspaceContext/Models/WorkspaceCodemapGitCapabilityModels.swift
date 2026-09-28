@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct WorkspaceCodemapRootEpoch: Hashable {
     let rootID: UUID

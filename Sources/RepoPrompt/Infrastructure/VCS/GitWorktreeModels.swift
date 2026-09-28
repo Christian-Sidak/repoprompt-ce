@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptDomainRuntime
 
 // MARK: - Git Worktree Models
 

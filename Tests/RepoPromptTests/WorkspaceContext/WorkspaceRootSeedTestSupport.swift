@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 
 enum WorkspaceRootSeedTestSupport {
     static func oid(_ scalar: Character = "1") -> GitObjectID {

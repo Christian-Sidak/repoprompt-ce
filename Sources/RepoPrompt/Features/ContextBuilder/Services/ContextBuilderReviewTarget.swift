@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 enum ContextBuilderReviewTargetUnavailableReason: Equatable, LocalizedError {
     case missingFrozenTarget

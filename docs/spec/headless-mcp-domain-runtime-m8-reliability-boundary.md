@@ -254,8 +254,8 @@ Ignore-layer parity contract: see the M8N table below, which supersedes the pre-
 |---|---|---|---|
 | `.git` / `.svn` / `.DS_Store` built-ins | always | same `IgnoreRules` base layers | `HeadlessIgnoreEnumerationTests` |
 | Root `.gitignore` | yes | yes | `HeadlessIgnoreParityTests` (non-Git) |
-| Git-root mandatory floor | yes | yes when the root contains `.git` | `HeadlessIgnoreEnumerationTests` |
-| Root nested inside a repository (ancestor `.gitignore` walk) | yes | **not applied** | gap |
+| Git-root mandatory floor | yes | yes, same `resolvingLoadedRoot` policy (M8O) | `HeadlessIgnoreEnumerationTests` |
+| Root nested inside a repository (ancestor `.gitignore` walk) | yes | yes, same `gitRootChain` (M8O) | `HeadlessIgnoreParityTests`, `HeadlessIgnoreEnumerationTests` |
 | Nested `.gitignore` / `.repo_ignore` / `.cursorignore` | yes when hierarchical (default) | yes, same `appendingDirectoryLayers` | `HeadlessIgnoreEnumerationTests` |
 | Global ignore defaults | `globalSettings.json` value | same value via M8M view | `HeadlessIgnoreParityTests` |
 | `.repo_ignore` / `.cursorignore` at root | yes when enabled | yes when enabled | `HeadlessIgnoreParityTests` |
@@ -271,8 +271,39 @@ real headless bug: enumerated items reported under `/private/var/...` for a `/va
 attributed to the root's rules only; enumeration now matches every equivalent root spelling and
 applies no ignore decision to an item it cannot attribute.
 
-Remaining ignore-parity gaps (not claimed): roots nested inside a repository (ancestor `.gitignore`
-walk), symlink policy (`skip_symlinks`), and `read_file` on an ignored path (app behavior unverified).
+Remaining ignore-parity gaps after M8N: roots nested inside a repository (closed by M8O below),
+symlink policy (`skip_symlinks`), and `read_file` on an ignored path (app behavior unverified).
+
+### M8O — nested Git root ignore parity
+
+- `IgnoreRulePolicy.resolvingLoadedRoot` (the app crawl's policy resolver: ancestor `.git` walk,
+  structural layout validation, gitfile/linked-worktree support, fail-closed on ambiguous topology),
+  `MandatoryGitIgnoreFile` (the no-symlink, bounded, UTF-8, unchanged-during-read `.gitignore`
+  reader), and `IgnoreLayerAssembly.gitRootChain` (repository root down to the loaded root: each
+  level's `.gitignore` as the mandatory floor, global defaults once at the repository root, each
+  level's `.repo_ignore` / `.cursorignore` when enabled) moved into the domain runtime with
+  `GitRepositoryLayout`. The app's `IgnoreRulesManager` forwards to them with no behavior change.
+- The headless evaluator resolves its policy and root chain through the same code, so a root nested
+  inside a repository applies its ancestors' `.gitignore` files (including repository-anchored
+  patterns, through the policy's repository-relative prefix) and the mandatory floor.
+- Failure policy now matches the app: ambiguous Git topology, a present but unreadable root-level
+  ignore file, or an unreadable nested `.gitignore` under a Git root fails the enumeration closed
+  with the typed `MCPDomainCanonicalReadError.ignoreRulesUnavailable(root:)` rather than enumerate
+  with the wrong rules. Nested `.repo_ignore` / `.cursorignore` stay best effort, as in the app.
+
+Evidence: `HeadlessIgnoreParityTests` (non-Git root and a root nested in a repository, compared
+against `IgnoreRulesManager` with the resolved policy) and `HeadlessIgnoreEnumerationTests`
+(nested root with ancestor, anchored, hierarchical, and subdirectory-base cases; gitfile linked
+worktree root; ambiguous topology, symlinked nested `.gitignore`, and unreadable root layer fail
+closed). Conductor evidence: focused suites (headless ignore, policy resolution, ignore manager,
+gitignore compiler, direct-headless) passed 54/54 (`3e1e3c95-4dd6-48ce-a05d-3f6c4555ed7f`); all
+products built (`bb9a724b-924b-4d94-a8dc-c3dd599da1ca`); lint passed
+(`96c9cdb1-3544-4253-be9f-febc96a0a0e3`) after whitespace/import-order-only formatting of four test
+files. A first run failed to compile because the relocated `GitRepositoryLayout` lost its
+synthesized cross-module initializer; it now declares an explicit `package` initializer.
+
+Remaining ignore-parity gaps (not claimed): symlink policy (`skip_symlinks`) and `read_file` on an
+ignored path (app behavior unverified).
 
 ### Later milestones (not started in this pass)
 

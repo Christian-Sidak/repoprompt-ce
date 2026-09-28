@@ -46,6 +46,60 @@ final class HeadlessIgnoreParityTests: XCTestCase {
         XCTAssertFalse(appAdmitted.isEmpty)
     }
 
+    /// M8O: a root nested inside a repository resolves to the same Git policy and ancestor chain in
+    /// the app crawl and headless enumeration.
+    func testHeadlessEnumerationMatchesAppForRootNestedInRepository() async throws {
+        let globalPatterns = "**/node_modules/\n**/*.tmp\n"
+        var files: [String: String] = [
+            ".git/HEAD": "ref: refs/heads/main\n",
+            ".git/config": "[core]\n\trepositoryformatversion = 0\n",
+            ".git/objects/info/packs": "",
+            ".gitignore": "*.log\n/packages/app/dist/\n",
+            ".repo_ignore": "secret.txt\n",
+            "packages/.gitignore": "generated/\n",
+            "packages/app/.cursorignore": "!debug.log\n!cache/keep.tmp\n"
+        ]
+        for relative in [
+            "src/a.swift",
+            "keep.txt",
+            "debug.log",
+            "dist/out.js",
+            "generated/g.swift",
+            "secret.txt",
+            "cache/b.tmp",
+            "cache/keep.tmp",
+            "node_modules/pkg/index.js"
+        ] {
+            files["packages/app/" + relative] = "x"
+        }
+        let repository = try makeTree(files)
+        let root = repository.appendingPathComponent("packages/app", isDirectory: true)
+
+        let policy = try IgnoreRulePolicy.resolvingLoadedRoot(root)
+        guard case let .gitRoot(prefix) = policy else { return XCTFail("expected a Git policy, got \(policy)") }
+        XCTAssertEqual(prefix.value, "packages/app")
+
+        let authority = GlobalIgnoreDefaultsAuthority()
+        authority.publish(globalPatterns)
+        await IgnoreRulesManager.shared.setGlobalDefaultsAuthorityOverride(authority)
+        addTeardownBlock { await IgnoreRulesManager.shared.setGlobalDefaultsAuthorityOverride(nil) }
+        let appRules = try await IgnoreRulesManager.shared.resolvedIgnoreRules(
+            for: root.path,
+            respectRepoIgnore: true,
+            respectCursorignore: true,
+            policy: policy
+        ).rules
+        let appAdmitted = allFiles(under: root).filter { admitted($0, by: appRules) }
+
+        let headless = try await headlessListedPaths(
+            root: root,
+            configuration: DomainIgnoreConfiguration(globalPatterns: globalPatterns, hierarchicalIgnores: false)
+        )
+
+        XCTAssertEqual(Set(headless), Set(appAdmitted))
+        XCTAssertEqual(Set(appAdmitted), [".cursorignore", "keep.txt", "src/a.swift", "cache/keep.tmp"])
+    }
+
     // MARK: - Helpers
 
     /// The crawl's rule use: a file is listed unless an ancestor directory is ignored without a

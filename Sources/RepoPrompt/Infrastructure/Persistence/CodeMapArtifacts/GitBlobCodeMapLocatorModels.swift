@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 
 enum GitBlobCodeMapLocatorModelError: Error, Equatable {
     case invalidNamespaceSalt

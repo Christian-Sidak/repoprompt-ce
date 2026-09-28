@@ -4,8 +4,16 @@ import MCP
 import XCTest
 
 /// M8N: headless enumeration applies the app's ignore layers through the shared
-/// `IgnoreLayerAssembly` / `IgnoreRules` engine.
+/// `IgnoreLayerAssembly` / `IgnoreRules` engine. M8O: roots nested inside a repository resolve their
+/// policy and ancestor `.gitignore` chain exactly as the app crawl does, and fail closed alike.
 final class HeadlessIgnoreEnumerationTests: XCTestCase {
+    /// The smallest `.git` directory `IgnoreRulePolicy.resolvingLoadedRoot` accepts as a work tree.
+    private let minimalGitDirectory: [String: String] = [
+        ".git/HEAD": "ref: refs/heads/main\n",
+        ".git/config": "[core]\n\trepositoryformatversion = 0\n",
+        ".git/objects/info/packs": ""
+    ]
+
     private let fixtureFiles: [String: String] = [
         ".gitignore": "build/\n*.log\n!keep.log\n",
         ".repo_ignore": "secret.txt\n",
@@ -38,7 +46,7 @@ final class HeadlessIgnoreEnumerationTests: XCTestCase {
     func testGitRootKeepsGitignoreAsAMandatoryFloorAndExcludesDotGit() async throws {
         var files = fixtureFiles
         files[".gitignore"] = "build/\n*.log\n!keep.log\n*.tmp\n"
-        files[".git/HEAD"] = "ref: refs/heads/main\n"
+        files.merge(minimalGitDirectory) { $1 }
         let root = try makeTree(files)
         let listed = try await listedPaths(root: root, configuration: .init(globalPatterns: globalPatterns))
 
@@ -68,6 +76,91 @@ final class HeadlessIgnoreEnumerationTests: XCTestCase {
         XCTAssertFalse(lines.contains("x.log"), "the root .gitignore applies below a subdirectory base")
     }
 
+    func testRootNestedInRepositoryAppliesAncestorGitignoreChain() async throws {
+        var files = minimalGitDirectory
+        files[".gitignore"] = "*.log\n/packages/app/dist/\n"
+        files[".repo_ignore"] = "secret.txt\n"
+        files["packages/.gitignore"] = "generated/\n"
+        files["packages/app/.cursorignore"] = "!debug.log\n"
+        files["packages/app/src/.gitignore"] = "local.swift\n"
+        for relative in ["src/a.swift", "src/local.swift", "keep.txt", "debug.log", "dist/out.js",
+                         "generated/g.swift", "secret.txt", "cache/b.tmp"]
+        {
+            files["packages/app/" + relative] = "x"
+        }
+        let repository = try makeTree(files)
+        let root = repository.appendingPathComponent("packages/app", isDirectory: true)
+
+        let listed = try await listedPaths(root: root, configuration: .init(globalPatterns: globalPatterns))
+
+        XCTAssertEqual(
+            listed,
+            [".cursorignore", "keep.txt", "src/.gitignore", "src/a.swift"],
+            "ancestor .gitignore files (including repository-anchored patterns), the ancestor .repo_ignore, "
+                + "global defaults, and nested .gitignore files apply; a secondary negation cannot re-include "
+                + "a Git-ignored file"
+        )
+
+        let service = makeService(root: root, configuration: .init(globalPatterns: globalPatterns))
+        let tree = try await service.renderFileTree(readRequest(["path": .string("src")])).mcpValue().stringValue
+        let lines = try XCTUnwrap(tree).split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        XCTAssertTrue(lines.contains("a.swift"))
+        XCTAssertFalse(lines.contains("local.swift"), "a subdirectory base keeps the nested root's Git chain")
+    }
+
+    func testLinkedWorktreeGitfileRootIsAGitRoot() async throws {
+        let files: [String: String] = [
+            "main/.git/HEAD": "ref: refs/heads/main\n",
+            "main/.git/config": "[core]\n\trepositoryformatversion = 0\n",
+            "main/.git/objects/info/packs": "",
+            "main/.git/worktrees/wt/HEAD": "ref: refs/heads/wt\n",
+            "main/.git/worktrees/wt/commondir": "../..\n",
+            "wt/.git": "gitdir: ../main/.git/worktrees/wt\n",
+            "wt/.gitignore": "*.tmp\n",
+            "wt/.cursorignore": "!keep.tmp\n",
+            "wt/src/a.swift": "x",
+            "wt/keep.tmp": "x",
+            "wt/other.tmp": "x"
+        ]
+        let root = try makeTree(files).appendingPathComponent("wt", isDirectory: true)
+
+        let listed = try await listedPaths(root: root, configuration: .init(globalPatterns: ""))
+
+        XCTAssertEqual(
+            listed,
+            [".cursorignore", ".gitignore", "src/a.swift"],
+            "a gitfile worktree root keeps the mandatory floor and the built-in .git layer hides the gitfile"
+        )
+    }
+
+    func testUnreadableRootIgnoreLayerFailsClosed() async throws {
+        let root = try makeTree(fixtureFiles)
+        try Data([0xFF, 0xFE, 0xFD, 0x80]).write(to: root.appendingPathComponent(".repo_ignore"))
+
+        await assertIgnoreRulesUnavailable(root: root)
+    }
+
+    func testAmbiguousGitTopologyFailsClosed() async throws {
+        var files = fixtureFiles
+        files[".git/HEAD"] = "ref: refs/heads/main\n"
+        let root = try makeTree(files)
+
+        await assertIgnoreRulesUnavailable(root: root)
+    }
+
+    func testUnreadableNestedMandatoryGitignoreFailsClosed() async throws {
+        var files = fixtureFiles.merging(minimalGitDirectory) { $1 }
+        files["sub/.gitignore"] = nil
+        files["elsewhere.ignore"] = "local.txt\n"
+        let root = try makeTree(files)
+        try FileManager.default.createSymbolicLink(
+            atPath: root.appendingPathComponent("sub/.gitignore").path,
+            withDestinationPath: root.appendingPathComponent("elsewhere.ignore").path
+        )
+
+        await assertIgnoreRulesUnavailable(root: root)
+    }
+
     func testWithoutConfigurationEnumerationKeepsLegacyBehavior() async throws {
         let root = try makeTree(fixtureFiles)
         let listed = try await listedPaths(root: root, configuration: nil)
@@ -76,6 +169,23 @@ final class HeadlessIgnoreEnumerationTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    private func assertIgnoreRulesUnavailable(
+        root: URL,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            let listed = try await listedPaths(root: root, configuration: .init(globalPatterns: globalPatterns))
+            XCTFail("expected enumeration to fail closed, listed \(listed)", file: file, line: line)
+        } catch let error as MCPDomainCanonicalReadError {
+            guard case .ignoreRulesUnavailable = error else {
+                return XCTFail("unexpected error \(error)", file: file, line: line)
+            }
+        } catch {
+            XCTFail("unexpected error \(error)", file: file, line: line)
+        }
+    }
 
     private func listedPaths(root: URL, configuration: DomainIgnoreConfiguration?) async throws -> [String] {
         let service = makeService(root: root, configuration: configuration)
