@@ -35,7 +35,7 @@ import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
@@ -88,6 +88,36 @@ def capture_job_ticket(environ: Dict[str, str]) -> Optional[str]:
 
 def current_job_ticket() -> Optional[str]:
     return _CURRENT_JOB_TICKET
+
+
+# Measurement builds (build-modularization P0.5): `swift-build` and aggregate `test` accept
+# `--scratch <label>` plus extra compiler or linker flags. They build in `.build/measure/<label>`,
+# never in the shared `.build`, so a flag change cannot invalidate ordinary jobs' outputs.
+MEASURE_SCRATCH_RELATIVE = Path(".build") / "measure"
+MEASURE_LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def measurement_scratch_path(repo_root: Path, label: str) -> Path:
+    if not MEASURE_LABEL_PATTERN.fullmatch(label) or ".." in label:
+        raise ConductorError("--scratch must be a short label of letters, digits, '.', '_', or '-'")
+    return repo_root / MEASURE_SCRATCH_RELATIVE / label
+
+
+def measurement_build_args(repo_root: Path, args: Dict[str, Any]) -> List[str]:
+    """SwiftPM arguments for an opt-in measurement build; empty for ordinary jobs."""
+    label = args.get("scratch")
+    swiftc_flags = [str(flag) for flag in args.get("swiftcFlags") or []]
+    linker_flags = [str(flag) for flag in args.get("linkerFlags") or []]
+    if not label:
+        if swiftc_flags or linker_flags:
+            raise ConductorError("--swiftc-flag and --linker-flag require --scratch <label>")
+        return []
+    result = ["--scratch-path", str(measurement_scratch_path(repo_root, str(label)))]
+    for flag in swiftc_flags:
+        result.extend(["-Xswiftc", flag])
+    for flag in linker_flags:
+        result.extend(["-Xlinker", flag])
+    return result
 
 
 BUILD_CACHE_ELIGIBLE_OPERATIONS = {"swift-build", "build", "package", "test", "install-debug-cli"}
@@ -234,9 +264,12 @@ Operation commands:
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor swift-build --product RepoPrompt|repoprompt-mcp --scratch <label> [--swiftc-flag=<flag>]... [--linker-flag=<flag>]...
+    measurement build in .build/measure/<label>; never touches the shared .build or the build cache
   ./conductor build
   ./conductor package debug|release
   ./conductor test [--module <TestTarget>] [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor test [--filter <filter>] --scratch <label> [--swiftc-flag=<flag>]... [--linker-flag=<flag>]...   # aggregate-path measurement build
   ./conductor provider-test [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
@@ -325,6 +358,93 @@ JOB_TIMING_MARKS = (
 TIMING_BUILD_COMPLETE_RE = re.compile(r"Build complete!\s*\((\d+(?:\.\d+)?)s\)")
 TIMING_FIRST_TEST_RE = re.compile(r"^(?:Test Suite '.+' started\b|.{0,4}Test run started\b)")
 TIMING_COLD_RETRY_TEXT = "seeded build failed; removing the proven seeded .build and retrying cold once"
+# Optional per-job peak RSS (build-modularization P0.5, input to admission v2). Heavy-slot jobs
+# sample `ps` once per interval and sum RSS over the job's process tree. The tree sum counts
+# shared pages once per process (an upper bound); sampling can miss short peaks (a lower bound).
+JOB_RSS_SAMPLE_INTERVAL_SECONDS = 1.0
+
+
+def parse_process_rss_table(text: str) -> Dict[int, Tuple[int, int, str]]:
+    """Parse `ps -axo pid=,ppid=,rss=,comm=` into pid -> (ppid, rss bytes, command name)."""
+    table: Dict[int, Tuple[int, int, str]] = {}
+    for line in text.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid, rss_kib = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        # `ps` wraps the name in parentheses once a process is exiting and its arguments are gone.
+        raw_name = parts[3].strip() if len(parts) == 4 else ""
+        if raw_name.startswith("(") and raw_name.endswith(")"):
+            raw_name = raw_name[1:-1]
+        name = os.path.basename(raw_name)
+        table[pid] = (ppid, rss_kib * 1024, name)
+    return table
+
+
+def process_rss_snapshot() -> Optional[Dict[int, Tuple[int, int, str]]]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,rss=,comm="],
+            text=True,
+            capture_output=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_process_rss_table(completed.stdout)
+
+
+def process_tree_rss(table: Dict[int, Tuple[int, int, str]], root_pid: int) -> Optional[Dict[str, Any]]:
+    """Sum RSS over `root_pid` and its descendants; None when the root is gone or a zombie."""
+    root = table.get(root_pid)
+    if root is None or root[1] <= 0:
+        return None
+    children: Dict[int, List[int]] = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    total = 0
+    count = 0
+    largest_bytes = -1
+    largest_name = ""
+    pending = [root_pid]
+    seen: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen or pid not in table:
+            continue
+        seen.add(pid)
+        _, rss, name = table[pid]
+        total += rss
+        count += 1
+        if rss > largest_bytes:
+            largest_bytes, largest_name = rss, name
+        pending.extend(children.get(pid, ()))
+    return {"treeBytes": total, "processes": count, "largestBytes": largest_bytes, "largestName": largest_name}
+
+
+def run_process_tree_rss_sampler(
+    root_pid: int,
+    is_running: Callable[[], bool],
+    record: Callable[[Dict[str, Any]], None],
+    *,
+    snapshot: Callable[[], Optional[Dict[int, Tuple[int, int, str]]]] = process_rss_snapshot,
+    wait: Callable[[float], None] = time.sleep,
+    interval: float = JOB_RSS_SAMPLE_INTERVAL_SECONDS,
+) -> None:
+    """Sample until the root exits. Read-only: it never signals or waits on the job's processes."""
+    while is_running():
+        table = snapshot()
+        if table is not None:
+            sample = process_tree_rss(table, root_pid)
+            if sample is None:
+                return
+            record(sample)
+        wait(interval)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -959,6 +1079,9 @@ class BuildCacheManager:
         # Module-scoped tests build in their own Swift Build scratch path, not the seeded `.build`.
         if operation == "test" and args.get("module"):
             return False
+        # Measurement builds use `.build/measure/<label>`, not the seeded `.build`.
+        if args.get("scratch"):
+            return False
         return operation in BUILD_CACHE_ELIGIBLE_OPERATIONS
 
     @staticmethod
@@ -1306,7 +1429,7 @@ class BuildCacheManager:
     @staticmethod
     def _sanitize_seed(build_dir: Path) -> None:
         deadline = BuildCacheManager._tree_deadline_seconds(build_dir)
-        for relative in ("xcode", "xcode-custom", ".conductor-cache-provenance.json"):
+        for relative in ("xcode", "xcode-custom", "measure", ".conductor-cache-provenance.json"):
             target = build_dir / relative
             if target.is_dir() and not target.is_symlink():
                 shutil.rmtree(target, ignore_errors=True)
@@ -3070,6 +3193,19 @@ class Job:
     phase_marks: Dict[str, float] = dataclasses.field(default_factory=dict)
     build_reported_seconds: Optional[float] = None
     build_complete_count: int = 0
+    peak_rss: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def observe_rss_sample(self, sample: Dict[str, Any]) -> None:
+        """Fold one process-tree RSS sample into the job's peaks."""
+        peak = self.peak_rss
+        peak["samples"] = int(peak.get("samples", 0)) + 1
+        peak["sampleIntervalSeconds"] = JOB_RSS_SAMPLE_INTERVAL_SECONDS
+        if int(sample["treeBytes"]) > int(peak.get("treeBytes", -1)):
+            peak["treeBytes"] = int(sample["treeBytes"])
+            peak["treeProcesses"] = int(sample["processes"])
+        if int(sample["largestBytes"]) > int(peak.get("largestProcessBytes", -1)):
+            peak["largestProcessBytes"] = int(sample["largestBytes"])
+            peak["largestProcessName"] = str(sample["largestName"])
 
     def mark_phase(self, name: str, at: Optional[float] = None) -> None:
         """Record the first time a timing mark is reached; later calls keep the original time."""
@@ -3114,13 +3250,16 @@ class Job:
             value = derived.get(name) if name in derived else self.phase_marks.get(name)
             if value is not None:
                 marks[name] = value
-        return {
+        timings: Dict[str, Any] = {
             "schemaVersion": JOB_TIMING_SCHEMA_VERSION,
             "marks": marks,
             "segments": phase_timing_segments(marks, self.build_reported_seconds),
             "buildCompleteCount": self.build_complete_count,
             "outputMarksAreReceiptTimes": True,
         }
+        if self.peak_rss:
+            timings["peakRss"] = dict(self.peak_rss)
+        return timings
 
     def timing_record(self) -> Dict[str, Any]:
         """Compact persisted record (`<ticket>.timing.json`) for retroactive timing analysis."""
@@ -3393,9 +3532,12 @@ class OperationRegistry:
         if operation == "swift-build":
             product = args.get("product")
             lanes = ["build"]
+            measurement = measurement_build_args(self.repo_root, args)
             if product == "all":
+                if measurement:
+                    raise ConductorError("measurement builds need a single --product")
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
-            return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            return ["swift", "build", "--product", str(product), *measurement], lanes, cwd, env, effective_timeout
         if operation == "build":
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
@@ -3404,6 +3546,12 @@ class OperationRegistry:
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
             argv = [sys.executable, script("ci_app_test_runner.py"), "--local"]
+            measurement = measurement_build_args(self.repo_root, args)
+            if measurement and args.get("module"):
+                raise ConductorError("--scratch applies to the aggregate path; --module has its own scratch path")
+            if measurement:
+                argv.extend(["--scratch-path", measurement[1]])
+                argv.extend(f"--build-arg={value}" for value in measurement[2:])
             if args.get("module"):
                 argv.extend(["--module", str(args["module"])])
             if args.get("testProduct"):
@@ -4516,6 +4664,12 @@ class DaemonState:
                     daemon=True,
                 )
                 watchdog.start()
+            if global_heavy_slot is not None:
+                threading.Thread(
+                    target=self._sample_job_rss,
+                    args=(job, process),
+                    daemon=True,
+                ).start()
             try:
                 exit_code = process.wait(timeout=effective_timeout)
             except subprocess.TimeoutExpired:
@@ -4877,6 +5031,17 @@ class DaemonState:
             wake_probe=bool(job.args.get("xctestStallWakeProbe")),
             triggered_at=timestamp,
         )
+
+    def _sample_job_rss(self, job: Job, process: subprocess.Popen[bytes]) -> None:
+        def record(sample: Dict[str, Any]) -> None:
+            with self.condition:
+                job.observe_rss_sample(sample)
+
+        try:
+            run_process_tree_rss_sampler(process.pid, lambda: process.returncode is None, record)
+        except Exception:
+            # Sampling is advisory; it must never affect the job.
+            return
 
     def _monitor_xctest_stall(self, ticket: str) -> None:
         while True:
@@ -8384,6 +8549,29 @@ def parse_no_args(prog: str, argv: List[str]) -> None:
     parser.parse_args(argv)
 
 
+def add_measurement_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--scratch", help="measurement build in .build/measure/<label> (plan P0.5)")
+    parser.add_argument(
+        "--swiftc-flag", action="append", default=[],
+        help="extra -Xswiftc argument for a --scratch build; write --swiftc-flag=<flag>",
+    )
+    parser.add_argument(
+        "--linker-flag", action="append", default=[],
+        help="extra -Xlinker argument for a --scratch build; write --linker-flag=<flag>",
+    )
+
+
+def apply_measurement_arguments(ns: argparse.Namespace, args: Dict[str, Any]) -> None:
+    if ns.scratch:
+        args["scratch"] = ns.scratch
+    if ns.swiftc_flag:
+        args["swiftcFlags"] = list(ns.swiftc_flag)
+    if ns.linker_flag:
+        args["linkerFlags"] = list(ns.linker_flag)
+    # Validate on the client too, so a bad label fails before enqueueing.
+    measurement_build_args(Path("."), args)
+
+
 def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     global_flags, rest = split_operation_flags(argv)
     if global_flags.timeout is not None and global_flags.timeout < 0:
@@ -8408,8 +8596,12 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
         parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
+        add_measurement_arguments(parser)
         ns = parser.parse_args(rest)
         args["product"] = ns.product
+        apply_measurement_arguments(ns, args)
+        if args.get("scratch") and ns.product == "all":
+            raise ConductorError("measurement builds need a single --product")
     elif operation == "package":
         parser = argparse.ArgumentParser(prog="conductor package")
         parser.add_argument("config", choices=["debug", "release"])
@@ -8426,7 +8618,13 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             )
         parser.add_argument("--xctest-stall-seconds", type=float)
         parser.add_argument("--xctest-stall-wake-probe", action="store_true")
+        if operation == "test":
+            add_measurement_arguments(parser)
         ns = parser.parse_args(rest)
+        if operation == "test":
+            apply_measurement_arguments(ns, args)
+            if args.get("scratch") and ns.module:
+                raise ConductorError("--scratch applies to the aggregate path; --module has its own scratch path")
         if ns.xctest_stall_seconds is not None and (
             not math.isfinite(ns.xctest_stall_seconds) or ns.xctest_stall_seconds <= 0
         ):

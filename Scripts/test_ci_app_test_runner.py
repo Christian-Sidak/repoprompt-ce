@@ -95,6 +95,51 @@ class LocalExecutionTests(unittest.TestCase):
         self.assertIsNotNone(sandbox)
         self.assertFalse(sandbox.exists())
 
+    def test_measurement_scratch_and_build_args_reach_build_discovery_and_fallback(self) -> None:
+        executor = mock.Mock(return_value=0)
+        seen = {}
+
+        def direct(**kwargs):
+            seen.update(kwargs)
+            return None
+
+        scratch = Path("/r/.build/measure/x")
+        runner.run_local_tests(
+            swift_binary="swift", cwd=None, test_filter="S", executor=executor, direct_command=direct,
+            scratch_path=scratch, build_args=("-Xlinker", "-no_deduplicate"),
+        )
+        swiftpm = ("--scratch-path", str(scratch), "-Xlinker", "-no_deduplicate")
+        self.assertEqual(executor.call_args_list[0].args[0], ("swift", "build", "--build-tests", *swiftpm))
+        self.assertEqual(seen["scratch_path"], scratch)
+        self.assertEqual(executor.call_args_list[1].args[0], ("swift", "test", "--skip-build", *swiftpm, "--filter", "S"))
+
+    def test_measurement_build_args_require_scratch_path(self) -> None:
+        executor = mock.Mock(return_value=0)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(runner.run_local_tests(
+                swift_binary="swift", cwd=None, executor=executor, build_args=("-Xlinker", "-x"),
+            ), 2)
+        executor.assert_not_called()
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            for argv in (
+                ["--local", "--build-arg=-Xlinker"],
+                ["--local", "--module", "XTests", "--scratch-path", "/s"],
+                ["--scratch-path", "/s"],
+            ):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    runner.parse_args(argv)
+        parsed = runner.parse_args(["--local", "--scratch-path", "/s", "--build-arg=-Xswiftc", "--build-arg=-v"])
+        self.assertEqual(parsed.build_args, ["-Xswiftc", "-v"])
+
+    def test_discovery_uses_the_measurement_scratch_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.CompletedProcess([], 0, stdout=f"{tmp}\n")
+            with mock.patch.object(runner.subprocess, "run", return_value=completed) as run:
+                runner.discover_test_bundles("swift", None, Path("/s"))
+                runner.discover_test_bundles("swift", None)
+        self.assertEqual(run.call_args_list[0].args[0], ["swift", "build", "--scratch-path", "/s", "--show-bin-path"])
+        self.assertEqual(run.call_args_list[1].args[0], ["swift", "build", "--show-bin-path"])
+
     def test_local_build_failure_does_not_launch_tests(self) -> None:
         executor = mock.Mock(return_value=9)
         self.assertEqual(runner.run_local_tests(
@@ -356,6 +401,60 @@ class ModuleExecutionTests(unittest.TestCase):
         self.assertEqual(lanes, ["build"])
         self.assertFalse(conductor.BuildCacheManager.eligible("test", {"module": "RepoPromptMCPCoreTests"}))
         self.assertTrue(conductor.BuildCacheManager.eligible("test", {}))
+
+    def test_conductor_measurement_builds_use_a_separate_scratch_path(self) -> None:
+        import conductor
+
+        root = SCRIPT_DIR.parent
+        registry = conductor.OperationRegistry(root)
+        scratch = str(root / ".build" / "measure" / "p05")
+        argv, lanes, _, _, _ = registry.prepare({"operation": "swift-build", "args": {
+            "product": "RepoPrompt", "scratch": "p05",
+            "swiftcFlags": ["-Xfrontend", "-warn-long-function-bodies=200"], "linkerFlags": ["-no_deduplicate"],
+        }})
+        self.assertEqual(argv, [
+            "swift", "build", "--product", "RepoPrompt", "--scratch-path", scratch,
+            "-Xswiftc", "-Xfrontend", "-Xswiftc", "-warn-long-function-bodies=200", "-Xlinker", "-no_deduplicate",
+        ])
+        self.assertEqual(lanes, ["build"])
+        argv, _, _, _, _ = registry.prepare({"operation": "test", "args": {
+            "filter": "X", "scratch": "p05", "linkerFlags": ["-no_deduplicate"],
+        }})
+        self.assertEqual(argv[2:], [
+            "--local", "--scratch-path", scratch, "--build-arg=-Xlinker", "--build-arg=-no_deduplicate", "--filter", "X",
+        ])
+        plain, _, _, _, _ = registry.prepare({"operation": "swift-build", "args": {"product": "RepoPrompt"}})
+        self.assertEqual(plain, ["swift", "build", "--product", "RepoPrompt"])
+        self.assertFalse(conductor.BuildCacheManager.eligible("swift-build", {"product": "RepoPrompt", "scratch": "p05"}))
+        self.assertFalse(conductor.BuildCacheManager.eligible("test", {"scratch": "p05"}))
+
+    def test_conductor_rejects_unsafe_measurement_requests(self) -> None:
+        import conductor
+
+        registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
+        rejected = (
+            ("swift-build", {"product": "RepoPrompt", "swiftcFlags": ["-v"]}),
+            ("test", {"linkerFlags": ["-no_deduplicate"]}),
+            ("swift-build", {"product": "all", "scratch": "p05"}),
+            ("test", {"module": "RepoPromptMCPCoreTests", "scratch": "p05"}),
+            ("swift-build", {"product": "RepoPrompt", "scratch": "../escape"}),
+            ("swift-build", {"product": "RepoPrompt", "scratch": "a/b"}),
+        )
+        for operation, args in rejected:
+            with self.subTest(operation=operation, args=args), self.assertRaises(conductor.ConductorError):
+                registry.prepare({"operation": operation, "args": args})
+
+    def test_seed_sanitizing_drops_measurement_scratch(self) -> None:
+        import conductor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / ".build"
+            (build / "measure" / "p05").mkdir(parents=True)
+            (build / "measure" / "p05" / "build.db").write_text("x")
+            (build / "debug").mkdir()
+            conductor.BuildCacheManager._sanitize_seed(build)
+            self.assertFalse((build / "measure").exists())
+            self.assertTrue((build / "debug").is_dir())
 
 
 class TestDiscoveryTests(unittest.TestCase):

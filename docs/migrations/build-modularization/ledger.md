@@ -11,6 +11,8 @@ Living record for [`../build-modularization-2026-09-28.md`](../build-modularizat
 | `Scripts/modularization_metrics.py check` / `update` | Ratchet gate (run by `make guardrails`) and baseline refresh | P0.7 |
 | `./conductor job status --json` → `phaseTimings` | Structured per-job phase marks and segments; also persisted as `<ticket>.timing.json` next to the job log | P0.1 |
 | `Scripts/conductor_job_timings.py` | Queue-wait, net job-duration, and per-phase percentiles; prefers `<ticket>.timing.json`, falls back to log parsing | P0.1 |
+| `./conductor swift-build --product P` / `./conductor test` with `--scratch <label> [--swiftc-flag=F]... [--linker-flag=F]...` | Measurement builds with extra compiler or linker flags in `.build/measure/<label>`: never the shared `.build`, never build-cache eligible, excluded from seeds. Flags are refused without `--scratch`; `test` accepts it only on the aggregate path | P0.5 |
+| `phaseTimings.peakRss` (job status and `<ticket>.timing.json`) | Optional per-job peak process-tree RSS, sampled once per second for heavy-slot jobs | P0.5 |
 
 Self-tests: `make conductor-selftest` (includes `test_modularization_metrics.py`, `test_modularization_index_graph.py`, `test_conductor_job_timings.py`, and `test_conductor_job_phases.py`).
 
@@ -49,7 +51,7 @@ Conductor timings (last 3,000 jobs, net of queue):
 - [x] P0.2 graph tool: regex prototype, then the index-store tool, validated against the top 40 and the seam catalog (see P0.2 below)
 - [x] P0.3 focused-test executor bake-off — gate holds on both slices (`RepoPromptMCPCoreTests` 77%, `RepoPromptDomainRuntimeTests` 95%); ADR-07 accepted. Not measured, not blockers: candidates (c) and (d), CI parity of module runs (CI stays on the aggregate)
 - [x] P0.4 fixed per-job overhead root cause and fix (see below)
-- [ ] P0.5 link and type-check levers
+- [x] P0.5 link and type-check levers: type-check baselines, frontend profile, link breakdown, `-no_deduplicate` rejected, per-job peak RSS added (see P0.5 below)
 - [ ] P0.6 compatibility inventory golden tests
 - [x] P0.7 ratchets file and guardrail gate
 
@@ -297,8 +299,8 @@ Gate: at least 30% lower median edit→owning-test time excluding queue, and no 
   - `Scripts/conductor_job_timings.py` prefers the record and falls back to log parsing. It adds per-category percentiles for the prepare, pre-build, build, post-build, test, and publication segments.
   - Tests: `Scripts/test_conductor_job_phases.py` (new, in `make conductor-selftest`) and new cases in `test_conductor_job_timings.py`.
 - **Not in this item:**
-  - the §5.1 compiler-flag measurement lane, which goes with P0.5 type-check budgets;
-  - per-job peak RSS, which goes with P1.3 admission v2.
+  - the §5.1 compiler-flag measurement lane, which goes with P0.5 type-check budgets. **P0.5** added opt-in measurement builds (`--scratch`); a scheduled lane is still open;
+  - per-job peak RSS, which goes with P1.3 admission v2. **Added in P0.5** as `phaseTimings.peakRss`.
 
 **Method.**
 - **Jobs:** four `conductor test --filter RepoPromptRegexCoreTests` jobs on the aggregate path, run in sequence after a daemon restart, plus one synthetic output job. Each row is one sample.
@@ -475,3 +477,200 @@ Not in the catalog:
   - Each run failed a different subset, always with a 15 s `install_local_production.sh` subprocess timeout. The 15-minute load average was about 45 at the start.
   - This change does not touch the installer or its test. The failures are the known load-sensitive flake.
 - `test_security_inventory.py`, the suite after it, passes standalone.
+
+## P0.5 — link and type-check levers (2026-09-29)
+
+**Tooling added** (`Scripts/conductor.py`, `Scripts/ci_app_test_runner.py`; default jobs unchanged):
+- **Measurement builds.** `swift-build --product P` and aggregate `test` accept `--scratch <label>`, repeatable `--swiftc-flag=<flag>` (→ `-Xswiftc`), and repeatable `--linker-flag=<flag>` (→ `-Xlinker`).
+  - The build runs in `.build/measure/<label>`, so a flag change never invalidates the shared `.build`.
+  - Extra flags without `--scratch` are refused, on both the client and the daemon.
+  - Measurement jobs are never build-cache eligible, and `_sanitize_seed` drops `.build/measure` from seeds.
+  - `--product all` and `test --module` reject `--scratch`; module runs already have their own scratch path.
+  - The runner forwards `--scratch-path` and `--build-arg=` to `swift build --build-tests`, bundle discovery, and the `swift test` fallback.
+  - Use the `--flag=value` form, and pass lists as separate words: zsh does not word-split `$VAR`. One job here crashed SwiftPM's planner (exit 251) when eight flags arrived as one argument; it was re-run.
+- **Per-job peak RSS** (the P0.1 deferral). Heavy-slot jobs run a read-only sampler thread that runs `ps -axo pid=,ppid=,rss=,comm=` once per second and sums RSS over the job's process tree.
+  - `phaseTimings.peakRss` (live status and `<ticket>.timing.json`) records `treeBytes` and `treeProcesses` at the tree peak, `largestProcessBytes` and `largestProcessName`, `samples`, and `sampleIntervalSeconds`. The field is absent when nothing was sampled.
+  - Cost: one `ps` per second per heavy job. Sampler errors are swallowed, and it never signals or waits on job processes.
+  - Caveats, as in P0.3: the tree sum is an upper bound (shared pages counted per process); 1 s sampling misses short peaks. Under load a sample took about 1.3 s.
+- **Tests:** 6 new cases in `test_ci_app_test_runner.py` (argv, forwarding, refusals, seed exclusion) and 4 in `test_conductor_job_phases.py` (ps parsing, tree sum, sampler stop, record fold).
+
+**Method.**
+- **Runs:** one scratch path, `.build/measure/p05-typecheck`, on HEAD `1c3de429` plus this change. Swift 6.3.3 / Xcode 26.3, 8 cores.
+  - **Run 1:** `-warn-long-function-bodies=200`, `-warn-long-expression-type-checking=100`, `-stats-output-dir`, and `-debug-time-function-bodies`. Load average 35–111. Tickets: `46541f94` (MCP product, dependencies warm) and `569c44ed` (app).
+  - **Run 2:** the two `-warn-long-*` flags only; this recompiles everything. Load average about 10. Ticket `c3a1636c`.
+- **Hit parsing.** Warnings are deduplicated by file, line, column, and message.
+  - **Area** is `body` (a View `body` getter or a ViewModifier `body(content:)`), another member of a file declaring a SwiftUI view, or non-view code.
+  - Expression hits sit inside function hits; the two kinds are counted separately.
+- **Link times** come from SwiftPM's llbuild database (`build.db`, per-command `start`/`end`). Each link command is `swiftc`, which runs `ld` and then `dsymutil`, because debug links pass `-g`. `ld` and `dsymutil` lifetimes come from a 0.5 s `ps` poll of processes whose arguments name the scratch path.
+- **Heavy-slot waits are excluded** (4.5 min on run 1, 69 s on the test build). The analysis scripts were throwaways under `.build/measure/tools` and were deleted with the scratch.
+- **Driver timing:** `-driver-time-compilation` prints nothing under SwiftPM's integrated driver.
+- **Stats granularity:** `-stats-output-dir` gives per-*batch* records (47 compile jobs of about 25 files for the app), so per-file cost comes from `-debug-time-function-bodies`.
+
+### Type-check budgets (`RepoPromptApp`)
+
+| Hits | Run 1 (load 35–111) | Run 2 (load ~10) |
+| --- | --- | --- |
+| Function bodies ≥ 200 ms | 104 | 92 |
+| Function bodies ≥ 500 ms | 24 | 21 |
+| Function bodies ≥ 1,000 ms | **10** | **10** |
+| Expressions ≥ 100 ms | 26 | 26 |
+| Expressions ≥ 200 ms | 10 | 11 |
+| Expressions ≥ 500 ms | **6** | **6** |
+| Files with a hit | 70 | — |
+
+- **Per-function times barely move with load.** 116 hits appear in both runs; their median ratio is 1.03. The counts that differ come from bodies near a threshold.
+- **Other first-party targets** (run 2, unique): `RepoPromptDomainRuntime` 4, `RepoPromptCodeMapCore` 1. SwiftPM builds remote dependencies with warnings suppressed.
+- **By area, function hits ≥ 200 ms** (run 1; run 2 in parentheses):
+  - View `body`: 33 (31), 41.6 s;
+  - other SwiftUI view-file members: 25 (24), 11.5 s;
+  - non-view code: 46 (37), 18.5 s.
+  - SwiftUI is 58 of 104 hits and **74% of hit time**. At ≥ 1,000 ms it is 8 of 10.
+- **Expression hits ≥ 100 ms:** 9 in SwiftUI view files and 17 in non-view code, but 5 of the 6 hits ≥ 500 ms are SwiftUI.
+- **By folder (all hits):** `Features/AgentMode` 48, `Features/Settings` 19, `Infrastructure/MCP` 12, `Infrastructure/WorkspaceContext` 8, `Infrastructure/UI` 7, `Features/ContextBuilder` 6.
+- **All bodies** (`-debug-time-function-bodies`): 82,422 bodies in 1,145 files, 327 s in total.
+  - Bodies at or above each threshold: 2,712 at 25 ms, 1,022 at 50 ms, 318 at 100 ms.
+  - The 408 view `body` getters take 53.5 s (16%). The four slowest bodies alone take 27.5 s (8.4%).
+
+Top 25 by time (run 1 ms; run 2 ms):
+
+| # | Run 1 | Run 2 | Kind | Location | What | Area |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 8,762 | 8,741 | function | `Features/AgentMode/Views/ContextDrawer/AgentContextDrawerFilesTab.swift:207` | getter `body` | view `body` |
+| 2 | 8,644 | 8,619 | expression | `Features/AgentMode/Views/ContextDrawer/AgentContextDrawerFilesTab.swift:222` | expression (in #1) | view file |
+| 3 | 7,882 | 7,663 | function | `App/Views/ContentViewNotificationHandler.swift:65` | `body(content:)` | view `body` |
+| 4 | 7,841 | 7,624 | expression | `App/Views/ContentViewNotificationHandler.swift:126` | expression (in #3) | view file |
+| 5 | 6,250 | 6,179 | function | `Features/AgentMode/Views/Components/AgentSessionRows.swift:610` | getter `body` | view `body` |
+| 6 | 4,605 | 4,688 | function | `Features/AgentMode/Views/Components/AgentSessionsSidebarView.swift:418` | getter `body` | view `body` |
+| 7 | 3,168 | 3,008 | function | `Infrastructure/MCP/MCPConnectionManager.swift:12082` | `registerHandlers(for:connectionID:)` | non-view |
+| 8 | 2,633 | 2,392 | function | `Infrastructure/MCP/WindowRoutingService.swift:2179` | `updateCachedTools()` | non-view |
+| 9 | 1,995 | 1,956 | function | `Features/AgentMode/Views/Components/AgentSessionRows.swift:1393` | getter `body` | view `body` |
+| 10 | 1,810 | 1,709 | function | `Features/AgentMode/Views/AgentModeView.swift:1916` | getter `chatTranscript` | view file |
+| 11 | 1,696 | 1,652 | function | `Features/AgentMode/Views/ToolCards/AgentAskUserWizardCard.swift:182` | `optionButton(option:question:draft:)` | view file |
+| 12 | 1,552 | 1,467 | expression | `Features/AgentMode/Views/AgentModeView.swift:1998` | expression | view file |
+| 13 | 1,274 | 1,157 | function | `Infrastructure/UI/Agent/AgentQuestionCard.swift:142` | `optionButton(option:)` | view file |
+| 14 | 1,238 | 1,181 | expression | `App/Changelog.swift:67` | expression | view file |
+| 15 | 856 | 802 | function | `Features/Settings/Views/ChatPresetsSettingsView.swift:686` | getter `body` | view `body` |
+| 16 | 830 | 797 | function | `Features/AgentMode/ViewModels/AgentModeViewModel.swift:4994` | `installPersistentSessionBindingUpdatingInferredWorkspace(…)` | non-view |
+| 17 | 809 | 773 | expression | `Features/AgentMode/ViewModels/AgentModeViewModel.swift:5008` | expression (in #16) | non-view |
+| 18 | 773 | 764 | function | `Features/Settings/Views/PermissionsSettingsView.swift:366` | getter `body` | view `body` |
+| 19 | 706 | 688 | function | `Features/Settings/Views/CopyPresetsSettingsView.swift:562` | getter `body` | view `body` |
+| 20 | 672 | 663 | function | `Features/ContextBuilder/Views/ContextBuilderAgentView.swift:1322` | getter `body` | view `body` |
+| 21 | 634 | 635 | function | `Features/AgentMode/Views/Components/AgentSessionRows.swift:939` | getter `hiddenCountChip` | view file |
+| 22 | 631 | 536 | function | `Features/AgentMode/Views/Components/AgentEmptyStateViews.swift:418` | getter `body` | view `body` |
+| 23 | 629 | 635 | function | `Features/Workspaces/Views/ManageWorkspacesView.swift:211` | getter `duplicateCleanupCallout` | view file |
+| 24 | 626 | 628 | expression | `Features/AgentMode/Views/Components/AgentSessionRows.swift:941` | expression (in #21) | view file |
+| 25 | 549 | 567 | function | `Features/Settings/Views/APISettingsView.swift:38` | getter `body` | view `body` |
+
+### Frontend time profile (run 1, `RepoPromptApp`)
+
+- **App compile.** The module's llbuild command took 497 s in run 1 and 297 s in run 2. It comprises 47 batch compile jobs (20–193 s wall each), which sum to 3,155 s wall and 1,325 s user in run 1. That is 2.4× oversubscribed, so the table uses instructions.
+- **Emit-module job.** It also takes 122 s wall, 93 of its 160 billion instructions in semantic analysis (81 billion declaration checking). It is on the critical path for every dependent.
+- **Peak frontend memory:** 1,972 MiB for a batch job, 1,759 MiB for emit-module.
+
+| Phase | Instructions (billions) | Share |
+| --- | --- | --- |
+| Type checking and semantic analysis | 1,063 | 23% |
+| SILGen | 492 | 11% |
+| IRGen | 371 | 8% |
+| Parse and import resolution | 252 | 5% |
+| SIL optimization | 127 | 3% |
+| Not separately timed (LLVM code generation and object emission, module loading) | 2,352 | 51% |
+| **Total (47 compile jobs)** | **4,657** | |
+
+Where the type-checking time goes, by file (function-body time, 327 s in total):
+
+| File | Seconds | Lines | ms per line |
+| --- | --- | --- | --- |
+| `Features/AgentMode/ViewModels/AgentModeViewModel.swift` | 14.4 | 21,787 | 0.66 |
+| `Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift` | 10.6 | 15,710 | 0.67 |
+| `Infrastructure/MCP/MCPConnectionManager.swift` | 10.6 | 16,904 | 0.63 |
+| `Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift` | 10.1 | 22,231 | 0.45 |
+| `Features/AgentMode/Views/Components/AgentSessionRows.swift` | 9.4 | 1,551 | 6.1 |
+| `Features/AgentMode/Views/ContextDrawer/AgentContextDrawerFilesTab.swift` | 9.2 | 714 | 12.9 |
+| `App/Views/ContentViewNotificationHandler.swift` | 8.0 | 191 | **41.9** |
+| `Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift` | 7.4 | 13,325 | 0.56 |
+| `Infrastructure/MCP/ToolOutputFormatter.swift` | 5.5 | 6,792 | 0.81 |
+| `Features/AgentMode/Views/Components/AgentSessionsSidebarView.swift` | 5.4 | 1,403 | 3.8 |
+| `Features/AgentMode/Views/AgentModeView.swift` | 5.1 | 6,034 | 0.85 |
+| `Features/AgentMode/Runtime/Codex/CodexAgentModeCoordinator.swift` | 4.8 | 11,396 | 0.42 |
+
+- **Correlation with the §1.3 god files.** The nine largest files hold 20% of the lines (129.8k) and take 21% of the function-body time (69.1 s): 0.53 ms per line against the module's 0.51.
+  - Their cost is size, not pathological code: they are expensive because every edit recompiles 9–22k lines in one frontend job, which the S16 splits address.
+  - The pathological files are small SwiftUI files at 3.8–42 ms per line, where single `body` getters take 2–9 s. By folder, `Features/AgentMode` takes 109 s (33%), `Infrastructure/MCP` 41 s, `Infrastructure/WorkspaceContext` 26 s, and `Features/Settings` 20 s.
+
+### Link levers
+
+Link command durations from the 12 local checkouts' `build.db` (the latest link of each, mixed load):
+
+| Product | p50 | Range |
+| --- | --- | --- |
+| `RepoPromptCEPackageTests.xctest` | 29 s | 10.5–81.3 s |
+| `RepoPrompt` | 51 s | 12.8–81.4 s |
+| `repoprompt-mcp` | 7.5 s | 1.8–19.1 s |
+
+Controlled relinks (tickets `2a199eb0`, `e85a8915`, `d9a49e62`, `0a8e958a`, alternating; load 15–45):
+- Only the three links re-ran; 0 files compiled.
+- Each job then ran `--filter RepoPromptRegexCoreTests` from the relinked bundle: 7 tests, 0 failures.
+
+| Job | `-no_deduplicate` | Test bundle: command / `ld` / `dsymutil` | `RepoPrompt`: command / `ld` / `dsymutil` | Job exec |
+| --- | --- | --- | --- | --- |
+| nd1 | yes | 21.7 / 6.1 / 13.7 s | 19.4 / 3.9 / 12.5 s | 34.9 s |
+| pl2 | no | 24.7 / 4.2 / 18.1 s | 21.4 / 3.1 / 15.6 s | 40.3 s |
+| nd3 | yes | 23.6 / 4.5 / 16.9 s | 20.9 / 4.5 / 14.2 s | 39.2 s |
+| pl4 | no | 20.1 / 4.8 / 13.4 s | 17.7 / 3.7 / 10.8 s | 33.3 s |
+
+- **`-no_deduplicate`: no measurable gain.** Test-bundle command mean 22.7 s with the flag vs 22.4 s without; `ld` 5.3 vs 4.5 s, within noise. The bundle still links and runs.
+- **`dsymutil` is the link cost.** It is 60–75% of every debug link command: 11–18 s for the test bundle and app at this load, 8.5 s for the app at load about 10, where `ld` took 1.5 s. It peaks at 1.8–2.1 GiB for the test bundle and 1.3–1.7 GiB for the app, and was the largest single process in every sampled job but one. `ld` itself takes 3–6 s and peaks at 1.2–2.0 GiB.
+- **Debug dynamic linkage:** deferred, not evaluated (§5.6 singleton-identity rule).
+
+### Per-job peak RSS (new field)
+
+| Job | Ticket | Exec | Peak tree RSS | Processes at peak | Largest process |
+| --- | --- | --- | --- | --- | --- |
+| App build, run 1 (dependencies and app) | `569c44ed` | 638 s | 4,838 MiB | 54 | `dsymutil` 1,922 MiB |
+| Test build + link + filter | `9d37d757` | 171 s | 5,069 MiB | 40 | `dsymutil` 2,126 MiB |
+| Relink + filter (4 jobs) | `2a199eb0`… | 33–40 s | 3,032–3,350 MiB | 6–10 | `ld` or `dsymutil` 1,854–2,043 MiB |
+| App build, run 2 | `c3a1636c` | 516 s | 5,140 MiB | 63 | `dsymutil` 1,804 MiB |
+
+These agree with P0.3's sampler: 3,856 MiB for an aggregate interface edit. For admission v2 (P1.3), compile fan-out drives the tree peak, but a single link or dSYM step alone holds about 2 GiB.
+
+### Recommendations
+
+1. **Type-check ratchet, proposed and not gated.**
+   - Track four counts for `RepoPromptApp`:
+
+     | Metric | Baseline |
+     | --- | --- |
+     | `app_long_function_bodies_1000ms` | 10 |
+     | `app_long_expressions_500ms` | 6 |
+     | `app_long_function_bodies_500ms` | 24 |
+     | `app_long_expressions_200ms` | 11 |
+
+   - Take the maximum of the two runs as the baseline.
+   - The first two were identical in both runs and are gate-ready. The ≥ 500 ms / ≥ 200 ms pair moved by up to 3 and stays tracked.
+   - The ≥ 200 ms function count (92–104) is a report-only indicator.
+   - Like the index metrics, these need a compile, so they cannot run in `make guardrails`. Gate them when a build-producing CI job exists (P1.4). Until then, record them per slice with `conductor swift-build --product RepoPrompt --scratch <label> --swiftc-flag=-Xfrontend --swiftc-flag=-warn-long-function-bodies=500 --swiftc-flag=-Xfrontend --swiftc-flag=-warn-long-expression-type-checking=200`.
+   - They are not added to `ratchets.json`, for the same `update` reason as the index baseline.
+2. **Cheapest type-check wins.** Split the four bodies over 4 s: `AgentContextDrawerFilesTab.body`, `SettingsNotificationHandler.body(content:)`, `AgentSessionRow.body`, and `AgentModeSessionsListView.body`. Together they cost 27.5 s of type checking per full compile and sit in batch jobs on the app's critical path. Pure view refactors: behavior-preserving, out of scope here.
+3. **Do not adopt `-no_deduplicate`** for debug test bundles.
+4. **Evaluate skipping dSYM generation for local debug links** (follow-up; not adopted).
+   - LLDB can read DWARF from the object files through the debug map, so a local test or debug-app link may not need `dsymutil`. The driver has no switch for this; SwiftPM passes `-g` to the link.
+   - Parity checks before adoption: breakpoints and backtraces in the test bundle and debug app, crash symbolication, and `package_app.sh`. Release packaging keeps its dSYM.
+5. **Measurement lane.** Do not schedule `-debug-time-function-bodies` over the whole graph: run 1's log was 1.19 GB, with 2.2M lines including dependencies. The two `-warn-long-*` flags are enough for the ratchet. Per-file profiling stays on-demand.
+
+**Not done here:**
+- P0.1 proposed measuring a lower-volume diagnostic style for local test builds; it is not measured and stays open.
+- SwiftPM product builds print `Build of product '…' complete!`, which the P0.1 `buildCompleted` pattern does not match. `swift-build` jobs therefore lack `buildReportedSeconds` (P1.3 follow-up).
+
+**Validation.**
+- `make guardrails` passes, with modularization ratchets ok.
+- `make conductor-selftest`: every suite passes except `test_local_production_installer.py`.
+  - It had 4 of 18 errors, each a 15 s `install_local_production.sh` subprocess timeout (the known load-sensitive flake; this change does not touch the installer).
+  - `test_security_inventory.py`, the suite after it, passes standalone.
+- Live checks:
+  - measurement flags reached SwiftPM (the job log shows `swift build … --scratch-path …/.build/measure/p05-typecheck -Xswiftc …`);
+  - relink-only jobs compiled nothing;
+  - `phaseTimings.peakRss` appeared in live status and in `.timing.json`.
+- **Cleanup.**
+  - The measurement scratch `.build/measure/p05-typecheck` (9.1 GB) and the throwaway scripts were deleted.
+  - Two conductor job logs stay under the daemon's retention: `569c44ed` at 1.19 GB (run 1, `-debug-time-function-bodies`) and `9d37d757` at 171 MB.

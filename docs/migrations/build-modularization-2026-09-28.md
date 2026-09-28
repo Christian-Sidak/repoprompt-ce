@@ -403,7 +403,7 @@ Waves proceed bottom-up by dependency closure. P2 and later waves interleave: de
 
   Measure cold and warm edit→test, test discovery completeness, resources, peak RSS, disk, and CI parity. This decides ADR-07 and exercises the §3.4 packaging gate.
 - **P0.4 Fixed per-job overhead** (§5.2) — done; see ledger.
-- **P0.5 Link and type-check levers** measured (§5.6, §5.7).
+- **P0.5 Link and type-check levers** measured (§5.6, §5.7) — done; see ledger.
 - **P0.6 Compatibility inventory** (§7.2) captured as golden tests where missing.
 - **P0.7 Ratchets file** with baselines, and a guardrail skeleton that fails only on regression.
 - **Exit gate:** baseline recorded; ADR-01…09 decided with evidence; the graph tool agrees with the top offenders; no production behavior changed.

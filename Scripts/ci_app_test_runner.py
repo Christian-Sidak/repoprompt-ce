@@ -111,13 +111,18 @@ def test_target_for_suite(suite: str) -> str:
     return suite.split(".", 1)[0]
 
 
+def scratch_path_args(scratch_path: Path | None) -> tuple[str, ...]:
+    return ("--scratch-path", str(scratch_path)) if scratch_path is not None else ()
+
+
 def discover_test_bundles(
     swift_binary: str,
     cwd: Path | None,
+    scratch_path: Path | None = None,
 ) -> dict[str, Path]:
     try:
         result = subprocess.run(
-            [swift_binary, "build", "--show-bin-path"],
+            [swift_binary, "build", *scratch_path_args(scratch_path), "--show-bin-path"],
             check=True,
             capture_output=True,
             cwd=cwd,
@@ -488,6 +493,7 @@ def direct_xctest_command(
     lister: BundleTestLister | None = None,
     bundle_discovery: Optional[Callable[[str, Path | None], Mapping[str, Path]]] = None,
     xctest_binary: Optional[Callable[[], tuple[str, ...]]] = None,
+    scratch_path: Path | None = None,
 ) -> tuple[str, ...] | None:
     """Build the direct xctest invocation, or None when SwiftPM must run the tests.
 
@@ -498,7 +504,10 @@ def direct_xctest_command(
     root = cwd or Path.cwd()
     if package_uses_swift_testing(root):
         return None
-    discovered = (bundle_discovery or discover_test_bundles)(swift_binary, cwd)
+    if bundle_discovery is None:
+        discovered = discover_test_bundles(swift_binary, cwd, scratch_path)
+    else:
+        discovered = bundle_discovery(swift_binary, cwd)
     bundle = package_test_bundle(discovered) if discovered else None
     if bundle is None:
         return None
@@ -527,10 +536,21 @@ def run_local_tests(
     test_product: str | None = None,
     executor: CommandExecutor = execute_command,
     direct_command: Callable[..., tuple[str, ...] | None] = direct_xctest_command,
+    scratch_path: Path | None = None,
+    build_args: Sequence[str] = (),
 ) -> int:
+    """Build the package tests, then run the selection in a sandbox.
+
+    `scratch_path` and `build_args` exist for measurement builds (plan P0.5): extra compiler or
+    linker flags go to a separate scratch path, so they never invalidate the shared `.build`.
+    """
+    if build_args and scratch_path is None:
+        print("::error::extra build arguments require a separate scratch path")
+        return 2
+    swiftpm_args = (*scratch_path_args(scratch_path), *build_args)
     # Keep compilation and its caches outside the disposable runtime home.
     environment = dict(os.environ)
-    status = executor((swift_binary, "build", "--build-tests"), cwd, environment)
+    status = executor((swift_binary, "build", "--build-tests", *swiftpm_args), cwd, environment)
     if status != 0:
         return status
     with tempfile.TemporaryDirectory(prefix="rpce-local-tests-") as directory:
@@ -539,12 +559,13 @@ def run_local_tests(
         if test_product is None:
             command = direct_command(
                 swift_binary=swift_binary, cwd=cwd, test_filter=test_filter, environment=environment,
+                scratch_path=scratch_path,
             )
         if command == ():
             print("No matching test cases were run")
             return 0
         if command is None:
-            command = (swift_binary, "test", "--skip-build")
+            command = (swift_binary, "test", "--skip-build", *swiftpm_args)
             if test_product:
                 command += ("--test-product", test_product)
             if test_filter:
@@ -727,6 +748,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--cwd", type=Path, default=None)
     parser.add_argument("--shard-count", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=1)
+    parser.add_argument("--scratch-path", type=Path, help="Measurement builds: SwiftPM scratch path for --local")
+    parser.add_argument(
+        "--build-arg", dest="build_args", action="append", default=[],
+        help="Measurement builds: extra SwiftPM build argument (use --build-arg=VALUE); requires --scratch-path",
+    )
     args = parser.parse_args(argv)
     if args.local and (args.shard_count != 1 or args.shard_index != 1):
         parser.error("--local cannot be combined with sharding")
@@ -734,6 +760,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         parser.error("--filter, --test-product, and --module require --local")
     if args.module and args.test_product:
         parser.error("--module cannot be combined with --test-product")
+    if (args.scratch_path or args.build_args) and (not args.local or args.module):
+        parser.error("--scratch-path and --build-arg apply only to --local runs without --module")
+    if args.build_args and not args.scratch_path:
+        parser.error("--build-arg requires --scratch-path")
     return args
 
 
@@ -748,6 +778,7 @@ def main(argv: Sequence[str]) -> int:
         return run_local_tests(
             swift_binary=args.swift_binary, cwd=args.cwd,
             test_filter=args.test_filter, test_product=args.test_product,
+            scratch_path=args.scratch_path, build_args=tuple(args.build_args),
         )
     try:
         validate_shard_args(args.shard_count, args.shard_index)

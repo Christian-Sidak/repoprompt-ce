@@ -209,5 +209,65 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(remaining, ["kept.log", "kept.timing.json"])
 
 
+class PeakRssTests(unittest.TestCase):
+    PS_OUTPUT = "\n".join([
+        "  100     1  2048 /usr/bin/python3",
+        "  200   100  1024 /usr/bin/swift-build",
+        "  300   200  4096 /Applications/Xcode.app/usr/bin/swift-frontend",
+        "  400     1  9999 /Applications/Other App.app/Contents/MacOS/Other App",
+        "  500   300     0 ld",
+        "  600   200   512 (swift-frontend)",
+        "garbage line",
+    ])
+
+    def test_parse_reads_pid_ppid_rss_and_name(self) -> None:
+        table = conductor.parse_process_rss_table(self.PS_OUTPUT)
+        self.assertEqual(table[300], (200, 4096 * 1024, "swift-frontend"))
+        self.assertEqual(table[400], (1, 9999 * 1024, "Other App"))
+        self.assertEqual(table[600], (200, 512 * 1024, "swift-frontend"))
+        self.assertNotIn("garbage", str(table))
+
+    def test_tree_sums_descendants_only(self) -> None:
+        table = conductor.parse_process_rss_table(self.PS_OUTPUT)
+        sample = conductor.process_tree_rss(table, 100)
+        self.assertEqual(sample, {
+            "treeBytes": (2048 + 1024 + 4096 + 512) * 1024, "processes": 5,
+            "largestBytes": 4096 * 1024, "largestName": "swift-frontend",
+        })
+        self.assertIsNone(conductor.process_tree_rss(table, 999))
+        self.assertIsNone(conductor.process_tree_rss(table, 500))  # zombie: RSS 0
+
+    def test_sampler_stops_when_root_exits_or_process_is_reaped(self) -> None:
+        tables = [
+            conductor.parse_process_rss_table(self.PS_OUTPUT),
+            None,
+            conductor.parse_process_rss_table("  100 1 0 python3"),
+        ]
+        records = []
+        waits = []
+        conductor.run_process_tree_rss_sampler(
+            100, lambda: True, records.append,
+            snapshot=lambda: tables.pop(0), wait=waits.append, interval=0.5,
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(waits, [0.5, 0.5])
+        records.clear()
+        conductor.run_process_tree_rss_sampler(100, lambda: False, records.append, snapshot=lambda: {}, wait=waits.append)
+        self.assertEqual(records, [])
+
+    def test_peaks_fold_into_phase_timings_and_record(self) -> None:
+        job = make_job()
+        self.assertNotIn("peakRss", job.phase_timings())
+        job.observe_rss_sample({"treeBytes": 10, "processes": 3, "largestBytes": 6, "largestName": "ld"})
+        job.observe_rss_sample({"treeBytes": 8, "processes": 5, "largestBytes": 7, "largestName": "dsymutil"})
+        expected = {
+            "samples": 2, "sampleIntervalSeconds": conductor.JOB_RSS_SAMPLE_INTERVAL_SECONDS,
+            "treeBytes": 10, "treeProcesses": 3, "largestProcessBytes": 7, "largestProcessName": "dsymutil",
+        }
+        self.assertEqual(job.phase_timings()["peakRss"], expected)
+        self.assertEqual(job.timing_record()["phaseTimings"]["peakRss"], expected)
+        json.dumps(job.timing_record())
+
+
 if __name__ == "__main__":
     unittest.main()
