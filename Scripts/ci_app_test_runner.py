@@ -279,15 +279,17 @@ def execute_command(
 
 SWIFT_TESTING_IMPORT = re.compile(r"^\s*(?:@testable\s+)?import\s+Testing\b", re.MULTILINE)
 XCTEST_HELPER_RELATIVE_PATH = Path("libexec/swift/pm/swiftpm-xctest-helper")
+SWIFT_TESTING_HELPER_RELATIVE_PATH = Path("libexec/swift/pm/swiftpm-testing-helper")
+# Swift Testing's EXIT_NO_TESTS_FOUND (EX_UNAVAILABLE); `swift test` treats it as success.
+SWIFT_TESTING_NO_TESTS_EXIT = 69
 BundleTestLister = Callable[[Path, Mapping[str, str]], Optional[list[str]]]
 
 
-def package_uses_swift_testing(root: Path) -> bool:
-    """Direct XCTest execution would silently skip Swift Testing tests, so detect them."""
-    tests_root = root / "Tests"
-    if not tests_root.is_dir():
+def sources_import_swift_testing(directory: Path) -> bool:
+    """Whether any Swift file under `directory` imports Testing; unreadable files count as yes."""
+    if not directory.is_dir():
         return False
-    for path in tests_root.rglob("*.swift"):
+    for path in directory.rglob("*.swift"):
         try:
             if SWIFT_TESTING_IMPORT.search(path.read_text(encoding="utf-8", errors="ignore")):
                 return True
@@ -296,7 +298,12 @@ def package_uses_swift_testing(root: Path) -> bool:
     return False
 
 
-def xctest_helper_path(swift_binary: str) -> Path | None:
+def package_uses_swift_testing(root: Path) -> bool:
+    """Direct XCTest execution would silently skip Swift Testing tests, so detect them."""
+    return sources_import_swift_testing(root / "Tests")
+
+
+def toolchain_helper_path(swift_binary: str, relative_path: Path) -> Path | None:
     try:
         result = subprocess.run(
             ["xcrun", "--find", swift_binary],
@@ -307,8 +314,58 @@ def xctest_helper_path(swift_binary: str) -> Path | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     swift_path = Path(result.stdout.strip())
-    helper = swift_path.parent.parent / XCTEST_HELPER_RELATIVE_PATH
+    helper = swift_path.parent.parent / relative_path
     return helper if helper.is_file() else None
+
+
+def xctest_helper_path(swift_binary: str) -> Path | None:
+    return toolchain_helper_path(swift_binary, XCTEST_HELPER_RELATIVE_PATH)
+
+
+def swift_testing_helper_path(swift_binary: str) -> Path | None:
+    return toolchain_helper_path(swift_binary, SWIFT_TESTING_HELPER_RELATIVE_PATH)
+
+
+def swift_testing_command(helper: Path, bundle: Path, test_filter: str | None) -> tuple[str, ...]:
+    """The `swift test --build-system swiftbuild` invocation of swiftpm-testing-helper, verbatim.
+
+    Captured from SwiftPM 6.3.3's own process arguments. SwiftPM forwards `--filter` unchanged to
+    Swift Testing, so passing it through keeps Swift Testing selection identical by construction.
+    """
+    binary = str(bundle / "Contents" / "MacOS" / bundle.stem)
+    filter_arguments = ("--filter", test_filter) if test_filter else ()
+    return (
+        str(helper), "--test-bundle-path", binary, "--build-system", "swiftbuild",
+        *filter_arguments, binary, "--testing-library", "swift-testing",
+    )
+
+
+def developer_library_environment(base: Mapping[str, str]) -> dict[str, str] | None:
+    """Add the platform Developer frameworks that `swift test` exposes to test processes.
+
+    The helper dlopens the bundle, which links XCTest and Testing through @rpath; without these
+    paths the load fails. Returns None when the platform path cannot be resolved.
+    """
+    try:
+        result = subprocess.run(
+            ["xcrun", "--show-sdk-platform-path"], check=True, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    developer = Path(result.stdout.strip()) / "Developer"
+    if not developer.is_dir():
+        return None
+    additions = {
+        "DYLD_FRAMEWORK_PATH": [developer / "Library/Frameworks", developer / "Library/PrivateFrameworks"],
+        "DYLD_LIBRARY_PATH": [developer / "usr/lib"],
+    }
+    environment = dict(base)
+    for key, paths in additions.items():
+        entries = [str(path) for path in paths]
+        if environment.get(key):
+            entries.append(environment[key])
+        environment[key] = ":".join(entries)
+    return environment
 
 
 def flatten_listed_tests(document: Mapping[str, object]) -> list[str]:
@@ -353,17 +410,57 @@ def helper_bundle_lister(helper: Path) -> BundleTestLister:
     return list_tests
 
 
+def is_portable_filter(test_filter: str) -> bool:
+    """Whether Python `re` and SwiftPM's ICU regex (NSRegularExpression) agree on this filter.
+
+    Accepts literals, escaped punctuation, `.`, `*`, `+`, `?`, `|`, anchors, plain groups, and
+    simple character classes. Rejects the constructs whose syntax or meaning differs between the
+    two engines: `\\<letter or digit>` escapes, `(?…)` groups, `{}` intervals, and nested or
+    set-operation (`[[`, `&&`, `--`) and leading-`]` character classes.
+    """
+    in_class = False
+    index = 0
+    while index < len(test_filter):
+        character = test_filter[index]
+        if character == "\\":
+            if index + 1 >= len(test_filter) or test_filter[index + 1].isalnum():
+                return False
+            index += 2
+            continue
+        if character in "{}":
+            return False
+        if in_class:
+            if character == "[" or test_filter.startswith(("&&", "--"), index):
+                return False
+            if character == "]":
+                in_class = False
+        elif character == "[":
+            if test_filter.startswith(("]", "^]"), index + 1):
+                return False
+            in_class = True
+        elif test_filter.startswith("(?", index):
+            return False
+        index += 1
+    if in_class:
+        return False
+    try:
+        re.compile(test_filter)
+    except re.error:
+        return False
+    return True
+
+
 def select_xctest_specifiers(specifiers: Sequence[str], test_filter: str | None) -> list[str] | None:
     """Apply SwiftPM `--filter` regex semantics; collapse fully selected suites.
 
-    Returns None when the filter is not a valid Python regex so callers can fall back to SwiftPM.
+    Returns None when equivalence with SwiftPM's matching is not guaranteed (see
+    `is_portable_filter`) so callers can fall back to SwiftPM or fail closed.
     """
     if not test_filter:
         return ["All"] if specifiers else []
-    try:
-        pattern = re.compile(test_filter)
-    except re.error:
+    if not is_portable_filter(test_filter):
         return None
+    pattern = re.compile(test_filter)
     selected = [specifier for specifier in specifiers if pattern.search(specifier)]
     by_suite: dict[str, list[str]] = {}
     for specifier in specifiers:
@@ -491,15 +588,35 @@ def run_module_tests(
     bundle_locator: Callable[[str, Path | None, str], Path | None] = module_bundle_path,
     lister: BundleTestLister | None = None,
     xctest_binary: Optional[Callable[[], tuple[str, ...]]] = None,
+    testing_helper: Optional[Callable[[str], Path | None]] = None,
+    testing_environment: Optional[Callable[[Mapping[str, str]], dict[str, str] | None]] = None,
 ) -> int:
     """Build only one test target's dependency closure and run its bundle directly.
 
     Native SwiftPM links every test target into one aggregate bundle, so a focused run always
     builds and links the whole package. The Swift Build engine emits one bundle per test target,
     which keeps a module's test loop independent of unrelated targets (plan P0.3/P1.3).
+
+    Like `swift test`, XCTest runs first, then Swift Testing when `Tests/<module>` imports it;
+    both always run, and the run fails if either fails. Anything that could make selection
+    differ from SwiftPM's fails closed instead of silently running fewer tests.
     """
     if not MODULE_TEST_TARGET_PATTERN.match(module):
         print(f"::error::--module must name a test target (got {module!r})")
+        return 2
+    test_sources = (cwd or Path.cwd()) / "Tests" / module
+    if not test_sources.is_dir():
+        print(f"::error::{test_sources} not found; cannot tell whether {module} uses Swift Testing")
+        return 2
+    testing_helper_binary: Path | None = None
+    if sources_import_swift_testing(test_sources):
+        testing_helper_binary = (testing_helper or swift_testing_helper_path)(swift_binary)
+        if testing_helper_binary is None:
+            print(f"::error::{module} imports Testing but swiftpm-testing-helper is unavailable")
+            return 2
+    if test_filter and not is_portable_filter(test_filter):
+        print(f"::error::--filter {test_filter!r} uses regex syntax whose XCTest matching could differ "
+              "from SwiftPM's; use a plain name or alternation, or run without --module")
         return 2
     environment = dict(os.environ)
     status = executor(module_build_command(swift_binary, module), cwd, environment)
@@ -523,13 +640,29 @@ def run_module_tests(
             return 2
         selectors = select_xctest_specifiers(specifiers, test_filter)
         if selectors is None:
-            print(f"::error::--filter is not a valid regular expression: {test_filter!r}")
+            print(f"::error::--filter could not be applied to XCTest: {test_filter!r}")
             return 2
-        if not selectors:
+        xctest_status = 0
+        if selectors:
+            binary = (xctest_binary or xctest_binary_path)()
+            # As `swift test` does: otherwise xctest also hosts the Swift Testing tests, running them twice.
+            xctest_environment = {**environment, "SWIFT_TESTING_ENABLED": "0"}
+            xctest_status = executor(
+                (*binary, "-XCTest", ",".join(selectors), str(bundle)), cwd, xctest_environment,
+            )
+        elif testing_helper_binary is None:
             print("No matching test cases were run")
             return 0
-        binary = (xctest_binary or xctest_binary_path)()
-        return executor((*binary, "-XCTest", ",".join(selectors), str(bundle)), cwd, environment)
+        if testing_helper_binary is None:
+            return xctest_status
+        testing_env = (testing_environment or developer_library_environment)(environment)
+        if testing_env is None:
+            print("::error::could not resolve the platform Developer frameworks for Swift Testing")
+            return 2
+        testing_status = executor(swift_testing_command(testing_helper_binary, bundle, test_filter), cwd, testing_env)
+        if testing_status == SWIFT_TESTING_NO_TESTS_EXIT:
+            testing_status = 0
+        return xctest_status or testing_status
 
 
 def run_selected_suites(
