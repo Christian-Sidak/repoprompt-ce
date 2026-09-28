@@ -89,17 +89,22 @@ package struct DomainIgnoreConfiguration: Equatable {
     package let respectRepoIgnore: Bool
     package let respectCursorignore: Bool
     package let hierarchicalIgnores: Bool
+    /// The app crawl's `skip_symlinks` policy (default on): skip every symlink, or follow links
+    /// with the app's cycle guard. See `HeadlessDirectoryWalk`.
+    package let skipSymlinks: Bool
 
     package init(
         globalPatterns: String,
         respectRepoIgnore: Bool = true,
         respectCursorignore: Bool = true,
-        hierarchicalIgnores: Bool = true
+        hierarchicalIgnores: Bool = true,
+        skipSymlinks: Bool = true
     ) {
         self.globalPatterns = globalPatterns
         self.respectRepoIgnore = respectRepoIgnore
         self.respectCursorignore = respectCursorignore
         self.hierarchicalIgnores = hierarchicalIgnores
+        self.skipSymlinks = skipSymlinks
     }
 }
 
@@ -689,24 +694,27 @@ package struct MCPDomainCanonicalWorkspaceService {
         var scan = FileScan()
         var visited = 0
         for root in roots {
-            let located = ignore?.locate(root)
+            if let located = ignore?.locate(root) {
+                try forEachConfiguredFile(
+                    under: root,
+                    located: located,
+                    visited: &visited,
+                    scan: &scan,
+                    cancellation: cancellation,
+                    visit
+                )
+                if scan.stoppedEarly || scan.enumerationLimitReached { return scan }
+                continue
+            }
+            // Legacy enumeration (no ignore configuration, or a base outside every root).
             guard let enumerator = FileManager.default.enumerator(
                 at: root,
                 includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey],
-                options: located == nil ? [.skipsHiddenFiles, .skipsPackageDescendants] : [.skipsPackageDescendants]
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
             ) else { continue }
             for case let url as URL in enumerator {
                 try cancellation.check()
                 let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey])
-                if let located, let relative = located.relativePath(of: url) {
-                    let isDirectory = values?.isDirectory == true
-                    guard try located.evaluator.admits(relative, isDirectory: isDirectory) else {
-                        if isDirectory, try !located.evaluator.requiresTraversal(relative) {
-                            enumerator.skipDescendants()
-                        }
-                        continue
-                    }
-                }
                 guard values?.isRegularFile == true else { continue }
                 guard visited < MCPDomainCanonicalReadBounds.maximumEnumeratedFiles else {
                     scan.enumerationLimitReached = true
@@ -722,6 +730,60 @@ package struct MCPDomainCanonicalWorkspaceService {
         return scan
     }
 
+    /// Configured enumeration: the app's ignore layers and symlink policy over logical paths.
+    private static func forEachConfiguredFile(
+        under base: URL,
+        located: HeadlessIgnoreContext.Located,
+        visited: inout Int,
+        scan: inout FileScan,
+        cancellation: BlockingCancellation,
+        _ visit: (URL, Int?) throws -> Bool
+    ) throws {
+        guard !located.baseIsUnreachableUnderSymlinkPolicy() else { return }
+        try located.makeWalk(cancellation: cancellation).walk(
+            base: base,
+            ancestorIDs: located.ancestorDirectoryIDs()
+        ) { entry in
+            if let decision = try located.ignoreDecision(for: entry) { return decision }
+            guard entry.isRegularFile else { return .descend }
+            guard visited < MCPDomainCanonicalReadBounds.maximumEnumeratedFiles else {
+                scan.enumerationLimitReached = true
+                return .stop
+            }
+            visited += 1
+            guard try visit(entry.url, entry.fileSize) else {
+                scan.stoppedEarly = true
+                return .stop
+            }
+            return .descend
+        }
+    }
+
+    private static func configuredTreeLines(
+        root: URL,
+        located: HeadlessIgnoreContext.Located,
+        maxDepth: Int,
+        maximumLines: Int,
+        cancellation: BlockingCancellation
+    ) throws -> [String] {
+        var lines = [root.lastPathComponent + "/"]
+        guard !located.baseIsUnreachableUnderSymlinkPolicy() else { return lines }
+        try located.makeWalk(cancellation: cancellation).walk(
+            base: root,
+            ancestorIDs: located.ancestorDirectoryIDs()
+        ) { entry in
+            guard lines.count < maximumLines else { return .stop }
+            if entry.depth > maxDepth { return .skipDescendants }
+            if let decision = try located.ignoreDecision(for: entry) { return decision }
+            lines.append(
+                String(repeating: "  ", count: entry.depth) + entry.url.lastPathComponent
+                    + (entry.isDirectory ? "/" : "")
+            )
+            return .descend
+        }
+        return lines
+    }
+
     private static func treeLines(
         root: URL,
         maxDepth: Int,
@@ -729,12 +791,21 @@ package struct MCPDomainCanonicalWorkspaceService {
         ignore: HeadlessIgnoreContext? = nil,
         cancellation: BlockingCancellation
     ) throws -> [String] {
+        if let located = ignore?.locate(root) {
+            return try configuredTreeLines(
+                root: root,
+                located: located,
+                maxDepth: maxDepth,
+                maximumLines: maximumLines,
+                cancellation: cancellation
+            )
+        }
+        // Legacy enumeration (no ignore configuration, or a base outside every root).
         var lines = [root.lastPathComponent + "/"]
-        let located = ignore?.locate(root)
         guard let enumerator = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: [.isDirectoryKey],
-            options: located == nil ? [.skipsHiddenFiles, .skipsPackageDescendants] : [.skipsPackageDescendants]
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return lines }
         for case let url as URL in enumerator {
             try cancellation.check()
@@ -746,14 +817,6 @@ package struct MCPDomainCanonicalWorkspaceService {
                 continue
             }
             let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-            if let located, let ignoredRelative = located.relativePath(of: url) {
-                guard try located.evaluator.admits(ignoredRelative, isDirectory: isDirectory) else {
-                    if isDirectory, try !located.evaluator.requiresTraversal(ignoredRelative) {
-                        enumerator.skipDescendants()
-                    }
-                    continue
-                }
-            }
             lines.append(String(repeating: "  ", count: depth) + url.lastPathComponent + (isDirectory ? "/" : ""))
         }
         return lines
@@ -818,6 +881,9 @@ private final class HeadlessIgnoreContext: @unchecked Sendable {
         /// Equivalent spellings of the base path; the enumerator may report `/private/var/...`
         /// for a base given as `/var/...`.
         let basePaths: [String]
+        /// The spelling of the workspace root that `basePrefix` is relative to.
+        let rootSpelling: String
+        let skipSymlinks: Bool
 
         /// Root-relative path of an enumerated item, or nil when it cannot be attributed to the
         /// base (the caller then applies no ignore decision rather than a wrong one).
@@ -827,11 +893,58 @@ private final class HeadlessIgnoreContext: @unchecked Sendable {
             let local = String(path.dropFirst(basePath.count + 1))
             return basePrefix.isEmpty ? local : basePrefix + "/" + local
         }
+
+        /// A walk with this root's symlink policy, containing followed links to its canonical root.
+        func makeWalk(cancellation: BlockingCancellation) -> HeadlessDirectoryWalk {
+            HeadlessDirectoryWalk(
+                skipSymlinks: skipSymlinks,
+                canonicalRootPath: skipSymlinks ? nil : HeadlessDirectoryWalk.canonicalPath(rootSpelling),
+                skipsPackageDescendants: true,
+                checkCancellation: { try cancellation.check() }
+            )
+        }
+
+        /// The walk decision for an entry the ignore rules reject, or nil when it is admitted. A
+        /// rejected directory is still descended when a negation beneath it requires traversal.
+        func ignoreDecision(for entry: HeadlessDirectoryWalk.Entry) throws -> HeadlessDirectoryWalk.Decision? {
+            guard let relative = relativePath(of: entry.url),
+                  try !evaluator.admits(relative, isDirectory: entry.isDirectory)
+            else { return nil }
+            return try entry.isDirectory && evaluator.requiresTraversal(relative) ? .descend : .skipDescendants
+        }
+
+        /// Under `skip_symlinks` the app catalogs nothing reached through a link, so a base below
+        /// the root that passes through a symlinked directory enumerates nothing (fail closed).
+        func baseIsUnreachableUnderSymlinkPolicy() -> Bool {
+            guard skipSymlinks else { return false }
+            return basePrefixDirectories().contains { path in
+                var status = stat()
+                return lstat(path, &status) != 0 || status.st_mode & S_IFMT == S_IFLNK
+            }
+        }
+
+        /// Directory identities from the workspace root down to the base itself, seeding the
+        /// walk's cycle guard as the app seeds its `DirChain` from the root and base components.
+        func ancestorDirectoryIDs() -> [HeadlessDirectoryWalk.DirectoryID] {
+            guard !skipSymlinks else { return [] }
+            return ([rootSpelling] + basePrefixDirectories()).compactMap(HeadlessDirectoryWalk.directoryID(atPath:))
+        }
+
+        /// Logical paths of each directory from just below the root down to the base itself.
+        private func basePrefixDirectories() -> [String] {
+            var path = rootSpelling
+            return basePrefix.split(separator: "/").map { component in
+                path += "/" + component
+                return path
+            }
+        }
     }
 
     private let evaluators: [(rootPath: String, evaluator: HeadlessIgnoreEvaluator)]
+    private let skipSymlinks: Bool
 
     init(roots: [URL], configuration: DomainIgnoreConfiguration) throws {
+        skipSymlinks = configuration.skipSymlinks
         evaluators = try roots.map { root in
             let rootPath = root.standardizedFileURL.path
             return try (rootPath, HeadlessIgnoreEvaluator(rootPath: rootPath, configuration: configuration))
@@ -846,13 +959,21 @@ private final class HeadlessIgnoreContext: @unchecked Sendable {
             for rootSpelling in Self.equivalentPaths(URL(fileURLWithPath: rootPath, isDirectory: true)) {
                 for basePath in basePaths {
                     if basePath == rootSpelling {
-                        return Located(evaluator: evaluator, basePrefix: "", basePaths: basePaths)
+                        return Located(
+                            evaluator: evaluator,
+                            basePrefix: "",
+                            basePaths: basePaths,
+                            rootSpelling: rootSpelling,
+                            skipSymlinks: skipSymlinks
+                        )
                     }
                     if basePath.hasPrefix(rootSpelling + "/") {
                         return Located(
                             evaluator: evaluator,
                             basePrefix: String(basePath.dropFirst(rootSpelling.count + 1)),
-                            basePaths: basePaths
+                            basePaths: basePaths,
+                            rootSpelling: rootSpelling,
+                            skipSymlinks: skipSymlinks
                         )
                     }
                 }

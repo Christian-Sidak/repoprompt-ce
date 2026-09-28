@@ -118,13 +118,16 @@ package enum DomainAppSettingsCatalog {
         bool("file_system.respect_cursorignore", "file_system", true, "Whether .cursorignore files are honored."),
         DomainSettingDescriptor(key: "file_system.global_ignore_defaults", group: "file_system", valueKind: .string, defaultValue: .string(""), description: "App-wide gitignore-style patterns."),
         bool("file_system.enable_hierarchical_ignores", "file_system", true, "Whether nested ignore files are honored."),
-        bool("file_system.skip_symlinks", "file_system", false, "Whether symbolic links are skipped."),
+        // Matches the app's `GlobalSettingsManager.skipSymlinks()` fallback.
+        bool("file_system.skip_symlinks", "file_system", true, "Whether symbolic links are skipped."),
         bool("file_system.show_empty_folders", "file_system", true, "Whether empty folders are shown.")
     ]
 
     private static let byKey = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.key, $0) })
 
-    package static func descriptor(for key: String) -> DomainSettingDescriptor? { byKey[key] }
+    package static func descriptor(for key: String) -> DomainSettingDescriptor? {
+        byKey[key]
+    }
 
     package static func descriptors(in group: String?) throws -> [DomainSettingDescriptor] {
         guard let group else { return descriptors }

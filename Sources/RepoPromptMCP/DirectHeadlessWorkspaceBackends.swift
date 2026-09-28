@@ -680,7 +680,8 @@ actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
             globalPatterns: globalPatterns,
             respectRepoIgnore: bool("file_system.respect_repo_ignore", default: true),
             respectCursorignore: bool("file_system.respect_cursorignore", default: true),
-            hierarchicalIgnores: bool("file_system.enable_hierarchical_ignores", default: true)
+            hierarchicalIgnores: bool("file_system.enable_hierarchical_ignores", default: true),
+            skipSymlinks: bool("file_system.skip_symlinks", default: true)
         )
     }
 

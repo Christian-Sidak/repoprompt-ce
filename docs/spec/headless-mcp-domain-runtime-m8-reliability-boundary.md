@@ -260,7 +260,7 @@ Ignore-layer parity contract: see the M8N table below, which supersedes the pre-
 | Global ignore defaults | `globalSettings.json` value | same value via M8M view | `HeadlessIgnoreParityTests` |
 | `.repo_ignore` / `.cursorignore` at root | yes when enabled | yes when enabled | `HeadlessIgnoreParityTests` |
 | Hidden files | listed unless ignored | listed unless ignored | `HeadlessIgnoreEnumerationTests` |
-| Symlinks | skipped by default | not governed by `skip_symlinks` | gap |
+| Symlinks | skipped by default; when off, only root-contained targets are eligible | same eligibility via `skip_symlinks`; never crosses the root (M8P) | `HeadlessSymlinkParityTests`, `HeadlessSymlinkPolicyTests` |
 | `read_file` of an ignored path | unverified | not ignore-filtered | not compared |
 
 Evidence: conductor ticket `ffa8bb9e-ef7b-4089-802a-f7003663a738` passed 62/62, including
@@ -302,8 +302,62 @@ products built (`bb9a724b-924b-4d94-a8dc-c3dd599da1ca`); lint passed
 files. A first run failed to compile because the relocated `GitRepositoryLayout` lost its
 synthesized cross-module initializer; it now declares an explicit `package` initializer.
 
-Remaining ignore-parity gaps (not claimed): symlink policy (`skip_symlinks`) and `read_file` on an
-ignored path (app behavior unverified).
+Remaining ignore-parity gaps after M8O: symlink policy (`skip_symlinks`, closed by M8P below) and
+`read_file` on an ignored path (app behavior unverified).
+
+### M8P — headless symlink policy parity (root-contained)
+
+The app has two layers. Its raw crawl (`FileSystemService.gatherPathsUsingEnumerator`) drops every
+link when `skip_symlinks` is on (the default) and, when it is off, follows directory links —
+including ones that leave the root — with a `DirChain` (device, inode) cycle guard, and lists file
+and broken links as files. Its authoritative discovery and read gates are narrower, independent of
+`skip_symlinks`: `catalogRegularFileEligibility` / `catalogFolderIsDiscoverable` and content-read
+validation (`validateContentFileForReading`, `PhysicalCatalogPathProbe`) refuse a final-component
+symlink (`.symbolicLink`), a missing target (`.missingOrDirectory`), and any path whose canonical
+target is outside the root's canonical root (`.outsideCanonicalRoot`); with `skip_symlinks` on they
+also refuse any path with a symlinked component (`.symlinkComponent`).
+
+Headless enumeration (`file_search`, `get_file_tree`, `get_code_structure` directory expansion)
+follows the authoritative gates, not the raw crawl. This is a deliberate, security-required
+divergence from the raw crawl: a workspace root is a disclosure boundary, and nothing outside it may
+be listed or read under an in-root logical path.
+
+- `HeadlessDirectoryWalk` (configured enumeration only; callers without a configuration keep the
+  legacy `FileManager` enumeration unchanged): with `skip_symlinks` on, every link is dropped. With
+  it off, the only link admitted is one whose kernel-canonical target (`realpath`) is a directory
+  inside the owning root's kernel-canonical root; it is listed and followed with the app's ancestor
+  cycle guard (a cycle is listed, not descended). File links, broken links, and links whose target
+  leaves the root — directly, via `../`, or nested beneath a followed in-root link — are neither
+  listed nor followed. If the canonical root cannot be read, every link is dropped. A directory whose
+  identity cannot be read is listed but not descended. Entries keep logical paths, so ignore rules
+  see the link's own relative path (an ignored link name is not followed). Children are visited in
+  name order; package directories stay listed-but-not-descended as before.
+- Only regular, non-link files inside the canonical root reach content search and code-map reads.
+- `DomainIgnoreConfiguration.skipSymlinks` (default true) carries the policy; the direct-headless
+  adapter reads `file_system.skip_symlinks`. The headless settings catalog default for that key was
+  `false` and is now `true`, matching `GlobalSettingsManager.skipSymlinks()`.
+- Explicit path authority is unchanged: `DirectHeadlessDomainContext.resolvePath` resolves symlinks
+  and requires the result inside a workspace root. For adapters that pass logical base paths, a base
+  below the root that passes through a symlinked directory enumerates nothing under `skip_symlinks`.
+- Consequence of following the gates rather than the raw crawl: with links followed, the app's
+  raw crawl can still surface a file link, a broken link, or an escaping directory's names in its own
+  tree; headless lists none of them.
+
+Evidence: `HeadlessSymlinkParityTests` (headless listing equals the app's raw crawl filtered by
+`catalogRegularFileEligibility` for both policy values, and pins that the raw crawl enumerates
+`linkfile.swift` and `outside/ext.swift` while eligibility rejects them as `.symbolicLink` and
+`.outsideCanonicalRoot`) and `HeadlessSymlinkPolicyTests` (default skips every link; follow admits
+only in-root directory links with the cycle guard and logical ignore paths; outside-root file,
+directory, `../`, and nested escape links never disclose names or content through path search,
+content search, tree, or code-structure expansion; file links are not read; base through a skipped
+link; settings default). Conductor evidence: focused suites (headless symlink and ignore, policy
+resolution, ignore manager, direct-headless, canonical workspace) passed 65/65
+(`d455a8ca`); all products built (`7d5f3a15`); lint passed with no formatting issues and strict
+SwiftLint clean (`51022a7a`). A first focused run (`d768f545`) failed to compile on an async call
+inside an `XCTUnwrap` autoclosure in the new test; the call is now hoisted.
+
+Remaining ignore-parity gap (not claimed): `read_file` on an ignored or symlinked path (the app's
+read eligibility, including `.symlinkComponent`, is not yet compared).
 
 ### Later milestones (not started in this pass)
 
