@@ -328,17 +328,64 @@ import XCTest
                     transientReason: reason
                 )
             }
+            var cancelled = event(first, .cancelled, .cancelled, atMS: 55)
+            cancelled.origin = "catalogAdvance.file_system_publication"
             let described = Harness.describeStoreEvents([
                 event(first, .scheduled, .eligibilityQueued, atMS: 0),
                 event(second, .eligibilityTerminal, .terminalNonGit, atMS: 12),
-                event(first, .retryScheduled, .transientRetry, atMS: 40, reason: "setup.registrationFailed")
+                event(first, .retryScheduled, .transientRetry, atMS: 40, reason: "setup.registrationFailed"),
+                cancelled
             ])
             XCTAssertEqual(
                 described,
                 "r0+0ms:scheduled:eligibilityQueued>r1+12ms:eligibilityTerminal:terminalNonGit"
                     + ">r0+40ms:retryScheduled:transientRetry:setup.registrationFailed"
+                    + ">r0+55ms:cancelled:cancelled:origin=catalogAdvance.file_system_publication"
             )
             XCTAssertFalse(described.contains(first.rootID.uuidString), "root identifiers never appear")
+        }
+
+        func testDemandEventsAreLabelledPerFileWithRelativeTimes() {
+            let rootEpoch = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+            let fileA = UUID()
+            let fileB = UUID()
+            func event(_ fileID: UUID, _ label: String, atMS milliseconds: UInt64) -> WorkspaceFileContextStore.CodemapDemandEvent {
+                WorkspaceFileContextStore.CodemapDemandEvent(
+                    ordinal: milliseconds,
+                    rootEpoch: rootEpoch,
+                    fileID: fileID,
+                    label: label,
+                    uptimeNanoseconds: 9_000_000_000 + milliseconds * 1_000_000
+                )
+            }
+            let described = Harness.describeDemandEvents([
+                event(fileA, "request.created.pending", atMS: 0),
+                event(fileB, "request.joined.ready", atMS: 3),
+                event(fileB, "release.cancelled.from.ready", atMS: 9)
+            ])
+            XCTAssertEqual(
+                described,
+                "f0+0ms:request.created.pending>f1+3ms:request.joined.ready>f1+9ms:release.cancelled.from.ready"
+            )
+            XCTAssertFalse(described.contains(fileA.uuidString), "file identifiers never appear")
+        }
+
+        func testSignatureIssueLabelNamesThePathWithoutRecordingIt() {
+            typealias Issue = ToolResultDTOs.CodeStructureReplyDTO.IssueDTO
+            let fallback = Issue(
+                code: "signature_unavailable", phase: "render", path: nil, retryable: false,
+                retryAfterMilliseconds: nil, attempted: nil, limit: nil,
+                message: "One or more signatures could not be rendered; graph data remains usable."
+            )
+            XCTAssertEqual(Harness.signatureIssueLabel(fallback), "signature_unavailable@render:renderFallback")
+            let artifact = Issue(
+                code: "signature_unavailable", phase: "render_demand", path: "root/src/b.swift", retryable: true,
+                retryAfterMilliseconds: 100, attempted: nil, limit: nil,
+                message: "A signature artifact is unavailable; graph data remains usable."
+            )
+            let label = Harness.signatureIssueLabel(artifact)
+            XCTAssertEqual(label, "signature_unavailable@render_demand:artifact:path:retryable")
+            XCTAssertFalse(label.contains("b.swift"), "the issue path is never recorded")
         }
 
         func testLatencySummaryUsesLowerMedianAndMax() {

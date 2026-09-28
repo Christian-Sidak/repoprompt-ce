@@ -137,8 +137,9 @@ import XCTest
             let appSettleMS: Double?
             /// Whether the app code-map index reached quiescence before sampling (nil for `read_file`).
             let appQuiescent: Bool?
-            /// App code-map pipeline state, captured only when an app code-structure answer stayed
-            /// unsettled (store launch events, engine graph-index accounting, root status).
+            /// App code-map pipeline state (store launch events with their origins, artifact-demand
+            /// events, engine graph-index accounting, root status): captured when settling fails, and
+            /// after sampling (`post_samples`) for every must-succeed code-structure scenario.
             let appDiagnostics: String?
             /// Code structure only: each measured app sample's state (`sampleState`), in order.
             let appSampleStates: [String]?
@@ -322,11 +323,11 @@ import XCTest
                     headlessSamples.append(headlessMS)
                 }
                 if scenario.tool == .codeStructure, diagnostics == nil,
-                   let first = appObservations.first?.outcome,
-                   appObservations.contains(where: { $0.outcome != first })
-                   || (scenario.effectiveAppAuthority == .mustSucceed && !first.isSuccess)
+                   scenario.effectiveAppAuthority == .mustSucceed
                 {
-                    // Readiness regressed after quiescence: record which launch path restarted it.
+                    // Always recorded for answers that must succeed (bounded event windows), so a
+                    // relaunch or a signature missing from one sample can be attributed to the store
+                    // path that caused it, including in runs that pass.
                     diagnostics = await "post_samples " + appCodemapDiagnostics()
                 }
                 reports.append(Self.evaluate(
@@ -455,6 +456,8 @@ import XCTest
             var parts: [String] = []
             let events = await store.codemapGraphIndexBuildStoreEventsForTesting()
             parts.append("store_events=" + Self.describeStoreEvents(events))
+            let demandEvents = await store.codemapDemandEventsForTesting()
+            parts.append("demand_events=" + Self.describeDemandEvents(demandEvents))
             do {
                 let accounting = try await codemapRuntime.runtime().bindingEngine().accounting()
                 parts.append("engine_roots=" + accounting.graphIndexRoots.map { root in
@@ -487,6 +490,22 @@ import XCTest
                 let offset = event.uptimeNanoseconds >= origin ? (event.uptimeNanoseconds - origin) / 1_000_000 : 0
                 return "\(labels[event.rootEpoch] ?? "r?")+\(offset)ms:\(event.kind):\(event.launchPhase)"
                     + (event.transientReason.map { ":\($0)" } ?? "")
+                    + (event.origin.map { ":origin=\($0)" } ?? "")
+            }.joined(separator: ">")
+        }
+
+        /// The last 60 artifact-demand events, each labelled with its file (`f0`, `f1`, … in order of
+        /// first appearance, never a path or identifier) and its offset in milliseconds from the first
+        /// event.
+        static func describeDemandEvents(_ events: [WorkspaceFileContextStore.CodemapDemandEvent]) -> String {
+            var labels: [UUID: String] = [:]
+            for event in events where labels[event.fileID] == nil {
+                labels[event.fileID] = "f\(labels.count)"
+            }
+            let origin = events.first?.uptimeNanoseconds ?? 0
+            return events.suffix(60).map { event in
+                let offset = event.uptimeNanoseconds >= origin ? (event.uptimeNanoseconds - origin) / 1_000_000 : 0
+                return "\(labels[event.fileID] ?? "f?")+\(offset)ms:\(event.label)"
             }.joined(separator: ">")
         }
 
@@ -624,8 +643,12 @@ import XCTest
                 guard let reply = value.decode(ToolResultDTOs.CodeStructureReplyDTO.self) else {
                     return Observation(outcome: .refused, detail: "undecodable get_code_structure reply")
                 }
-                let issueCodes = (reply.issues + reply.roots.flatMap(\.issues)).map(\.code)
-                let detail = "status=\(reply.status.rawValue)" + (issueCodes.isEmpty ? "" : " issues=\(issueCodes.joined(separator: ","))")
+                let issues = reply.issues + reply.roots.flatMap(\.issues)
+                let issueCodes = issues.map(\.code)
+                let signatureIssues = issues.filter { $0.code.hasPrefix("signature_") }.map(Self.signatureIssueLabel)
+                let detail = "status=\(reply.status.rawValue)"
+                    + (issueCodes.isEmpty ? "" : " issues=\(issueCodes.joined(separator: ","))")
+                    + (signatureIssues.isEmpty ? "" : " signature_issues=\(signatureIssues.joined(separator: ","))")
                 let seeds = reply.files
                     .filter { $0.role == "seed" && !$0.content.isEmpty }
                     .map { MappedFile(name: URL(fileURLWithPath: $0.path).lastPathComponent, text: $0.content) }
@@ -685,6 +708,25 @@ import XCTest
                     : .mapped(mapped.sorted { $0.name < $1.name })
                 return Observation(outcome: outcome, detail: diagnostics.joined(separator: ",").nilIfEmpty)
             }
+        }
+
+        /// Which app path produced a `signature_*` issue: `code@phase:variant`, plus `:path` when the
+        /// issue names a file and `:retryable`. The variant comes from the issue's fixed message (the
+        /// same code is emitted by several paths); the message and path themselves are never recorded.
+        static func signatureIssueLabel(_ issue: ToolResultDTOs.CodeStructureReplyDTO.IssueDTO) -> String {
+            let variant = switch issue.message {
+            case "Signature coordination is temporarily unavailable.": "coordination"
+            case "Signature rendering was cancelled.": "cancelled"
+            case "A current signature candidate is unavailable.": "candidate"
+            case "Signature generation is still pending.": "pending"
+            case "A signature artifact is unavailable; graph data remains usable.": "artifact"
+            case "Signature selection is unavailable.": "selection"
+            case "One or more signatures could not be rendered; graph data remains usable.": "renderFallback"
+            default: "other"
+            }
+            return "\(issue.code)@\(issue.phase):\(variant)"
+                + (issue.path == nil ? "" : ":path")
+                + (issue.retryable ? ":retryable" : "")
         }
 
         private static func normalized(_ content: String) -> String {
