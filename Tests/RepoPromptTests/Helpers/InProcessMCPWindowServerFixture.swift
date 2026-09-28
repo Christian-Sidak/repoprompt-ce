@@ -41,13 +41,16 @@ enum InProcessMCPWindowServerFixture {
     /// test connection on the window's own `mcpServer`. Domain read routing resolves the window
     /// through `WindowStatesManager`, so file-tool reads run their real authority path. Call
     /// `close(_:)` when done.
+    /// Pass `workspaceFileContextStore` to inject a store (for example one with an isolated
+    /// code-map runtime instead of the process-wide artifact store).
     static func makeRegisteredWindow(
         root: URL,
-        workspaceName: String = "In-process MCP fixture"
+        workspaceName: String = "In-process MCP fixture",
+        workspaceFileContextStore: WorkspaceFileContextStore? = nil
     ) async throws -> RegisteredWindow {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window = workspaceFileContextStore.map { WindowState(workspaceFileContextStore: $0) } ?? WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         do {

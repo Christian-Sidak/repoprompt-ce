@@ -500,7 +500,8 @@ versus about 0.4 ms (headless) on one machine; this is recorded, not a claim abo
 cross-machine latency. Code-structure parity is not yet compared: the in-process app reports
 `unavailable` for `get_code_structure` even after the settle wait (its code-map graph service does
 not become available in this fixture), so those scenarios are `unsettled` on the app side and only
-the headless authority is asserted.
+the headless authority is asserted. (Superseded by M8T below: the fixture is now a Git repository and
+code-structure parity is compared on content.)
 
 Not proven by M8S: transport, the JSON-RPC envelope, lanes, leases, and the watchdog (both backends
 are driven at the tool layer); the app socket / connection-manager path; app-side code-structure
@@ -515,6 +516,74 @@ Evidence: `MCPBackendParityHarnessTests` 11/11 and the focused suites
 an unretained app runtime, an unactivated workspace, and an unregistered app window; each would
 otherwise have let `must_refuse` scenarios pass vacuously, which the reason and infrastructure
 checks now reject. All-products build and lint: pending (coordinator).
+
+### M8T — real `get_code_structure` parity gate (Git-eligible, quiescent, content-compared)
+
+M8S left code-structure parity uncompared: its fixture had no Git repository, and the app's code-map
+graph requires Git repository authority. Verified in source: a non-Git root classifies as
+`WorkspaceCodemapGitEligibilityPreflightResult.terminalUnavailable(.nonGit)`
+(`WorkspaceCodemapGitCapabilityService.eligibilityPreflight`), the store installs a terminal setup
+disposition instead of scheduling the graph, and the structure query answers
+`status: unavailable` with the non-retryable issue `git_root_unavailable`. That is intended app
+behavior, not a defect.
+
+- The primary fixture is a committed Git repository (`ReviewGitRepositoryFixture`: isolated `HOME`,
+  local identity, no signing, an explicit `main` branch) under a kernel-canonical temporary parent;
+  the symlink scenarios are committed links.
+- The app window's store uses an isolated code-map runtime (`CodemapStoreFixture`: temporary
+  artifact root, production binding engine and Git capability service) instead of
+  `CodeMapArtifactRuntime.processWide()`, so no process-wide artifact state is read or written, with
+  the production local-classification and Git-eligibility probes (not the forced-eligible probe of
+  `CodemapStoreFixture.makeStore`), so Git gating stays real. The harness shuts the runtime down on
+  close. `InProcessMCPWindowServerFixture.makeRegisteredWindow` gained an optional injected store.
+- Content comparison: app `FileDTO.content` is `CodeMapAPIContentFormatter.pathAndImportsBlock` plus
+  `artifact.apiDescription`; headless `signatures` is the same `apiDescription` from the shared
+  `CodeMapSyntaxArtifactBuilder`. Seeds are equivalent only when their names match and each app text
+  ends, byte for byte, with the corresponding non-empty headless text. App graph expansion
+  (`related` files) is app-only and not compared. Scenarios: one seed, two seeds (with a cross-file
+  reference), a file link, and an escaping link.
+- No escape hatch. An app reply still `pending` after the settle bound is `unsettled`, a terminal
+  `unavailable` is `unavailable(codes)`, and an `ok` reply without mapped seeds is `mapped([])`:
+  none is a success or a refusal. The app's typed code-structure refusal (no seeds, every issue
+  `path_not_found`) is `refused`; an infrastructure code alongside it is not a clean refusal.
+  Per-backend authority lets a scenario require `must_be_unavailable` with a specific code.
+- Quiescent readiness: app code-map readiness is not monotonic after workspace activation — a focused
+  run showed a graph that answered settled and then returned to `pending` (`seed_pending`,
+  `graph_indexing`) mid-sampling, around activation-time Git data maintenance. The settle wait
+  (untimed, 45 s bound) therefore requires the tool to answer settled and every app root to report
+  `ready` (or terminal `unavailable`) through `currentCodemapRootStatusUpdate()`, continuously for
+  1.5 s. Not reaching quiescence is a violation; the report then carries `APP_CODEMAP` diagnostics
+  (store launch events, engine graph-index accounting, root status).
+- Documented divergence (`MCPBackendParityHarnessTests.testNonGitRootCodeStructureIsADocumentedDivergence`):
+  in a non-Git root the app must answer `unavailable` with `git_root_unavailable` while headless maps
+  the file; reads in that root must still be equal. If the two ever agree, the gate fails and the
+  table must be updated.
+- Regression coverage (backend-free): unsettled and terminal-unavailable answers fail
+  `must_succeed`; unsettled, unavailable, and empty answers are never refusals; an unsettled app
+  cannot mask a headless disclosure; content equivalence rejects different API text, empty headless
+  signatures, and different seed sets; `must_be_unavailable` requires its code; app code-structure
+  classification separates path refusals from infrastructure codes; a non-quiescent index is a
+  violation even when outcomes agree.
+
+Findings. Code-structure parity holds on content: with the index quiescent, both seed scenarios
+map on both backends with the app text ending exactly in the headless API description, and both link
+scenarios are refused by both. App code-structure latency at the tool layer was about 0.7–1.9 s p50
+(graph query and presentation) versus about 4–12 ms headless on one machine — recorded, not asserted.
+Not a production fix (hypothesis not confirmed): after three transient retries a graph-build launch
+records `retryExhausted` and stops rescheduling; `makeCodemapRootStatusSnapshot` classifies that as
+`unavailable`, but the code-structure query's fallback would still answer `pending` with a retryable
+`graph_indexing`. The failing focused runs showed active indexing (`seed_pending`,
+`graph_indexing`), not exhaustion, so this inconsistency was not exercised and is left for a
+follow-up with a deterministic reproduction.
+
+Not proven by M8T: app graph expansion parity (headless has no graph), code-structure behavior for
+worktrees, submodules, or nested repositories, and anything listed as not proven for M8S.
+
+Evidence: focused `MCPBackendParityHarness|MCPReadMutationPathContract` passed 74/74 on two
+consecutive runs of unchanged source (conductor `8b334035` and `3c45e359`). Earlier runs
+(`1e1fa3fb`, `f5a9ef89`, `7f840feb`, `56bab008`) surfaced, in turn, the process-wide code-map
+runtime dependency, the app's `path_not_found` refusal form, and non-monotonic readiness; `7f840feb`
+was green before the quiescence requirement and is not counted.
 
 ### Later milestones (not started in this pass)
 

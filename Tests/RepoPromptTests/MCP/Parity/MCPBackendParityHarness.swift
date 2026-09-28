@@ -6,28 +6,35 @@ import RepoPromptDomainRuntime
 import XCTest
 
 #if DEBUG
-    /// M8S: in-process app-versus-headless parity and latency harness for the MCP read boundary.
+    /// M8S/M8T: in-process app-versus-headless parity and latency harness for the MCP read boundary.
     ///
     /// Both backends run against the same fixture root, ignore defaults, and `skip_symlinks` policy:
-    /// the app through its real window tools on an in-process `MCPServerViewModel`
-    /// (`InProcessMCPWindowServerFixture`), headless through `MCPDomainCanonicalWorkspaceService` with
-    /// the production `DirectHeadlessDomainContext.resolvePath`. Each scenario's outcomes are normalized
-    /// (a thrown error and an error DTO are both `refused`; content is compared after one trailing
-    /// newline is removed) and checked against a checked-in expectation: an authority class
-    /// (`mustSucceed` / `mustRefuse`, for both backends) and a relation (`equal`, or a documented
-    /// `knownDivergence` that must still diverge, so the table cannot silently go stale). Outcomes must
-    /// be stable across iterations. Latency is sampled per backend with interleaved iterations after a
-    /// warm-up and reported (p50 / max), never asserted against a threshold.
+    /// the app through the real window tools of a registered, activated `WindowState`
+    /// (`InProcessMCPWindowServerFixture.makeRegisteredWindow`), headless through
+    /// `MCPDomainCanonicalWorkspaceService` with the production `DirectHeadlessDomainContext.resolvePath`.
     ///
-    /// Not proven: transport, JSON-RPC envelope (`isError` vs protocol error), lanes, leases, and the
-    /// watchdog (both sides are driven at the tool layer); the app's socket/connection-manager path;
-    /// `file_search` (not wired in the fixture); multi-root namespaces; cold-start or large-tree
-    /// performance; and absolute latency comparability across machines.
+    /// Outcomes are normalized per tool. `read_file`: a thrown error and an error DTO are both
+    /// `refused`; content is compared after one trailing newline is removed. `get_code_structure`:
+    /// the seed files that received a code map, each with its text — the app's rendered
+    /// `content` (a path/imports header followed by the Code Map API description) and headless
+    /// `signatures` (the same API description from the shared `CodeMapSyntaxArtifactBuilder`); the two
+    /// are equivalent only when every seed name matches and each app text ends with the non-empty
+    /// headless text. App graph expansion (`related` files) is app-only and not compared. An app reply
+    /// with `unavailable` status is a terminal `unavailable(codes)`; one still `pending` after the
+    /// bounded settle wait is `unsettled`. Neither is ever a success or a refusal.
+    ///
+    /// Each scenario declares an authority class per backend (`mustSucceed` / `mustRefuse` /
+    /// `mustBeUnavailable`) and a relation (`equal`, or a documented `knownDivergence` that must still
+    /// diverge, so the table cannot silently go stale). Outcomes must be stable across iterations.
+    /// Latency is sampled per backend with interleaved iterations after a warm-up and reported
+    /// (p50 / max), never asserted against a threshold.
     @MainActor
     final class MCPBackendParityHarness {
         enum Authority: String, Encodable {
             case mustSucceed = "must_succeed"
             case mustRefuse = "must_refuse"
+            /// The backend must answer with a terminal `unavailable` carrying `Scenario.unavailableCode`.
+            case mustBeUnavailable = "must_be_unavailable"
         }
 
         enum Relation: Equatable {
@@ -44,35 +51,51 @@ import XCTest
             let name: String
             let tool: Tool
             let arguments: [String: Value]
+            /// Applies to both backends unless `appAuthority` overrides it for the app.
             let authority: Authority
             let relation: Relation
             /// For `mustRefuse`: a substring the headless refusal detail must contain, so a refusal
             /// for the wrong reason (for example a broken harness path) cannot pass vacuously.
             var headlessRefusal: String?
+            var appAuthority: Authority?
+            /// For `mustBeUnavailable`: an issue code the unavailable answer must carry.
+            var unavailableCode: String?
+
+            var effectiveAppAuthority: Authority {
+                appAuthority ?? authority
+            }
+        }
+
+        struct MappedFile: Equatable {
+            let name: String
+            let text: String
         }
 
         enum Outcome: Equatable, CustomStringConvertible {
             /// `read_file` content.
             case content(String)
-            /// `get_code_structure`: names of files that received a code map.
-            case mapped([String])
+            /// `get_code_structure`: seed files that received a code map, sorted by name.
+            case mapped([MappedFile])
             case refused
-            /// The app's code-structure index had not settled (`pending` / `unavailable`).
+            /// A terminal `unavailable` answer, with its issue codes.
+            case unavailable([String])
+            /// Still `pending` after the bounded settle wait.
             case unsettled
 
             var isSuccess: Bool {
                 switch self {
                 case .content: true
-                case let .mapped(names): !names.isEmpty
-                case .refused, .unsettled: false
+                case let .mapped(files): !files.isEmpty
+                case .refused, .unavailable, .unsettled: false
                 }
             }
 
             var description: String {
                 switch self {
                 case let .content(text): "content(\(text.count) chars)"
-                case let .mapped(names): "mapped(\(names.joined(separator: ",")))"
+                case let .mapped(files): "mapped(\(files.map(\.name).joined(separator: ",")))"
                 case .refused: "refused"
+                case let .unavailable(codes): "unavailable(\(codes.joined(separator: ",")))"
                 case .unsettled: "unsettled"
                 }
             }
@@ -101,6 +124,7 @@ import XCTest
             let name: String
             let tool: Tool
             let authority: Authority
+            let appAuthority: Authority
             let expectedRelation: String
             let appOutcome: String
             let headlessOutcome: String
@@ -108,6 +132,13 @@ import XCTest
             let headlessDetail: String?
             let appStable: Bool
             let headlessStable: Bool
+            /// Untimed wait for the app code-structure index before sampling (nil for `read_file`).
+            let appSettleMS: Double?
+            /// Whether the app code-map index reached quiescence before sampling (nil for `read_file`).
+            let appQuiescent: Bool?
+            /// App code-map pipeline state, captured only when an app code-structure answer stayed
+            /// unsettled (store launch events, engine graph-index accounting, root status).
+            let appDiagnostics: String?
             let appLatency: LatencySummary
             let headlessLatency: LatencySummary
             /// Human-readable expectation failures; empty when the scenario passes.
@@ -134,40 +165,76 @@ import XCTest
         static let notProven = [
             "transport, JSON-RPC envelope (isError vs protocol error), lanes, leases, and watchdog",
             "the app socket/connection-manager path (both backends are driven at the tool layer)",
+            "app code-structure graph expansion (related files; headless has no graph)",
             "file_search (not wired in the in-process fixture)",
             "multi-root namespaces, cold start, and large-tree performance",
             "absolute latency comparability across machines or runs"
         ]
 
+        /// App error codes that mean the workspace or its freshness was not ready: infrastructure, not an
+        /// authority decision, so they can never satisfy a `mustRefuse` scenario.
+        static let appInfrastructureRefusalCodes = [
+            "workspace_authority_", "workspace_freshness_timeout", "worktree_scope_unavailable"
+        ]
+
+        /// Upper bound on the untimed wait for the app code-map index to reach quiescence.
+        static let appIndexSettleTimeout: Duration = .seconds(45)
+        /// How long readiness must hold continuously to count as quiescent. App readiness is not
+        /// monotonic after activation (the graph can restart, e.g. after activation-time Git data
+        /// maintenance), so a single settled answer is not enough.
+        static let appIndexQuiescenceWindow: Duration = .milliseconds(1500)
+
         let root: URL
         /// Retained for the harness's lifetime (window tools hold their runtime weakly); release with
         /// `close()`.
         private let appWindow: InProcessMCPWindowServerFixture.RegisteredWindow
+        /// The app store's isolated code-map runtime (temporary artifact root, production binding
+        /// engine and Git capability service), so no process-wide artifact state is read or written.
+        private let codemapRuntime: CodemapStoreFixture
         private let appTools: [Tool: RepoPromptApp.Tool]
         private let headless: MCPDomainCanonicalWorkspaceService
 
         private init(
             root: URL,
             appWindow: InProcessMCPWindowServerFixture.RegisteredWindow,
+            codemapRuntime: CodemapStoreFixture,
             appTools: [Tool: RepoPromptApp.Tool],
             headless: MCPDomainCanonicalWorkspaceService
         ) {
             self.root = root
             self.appWindow = appWindow
+            self.codemapRuntime = codemapRuntime
             self.appTools = appTools
             self.headless = headless
         }
 
-        /// Closes and unregisters the app window.
+        /// Closes and unregisters the app window, then shuts down its code-map runtime.
         func close() async {
             await InProcessMCPWindowServerFixture.close(appWindow)
+            await codemapRuntime.shutdown()
         }
 
         /// Activates `root` as the app workspace (after the caller has pinned the app's global ignore
         /// defaults to `globalPatterns`; the app crawl uses its default `skip_symlinks`, which headless
         /// mirrors) and builds both backends over it.
         static func make(root: URL, globalPatterns: String) async throws -> MCPBackendParityHarness {
-            let window = try await InProcessMCPWindowServerFixture.makeRegisteredWindow(root: root)
+            let codemapRuntime = try CodemapStoreFixture(name: "mcp-backend-parity")
+            // Production Git classification and eligibility probes (unlike `CodemapStoreFixture.makeStore`,
+            // which forces eligibility), so the app's Git gating for code structure stays real.
+            let store = WorkspaceFileContextStore(
+                enableCatalogShardShadowValidation: false,
+                codemapRuntimeProvider: { try codemapRuntime.runtime() }
+            )
+            let window: InProcessMCPWindowServerFixture.RegisteredWindow
+            do {
+                window = try await InProcessMCPWindowServerFixture.makeRegisteredWindow(
+                    root: root,
+                    workspaceFileContextStore: store
+                )
+            } catch {
+                await codemapRuntime.shutdown()
+                throw error
+            }
             var appTools: [Tool: RepoPromptApp.Tool] = [:]
             do {
                 appTools[.readFile] = try await InProcessMCPWindowServerFixture.tool(
@@ -180,6 +247,7 @@ import XCTest
                 )
             } catch {
                 await InProcessMCPWindowServerFixture.close(window)
+                await codemapRuntime.shutdown()
                 throw error
             }
             let snapshot = DomainCanonicalWorkspaceSnapshot(
@@ -198,10 +266,17 @@ import XCTest
                 },
                 ignoreConfiguration: { configuration }
             ))
-            return MCPBackendParityHarness(root: root, appWindow: window, appTools: appTools, headless: headless)
+            return MCPBackendParityHarness(
+                root: root,
+                appWindow: window,
+                codemapRuntime: codemapRuntime,
+                appTools: appTools,
+                headless: headless
+            )
         }
 
-        /// Runs every scenario: one warm-up, then `iterations` interleaved app/headless samples.
+        /// Runs every scenario: an untimed settle (code structure), one warm-up, then `iterations`
+        /// interleaved app/headless samples.
         func run(_ scenarios: [Scenario], iterations: Int) async -> Report {
             EditFlowPerf.resetDebugCaptureForTesting()
             let captureStarted = switch EditFlowPerf.beginDebugCapture(label: "mcp-backend-parity", maxSamples: 4000) {
@@ -210,7 +285,11 @@ import XCTest
             }
             var reports: [ScenarioReport] = []
             for scenario in scenarios {
-                await settleAppIndex(for: scenario)
+                let settle = await settleAppIndex(for: scenario)
+                var diagnostics: String?
+                if settle?.quiescent == false {
+                    diagnostics = await appCodemapDiagnostics()
+                }
                 _ = await observeApp(scenario)
                 _ = await observeHeadless(scenario)
                 var appObservations: [Observation] = []
@@ -230,7 +309,10 @@ import XCTest
                     app: appObservations,
                     headless: headlessObservations,
                     appSamples: appSamples,
-                    headlessSamples: headlessSamples
+                    headlessSamples: headlessSamples,
+                    appSettleMS: settle?.milliseconds,
+                    appQuiescent: settle?.quiescent,
+                    appDiagnostics: diagnostics
                 ))
             }
             var stages: [StageSummary]?
@@ -249,34 +331,115 @@ import XCTest
             return Report(iterations: iterations, scenarios: reports, appStages: stages, notProven: Self.notProven)
         }
 
-        /// Bounded wait (outside the timed samples) for the app's code-structure index to leave
-        /// `pending` / `unavailable` after activation. A still-unsettled index is reported, not failed.
-        private func settleAppIndex(for scenario: Scenario) async {
-            guard scenario.tool == .codeStructure else { return }
-            for _ in 0 ..< Self.appIndexSettleAttempts {
-                guard await observeApp(scenario).outcome == .unsettled else { return }
+        /// Untimed, bounded wait for the app code-map index to become quiescent: the code-structure tool
+        /// answers settled and every app root reports `ready` (or terminal `unavailable`) through the
+        /// store's root status, continuously for `appIndexQuiescenceWindow`. Not reaching quiescence
+        /// within `appIndexSettleTimeout` is a violation in `evaluate`, never an exemption.
+        private func settleAppIndex(for scenario: Scenario) async -> (milliseconds: Double, quiescent: Bool)? {
+            guard scenario.tool == .codeStructure else { return nil }
+            let clock = ContinuousClock()
+            let start = clock.now
+            var readySince: ContinuousClock.Instant?
+            while clock.now - start < Self.appIndexSettleTimeout {
+                let settled = await observeApp(scenario).outcome != .unsettled
+                let rootsReady = await appRootsAreQuiescent()
+                if settled, rootsReady {
+                    let since = readySince ?? clock.now
+                    readySince = since
+                    if clock.now - since >= Self.appIndexQuiescenceWindow {
+                        return (Self.milliseconds(clock.now - start), true)
+                    }
+                } else {
+                    readySince = nil
+                }
                 try? await Task.sleep(for: .milliseconds(100))
+            }
+            return (Self.milliseconds(clock.now - start), false)
+        }
+
+        private func appRootsAreQuiescent() async -> Bool {
+            let status = await appWindow.window.workspaceFileContextStore.currentCodemapRootStatusUpdate()
+            return !status.roots.isEmpty && status.roots.allSatisfy { root in
+                root.availability == .ready || root.availability == .unavailable
             }
         }
 
-        private static let appIndexSettleAttempts = 100
+        /// App code-structure issue codes that mean the requested path itself was refused (not found in
+        /// the workspace catalog, which excludes links and outside-root targets).
+        static let appCodeStructurePathRefusalCodes: Set = ["path_not_found"]
 
-        /// App error codes that mean the workspace or its freshness was not ready: infrastructure, not an
-        /// authority decision, so they can never satisfy a `mustRefuse` scenario.
-        static let appInfrastructureRefusalCodes = [
-            "workspace_authority_", "workspace_freshness_timeout", "worktree_scope_unavailable"
-        ]
+        /// Normalizes an app code-structure reply. Seeds make it `mapped`. With no seeds, an answer
+        /// whose issues are all path refusals is `refused`; otherwise `pending` is `unsettled`, any other
+        /// status is `unavailable` with its codes (terminal, e.g. `git_root_unavailable`), and an empty
+        /// `ok` answer is `mapped([])` — none of which is a success or a refusal.
+        static func classifyAppCodeStructure(
+            status: ToolResultDTOs.CodeStructureReplyDTO.Status,
+            seeds: [MappedFile],
+            issueCodes: [String]
+        ) -> Outcome {
+            if !seeds.isEmpty { return .mapped(seeds.sorted { $0.name < $1.name }) }
+            if !issueCodes.isEmpty, issueCodes.allSatisfy(appCodeStructurePathRefusalCodes.contains) {
+                return .refused
+            }
+            switch status {
+            case .pending: return .unsettled
+            case .unavailable: return .unavailable(issueCodes.sorted())
+            case .ok, .partial: return .mapped([])
+            }
+        }
+
+        /// A compact description of the app code-map pipeline for diagnosing an unsettled index.
+        private func appCodemapDiagnostics() async -> String {
+            let store = appWindow.window.workspaceFileContextStore
+            var parts: [String] = []
+            let events = await store.codemapGraphIndexBuildStoreEventsForTesting()
+            parts.append("store_events=" + events.suffix(24).map { "\($0.kind):\($0.launchPhase)" }.joined(separator: ">"))
+            do {
+                let accounting = try await codemapRuntime.runtime().bindingEngine().accounting()
+                parts.append("engine_roots=" + accounting.graphIndexRoots.map { root in
+                    "phase=\(root.phase) retry=\(root.retryAttempt) worker=\(root.workerPresent)"
+                        + " completion=\(root.lastWorkerCompletionReason.map { "\($0)" } ?? "-")"
+                        + " counts=\(root.progress.counts)"
+                }.joined(separator: ";"))
+            } catch {
+                parts.append("engine=unavailable(\(error))")
+            }
+            let status = await store.currentCodemapRootStatusUpdate()
+            parts.append("root_status=" + status.roots.map { root in
+                "\(root.availability) unavailable=\(root.unavailableReason.map { "\($0)" } ?? "-")"
+                    + " updates_pending=\(root.updatesPending)"
+            }.joined(separator: ";"))
+            return parts.joined(separator: " | ")
+        }
 
         // MARK: - Evaluation
+
+        /// Whether two outcomes agree: exact equality, except code structure, where seed names must
+        /// match and each app text must end with the corresponding non-empty headless text.
+        static func equivalent(app: Outcome, headless: Outcome) -> Bool {
+            guard case let .mapped(appFiles) = app, case let .mapped(headlessFiles) = headless else {
+                return app == headless
+            }
+            return appFiles.map(\.name) == headlessFiles.map(\.name)
+                && zip(appFiles, headlessFiles).allSatisfy { appFile, headlessFile in
+                    !headlessFile.text.isEmpty && appFile.text.hasSuffix(headlessFile.text)
+                }
+        }
 
         static func evaluate(
             _ scenario: Scenario,
             app: [Observation],
             headless: [Observation],
             appSamples: [Double],
-            headlessSamples: [Double]
+            headlessSamples: [Double],
+            appSettleMS: Double? = nil,
+            appQuiescent: Bool? = nil,
+            appDiagnostics: String? = nil
         ) -> ScenarioReport {
             var violations: [String] = []
+            if appQuiescent == false {
+                violations.append("app code-map index did not reach quiescence within the settle bound")
+            }
             let appOutcome = app.first?.outcome ?? .refused
             let headlessOutcome = headless.first?.outcome ?? .refused
             let appStable = app.allSatisfy { $0.outcome == appOutcome }
@@ -284,15 +447,23 @@ import XCTest
             if !appStable { violations.append("app outcome changed across iterations") }
             if !headlessStable { violations.append("headless outcome changed across iterations") }
 
-            for (backend, outcome) in [("app", appOutcome), ("headless", headlessOutcome)] {
-                switch scenario.authority {
+            let checks: [(String, Authority, Outcome)] = [
+                ("app", scenario.effectiveAppAuthority, appOutcome),
+                ("headless", scenario.authority, headlessOutcome)
+            ]
+            for (backend, authority, outcome) in checks {
+                switch authority {
                 case .mustSucceed:
-                    // An unsettled app code-structure index cannot be judged; it is reported, not failed.
-                    if !outcome.isSuccess, outcome != .unsettled {
-                        violations.append("\(backend) must succeed but was \(outcome)")
-                    }
+                    if !outcome.isSuccess { violations.append("\(backend) must succeed but was \(outcome)") }
                 case .mustRefuse:
-                    if outcome.isSuccess { violations.append("\(backend) must refuse but was \(outcome)") }
+                    // Only an explicit refusal counts; an unsettled, unavailable, or empty answer is not one.
+                    if outcome != .refused { violations.append("\(backend) must refuse but was \(outcome)") }
+                case .mustBeUnavailable:
+                    let expected = scenario.unavailableCode ?? ""
+                    if case let .unavailable(codes) = outcome, codes.contains(expected) {
+                        break
+                    }
+                    violations.append("\(backend) must be unavailable with \(expected) but was \(outcome)")
                 }
             }
 
@@ -312,17 +483,17 @@ import XCTest
                 violations.append("headless refused for the wrong reason: \(headless.first?.detail ?? "-"), expected \(expected)")
             }
 
-            let comparable = appOutcome != .unsettled && headlessOutcome != .unsettled
+            let agree = equivalent(app: appOutcome, headless: headlessOutcome)
             let expectedRelation: String
             switch scenario.relation {
             case .equal:
                 expectedRelation = "equal"
-                if comparable, appOutcome != headlessOutcome {
+                if !agree {
                     violations.append("expected equal outcomes, app \(appOutcome) vs headless \(headlessOutcome)")
                 }
             case let .knownDivergence(reason):
                 expectedRelation = "known_divergence: \(reason)"
-                if comparable, appOutcome == headlessOutcome {
+                if agree {
                     violations.append("documented divergence no longer diverges (\(appOutcome)); update the table")
                 }
             }
@@ -331,6 +502,7 @@ import XCTest
                 name: scenario.name,
                 tool: scenario.tool,
                 authority: scenario.authority,
+                appAuthority: scenario.effectiveAppAuthority,
                 expectedRelation: expectedRelation,
                 appOutcome: appOutcome.description,
                 headlessOutcome: headlessOutcome.description,
@@ -338,6 +510,9 @@ import XCTest
                 headlessDetail: headless.first?.detail,
                 appStable: appStable,
                 headlessStable: headlessStable,
+                appSettleMS: appSettleMS,
+                appQuiescent: appQuiescent,
+                appDiagnostics: appDiagnostics,
                 appLatency: LatencySummary(samples: appSamples),
                 headlessLatency: LatencySummary(samples: headlessSamples),
                 violations: violations
@@ -367,13 +542,14 @@ import XCTest
                 guard let reply = value.decode(ToolResultDTOs.CodeStructureReplyDTO.self) else {
                     return Observation(outcome: .refused, detail: "undecodable get_code_structure reply")
                 }
-                if reply.status == .pending || reply.status == .unavailable {
-                    return Observation(outcome: .unsettled, detail: reply.status.rawValue)
-                }
-                let names = reply.files.filter { !$0.content.isEmpty }.map { URL(fileURLWithPath: $0.path).lastPathComponent }
+                let issueCodes = (reply.issues + reply.roots.flatMap(\.issues)).map(\.code)
+                let detail = "status=\(reply.status.rawValue)" + (issueCodes.isEmpty ? "" : " issues=\(issueCodes.joined(separator: ","))")
+                let seeds = reply.files
+                    .filter { $0.role == "seed" && !$0.content.isEmpty }
+                    .map { MappedFile(name: URL(fileURLWithPath: $0.path).lastPathComponent, text: $0.content) }
                 return Observation(
-                    outcome: names.isEmpty ? .refused : .mapped(names.sorted()),
-                    detail: reply.issues.map(\.code).joined(separator: ",").nilIfEmpty
+                    outcome: Self.classifyAppCodeStructure(status: reply.status, seeds: seeds, issueCodes: issueCodes),
+                    detail: detail
                 )
             }
         }
@@ -409,18 +585,23 @@ import XCTest
                 return Observation(outcome: .content(Self.normalized(value.stringValue ?? "")), detail: nil)
             case .codeStructure:
                 let files = value.objectValue?["files"]?.arrayValue?.compactMap(\.objectValue) ?? []
-                let mapped = files.filter { file in
-                    file["diagnostic"] == nil && file["signatures"]?.stringValue?.isEmpty == false
+                let mapped = files.compactMap { file -> MappedFile? in
+                    guard file["diagnostic"] == nil,
+                          let path = file["path"]?.stringValue,
+                          let signatures = file["signatures"]?.stringValue,
+                          !signatures.isEmpty
+                    else { return nil }
+                    return MappedFile(name: URL(fileURLWithPath: path).lastPathComponent, text: signatures)
                 }
-                let names = mapped.compactMap { $0["path"]?.stringValue }.map { URL(fileURLWithPath: $0).lastPathComponent }
                 let diagnostics = files.compactMap { file -> String? in
                     guard let code = file["diagnostic"]?.stringValue else { return nil }
                     return [code, file["reason"]?.stringValue].compactMap(\.self).joined(separator: ":")
                 }
-                return Observation(
-                    outcome: names.isEmpty ? .refused : .mapped(names.sorted()),
-                    detail: diagnostics.joined(separator: ",").nilIfEmpty
-                )
+                // Headless answers a refused explicit file with a per-file diagnostic, not a throw.
+                let outcome: Outcome = mapped.isEmpty && !diagnostics.isEmpty
+                    ? .refused
+                    : .mapped(mapped.sorted { $0.name < $1.name })
+                return Observation(outcome: outcome, detail: diagnostics.joined(separator: ",").nilIfEmpty)
             }
         }
 
@@ -432,9 +613,12 @@ import XCTest
             let clock = ContinuousClock()
             let start = clock.now
             let value = await body()
-            let elapsed = clock.now - start
-            let components = elapsed.components
-            return (value, Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15)
+            return (value, milliseconds(clock.now - start))
+        }
+
+        private static func milliseconds(_ duration: Duration) -> Double {
+            let components = duration.components
+            return Double(components.seconds) * 1000 + Double(components.attoseconds) / 1e15
         }
     }
 
