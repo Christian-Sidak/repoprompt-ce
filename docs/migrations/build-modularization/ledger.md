@@ -39,13 +39,13 @@ Conductor timings (last 3,000 jobs, net of queue):
 | ID | Decision | Status |
 | --- | --- | --- |
 | ADR-01 | Root-package targets first; separate packages only past the §3.4 gate | Accepted (plan) |
-| ADR-07 | Focused-test executor | Proposed: Swift Build per-target bundles (`conductor test --module`) for test targets that do not depend on `RepoPromptApp`; native aggregate stays the default and CI path. Passes the §3.4 gate on the leaf slice; the agent-adjacent slice is pending (see P0.3) |
+| ADR-07 | Focused-test executor | Accepted (2026-09-28): Swift Build per-target bundles (`conductor test --module`) for test targets whose closure excludes `RepoPromptApp`, including Swift Testing; native aggregate stays the default `FILTER` path, the path for app-dependent targets, and the CI path. Passed the gate on both P0.3 slices (77% and 95% lower median edit→test, no discovery loss) |
 
 ## Phase 0 progress
 
 - [x] P0.1 retroactive timing baseline (structured conductor timing still open)
 - [x] P0.2 prototype graph tool (index-store replacement still open)
-- [ ] P0.3 focused-test executor bake-off — leaf slice (`RepoPromptMCPCoreTests`, candidates a vs b) done and passes the gate; still open: the workspace/agent-adjacent slice, candidates (c) xcodebuild and (d) local package, peak RSS, CI parity
+- [x] P0.3 focused-test executor bake-off — gate holds on both slices (`RepoPromptMCPCoreTests` 77%, `RepoPromptDomainRuntimeTests` 95%); ADR-07 accepted. Not measured, not blockers: candidates (c) and (d), CI parity of module runs (CI stays on the aggregate)
 - [x] P0.4 fixed per-job overhead root cause and fix (see below)
 - [ ] P0.5 link and type-check levers
 - [ ] P0.6 compatibility inventory golden tests
@@ -133,10 +133,137 @@ Findings:
   - `.build/swiftbuild` is 5.4 GB for this one closure, against 4.2 GB for the whole native `.build/arm64-apple-macosx`. Disk and a cold start are the price of a second scratch path until §5.5 shares caches.
 - **Noise.** Test execution for the same 66 tests ranged from 17 s to 82 s. That target's `DirectHeadlessOracleGroupTests` is timing-sensitive, and other checkouts were building concurrently. `pre-test` is the cleaner comparison; each row is one sample.
 
-**ADR-07 recommendation (leaf slice):** adopt (b) as the focused-test executor for test targets whose closure excludes `RepoPromptApp`, behind `dev-test MODULE=` (P1.3).
+**ADR-07 recommendation (leaf slice; superseded by the decision in the next section):** adopt (b) as the focused-test executor for test targets whose closure excludes `RepoPromptApp`, behind `dev-test MODULE=` (P1.3).
 - It clears the §3.4/P0.3 gate: the median edit→owning-test time, excluding queue, is 77% lower (the gate is ≥ 30%), with no discovery loss.
 - Keep the native aggregate as the default `FILTER` path and in CI until:
   1. the workspace/agent-adjacent slice repeats this result;
   2. module runs support Swift Testing (the helper path lists XCTest only);
   3. peak RSS and CI parity are measured.
 - Candidates (c) xcodebuild per-module schemes and (d) local package were not measured. (b) already removes the app from the loop without new packaging, so (d) needs a separate justification under §3.4.
+
+## P0.3 focused-test executor — agent-adjacent slice, Swift Testing, and decision (2026-09-28)
+
+### Swift Testing in `--module` runs
+
+The invocation was derived from SwiftPM 6.3.3 on a throwaway package with XCTest and Swift Testing tests. `swiftpm-testing-helper --help` prints nothing, and `swift test --build-system swiftbuild -v` does not print the test commands, so the argument vectors and environment were captured with `ps` while `swift test` ran:
+
+- **XCTest:** `xctest [-XCTest <selectors>] <T>.xctest` with `SWIFT_TESTING_ENABLED=0`. Without that variable `xctest` also hosts the Swift Testing tests. Our first real-repo run hit exactly this and ran them twice.
+- **Swift Testing:** `swiftpm-testing-helper --test-bundle-path <T>.xctest/Contents/MacOS/<T> --build-system swiftbuild [--filter F] <same path> --testing-library swift-testing`.
+  - `DYLD_FRAMEWORK_PATH` and `DYLD_LIBRARY_PATH` must point at the platform's Developer frameworks. Without them the helper cannot `dlopen` the bundle (`@rpath/XCTest.framework` not found).
+- **Order and exit status:** both libraries always run, XCTest first. The run fails if either fails. Swift Testing's exit 69 (no tests matched) counts as success, as in `swift test`.
+
+`Scripts/ci_app_test_runner.py` now does the same in `--module` runs whenever a file under `Tests/<Target>` imports Testing (commit `145862db`).
+- **Detection:** `sources_import_swift_testing`, which the aggregate path's `package_uses_swift_testing` now also uses (over `Tests/`).
+- **Filter equivalence:**
+  - Swift Testing receives `--filter` verbatim, as SwiftPM forwards it, so its selection is identical by construction.
+  - XCTest selection matches the helper's listing with Python `re`, whereas SwiftPM uses ICU. The runner therefore accepts only a portable subset: literals, escaped punctuation, `.`, `*`, `+`, `?`, `|`, anchors, plain groups, and simple classes.
+  - Anything else fails closed: `--module` exits 2 before building, and the aggregate direct path falls back to `swift test`.
+- **Other fail-closed cases (exit 2):** `Tests/<Target>` is missing; or the target imports Testing but the helper or the platform path is unavailable.
+- **Unit tests:** 7 new cases in `Scripts/test_ci_app_test_runner.py` cover:
+  - argument vectors and environments;
+  - exit-code mapping;
+  - both libraries running after an XCTest failure;
+  - a Swift Testing–only selection;
+  - the fail-closed paths and portable filters;
+  - the shared detection.
+- **End to end on this repo,** with a temporary two-test `@Suite` in `Tests/RepoPromptDomainRuntimeTests` (removed afterwards):
+  - unfiltered: 258 XCTest plus 2 Swift Testing tests, each run once (`28a964b4`);
+  - `--filter 'P03SwiftTestingProbe|DomainAgentRunExecutionContractsTests'`: 5 plus 2 (`75ece559`).
+
+No first-party test target imports Testing today.
+
+### Second slice: `RepoPromptDomainRuntimeTests`
+
+This is the workspace/agent domain: agent-session links, worktree bindings, Oracle groups, and workspace activation.
+- In `Package.swift` the test target depends only on `RepoPromptDomainRuntime` and the `MCP` product.
+- `RepoPromptDomainRuntime` depends on `RepoPromptShared`, `RepoPromptWorkspaceCore`, `RepoPromptC`, `RepoPromptCodeMapCore`, `Logging`, and `MCP`.
+- No path reaches `RepoPromptApp`.
+
+Method: the same as the leaf slice, with these specifics.
+- **Probe file:** `Sources/RepoPromptDomainRuntime/ArrayExtensions.swift`.
+  - **body:** `chunked(into:)` computes its reserve capacity through a `let`;
+  - **interface:** an unused top-level `func` appended;
+  - **revert:** `git checkout`, a second interface change.
+- **Order:** in each scenario (b) ran first, then (a), from the same source state. One sample per path per scenario.
+- **Metrics:** `exec`, `pre-test`, and `build` are defined as before. Heavy-slot waits (up to 6 min 15 s here) are excluded.
+- **What was rebuilt:**
+  - for (a), from the native `Compiling`/`Linking` lines;
+  - for (b), from index-store units and object/product mtimes in `.build/swiftbuild`, because Swift Build prints no per-file lines.
+
+| Scenario | Path | Ticket | exec | pre-test | build | What was rebuilt |
+| --- | --- | --- | --- | --- | --- | --- |
+| Warm-up | b | `5b0dc819` | 89.0 s | 71.9 s | 52.2 s | The test target (the Swift Testing probe had just been removed) |
+| Warm-up | a | `ae2e90f5` | 46.3 s | 35.3 s | 22.7 s | Nothing |
+| No-op | b | `14dd4be9` | 22.1 s | 13.6 s | 6.3 s | Nothing; Swift Build re-plans |
+| No-op | a | `e389e5ca` | 7.7 s | 3.7 s | 1.1 s | Nothing |
+| Body edit | b | `64abd3ff` | **15.5 s** | **13.1 s** | 7.7 s | `ArrayExtensions.o`, the prelinked `RepoPromptDomainRuntime.o`, the module bundle |
+| Body edit | a | `59e607e0` | 72.6 s | 64.0 s | 53.0 s | All 86 `RepoPromptDomainRuntime` files; relinks `repoprompt-mcp`, the `RepoPrompt` app executable, and the aggregate bundle |
+| Interface edit | b | `c49b5a2a` | **86.1 s** | **80.8 s** | 68.6 s | 81 of 86 DomainRuntime files, all 20 test files, the bundle |
+| Interface edit | a | `273905ca` | 866.6 s | 859.3 s | 530.0 s | DomainRuntime 81, MCPCore 32, MCP 1, MCPCoreTests 9, DomainRuntimeTests 2, **`RepoPromptApp` 1,142 and `RepoPromptTests` 360 files**; the same three links |
+| Revert (interface) | b | `b8df4df5` | **33.5 s** | **30.5 s** | 25.4 s | As for the interface edit |
+| Revert (interface) | a | `b31cf893` | 665.1 s | 662.6 s | 558.6 s | As for the interface edit |
+
+Medians over the three edit scenarios:
+
+| Metric | (a) aggregate | (b) module | Reduction |
+| --- | --- | --- | --- |
+| exec (edit → tests finished, excluding queue) | 665.1 s | 33.5 s | 95% |
+| pre-test (edit → first test starts) | 662.6 s | 30.5 s | 95% |
+| build tool only | 530.0 s | 25.4 s | 95% |
+
+Findings:
+
+- **App exclusion.** No (b) log mentions `RepoPromptApp`, and `.build/swiftbuild` contains no `RepoPromptApp` artifacts. On (a), any `RepoPromptDomainRuntime` interface change recompiles the whole app (1,142 files), because the app imports the module, plus 360 app test files.
+- **Discovery parity.**
+  - `swiftpm-xctest-helper` lists 258 tests in 20 suites from `RepoPromptDomainRuntimeTests.xctest`.
+  - That equals the 258 `func test…()` declarations in `Tests/RepoPromptDomainRuntimeTests`.
+  - Every run in both paths executed 258 with 0 failures.
+- **Noise.** The (b) interface (86 s) and revert (34 s) runs rebuilt the same files; each row is one sample.
+- **Unattributed gap on (a).** It spent 11–329 s between `Build complete!` and the first test. This is not conductor's cache publication, which runs after the tests. The gap is unattributed, like the leaf-slice and P0.4 follow-ups.
+- **Costs of (b).**
+  - A no-op starts tests about 10 s later (Swift Build re-plans: 6.3 s versus 1.1 s).
+  - `.build/swiftbuild` is 5.5 GB now that it covers both slices (5.4 GB after the leaf slice), next to 4.2 GB for `.build/arm64-apple-macosx`.
+- **Cold start.** Not re-measured, because the scratch path was already warm from the leaf slice, which shares the DomainRuntime closure. This target's first build there (`0c42dc38`, with the Swift Testing probe) took 159 s exec and a 65.6 s build.
+
+### Peak RSS
+
+Method:
+- **Sampler:** a local script (`.build/p03-rss/rss_sampler.py`, not committed) polled `ps -axww -o pid=,ppid=,rss=,args=` every 0.5 s while the job ran. It is read-only and sends no signals.
+- **Root process:** the job's `ci_app_test_runner.py`, matched on this worktree's absolute script path plus `--local --module …` or `--local --filter …`, so jobs from other checkouts cannot match.
+- **Aggregation:** each sample sums RSS over the root's descendant tree.
+- **Build service:** the sampler also looked for a `SWBBuildService` outside the tree. None appeared: SwiftPM 6.3.3 runs Swift Build in-process in `swift-build`.
+- **Caveats:**
+  - the tree sum counts shared pages once per process, so it is an upper bound;
+  - 0.5 s sampling can miss short compiler peaks, so single-process figures are lower bounds.
+- **Runs sampled:** the interface-edit rows, the heaviest edit scenario.
+
+| Run | Ticket | Samples | Peak tree RSS | Processes at peak | Largest single processes |
+| --- | --- | --- | --- | --- | --- |
+| (b) module, interface edit | `c49b5a2a` | 77 | 1,553 MiB | 10 | `swift-build` 313, `ld` 263, `swift-frontend` 237 MiB |
+| (a) aggregate, interface edit | `273905ca` | 860 | 3,856 MiB | 15 | `dsymutil` 2,070, `ld` 1,988, `swift-frontend` 1,153, `swift-driver` 596 MiB |
+
+(a) peaked 55 s into the app recompile, with parallel `swift-frontend` jobs. Its largest single processes are the app and aggregate link and dSYM steps, which (b) never runs.
+
+### ADR-07 decision
+
+Gate: at least 30% lower median edit→owning-test time excluding queue, and no discovery loss.
+
+| Slice | Median exec, (a) → (b) | Reduction | Discovery (helper = declared = executed) |
+| --- | --- | --- | --- |
+| Leaf: `RepoPromptMCPCoreTests` | 210.5 s → 48.1 s | 77% | 66 = 66 = 66 |
+| Agent-adjacent: `RepoPromptDomainRuntimeTests` | 665.1 s → 33.5 s | 95% | 258 = 258 = 258 |
+
+**Accepted.**
+- **Adopted executor:** Swift Build per-target bundles (`conductor test --module`), for test targets whose closure excludes `RepoPromptApp`. P1.3 surfaces it as `dev-test MODULE=`.
+- **Unchanged paths:** the native aggregate stays the default `FILTER` path, the path for targets that depend on the app, and the CI path.
+- **Preconditions met:**
+  - Swift Testing is supported (above).
+  - Release builds and packaging are untouched (still native SwiftPM), so the §3.4 clean-build clause is unaffected.
+- **Not adopted:** candidates (c) xcodebuild per-module schemes and (d) a local package were not measured. (b) already takes the app out of the loop without new packaging or generated schemes, and (d) would still need its own §3.4 justification.
+- **Costs accepted:**
+  - a no-op about 10 s slower;
+  - a second scratch path (5.5 GB) with a one-time cold resolve and build per worktree, until §5.5 shares caches.
+- **Follow-ups, not blockers:**
+  - CI parity for module runs (CI stays on the aggregate);
+  - the unattributed post-build gap on (a) (P0.1);
+  - cross-worktree cache sharing (§5.5).
