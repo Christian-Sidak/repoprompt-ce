@@ -125,6 +125,14 @@ package enum MCPDomainCanonicalReadError: Error, Equatable, LocalizedError {
     /// A root's ignore rules could not be established (ambiguous Git topology or an unreadable
     /// mandatory `.gitignore`), so enumeration fails closed rather than apply the wrong rules.
     case ignoreRulesUnavailable(root: String)
+    /// Explicit-read refusals mirroring the app's `CatalogRegularFileIneligibilityReason` (see
+    /// `HeadlessReadAuthority`): ignore rules never refuse an explicit read, these do.
+    case symbolicLinkPath
+    case symlinkComponent
+    case outsideCanonicalRoot
+    case outsideRoot
+    /// A path component became a symlink or stopped being a directory after authorization.
+    case pathChangedDuringRead
 
     package var errorDescription: String? {
         switch self {
@@ -136,6 +144,16 @@ package enum MCPDomainCanonicalReadError: Error, Equatable, LocalizedError {
             "Path is not a regular file."
         case let .ignoreRulesUnavailable(root):
             "Ignore rules for \(root) could not be resolved (ambiguous Git topology or unreadable .gitignore)."
+        case .symbolicLinkPath:
+            "Path is a symbolic link."
+        case .symlinkComponent:
+            "Path contains a symbolic-link component."
+        case .outsideCanonicalRoot:
+            "Canonical path is outside the workspace root."
+        case .outsideRoot:
+            "Path is outside the workspace root."
+        case .pathChangedDuringRead:
+            "Path changed during the read (a component became a symbolic link); the read was refused."
         }
     }
 }
@@ -298,9 +316,18 @@ package struct MCPDomainCanonicalWorkspaceService {
         guard let rawPath = args["path"]?.stringValue else {
             throw MCPError.invalidParams("missing path")
         }
-        let url = try adapter.resolvePath(rawPath, snapshot.roots, false)
+        // The adapter's resolution keeps its own path errors (outside the workspace, ambiguous
+        // relative path); the read itself goes through the app-equivalent explicit-read authority.
+        _ = try adapter.resolvePath(rawPath, snapshot.roots, false)
+        let skipSymlinks = await adapter.ignoreConfiguration?()?.skipSymlinks ?? true
+        let roots = snapshot.roots
         let text = try await Self.runCancellableBlocking { _ in
-            try Self.readText(at: url, limit: MCPDomainCanonicalReadBounds.maximumReadFileBytes)
+            try HeadlessReadAuthority.readText(
+                rawPath: rawPath,
+                roots: roots,
+                skipSymlinks: skipSymlinks,
+                limit: MCPDomainCanonicalReadBounds.maximumReadFileBytes
+            )
         }
         let lines = text.components(separatedBy: .newlines)
         let start = args["start_line"]?.intValue
@@ -658,17 +685,7 @@ package struct MCPDomainCanonicalWorkspaceService {
         guard data.count <= limit else {
             throw MCPDomainCanonicalReadError.fileTooLarge(byteCount: data.count, limit: limit)
         }
-        if data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]) {
-            guard let text = String(data: data, encoding: .utf16) else {
-                throw MCPDomainCanonicalReadError.undecodableText
-            }
-            return text
-        }
-        let body = data.starts(with: [0xEF, 0xBB, 0xBF]) ? data.dropFirst(3) : data[...]
-        guard let text = String(data: Data(body), encoding: .utf8) else {
-            throw MCPDomainCanonicalReadError.undecodableText
-        }
-        return text
+        return try HeadlessReadAuthority.decodeText(data)
     }
 
     private func makeIgnoreContext(roots: [URL]) async throws -> HeadlessIgnoreContext? {
@@ -982,23 +999,8 @@ private final class HeadlessIgnoreContext: @unchecked Sendable {
         return nil
     }
 
-    /// The given, symlink-resolved, and `/private`-toggled spellings of a path. macOS exposes
-    /// `/var`, `/tmp`, and `/etc` as symlinks into `/private`, and `resolvingSymlinksInPath()`
-    /// strips `/private`, so the same directory can be reported either way.
     static func equivalentPaths(_ url: URL) -> [String] {
-        let given = url.standardizedFileURL.path
-        let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
-        var spellings: [String] = []
-        for path in [given, resolved] {
-            spellings.append(path)
-            if path.hasPrefix("/private/") {
-                spellings.append(String(path.dropFirst("/private".count)))
-            } else if ["/var/", "/tmp/", "/etc/"].contains(where: { path.hasPrefix($0) }) {
-                spellings.append("/private" + path)
-            }
-        }
-        var seen: Set<String> = []
-        return spellings.filter { seen.insert($0).inserted }
+        HeadlessPathSpelling.equivalentPaths(url)
     }
 }
 

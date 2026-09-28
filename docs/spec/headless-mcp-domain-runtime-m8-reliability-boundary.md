@@ -261,7 +261,7 @@ Ignore-layer parity contract: see the M8N table below, which supersedes the pre-
 | `.repo_ignore` / `.cursorignore` at root | yes when enabled | yes when enabled | `HeadlessIgnoreParityTests` |
 | Hidden files | listed unless ignored | listed unless ignored | `HeadlessIgnoreEnumerationTests` |
 | Symlinks | skipped by default; when off, only root-contained targets are eligible | same eligibility via `skip_symlinks`; never crosses the root (M8P) | `HeadlessSymlinkParityTests`, `HeadlessSymlinkPolicyTests` |
-| `read_file` of an ignored path | unverified | not ignore-filtered | not compared |
+| `read_file` of an ignored or symlinked path | ignored readable; link/component/outside refused | same gates on the logical path; no-follow canonical read (M8Q) | `HeadlessReadAuthorityParityTests`, `HeadlessReadAuthorityTests` |
 
 Evidence: conductor ticket `ffa8bb9e-ef7b-4089-802a-f7003663a738` passed 62/62, including
 `HeadlessIgnoreEnumerationTests` 5/5 and `HeadlessIgnoreParityTests` 1/1 plus the existing ignore,
@@ -356,8 +356,59 @@ resolution, ignore manager, direct-headless, canonical workspace) passed 65/65
 SwiftLint clean (`51022a7a`). A first focused run (`d768f545`) failed to compile on an async call
 inside an `XCTUnwrap` autoclosure in the new test; the call is now hoisted.
 
-Remaining ignore-parity gap (not claimed): `read_file` on an ignored or symlinked path (the app's
-read eligibility, including `.symlinkComponent`, is not yet compared).
+Remaining ignore-parity gap after M8P: `read_file` on an ignored or symlinked path (closed by M8Q
+below).
+
+### M8Q — explicit `read_file` authority parity
+
+App contract (explicit read, not discovery): `WorkspaceReadableFileService.resolveReadFileRequest`
+resolves through `WorkspaceFileContextStore.resolveExactExistingWorkspaceFile`, whose explicit
+materialization (`exactFileCandidates`, `materializeSingleExactFile`) admits a path whose
+`catalogRegularFileEligibility` is `.eligible` **or `.ineligible(.ignored)`** — ignore rules filter
+discovery; they do not authorize or refuse an explicit read. Every other reason blocks it:
+`.symbolicLink` (final component is a link, whatever `skip_symlinks` says), `.symlinkComponent`
+(a symlinked directory component while `skip_symlinks` is on), `.outsideCanonicalRoot`,
+`.outsideRoot`, `.nonRegularFile`, `.missingOrDirectory`. The content read re-validates the same
+gates (`FileSystemService.validateContentFileForReading`). App-only always-readable external
+paths are out of scope and remain unsupported headless.
+
+Before M8Q, headless `read_file` read whatever the adapter resolved: ignored files were readable
+(correct), but because `DirectHeadlessDomainContext.resolvePath` resolves symlinks, a final-component
+link to an in-root file and a path through a symlinked directory under `skip_symlinks` were readable
+(the app refuses both), and the content was re-opened by path after the containment check, so a
+component swapped for a symlink in between could escape the root.
+
+- `HeadlessReadAuthority` applies the app's gates to the *logical* path the caller named (below the
+  root spelling it matches), independent of adapter-side resolution: final-component link →
+  `symbolicLinkPath`; symlinked component under `skip_symlinks` → `symlinkComponent`; `realpath`
+  target outside the root's `realpath` → `outsideCanonicalRoot`; a path (absolute or `..`-escaping)
+  under no root → `outsideRoot`; non-regular → `notARegularFile`. Ignored files are read. The policy
+  comes from `DomainIgnoreConfiguration.skipSymlinks` (default on when no configuration is supplied).
+- The content is read through a component-by-component `openat(O_NOFOLLOW)` walk of the canonical
+  target from the canonical root, then `fstat`-checked as a regular file within the read limit. A
+  directory component or the final file replaced by a symlink after authorization yields `ELOOP` /
+  `ENOTDIR` and fails closed as `pathChangedDuringRead`; no symlink is traversed at read time. The
+  root directory itself is trusted workspace authority (not re-validated per component).
+- The adapter's `resolvePath` still runs first, so its own errors (outside the workspace, ambiguous
+  relative path) are unchanged.
+
+Evidence: `HeadlessReadAuthorityParityTests` (for every fixture path and both policy values, headless
+reads exactly when the app's `catalogRegularFileEligibility` is `.eligible` or `.ignored`, and each
+refusal maps to the app reason: ignored in-root file and ignored file through an in-root directory
+link are read; file links in and out of the root, symlinked components under skip, and `outside/` /
+`../` escapes are refused) and `HeadlessReadAuthorityTests` (ignored readable; final links refused
+under either policy; component policy; outside-root link, `../` link, `..` traversal, and absolute
+outside paths refused with a deliberately non-resolving adapter; directories refused; directory
+component and final file swapped for outside-root links after authorization fail closed as
+`pathChangedDuringRead`). Conductor evidence: focused suites (headless read authority, symlink,
+ignore, canonical workspace, direct-headless, protected-mutation security) passed 87/87
+(`91d9f728`); all products built (`190b59f4`); lint passed with 0/1602 files needing formatting and
+strict SwiftLint clean (`205454bc`). A first focused run (`b1b7b79e`) failed to compile because the
+app-side parity test called the domain-internal `mcpValue()`; it now decodes `result.json`, as the
+other app-side parity tests do, with no production API widened.
+
+Remaining residual (not claimed): a swap of the workspace root directory itself, and the app-only
+always-readable external read paths.
 
 ### Later milestones (not started in this pass)
 
