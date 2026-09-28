@@ -57,21 +57,49 @@ package struct DomainCanonicalWorkspaceAdapter {
         _ allowMissingLeaf: Bool
     ) throws -> URL
 
+    package typealias IgnoreConfigurationProvider = @Sendable () async -> DomainIgnoreConfiguration?
+
     package let toolSnapshot: ToolSnapshot
     package let readSnapshot: ReadSnapshot
     package let mutate: Mutate
     package let resolvePath: ResolvePath
+    /// When present, enumeration applies the app's ignore layers; when nil, enumeration keeps the
+    /// legacy hidden-file-only filtering.
+    package let ignoreConfiguration: IgnoreConfigurationProvider?
 
     package init(
         toolSnapshot: @escaping ToolSnapshot,
         readSnapshot: @escaping ReadSnapshot,
         mutate: @escaping Mutate,
-        resolvePath: @escaping ResolvePath
+        resolvePath: @escaping ResolvePath,
+        ignoreConfiguration: IgnoreConfigurationProvider? = nil
     ) {
         self.toolSnapshot = toolSnapshot
         self.readSnapshot = readSnapshot
         self.mutate = mutate
         self.resolvePath = resolvePath
+        self.ignoreConfiguration = ignoreConfiguration
+    }
+}
+
+/// Ignore inputs for headless enumeration: the app's effective global defaults and the
+/// respect/hierarchical switches, matching the app crawl's defaults when settings are unset.
+package struct DomainIgnoreConfiguration: Equatable {
+    package let globalPatterns: String
+    package let respectRepoIgnore: Bool
+    package let respectCursorignore: Bool
+    package let hierarchicalIgnores: Bool
+
+    package init(
+        globalPatterns: String,
+        respectRepoIgnore: Bool = true,
+        respectCursorignore: Bool = true,
+        hierarchicalIgnores: Bool = true
+    ) {
+        self.globalPatterns = globalPatterns
+        self.respectRepoIgnore = respectRepoIgnore
+        self.respectCursorignore = respectCursorignore
+        self.hierarchicalIgnores = hierarchicalIgnores
     }
 }
 
@@ -180,13 +208,18 @@ package struct MCPDomainCanonicalWorkspaceService {
         let resolved = try requested.prefix(limit).map { raw in
             try adapter.resolvePath(raw, snapshot.roots, false)
         }
+        let ignoreContext = await makeIgnoreContext(roots: snapshot.roots)
         let (files, truncated) = try await Self.runCancellableBlocking { cancellation in
             var candidates: [URL] = []
             var truncated = false
             for url in resolved {
                 var isDirectory: ObjCBool = false
                 if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
-                    let scan = try Self.forEachFile(under: [url], cancellation: cancellation) { file, _ in
+                    let scan = try Self.forEachFile(
+                        under: [url],
+                        ignore: ignoreContext,
+                        cancellation: cancellation
+                    ) { file, _ in
                         guard CodeMapSyntaxEngine.supportsCodeMap(fileExtension: file.pathExtension) else { return true }
                         candidates.append(file)
                         return candidates.count < limit
@@ -227,6 +260,7 @@ package struct MCPDomainCanonicalWorkspaceService {
         } else {
             snapshot.roots
         }
+        let ignoreContext = await makeIgnoreContext(roots: snapshot.roots)
         let lines = try await Self.runCancellableBlocking { cancellation in
             var lines: [String] = []
             for root in roots {
@@ -236,6 +270,7 @@ package struct MCPDomainCanonicalWorkspaceService {
                     root: root,
                     maxDepth: maxDepth,
                     maximumLines: remaining,
+                    ignore: ignoreContext,
                     cancellation: cancellation
                 ))
             }
@@ -294,11 +329,12 @@ package struct MCPDomainCanonicalWorkspaceService {
         let searchesContent = mode == "content" || mode == "both" || (mode == "auto" && !searchesPaths)
         let relativeRoots = Self.relativeRoots(snapshot.roots)
         let roots = snapshot.roots
+        let ignoreContext = await makeIgnoreContext(roots: roots)
         let (results, enumerationTruncated, skippedLargeFiles) = try await Self.runCancellableBlocking { cancellation in
             let regex = regexEnabled ? try NSRegularExpression(pattern: regexPattern) : nil
             var results: [Value] = []
             var skippedLargeFiles = 0
-            let scan = try Self.forEachFile(under: roots, cancellation: cancellation) { file, byteCount in
+            let scan = try Self.forEachFile(under: roots, ignore: ignoreContext, cancellation: cancellation) { file, byteCount in
                 let relative = Self.relativePath(file, roots: relativeRoots)
                 guard Self.includes(relativePath: relative, file: file, filter: filter) else {
                     return true
@@ -625,6 +661,11 @@ package struct MCPDomainCanonicalWorkspaceService {
         return text
     }
 
+    private func makeIgnoreContext(roots: [URL]) async -> HeadlessIgnoreContext? {
+        guard let configuration = await adapter.ignoreConfiguration?() else { return nil }
+        return HeadlessIgnoreContext(roots: roots, configuration: configuration)
+    }
+
     private struct FileScan {
         /// The visitor asked to stop.
         var stoppedEarly = false
@@ -636,20 +677,31 @@ package struct MCPDomainCanonicalWorkspaceService {
     /// The visitor returns false to stop.
     private static func forEachFile(
         under roots: [URL],
+        ignore: HeadlessIgnoreContext? = nil,
         cancellation: BlockingCancellation,
         _ visit: (URL, Int?) throws -> Bool
     ) throws -> FileScan {
         var scan = FileScan()
         var visited = 0
         for root in roots {
+            let located = ignore?.locate(root)
             guard let enumerator = FileManager.default.enumerator(
                 at: root,
-                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+                includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey],
+                options: located == nil ? [.skipsHiddenFiles, .skipsPackageDescendants] : [.skipsPackageDescendants]
             ) else { continue }
             for case let url as URL in enumerator {
                 try cancellation.check()
-                let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey, .fileSizeKey])
+                if let located, let relative = located.relativePath(of: url) {
+                    let isDirectory = values?.isDirectory == true
+                    guard located.evaluator.admits(relative, isDirectory: isDirectory) else {
+                        if isDirectory, !located.evaluator.requiresTraversal(relative) {
+                            enumerator.skipDescendants()
+                        }
+                        continue
+                    }
+                }
                 guard values?.isRegularFile == true else { continue }
                 guard visited < MCPDomainCanonicalReadBounds.maximumEnumeratedFiles else {
                     scan.enumerationLimitReached = true
@@ -669,13 +721,15 @@ package struct MCPDomainCanonicalWorkspaceService {
         root: URL,
         maxDepth: Int,
         maximumLines: Int,
+        ignore: HeadlessIgnoreContext? = nil,
         cancellation: BlockingCancellation
     ) throws -> [String] {
         var lines = [root.lastPathComponent + "/"]
+        let located = ignore?.locate(root)
         guard let enumerator = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            options: located == nil ? [.skipsHiddenFiles, .skipsPackageDescendants] : [.skipsPackageDescendants]
         ) else { return lines }
         for case let url as URL in enumerator {
             try cancellation.check()
@@ -687,6 +741,14 @@ package struct MCPDomainCanonicalWorkspaceService {
                 continue
             }
             let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            if let located, let ignoredRelative = located.relativePath(of: url) {
+                guard located.evaluator.admits(ignoredRelative, isDirectory: isDirectory) else {
+                    if isDirectory, !located.evaluator.requiresTraversal(ignoredRelative) {
+                        enumerator.skipDescendants()
+                    }
+                    continue
+                }
+            }
             lines.append(String(repeating: "  ", count: depth) + url.lastPathComponent + (isDirectory ? "/" : ""))
         }
         return lines
@@ -737,5 +799,165 @@ package struct MCPDomainCanonicalWorkspaceService {
 
     private static func looksLikeRegex(_ pattern: String) -> Bool {
         pattern.range(of: #"[\[\](){}|+?^$\\]"#, options: .regularExpression) != nil
+    }
+}
+
+// MARK: - Headless ignore evaluation
+
+/// Maps enumeration bases to the workspace root that owns their ignore chain.
+private final class HeadlessIgnoreContext: @unchecked Sendable {
+    struct Located {
+        let evaluator: HeadlessIgnoreEvaluator
+        /// Path of the enumeration base relative to the workspace root ("" for the root itself).
+        let basePrefix: String
+        /// Equivalent spellings of the base path; the enumerator may report `/private/var/...`
+        /// for a base given as `/var/...`.
+        let basePaths: [String]
+
+        /// Root-relative path of an enumerated item, or nil when it cannot be attributed to the
+        /// base (the caller then applies no ignore decision rather than a wrong one).
+        func relativePath(of url: URL) -> String? {
+            let path = url.path
+            guard let basePath = basePaths.first(where: { path.hasPrefix($0 + "/") }) else { return nil }
+            let local = String(path.dropFirst(basePath.count + 1))
+            return basePrefix.isEmpty ? local : basePrefix + "/" + local
+        }
+    }
+
+    private let evaluators: [(rootPath: String, evaluator: HeadlessIgnoreEvaluator)]
+
+    init(roots: [URL], configuration: DomainIgnoreConfiguration) {
+        evaluators = roots.map { root in
+            let rootPath = root.standardizedFileURL.path
+            return (rootPath, HeadlessIgnoreEvaluator(rootPath: rootPath, configuration: configuration))
+        }
+    }
+
+    /// The evaluator for the workspace root containing `base`, or nil when `base` is outside
+    /// every root (ignore rules then do not apply).
+    func locate(_ base: URL) -> Located? {
+        let basePaths = Self.equivalentPaths(base)
+        for (rootPath, evaluator) in evaluators {
+            for rootSpelling in Self.equivalentPaths(URL(fileURLWithPath: rootPath, isDirectory: true)) {
+                for basePath in basePaths {
+                    if basePath == rootSpelling {
+                        return Located(evaluator: evaluator, basePrefix: "", basePaths: basePaths)
+                    }
+                    if basePath.hasPrefix(rootSpelling + "/") {
+                        return Located(
+                            evaluator: evaluator,
+                            basePrefix: String(basePath.dropFirst(rootSpelling.count + 1)),
+                            basePaths: basePaths
+                        )
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    /// The given, symlink-resolved, and `/private`-toggled spellings of a path. macOS exposes
+    /// `/var`, `/tmp`, and `/etc` as symlinks into `/private`, and `resolvingSymlinksInPath()`
+    /// strips `/private`, so the same directory can be reported either way.
+    static func equivalentPaths(_ url: URL) -> [String] {
+        let given = url.standardizedFileURL.path
+        let resolved = url.resolvingSymlinksInPath().standardizedFileURL.path
+        var spellings: [String] = []
+        for path in [given, resolved] {
+            spellings.append(path)
+            if path.hasPrefix("/private/") {
+                spellings.append(String(path.dropFirst("/private".count)))
+            } else if ["/var/", "/tmp/", "/etc/"].contains(where: { path.hasPrefix($0) }) {
+                spellings.append("/private" + path)
+            }
+        }
+        var seen: Set<String> = []
+        return spellings.filter { seen.insert($0).inserted }
+    }
+}
+
+/// App-equivalent ignore evaluation for one workspace root, built with `IgnoreLayerAssembly`.
+///
+/// A root that contains `.git` is treated as a Git work-tree root (mandatory `.gitignore` floor).
+/// Roots nested inside a repository do not yet load their ancestors' `.gitignore` files.
+private final class HeadlessIgnoreEvaluator: @unchecked Sendable {
+    private let rootPath: String
+    private let configuration: DomainIgnoreConfiguration
+    private let policy: IgnoreRulePolicy
+    private let rootRules: IgnoreRules
+    private let lock = NSLock()
+    private var rulesByDirectory: [String: IgnoreRules] = [:]
+
+    init(rootPath: String, configuration: DomainIgnoreConfiguration) {
+        self.rootPath = rootPath
+        self.configuration = configuration
+        let isGitRoot = FileManager.default.fileExists(atPath: rootPath + "/.git")
+        if isGitRoot, let prefix = try? IgnoreRepositoryRootPrefix("") {
+            policy = .gitRoot(repositoryRelativeRootPrefix: prefix)
+        } else {
+            policy = .nonGitRoot
+        }
+        let authority = IgnoreLayerAssembly.compileRootAuthority(
+            gitignoreContent: Self.content(at: rootPath + "/.gitignore"),
+            globalIgnoreContent: configuration.globalPatterns,
+            repoIgnoreContent: configuration.respectRepoIgnore ? Self.content(at: rootPath + "/.repo_ignore") : nil,
+            cursorignoreContent: configuration.respectCursorignore ? Self.content(at: rootPath + "/.cursorignore") : nil
+        )
+        rootRules = IgnoreLayerAssembly.makeRootRules(
+            authority: authority,
+            respectRepoIgnore: configuration.respectRepoIgnore,
+            respectCursorignore: configuration.respectCursorignore,
+            policy: policy
+        )
+    }
+
+    func admits(_ relativePath: String, isDirectory: Bool) -> Bool {
+        !rules(forDirectory: Self.parent(of: relativePath)).isIgnored(
+            relativePath: relativePath,
+            isDirectory: isDirectory
+        )
+    }
+
+    /// Whether an ignored directory must still be traversed because a negation may re-include
+    /// something beneath it.
+    func requiresTraversal(_ relativePath: String) -> Bool {
+        rules(forDirectory: Self.parent(of: relativePath)).requiresTraversal(for: relativePath)
+    }
+
+    private func rules(forDirectory relativeDirectory: String) -> IgnoreRules {
+        guard configuration.hierarchicalIgnores, !relativeDirectory.isEmpty else { return rootRules }
+        if let cached = lock.withLock({ rulesByDirectory[relativeDirectory] }) {
+            return cached
+        }
+        let parentRules = rules(forDirectory: Self.parent(of: relativeDirectory))
+        let directoryPath = rootPath + "/" + relativeDirectory
+        let gitignore = Self.content(at: directoryPath + "/.gitignore")
+        let repoIgnore = configuration.respectRepoIgnore ? Self.content(at: directoryPath + "/.repo_ignore") : nil
+        let cursorignore = configuration.respectCursorignore ? Self.content(at: directoryPath + "/.cursorignore") : nil
+        let resolved = gitignore == nil && repoIgnore == nil && cursorignore == nil
+            ? parentRules
+            : IgnoreLayerAssembly.appendingDirectoryLayers(
+                to: parentRules,
+                policy: policy,
+                directoryRelativePath: relativeDirectory,
+                gitignoreContent: gitignore,
+                repoIgnoreContent: repoIgnore,
+                cursorignoreContent: cursorignore
+            )
+        lock.withLock { rulesByDirectory[relativeDirectory] = resolved }
+        return resolved
+    }
+
+    private static func parent(of relativePath: String) -> String {
+        guard let slash = relativePath.lastIndex(of: "/") else { return "" }
+        return String(relativePath[..<slash])
+    }
+
+    private static func content(at path: String) -> String? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            return nil
+        }
+        return try? String(contentsOfFile: path, encoding: .utf8)
     }
 }

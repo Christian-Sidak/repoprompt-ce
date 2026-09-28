@@ -229,19 +229,50 @@ layer yet: explicit parity contract and the read-only authority view are the nex
   rejects `set` with `appAuthorityReadOnly`. A value previously stored for this key in headless
   `direct-settings.json` is ignored but left in place. Other headless settings are unchanged.
 
-Ignore-layer parity contract (what headless enumeration applies today versus the app):
+Ignore-layer parity contract: see the M8N table below, which supersedes the pre-M8N state
+(headless applied no ignore layer).
 
-| Layer | App crawl | Headless enumeration |
-|---|---|---|
-| `.git` exclusion | always | not applied (hidden-file skip only) |
-| Root `.gitignore` | yes (mandatory floor in Git roots) | not applied |
-| Nested `.gitignore` | yes when hierarchical ignores are on (default) | not applied |
-| Global ignore defaults | `globalSettings.json` value (M8K) | value readable via M8M; not applied |
-| `.repo_ignore` / `.cursorignore` | yes when enabled (default) | not applied |
-| Symlinks | skipped by default | not governed by `skip_symlinks`; FileManager enumerator defaults (unverified) |
+### M8N — shared ignore-layer engine and headless ignore enumeration
 
-No row is claimed as parity until headless enumeration applies it with the shared compiler (M8L)
-and a fixture test compares it with the app's result.
+- `IgnoreRules`, `IgnoreRulesSnapshot`, `IgnoreRuleAuthority`, and `IgnoreRulePolicy` moved into
+  the domain runtime with no behavior change. The Git-root payload is the domain
+  `IgnoreRepositoryRootPrefix`, which now owns prefix validation; the app's
+  `GitRepositoryRelativeRootPrefix` stores it and maps validation failures onto its existing
+  `GitWorktreeInitializationError` cases.
+- `IgnoreLayerAssembly` owns root assembly (`compileRootAuthority`, `makeRootRules`) and per-directory
+  assembly (`appendingDirectoryLayers`). The app's `IgnoreRulesManager` forwards to it and the
+  app's nested-directory path loads files with its unchanged I/O and error policy, then assembles
+  through it.
+- Headless enumeration (`file_search`, `get_file_tree`, `get_code_structure` directory expansion)
+  applies these layers when the adapter supplies a `DomainIgnoreConfiguration`: global patterns
+  from the M8M app-authority view and the headless `respect_repo_ignore`, `respect_cursorignore`,
+  and `enable_hierarchical_ignores` switches (defaults match the app). Ignored directories are
+  skipped unless a negation requires traversal, as in the app. With a configuration, the blanket
+  hidden-file skip is dropped (the app has none); callers without one keep the legacy behavior.
+
+| Layer | App crawl | Headless enumeration | Evidence |
+|---|---|---|---|
+| `.git` / `.svn` / `.DS_Store` built-ins | always | same `IgnoreRules` base layers | `HeadlessIgnoreEnumerationTests` |
+| Root `.gitignore` | yes | yes | `HeadlessIgnoreParityTests` (non-Git) |
+| Git-root mandatory floor | yes | yes when the root contains `.git` | `HeadlessIgnoreEnumerationTests` |
+| Root nested inside a repository (ancestor `.gitignore` walk) | yes | **not applied** | gap |
+| Nested `.gitignore` / `.repo_ignore` / `.cursorignore` | yes when hierarchical (default) | yes, same `appendingDirectoryLayers` | `HeadlessIgnoreEnumerationTests` |
+| Global ignore defaults | `globalSettings.json` value | same value via M8M view | `HeadlessIgnoreParityTests` |
+| `.repo_ignore` / `.cursorignore` at root | yes when enabled | yes when enabled | `HeadlessIgnoreParityTests` |
+| Hidden files | listed unless ignored | listed unless ignored | `HeadlessIgnoreEnumerationTests` |
+| Symlinks | skipped by default | not governed by `skip_symlinks` | gap |
+| `read_file` of an ignored path | unverified | not ignore-filtered | not compared |
+
+Evidence: conductor ticket `ffa8bb9e-ef7b-4089-802a-f7003663a738` passed 62/62, including
+`HeadlessIgnoreEnumerationTests` 5/5 and `HeadlessIgnoreParityTests` 1/1 plus the existing ignore,
+search, settings-authority, and direct-headless suites; all products built (`38a30899`); lint passed
+before the final path-attribution fix (that fix was formatter-clean). Validation found and fixed a
+real headless bug: enumerated items reported under `/private/var/...` for a `/var/...` root were
+attributed to the root's rules only; enumeration now matches every equivalent root spelling and
+applies no ignore decision to an item it cannot attribute.
+
+Remaining ignore-parity gaps (not claimed): roots nested inside a repository (ancestor `.gitignore`
+walk), symlink policy (`skip_symlinks`), and `read_file` on an ignored path (app behavior unverified).
 
 ### Later milestones (not started in this pass)
 

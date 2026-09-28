@@ -3,6 +3,7 @@ import CoreServices
 import Dispatch
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 #if DEBUG
     import CryptoKit
 #endif

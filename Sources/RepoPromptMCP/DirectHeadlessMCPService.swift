@@ -208,7 +208,7 @@ actor DirectHeadlessMCPService {
                     DomainGlobalIgnoreDefaultsView.resolve(settingsFileURL: appSettingsFileURL)
                 }
             )
-            let workspace = DirectHeadlessWorkspaceBackend(context: context)
+            let workspace = DirectHeadlessWorkspaceBackend(context: context, settingsStore: settingsStore)
             let global = DirectHeadlessGlobalBackend(
                 runtime: runtime,
                 scopeID: scopeID,

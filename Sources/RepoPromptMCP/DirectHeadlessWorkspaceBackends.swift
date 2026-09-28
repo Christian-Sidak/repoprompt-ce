@@ -636,7 +636,7 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
 actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
     private let service: MCPDomainCanonicalWorkspaceService
 
-    init(context: DirectHeadlessDomainContext) {
+    init(context: DirectHeadlessDomainContext, settingsStore: DomainDirectSettingsStore? = nil) {
         service = MCPDomainCanonicalWorkspaceService(
             adapter: DomainCanonicalWorkspaceAdapter(
                 toolSnapshot: { request in
@@ -656,8 +656,31 @@ actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
                 },
                 resolvePath: { rawPath, roots, allowMissingLeaf in
                     try context.resolvePath(rawPath, roots: roots, allowMissingLeaf: allowMissingLeaf)
+                },
+                ignoreConfiguration: settingsStore.map { store in
+                    { await Self.ignoreConfiguration(from: store) }
                 }
             )
+        )
+    }
+
+    /// Global patterns come from the app authority view (M8M); switches from headless settings,
+    /// whose defaults match the app crawl's.
+    private static func ignoreConfiguration(from store: DomainDirectSettingsStore) async -> DomainIgnoreConfiguration {
+        await store.bootstrap()
+        func bool(_ key: String, default fallback: Bool) async -> Bool {
+            if case let .bool(value)? = try? await store.effectiveValue(for: key) { return value }
+            return fallback
+        }
+        var globalPatterns = DomainGlobalIgnoreDefaults.canonical
+        if case let .string(value)? = try? await store.effectiveValue(for: DomainGlobalIgnoreDefaults.settingKey) {
+            globalPatterns = value
+        }
+        return await DomainIgnoreConfiguration(
+            globalPatterns: globalPatterns,
+            respectRepoIgnore: bool("file_system.respect_repo_ignore", default: true),
+            respectCursorignore: bool("file_system.respect_cursorignore", default: true),
+            hierarchicalIgnores: bool("file_system.enable_hierarchical_ignores", default: true)
         )
     }
 

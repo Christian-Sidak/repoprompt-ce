@@ -147,7 +147,7 @@ extension IgnoreRulePolicy {
                 guard prefix.value.split(separator: "/").first != ".git" else {
                     throw IgnoreRulePolicyResolutionError.ambiguousGitTopology
                 }
-                return .gitRoot(repositoryRelativeRootPrefix: prefix)
+                return .gitRoot(repositoryRelativeRootPrefix: prefix.ignorePrefix)
             }
             guard errno == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
             guard candidate.path != "/" else { break }
@@ -175,7 +175,6 @@ extension IgnoreRulePolicy {
     }
 }
 
-/// A lightweight manager that builds `IgnoreRules` on demand, with no caching.
 /// Lock-protected effective global ignore defaults published by the settings authority
 /// (`GlobalSettingsStore`, backed by `globalSettings.json`), readable from the ignore actor without
 /// a MainActor hop.
@@ -195,13 +194,10 @@ final class GlobalIgnoreDefaultsAuthority: @unchecked Sendable {
     }
 }
 
+/// A lightweight manager that builds `IgnoreRules` on demand, with no caching.
 actor IgnoreRulesManager {
-    struct CompiledRootAuthority {
-        let gitignore: CompiledIgnoreRules?
-        let global: CompiledIgnoreRules
-        let repoIgnore: CompiledIgnoreRules?
-        let cursorignore: CompiledIgnoreRules?
-    }
+    /// Root layer inputs; assembly is shared with headless enumeration via `IgnoreLayerAssembly`.
+    typealias CompiledRootAuthority = IgnoreLayerAssembly.CompiledRootAuthority
 
     struct ResolvedIgnoreRules {
         let rules: IgnoreRules
@@ -340,7 +336,7 @@ actor IgnoreRulesManager {
 
     private func resolvedGitIgnoreRules(
         loadedPath: String,
-        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
+        repositoryRelativeRootPrefix: IgnoreRepositoryRootPrefix,
         respectRepoIgnore: Bool,
         respectCursorignore: Bool,
         policy: IgnoreRulePolicy
@@ -488,36 +484,27 @@ actor IgnoreRulesManager {
         repoIgnoreContent: String?,
         cursorignoreContent: String?
     ) -> CompiledRootAuthority {
-        CompiledRootAuthority(
-            gitignore: gitignoreContent.map { GitignoreCompiler.compile(content: $0) },
-            global: GitignoreCompiler.compile(content: globalIgnoreContent),
-            repoIgnore: repoIgnoreContent.map { GitignoreCompiler.compile(content: $0) },
-            cursorignore: cursorignoreContent.map { GitignoreCompiler.compile(content: $0) }
+        IgnoreLayerAssembly.compileRootAuthority(
+            gitignoreContent: gitignoreContent,
+            globalIgnoreContent: globalIgnoreContent,
+            repoIgnoreContent: repoIgnoreContent,
+            cursorignoreContent: cursorignoreContent
         )
     }
 
-    /// Builds the authoritative ordinary-crawl root chain. For Git roots, Git's
-    /// own ignore chain is a mandatory floor: global/app controls may add
-    /// exclusions but their negations cannot re-include a Git-ignored path.
-    /// Non-Git callers retain the historical single-chain precedence.
+    /// Builds the authoritative ordinary-crawl root chain; see `IgnoreLayerAssembly.makeRootRules`.
     nonisolated static func makeRootRules(
         authority: CompiledRootAuthority,
         respectRepoIgnore: Bool,
         respectCursorignore: Bool,
         policy: IgnoreRulePolicy
     ) -> IgnoreRules {
-        let rules = IgnoreRules(policy: policy)
-        if let gitignore = authority.gitignore {
-            rules.addCompiledLayer(gitignore, authority: .mandatoryGit)
-        }
-        rules.addCompiledLayer(authority.global, authority: .secondary)
-        if respectRepoIgnore, let repoIgnore = authority.repoIgnore {
-            rules.addCompiledLayer(repoIgnore, authority: .secondary)
-        }
-        if respectCursorignore, let cursorignore = authority.cursorignore {
-            rules.addCompiledLayer(cursorignore, authority: .secondary)
-        }
-        return rules
+        IgnoreLayerAssembly.makeRootRules(
+            authority: authority,
+            respectRepoIgnore: respectRepoIgnore,
+            respectCursorignore: respectCursorignore,
+            policy: policy
+        )
     }
 
     func resolvedGlobalIgnoreContent() -> String {

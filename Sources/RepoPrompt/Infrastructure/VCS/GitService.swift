@@ -5883,7 +5883,7 @@ actor GitService {
             repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
         ) -> PrefixControlReachabilityRules {
             let policy = IgnoreRulePolicy.gitRoot(
-                repositoryRelativeRootPrefix: repositoryRelativeRootPrefix
+                repositoryRelativeRootPrefix: repositoryRelativeRootPrefix.ignorePrefix
             )
             return PrefixControlReachabilityRules(
                 gitignoreOnly: IgnoreRulesManager.makeRootRules(
