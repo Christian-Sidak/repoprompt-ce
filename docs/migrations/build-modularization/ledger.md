@@ -38,12 +38,25 @@ Conductor timings (last 3,000 jobs, net of queue):
 
 **Correction:** the first draft of the plan reported a heavy-slot wait of p50 12.3 min, because an ad-hoc parser read `739ms` as minutes. The tested parser shows that 75% of jobs are admitted immediately, 295 waited at least a minute, and 22 waited over an hour. The plan text has been corrected.
 
+## Ratchet re-baseline — 2026-09-29 (rebase onto `5d5a99de`)
+
+`update --allow-regression`, because main moved between the baseline and this branch landing. No change on this branch worsens a gated metric.
+- **Gated:** `tests_sleep_calls` 47 → 49. Both come from main: #1067 added a fake clock whose `func sleep(_:)` declaration the regex counts (`ContextBuilderGroupedSupervisionTests`), and #1092 added a 2 ms `Task.sleep` poll (`AgentAdmissionRecoveryTests`).
+- **Tracked (refreshed, not gated):** app files 1,160 → 1,161, app lines 648,091 → 651,485, files over 2,000 lines 50 → 51, `.shared` uses 1,220 → 1,222, wrong-way edges 1,102 → 1,104, `@testable import RepoPromptApp` test files 319 → 324. Of these, this branch adds 2 app lines (the P0.6 access change) and 1 `@testable` file (the P0.6 goldens); the rest is main (`origin/main` alone measures 651,483 lines and 323 files).
+
 ## Decisions
 
 | ID | Decision | Status |
 | --- | --- | --- |
 | ADR-01 | Root-package targets first; separate packages only past the §3.4 gate | Accepted (plan) |
+| ADR-02 | Capability graph and allowed edges (plan §3.2) | Accepted (2026-09-29) as written. Evidence: P0.2 index graph (1,360 wrong-way file edges, largest cycle 66 of 75 components, seam catalog and Appendix B validated) |
+| ADR-03 | Contract policy (plan §3.5, principle 7) | Accepted (2026-09-29) as written. Evidence: P0.2 index `edge`/seam data, where fan-in alone overstated coupling (S8 fan-in 109 → 33 by index) |
+| ADR-04 | Composition root and injection (plan §3.1 principles 3–4) | Accepted (2026-09-29) as written. Evidence: P0.2 index graph, where ambient `.shared` authorities carry the cross-layer edges (S1, S2, S6, S7: 116–129 refs each) |
+| ADR-05 | Logic/UI split (plan §3.1 principle 6) | Accepted (2026-09-29) as written. Evidence: P0.5 type-check data (SwiftUI is 58 of 104 function bodies ≥ 200 ms and 74% of their time) |
+| ADR-06 | Test ownership and hermeticity (plan §3.6) | Accepted (2026-09-29) as written. Evidence: P0.3 bake-off (module-owned test targets cut median edit→test by 77% and 95%; an app interface change recompiles 360 app test files) |
 | ADR-07 | Focused-test executor | Accepted (2026-09-28): Swift Build per-target bundles (`conductor test --module`) for test targets whose closure excludes `RepoPromptApp`, including Swift Testing; native aggregate stays the default `FILTER` path, the path for app-dependent targets, and the CI path. Passed the gate on both P0.3 slices (77% and 95% lower median edit→test, no discovery loss) |
+| ADR-08 | Admission and caching (plan §5.4–5.5) | Proposed. Deferred to P1.3 (admission v2 from measured per-job peak RSS, P0.5) and §5.5 (cross-worktree caching needs clean-vs-cached correctness evidence) |
+| ADR-09 | Per-module concurrency (plan §3.7) | Accepted (2026-09-29) as written. Evidence: the existing [Swift 6.2 concurrency migration ledger](../swift-6-2-concurrency/migration-ledger.md), which each extraction extends |
 
 ## Phase 0 progress
 
@@ -55,10 +68,12 @@ Conductor timings (last 3,000 jobs, net of queue):
 - [x] P0.6 compatibility inventory: type-name, bundle, and persisted-identity inventory; goldens where missing; runtime-identity guardrail; slice checklist (see P0.6 below)
 - [x] P0.7 ratchets file and guardrail gate
 
-**Phase 0 exit gate (2026-09-29): not yet met.** Every P0 item is ticked, but the gate also requires ADR-01…09 to be decided with evidence.
+**Phase 0 exit gate (2026-09-29): closed, with ADR-08 explicitly deferred.**
 - Met: baseline recorded (Baseline, P0.1); the index graph agrees with the top offenders (P0.2); no production behavior changed. P0.6 made one access-only change.
-- Decided: ADR-01 (accepted with the plan; the §3.4 gate was exercised by P0.3) and ADR-07 (accepted with P0.3 measurements).
-- **Not yet decided (no decision record here):** ADR-02 capability graph and allowed edges, ADR-03 contract policy, ADR-04 composition root and injection, ADR-05 logic/UI split, ADR-06 test ownership and hermeticity, ADR-08 admission and caching, ADR-09 per-module concurrency. The plan states a position on each (§3.2, §3.5, §3.1 principles 3–4, §3.1 principle 6, §3.6, §5.4–5.5, §3.7), and P0.2, P0.3, and P0.5 provide partial evidence (index graph, `RepoPromptTestSupport` precedent, per-job peak RSS). None is recorded as accepted. Recording them needs a maintainer decision.
+- Decided with evidence (see Decisions): ADR-01 and ADR-07, then ADR-02, 03, 04, 05, 06, and 09, accepted as written in the plan.
+- **Deferred:** ADR-08 admission and caching stays Proposed. It is gated to P1.3 (admission v2) and §5.5 (caching correctness evidence), and it does not block P1 or W1.
+
+~~Phase 0 exit gate (2026-09-29): not yet met.~~ Superseded the same day by the maintainer decisions above.
 
 ## P0.4 — fixed per-job overhead (2026-09-28)
 
@@ -359,6 +374,7 @@ Proposed fixes (not implemented in P0.1):
    - Resolve the bin path once instead of running `swift build --show-bin-path` (0.6–3.4 s).
 3. **Publication, needs a decision.**
    - Exclude `.build/swiftbuild` from the seed in `_sanitize_seed`. That is about 5.5 GiB less to clone, sanitize, and measure, but new worktrees lose a warm module scratch path.
+     - **Decided (2026-09-29): excluded**, next to `.build/measure`, with a unit test (`test_seed_sanitizing_drops_module_test_scratch`). A new worktree's first module run builds its closure cold.
    - Alternatively, report the job result before publishing. That changes the deliberate hold on the build lane and needs a design.
 
 ## P0.2 — index-store dependency graph (2026-09-29)

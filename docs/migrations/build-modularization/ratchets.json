@@ -16,18 +16,18 @@
   ],
   "metrics": {
     "app_components": 75,
-    "app_files_over_2000_lines": 50,
+    "app_files_over_2000_lines": 51,
     "app_files_over_5000_lines": 17,
     "app_largest_cycle_components": 67,
-    "app_share_permille": 883,
-    "app_shared_accessor_uses": 1220,
+    "app_share_permille": 884,
+    "app_shared_accessor_uses": 1222,
     "app_static_shared_declarations": 102,
-    "app_target_swift_files": 1160,
-    "app_target_swift_lines": 648091,
+    "app_target_swift_files": 1161,
+    "app_target_swift_lines": 651485,
     "app_userdefaults_standard_uses": 234,
-    "app_wrong_way_file_edges": 1102,
-    "first_party_swift_lines": 733175,
-    "tests_sleep_calls": 47,
-    "tests_testable_import_app_files": 319
+    "app_wrong_way_file_edges": 1104,
+    "first_party_swift_lines": 736569,
+    "tests_sleep_calls": 49,
+    "tests_testable_import_app_files": 324
   }
 }

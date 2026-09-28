@@ -456,6 +456,18 @@ class ModuleExecutionTests(unittest.TestCase):
             self.assertFalse((build / "measure").exists())
             self.assertTrue((build / "debug").is_dir())
 
+    def test_seed_sanitizing_drops_module_test_scratch(self) -> None:
+        import conductor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp) / ".build"
+            (build / "swiftbuild" / "arm64-apple-macosx").mkdir(parents=True)
+            (build / "swiftbuild" / "arm64-apple-macosx" / "build.db").write_text("x")
+            (build / "debug").mkdir()
+            conductor.BuildCacheManager._sanitize_seed(build)
+            self.assertFalse((build / "swiftbuild").exists())
+            self.assertTrue((build / "debug").is_dir())
+
 
 class TestDiscoveryTests(unittest.TestCase):
     def test_parse_suite_methods_deduplicates_and_sorts(self) -> None:

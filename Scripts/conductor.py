@@ -1429,7 +1429,7 @@ class BuildCacheManager:
     @staticmethod
     def _sanitize_seed(build_dir: Path) -> None:
         deadline = BuildCacheManager._tree_deadline_seconds(build_dir)
-        for relative in ("xcode", "xcode-custom", "measure", ".conductor-cache-provenance.json"):
+        for relative in ("xcode", "xcode-custom", "measure", "swiftbuild", ".conductor-cache-provenance.json"):
             target = build_dir / relative
             if target.is_dir() and not target.is_symlink():
                 shutil.rmtree(target, ignore_errors=True)
