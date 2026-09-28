@@ -215,6 +215,10 @@ actor WorkspaceFileContextStore {
             let kind: CodemapGraphIndexBuildStoreEventKind
             let launchPhase: WorkspaceCodemapGraphIndexLaunchPhase
             let uptimeNanoseconds: UInt64
+            /// Why a launch was retried: `eligibility.<reason>` or `setup.<reason>`. Set on
+            /// `eligibilityTransient`, `retryScheduled`, and `retryExhausted`; case names only, never
+            /// paths or payload values.
+            let transientReason: String?
         }
 
         enum RootCatalogShardFallbackReason: String, CaseIterable, Hashable {
@@ -13025,7 +13029,8 @@ actor WorkspaceFileContextStore {
     private func recordCodemapGraphIndexBuildStoreEvent(
         _ kind: CodemapGraphIndexBuildStoreEventKind,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        phase: WorkspaceCodemapGraphIndexLaunchPhase
+        phase: WorkspaceCodemapGraphIndexLaunchPhase,
+        transientReason: String? = nil
     ) {
         #if DEBUG
             nextCodemapGraphIndexBuildStoreEventOrdinal &+= 1
@@ -13034,7 +13039,8 @@ actor WorkspaceFileContextStore {
                 rootEpoch: rootEpoch,
                 kind: kind,
                 launchPhase: phase,
-                uptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
+                uptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds(),
+                transientReason: transientReason
             ))
             if codemapGraphIndexBuildStoreEvents.count > 2048 {
                 codemapGraphIndexBuildStoreEvents.removeFirst(
@@ -13178,11 +13184,13 @@ actor WorkspaceFileContextStore {
                 phase: phase
             )
             return
-        case .transient:
+        case let .transient(reason):
+            let transientReason = "eligibility.\(reason.rawValue)"
             recordCodemapGraphIndexBuildStoreEvent(
                 .eligibilityTransient,
                 rootEpoch: authority.rootEpoch,
-                phase: .transientRetry
+                phase: .transientRetry,
+                transientReason: transientReason
             )
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
@@ -13191,7 +13199,8 @@ actor WorkspaceFileContextStore {
             )
             scheduleCodemapGraphIndexBuildRetry(
                 launchID: launchID,
-                authority: authority
+                authority: authority,
+                transientReason: transientReason
             )
             return
         case .stale:
@@ -13252,7 +13261,8 @@ actor WorkspaceFileContextStore {
             if retryable {
                 scheduleCodemapGraphIndexBuildRetry(
                     launchID: launchID,
-                    authority: authority
+                    authority: authority,
+                    transientReason: Self.codemapSetupTransientReasonLabel(setupDisposition)
                 )
             }
             return
@@ -13543,9 +13553,31 @@ actor WorkspaceFileContextStore {
         return !codemapUnavailableIsStable(reason)
     }
 
+    /// A privacy-safe label for a retryable setup disposition: `setup.<case>` with case names only.
+    private static func codemapSetupTransientReasonLabel(_ disposition: CodemapSetupDisposition) -> String {
+        guard case let .unavailable(reason) = disposition else { return "setup.ready" }
+        let name = switch reason {
+        case .rootNotLoaded: "rootNotLoaded"
+        case .fileNotCataloged: "fileNotCataloged"
+        case .unsupportedFileType: "unsupportedFileType"
+        case let .gitTerminal(terminal): "gitTerminal.\(terminal.rawValue)"
+        case let .gitTransient(transient): "gitTransient.\(transient.rawValue)"
+        case .demandUnavailable: "demandUnavailable"
+        case .busy: "busy"
+        case let .rejected(rejection): "rejected.\(rejection)"
+        case .routeConflict: "routeConflict"
+        case .registrationFailed: "registrationFailed"
+        case .runtimeFailure: "runtimeFailure"
+        case .staleCurrentness: "staleCurrentness"
+        case .cancelled: "cancelled"
+        }
+        return "setup.\(name)"
+    }
+
     private func scheduleCodemapGraphIndexBuildRetry(
         launchID: UUID,
-        authority: CodemapRootAuthority
+        authority: CodemapRootAuthority,
+        transientReason: String
     ) {
         guard !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
               let launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch],
@@ -13572,7 +13604,8 @@ actor WorkspaceFileContextStore {
             recordCodemapGraphIndexBuildStoreEvent(
                 .retryExhausted,
                 rootEpoch: authority.rootEpoch,
-                phase: .retryExhausted
+                phase: .retryExhausted,
+                transientReason: transientReason
             )
             return
         }
@@ -13606,7 +13639,8 @@ actor WorkspaceFileContextStore {
         recordCodemapGraphIndexBuildStoreEvent(
             .retryScheduled,
             rootEpoch: authority.rootEpoch,
-            phase: .transientRetry
+            phase: .transientRetry,
+            transientReason: transientReason
         )
     }
 

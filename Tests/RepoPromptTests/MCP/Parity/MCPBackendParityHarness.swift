@@ -399,7 +399,7 @@ import XCTest
             let store = appWindow.window.workspaceFileContextStore
             var parts: [String] = []
             let events = await store.codemapGraphIndexBuildStoreEventsForTesting()
-            parts.append("store_events=" + events.suffix(40).map { "\($0.kind):\($0.launchPhase)" }.joined(separator: ">"))
+            parts.append("store_events=" + events.suffix(40).map { "\($0.kind):\($0.launchPhase)" + ($0.transientReason.map { ":\($0)" } ?? "") }.joined(separator: ">"))
             do {
                 let accounting = try await codemapRuntime.runtime().bindingEngine().accounting()
                 parts.append("engine_roots=" + accounting.graphIndexRoots.map { root in

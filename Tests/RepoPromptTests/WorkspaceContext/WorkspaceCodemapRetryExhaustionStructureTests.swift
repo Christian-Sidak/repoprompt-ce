@@ -137,6 +137,42 @@ import XCTest
             XCTAssertEqual(root.issues.first?.retryable, true)
         }
 
+        func testEligibilityTransientReasonIsRecordedOnRetryAndExhaustion() async throws {
+            let harness = try await makeHarness(
+                eligibility: .transientUnavailable(.repositoryChanging),
+                retryPolicy: Self.policy(maximumRetryCount: 1)
+            )
+            try await waitForRootStatus(harness) { $0.unavailableReason == .retryExhausted }
+
+            let events = await harness.store.codemapGraphIndexBuildStoreEventsForTesting(rootID: harness.rootID)
+            let label = "eligibility.repositoryChanging"
+            // Another root-ready trigger may start a fresh launch, so counts can vary; every label must
+            // name the eligibility cause, a retry must have been scheduled, and exhaustion is labelled.
+            let transient = events.filter { $0.kind == .eligibilityTransient }.map(\.transientReason)
+            let scheduled = events.filter { $0.kind == .retryScheduled }.map(\.transientReason)
+            XCTAssertGreaterThanOrEqual(transient.count, 2)
+            XCTAssertTrue(transient.allSatisfy { $0 == label }, "\(transient)")
+            XCTAssertFalse(scheduled.isEmpty)
+            XCTAssertTrue(scheduled.allSatisfy { $0 == label }, "\(scheduled)")
+            XCTAssertEqual(events.filter { $0.kind == .retryExhausted }.map(\.transientReason), [label])
+            assertPrivacySafe(events, harness)
+        }
+
+        func testRetryableSetupReasonIsRecordedOnExhaustion() async throws {
+            let harness = try await makeHarness(
+                eligibility: .eligible,
+                retryPolicy: Self.policy(maximumRetryCount: 0),
+                runtimeFails: true
+            )
+            try await waitForRootStatus(harness) { $0.unavailableReason == .retryExhausted }
+
+            let events = await harness.store.codemapGraphIndexBuildStoreEventsForTesting(rootID: harness.rootID)
+            XCTAssertTrue(events.contains { $0.kind == .eligibilityEligible })
+            XCTAssertFalse(events.contains { $0.kind == .eligibilityTransient }, "the failure is in setup, not eligibility")
+            XCTAssertEqual(events.filter { $0.kind == .retryExhausted }.map(\.transientReason), ["setup.runtimeFailure"])
+            assertPrivacySafe(events, harness)
+        }
+
         func testNonGitEligibilityWithoutLocalProofIsUnavailable() async throws {
             let harness = try await makeHarness(
                 eligibility: .terminalUnavailable(.nonGit),
@@ -193,6 +229,19 @@ import XCTest
                 XCTAssertTrue(text.contains(fragment), "\(fragment) missing from: \(text)", file: file, line: line)
             }
             XCTAssertFalse(text.contains("Retry shortly"), text, file: file, line: line)
+        }
+
+        /// Transient-reason labels carry case names only: no path components.
+        private func assertPrivacySafe(
+            _ events: [WorkspaceFileContextStore.CodemapGraphIndexBuildStoreEvent],
+            _ harness: Harness,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            for reason in events.compactMap(\.transientReason) {
+                XCTAssertFalse(reason.contains("/"), reason, file: file, line: line)
+                XCTAssertFalse(reason.contains(harness.rootURL.lastPathComponent), reason, file: file, line: line)
+            }
         }
 
         /// Unloads and reloads the harness root (a new root epoch) in the same store.
@@ -253,7 +302,8 @@ import XCTest
         /// answers `eligibility`, with an isolated code-map runtime (no process-wide artifact state).
         private func makeHarness(
             eligibility: WorkspaceCodemapGitEligibilityPreflightResult,
-            retryPolicy: WorkspaceFileContextStore.CodemapGraphIndexBuildRetryPolicy
+            retryPolicy: WorkspaceFileContextStore.CodemapGraphIndexBuildRetryPolicy,
+            runtimeFails: Bool = false
         ) async throws -> Harness {
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("codemap-retry-exhaustion-\(UUID().uuidString)", isDirectory: true)
@@ -263,7 +313,10 @@ import XCTest
             let runtime = try CodemapStoreFixture(name: "retry-exhaustion")
             let answer = EligibilityAnswer(eligibility)
             let store = WorkspaceFileContextStore(
-                codemapRuntimeProvider: { try runtime.runtime() },
+                codemapRuntimeProvider: {
+                    if runtimeFails { throw CocoaError(.featureUnsupported) }
+                    return try runtime.runtime()
+                },
                 codemapLocalGitClassificationProbe: .init { _ in .requiresGitPreflight },
                 codemapGitEligibilityProbe: .init { _ in answer.value },
                 codemapGraphIndexBuildRetryPolicy: retryPolicy

@@ -742,6 +742,42 @@ CodemapGraphStatusDebugDiagnostics|MCPBackendParityHarness` passed 41/41 after t
 because the retry-exhaustion path is unfixed, that is an observation, not a claim the gate is
 stable. All-products build and lint pending on this checkpoint.
 
+### M8X — transient-reason diagnostics for code-map graph-build retries (instrumentation; cause unresolved)
+
+Instrumentation for the retry-exhaustion half of the intermittent M8T gate failure, before any policy
+change. Verified retry sources: only two launch sites consume the store's 3-retry budget
+(`CodemapGraphIndexBuildRetryPolicy.production`: 250 / 500 / 1000 ms) — a transient eligibility result
+(`WorkspaceCodemapGitTransientUnavailableReason`) and a retryable setup disposition
+(`codemapSetupDispositionIsRetryable`). Engine scheduling never retries, and a launch that finishes
+`.cancelled` (for example when a detached session advances root authority mid-flight) exits without
+consuming a retry; a setup `.staleCurrentness` consumes one only when the launch is still current.
+
+- DEBUG store events (`CodemapGraphIndexBuildStoreEvent`, bounded at 2048) gain an optional
+  `transientReason`: `eligibility.<reason>` on `eligibilityTransient`, and the triggering reason on
+  `retryScheduled` and `retryExhausted` (so an exhaustion names the cause of its final attempt), or
+  `setup.<case>` for a retryable setup disposition (`codemapSetupTransientReasonLabel`). Labels are
+  case names only — no paths or payload values. Release builds are unchanged (the recorder is
+  DEBUG-only).
+- The parity harness's `APP_CODEMAP` diagnostics print each event's reason.
+- Tests (`WorkspaceCodemapRetryExhaustionStructureTests`): a `repositoryChanging` eligibility transient
+  with one retry labels every transient, scheduled-retry, and exhaustion event
+  `eligibility.repositoryChanging`; an eligible root whose runtime provider throws exhausts with
+  `setup.runtimeFailure` and no eligibility transient; labels never contain a path component.
+
+Unresolved (not claimed): no `graph_retry_exhausted` occurred in the M8X focused run, so the cause of
+the earlier exhaustion (`190e7d65`) is still unproven and the retry policy is unchanged. The M8T
+parity gate is NOT passing on this checkpoint: in `22c7e783` every other scenario held exact parity,
+but "code structure of two seed files" reached quiescence and its app outcome still changed across
+the measured iterations — further evidence of non-monotonic app readiness after activation, not a
+retry event. Per-iteration app outcomes are not yet reported, so what changed is unknown. The next
+gate step is to report per-iteration outcomes and keep capturing `APP_CODEMAP` reasons until an
+exhaustion or readiness regression is caught with its cause.
+
+Evidence (scoped): in focused run `22c7e783` on frozen source,
+`WorkspaceCodemapRetryExhaustionStructureTests` 9/9, `WorkspaceCodemapGraphIndexAdmissionTests`, and
+`CodemapGraphStatusDebugDiagnosticsTests` passed; the parity gate failed only on the iteration-stability
+check above (30 tests, 1 failure). All-products build and lint pending on this checkpoint.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
