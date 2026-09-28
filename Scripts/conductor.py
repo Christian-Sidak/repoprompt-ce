@@ -236,7 +236,7 @@ Operation commands:
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
   ./conductor build
   ./conductor package debug|release
-  ./conductor test [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor test [--module <TestTarget>] [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor provider-test [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
@@ -933,7 +933,9 @@ class BuildCacheManager:
 
     @staticmethod
     def eligible(operation: str, args: Dict[str, Any]) -> bool:
-        del args
+        # Module-scoped tests build in their own Swift Build scratch path, not the seeded `.build`.
+        if operation == "test" and args.get("module"):
+            return False
         return operation in BUILD_CACHE_ELIGIBLE_OPERATIONS
 
     @staticmethod
@@ -3257,6 +3259,8 @@ class OperationRegistry:
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
             argv = [sys.executable, script("ci_app_test_runner.py"), "--local"]
+            if args.get("module"):
+                argv.extend(["--module", str(args["module"])])
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("filter"):
@@ -8237,6 +8241,11 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser = argparse.ArgumentParser(prog=f"conductor {operation}")
         parser.add_argument("--filter")
         parser.add_argument("--test-product")
+        if operation == "test":
+            parser.add_argument(
+                "--module",
+                help="build and run only this test target's closure with the Swift Build engine",
+            )
         parser.add_argument("--xctest-stall-seconds", type=float)
         parser.add_argument("--xctest-stall-wake-probe", action="store_true")
         ns = parser.parse_args(rest)
@@ -8250,6 +8259,12 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             args["filter"] = ns.filter
         if ns.test_product:
             args["testProduct"] = ns.test_product
+        if getattr(ns, "module", None):
+            if ns.test_product:
+                raise ConductorError("--module cannot be combined with --test-product")
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*Tests", ns.module):
+                raise ConductorError("--module must name a test target, for example RepoPromptMCPCoreTests")
+            args["module"] = ns.module
         if ns.xctest_stall_seconds is not None:
             args["xctestStallSeconds"] = ns.xctest_stall_seconds
         if ns.xctest_stall_wake_probe:

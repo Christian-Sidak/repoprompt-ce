@@ -208,6 +208,51 @@ class DirectXCTestExecutionTests(unittest.TestCase):
         self.assertEqual(executor.call_args_list[1].args[0], ("swift", "test", "--skip-build", "--filter", "S"))
 
 
+class ModuleExecutionTests(unittest.TestCase):
+    def test_module_run_builds_only_its_product_and_runs_bundle(self) -> None:
+        calls = []
+
+        def execute(command, cwd, environment):
+            calls.append((tuple(command), environment.get("HOME")))
+            return 0
+
+        with mock.patch.dict(runner.os.environ, {"PATH": "/usr/bin", "HOME": "/real"}, clear=True):
+            result = runner.run_module_tests(
+                swift_binary="swift", cwd=None, module="RepoPromptMCPCoreTests", test_filter="CLIMode",
+                executor=execute,
+                bundle_locator=lambda swift, cwd, module: Path("/b/RepoPromptMCPCoreTests.xctest"),
+                lister=lambda bundle, env: ["RepoPromptMCPCoreTests.CLIModeParsingTests/testA"],
+                xctest_binary=lambda: ("/x/xctest",),
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(calls[0], (("swift", "build", "--build-system", "swiftbuild", "--scratch-path",
+                                     ".build/swiftbuild", "--product", "RepoPromptMCPCoreTests"), "/real"))
+        self.assertEqual(calls[1][0], ("/x/xctest", "-XCTest", "RepoPromptMCPCoreTests.CLIModeParsingTests",
+                                       "/b/RepoPromptMCPCoreTests.xctest"))
+        self.assertIn("rpce-module-tests-", calls[1][1])
+
+    def test_module_run_rejects_non_test_targets_and_missing_bundles(self) -> None:
+        executor = mock.Mock(return_value=0)
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(runner.run_module_tests(swift_binary="swift", cwd=None, module="RepoPromptApp",
+                                                     executor=executor), 2)
+            executor.assert_not_called()
+            self.assertEqual(runner.run_module_tests(swift_binary="swift", cwd=None, module="XTests",
+                                                     executor=executor,
+                                                     bundle_locator=lambda *a: None), 2)
+
+    def test_conductor_forwards_module_and_skips_build_cache(self) -> None:
+        import conductor
+
+        argv, lanes, _, _, _ = conductor.OperationRegistry(SCRIPT_DIR.parent).prepare({
+            "operation": "test", "args": {"module": "RepoPromptMCPCoreTests", "filter": "X"},
+        })
+        self.assertEqual(argv[2:], ["--local", "--module", "RepoPromptMCPCoreTests", "--filter", "X"])
+        self.assertEqual(lanes, ["build"])
+        self.assertFalse(conductor.BuildCacheManager.eligible("test", {"module": "RepoPromptMCPCoreTests"}))
+        self.assertTrue(conductor.BuildCacheManager.eligible("test", {}))
+
+
 class TestDiscoveryTests(unittest.TestCase):
     def test_parse_suite_methods_deduplicates_and_sorts(self) -> None:
         output = "\n".join(

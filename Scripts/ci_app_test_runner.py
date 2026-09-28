@@ -455,6 +455,83 @@ def run_local_tests(
         return executor(command, cwd, environment)
 
 
+MODULE_TEST_TARGET_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*Tests$")
+MODULE_SCRATCH_PATH = Path(".build/swiftbuild")
+
+
+def module_build_command(swift_binary: str, module: str) -> tuple[str, ...]:
+    return (
+        swift_binary, "build", "--build-system", "swiftbuild",
+        "--scratch-path", str(MODULE_SCRATCH_PATH), "--product", module,
+    )
+
+
+def module_bundle_path(swift_binary: str, cwd: Path | None, module: str) -> Path | None:
+    try:
+        result = subprocess.run(
+            [swift_binary, "build", "--build-system", "swiftbuild",
+             "--scratch-path", str(MODULE_SCRATCH_PATH), "--show-bin-path"],
+            check=True, capture_output=True, cwd=cwd, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    bundle = Path(result.stdout.strip()) / f"{module}.xctest"
+    if not bundle.is_absolute() and cwd is not None:
+        bundle = cwd / bundle
+    return bundle if bundle.is_dir() else None
+
+
+def run_module_tests(
+    *,
+    swift_binary: str,
+    cwd: Path | None,
+    module: str,
+    test_filter: str | None = None,
+    executor: CommandExecutor = execute_command,
+    bundle_locator: Callable[[str, Path | None, str], Path | None] = module_bundle_path,
+    lister: BundleTestLister | None = None,
+    xctest_binary: Optional[Callable[[], tuple[str, ...]]] = None,
+) -> int:
+    """Build only one test target's dependency closure and run its bundle directly.
+
+    Native SwiftPM links every test target into one aggregate bundle, so a focused run always
+    builds and links the whole package. The Swift Build engine emits one bundle per test target,
+    which keeps a module's test loop independent of unrelated targets (plan P0.3/P1.3).
+    """
+    if not MODULE_TEST_TARGET_PATTERN.match(module):
+        print(f"::error::--module must name a test target (got {module!r})")
+        return 2
+    environment = dict(os.environ)
+    status = executor(module_build_command(swift_binary, module), cwd, environment)
+    if status != 0:
+        return status
+    bundle = bundle_locator(swift_binary, cwd, module)
+    if bundle is None:
+        print(f"::error::built bundle for {module} was not found under {MODULE_SCRATCH_PATH}")
+        return 2
+    with tempfile.TemporaryDirectory(prefix="rpce-module-tests-") as directory:
+        environment = isolated_suite_environment(Path(directory), module, environment)
+        if lister is None:
+            helper = xctest_helper_path(swift_binary)
+            if helper is None:
+                print("::error::swiftpm-xctest-helper is unavailable; cannot list module tests")
+                return 2
+            lister = helper_bundle_lister(helper)
+        specifiers = lister(bundle, environment)
+        if specifiers is None:
+            print(f"::error::could not list tests in {bundle}")
+            return 2
+        selectors = select_xctest_specifiers(specifiers, test_filter)
+        if selectors is None:
+            print(f"::error::--filter is not a valid regular expression: {test_filter!r}")
+            return 2
+        if not selectors:
+            print("No matching test cases were run")
+            return 0
+        binary = (xctest_binary or xctest_binary_path)()
+        return executor((*binary, "-XCTest", ",".join(selectors), str(bundle)), cwd, environment)
+
+
 def run_selected_suites(
     suites: Sequence[str],
     *,
@@ -512,6 +589,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--local", action="store_true", help="Build, then run sandboxed local tests with SwiftPM selection")
     parser.add_argument("--filter", dest="test_filter")
     parser.add_argument("--test-product")
+    parser.add_argument("--module", help="Build and run only this test target (Swift Build engine)")
     parser.add_argument("--swift-binary", default="swift")
     parser.add_argument("--cwd", type=Path, default=None)
     parser.add_argument("--shard-count", type=int, default=1)
@@ -519,13 +597,20 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.local and (args.shard_count != 1 or args.shard_index != 1):
         parser.error("--local cannot be combined with sharding")
-    if not args.local and (args.test_filter or args.test_product):
-        parser.error("--filter and --test-product require --local")
+    if not args.local and (args.test_filter or args.test_product or args.module):
+        parser.error("--filter, --test-product, and --module require --local")
+    if args.module and args.test_product:
+        parser.error("--module cannot be combined with --test-product")
     return args
 
 
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
+    if args.local and args.module:
+        return run_module_tests(
+            swift_binary=args.swift_binary, cwd=args.cwd,
+            module=args.module, test_filter=args.test_filter,
+        )
     if args.local:
         return run_local_tests(
             swift_binary=args.swift_binary, cwd=args.cwd,
