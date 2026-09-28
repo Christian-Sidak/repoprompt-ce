@@ -451,10 +451,76 @@ SwiftLint clean (`bbced235`). A first focused run (`f66780f0`) failed one assert
 budget fixture (`struct S {}`) legitimately maps to `no_symbols`; fixtures now carry symbols and the
 assertions require a fully mapped file (language and non-empty signatures, no diagnostic).
 
+### M8S — in-process app-versus-headless parity and latency harness (read boundary)
+
+A deterministic, in-process gate for the cutover evidence named below, scoped to the MCP read
+boundary (`read_file`, `get_code_structure`).
+
+- App backend: the real window tools of a registered `WindowState` whose ephemeral workspace is
+  activated through `switchWorkspace` (`InProcessMCPWindowServerFixture.makeRegisteredWindow`), so
+  file-tool reads run the app's real workspace-authority and domain read routing path
+  (`WindowStatesManager` window lookup, root catalog readiness). The fixture's standalone `make`,
+  extracted from `MCPReadMutationPathContractTests` (which now uses it), is unchanged. Headless
+  backend: `MCPDomainCanonicalWorkspaceService` with the production
+  `DirectHeadlessDomainContext.resolvePath`. Both share one fixture root and one set of global
+  ignore defaults (pinned through `IgnoreRulesManager`'s authority override); headless uses the
+  app's default `skip_symlinks`.
+- Normalization: a thrown error and an error DTO are both `refused` (the tool layer; the MCP
+  `isError` result vs JSON-RPC error envelope is decided at the transport and is not compared);
+  `read_file` content is compared after removing one trailing newline; `get_code_structure` is
+  compared as the set of file names that received a code map; an app code-structure reply with
+  `pending` / `unavailable` status is `unsettled` (a bounded, untimed settle wait precedes sampling).
+- Expectation table (`MCPBackendParityHarnessTests.scenarios`): every scenario declares an authority
+  class for both backends (`must_succeed` / `must_refuse`) and a relation (`equal`, or a documented
+  `known_divergence` that must still diverge, so the table cannot silently go stale). Outcomes must be
+  stable across iterations. Vacuous refusals are rejected: a `must_refuse` scenario names the
+  headless refusal reason it expects; an app refusal carrying an internal error (`-32603`) or a
+  workspace-not-ready code (`workspace_authority_*`, `workspace_freshness_timeout`,
+  `worktree_scope_unavailable`) is a violation, never an authority refusal. An unsettled app index is
+  reported, not failed, but cannot mask a headless disclosure. The evaluator is covered by
+  backend-free unit tests.
+- Scenarios: relative and absolute in-root reads, a line slice, an ignored file (readable), a
+  final-component symlink, a symlinked directory component, an escape through a symlinked
+  directory, an absolute outside path, a `..` escape, a missing file, a directory, and code structure
+  for an in-root file, a file link, and an escaping link.
+- Latency: one warm-up, then interleaved app/headless iterations per scenario (5), timed with
+  `ContinuousClock`; the report carries samples, p50, and max per backend plus the app's
+  `EditFlowPerf` DEBUG stage breakdown (omitted when another capture holds the recorder). The gate
+  asserts only sample count and sanity (finite, non-negative, p50 <= max) — never a threshold or a
+  backend ratio. The JSON report is attached to the test run and summarized in `MCPParity` log lines.
+- Production fix found by the harness: `DirectHeadlessDomainContext.resolvePath` compared the
+  `resolvingSymlinksInPath()` result (which strips a leading `/private`) against `root.path`, so a
+  workspace root spelled `/private/var/...` rejected every in-root path as outside the workspace. It
+  now also accepts the root's resolved spelling.
+
+Findings (focused run `43111c88`): all four `must_succeed` reads return identical content from both
+backends; every `must_refuse` read is refused by both — the app with `-32602` invalid-params
+refusals, headless with the expected typed reason. Tool-layer read p50 was about 3.9–5.6 ms (app)
+versus about 0.4 ms (headless) on one machine; this is recorded, not a claim about end-to-end or
+cross-machine latency. Code-structure parity is not yet compared: the in-process app reports
+`unavailable` for `get_code_structure` even after the settle wait (its code-map graph service does
+not become available in this fixture), so those scenarios are `unsettled` on the app side and only
+the headless authority is asserted.
+
+Not proven by M8S: transport, the JSON-RPC envelope, lanes, leases, and the watchdog (both backends
+are driven at the tool layer); the app socket / connection-manager path; app-side code-structure
+parity (above); `file_search` (not wired in the fixture); multi-root namespaces; cold-start or
+large-tree performance; and absolute latency comparability across machines or runs. The live chaos
+matrix and packaged-release evidence remain separate cutover-gate items.
+
+Evidence: `MCPBackendParityHarnessTests` 11/11 and the focused suites
+(`MCPReadMutationPathContractTests`, `HeadlessReadAuthority*`, `HeadlessCodeStructureResilienceTests`,
+`DirectHeadless*`) passed 121/121 (conductor `43111c88`). Earlier focused runs (`e449bb10`, `aa789798`,
+`3f77020f`, `460d7739`) failed while the gate surfaced, in turn, the headless `/private` resolver bug,
+an unretained app runtime, an unactivated workspace, and an unregistered app window; each would
+otherwise have let `must_refuse` scenarios pass vacuously, which the reason and infrastructure
+checks now reject. All-products build and lint: pending (coordinator).
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
-- Cross-backend app-versus-headless parity and latency harness.
+- Cross-backend app-versus-headless parity and latency harness beyond the read boundary (M8S covers
+  `read_file` and `get_code_structure` at the tool layer).
 - Live chaos matrix (app killed mid-request, restart during `initialize`), which
   requires explicit approval to stop or relaunch the visible app.
 
