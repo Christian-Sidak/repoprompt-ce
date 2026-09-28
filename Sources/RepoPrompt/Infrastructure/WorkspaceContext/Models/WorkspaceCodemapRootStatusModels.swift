@@ -16,6 +16,10 @@ enum WorkspaceCodemapRootStatusUnavailableReason: String, Hashable {
     case graphUnavailable
     case retryExhausted
     case workerRecoveryExhausted
+    /// The root is a bare Git repository: there is no work tree to index.
+    case bareRepository
+    /// The root's Git layout is invalid (for example a `.git` file or work tree Git cannot resolve).
+    case invalidGitLayout
 }
 
 struct WorkspaceCodemapGraphCommitCadence: Hashable {

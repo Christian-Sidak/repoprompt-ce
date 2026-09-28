@@ -289,6 +289,12 @@ import XCTest
                 var diagnostics: String?
                 if settle?.quiescent == false {
                     diagnostics = await appCodemapDiagnostics()
+                } else if settle != nil, scenario.effectiveAppAuthority == .mustSucceed,
+                          await !(observeApp(scenario).outcome.isSuccess)
+                {
+                    // A settled but failed must-succeed answer (for example a terminal
+                    // `graph_retry_exhausted`) records which launch path failed.
+                    diagnostics = await appCodemapDiagnostics()
                 }
                 _ = await observeApp(scenario)
                 _ = await observeHeadless(scenario)
@@ -393,7 +399,7 @@ import XCTest
             let store = appWindow.window.workspaceFileContextStore
             var parts: [String] = []
             let events = await store.codemapGraphIndexBuildStoreEventsForTesting()
-            parts.append("store_events=" + events.suffix(24).map { "\($0.kind):\($0.launchPhase)" }.joined(separator: ">"))
+            parts.append("store_events=" + events.suffix(40).map { "\($0.kind):\($0.launchPhase)" }.joined(separator: ">"))
             do {
                 let accounting = try await codemapRuntime.runtime().bindingEngine().accounting()
                 parts.append("engine_roots=" + accounting.graphIndexRoots.map { root in

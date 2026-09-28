@@ -10753,17 +10753,30 @@ actor WorkspaceFileContextStore {
     /// reload, or `prioritizeCodemapGraphIndexNow`), or nil while it is still being built or retried.
     /// The single source for both root status and the structure query's no-graph answer, so the two
     /// cannot disagree about whether a client should retry.
+    ///
+    /// A bare repository or an invalid Git layout finishes its launch as `superseded`, but its
+    /// `gitTerminal` setup disposition is sticky for the root epoch (`ensureCodemapSetupTask` replays
+    /// it, and `codemapUnavailableIsStable` treats it as stable), so it cannot recover until the root
+    /// is reloaded. It is reported from that disposition, distinct from an ordinary non-Git root.
     private func codemapRootUnavailableReason(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> WorkspaceCodemapRootStatusUnavailableReason? {
         if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
             return .workerRecoveryExhausted
         }
-        return switch codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase {
-        case .terminalNonGit: .notGitRepository
-        case .retryExhausted: .retryExhausted
-        default: nil
+        switch codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase {
+        case .terminalNonGit: return .notGitRepository
+        case .retryExhausted: return .retryExhausted
+        default: break
         }
+        if case let .unavailable(.gitTerminal(reason))? = codemapSessionsByRootEpoch[rootEpoch]?.setupDisposition {
+            switch reason {
+            case .bareRepository: return .bareRepository
+            case .invalidLayout: return .invalidGitLayout
+            default: break
+            }
+        }
+        return nil
     }
 
     private func makeCodemapRootStatusSnapshot(
@@ -14342,6 +14355,20 @@ actor WorkspaceFileContextStore {
                 "graph_worker_recovery_exhausted",
                 "Code structure is unavailable because this root's code-map graph worker could not be "
                     + "recovered; it is not retried again until the root is reloaded."
+            )
+        case .bareRepository:
+            return (
+                true,
+                "git_bare_repository",
+                "Code structure is unavailable because this root is a bare Git repository with no work "
+                    + "tree to index; open a checkout of the repository instead."
+            )
+        case .invalidGitLayout:
+            return (
+                true,
+                "git_layout_invalid",
+                "Code structure is unavailable because Git cannot resolve this root's repository layout; "
+                    + "repair it, then reload the root."
             )
         case .setupFailed, .graphUnavailable, nil:
             return (false, "graph_indexing", "The root-local committed graph is still being initialized.")

@@ -4,11 +4,13 @@ import MCP
 import XCTest
 
 #if DEBUG
-    /// M8U: a root whose code-map graph can no longer be built without a reload must not be reported
-    /// to MCP clients as a retryable pending index. The structure query's no-graph answer shares root
-    /// status's unavailable reason: exhausted build retries, exhausted worker recovery, and terminal
-    /// non-Git are unavailable and not retryable; a graph still being retried stays pending and
-    /// retryable.
+    /// M8U/M8V: a root whose code-map graph can no longer be built without a reload must not be
+    /// reported to MCP clients as a retryable pending index. The structure query's no-graph answer
+    /// shares root status's unavailable reason: exhausted build retries, exhausted worker recovery,
+    /// terminal non-Git, a bare repository, and an invalid Git layout are unavailable and not
+    /// retryable (the Git-layout answers stay distinct from non-Git); a graph still being retried stays
+    /// pending and retryable. A Git-layout terminal answer is sticky for the root epoch and cleared
+    /// only by reloading the root.
     @MainActor
     final class WorkspaceCodemapRetryExhaustionStructureTests: XCTestCase {
         func testExhaustedGraphBuildRetriesAreUnavailableAndNotRetryable() async throws {
@@ -86,6 +88,55 @@ import XCTest
             XCTAssertEqual(pending.issues.first?.code, "graph_indexing")
         }
 
+        func testBareRepositoryIsTerminalAndDistinctFromNonGit() async throws {
+            try await assertGitLayoutTerminal(
+                eligibility: .terminalUnavailable(.bareRepository),
+                reason: .bareRepository,
+                code: "git_bare_repository",
+                textFragments: ["bare Git repository", "Open a checkout"]
+            )
+        }
+
+        func testInvalidGitLayoutIsTerminalAndDistinctFromNonGit() async throws {
+            try await assertGitLayoutTerminal(
+                eligibility: .terminalUnavailable(.invalidLayout),
+                reason: .invalidGitLayout,
+                code: "git_layout_invalid",
+                textFragments: ["Git cannot resolve", "Repair the root", "then reload the workspace root"]
+            )
+        }
+
+        func testGitLayoutTerminalAnswerIsStickyForTheEpochAndClearedByReload() async throws {
+            let harness = try await makeHarness(
+                eligibility: .terminalUnavailable(.bareRepository),
+                retryPolicy: Self.policy(maximumRetryCount: 3, sleepsForever: true)
+            )
+            let rootEpoch = try await waitForRootStatus(harness) { $0.unavailableReason == .bareRepository }.rootEpoch
+
+            // Even with eligibility now reporting only a transient condition, re-prioritizing in the
+            // same root epoch starts a fresh launch that replays the sticky Git-terminal setup
+            // disposition (it finishes `superseded` without recovering), so the answer must stay
+            // terminal rather than flip to a retryable pending index.
+            harness.answer.value = .transientUnavailable(.permissionFailure)
+            _ = await harness.store.prioritizeCodemapGraphIndexNow(rootID: harness.rootID)
+            try await waitForSupersededLaunchAfterPrioritize(harness)
+            let phaseAfterPrioritize = await harness.store.codemapGraphIndexBuildLaunchPhaseForTesting(rootEpoch: rootEpoch)
+            XCTAssertEqual(phaseAfterPrioritize, .superseded)
+            let sameEpoch = try await query(harness)
+            XCTAssertEqual(sameEpoch.roots.first?.status, .unavailable)
+            XCTAssertEqual(sameEpoch.roots.first?.issues.first?.code, "git_bare_repository")
+            try await waitForRootStatus(harness) { $0.unavailableReason == .bareRepository }
+
+            // Reloading the root starts a new epoch that re-runs eligibility from scratch.
+            let reloaded = try await reload(harness)
+            try await waitForRootStatus(reloaded) { $0.availability == .indexing && $0.unavailableReason == nil }
+            let fresh = try await query(reloaded)
+            let root = try XCTUnwrap(fresh.roots.first)
+            XCTAssertEqual(root.status, .pending)
+            XCTAssertEqual(root.issues.first?.code, "graph_indexing")
+            XCTAssertEqual(root.issues.first?.retryable, true)
+        }
+
         func testNonGitEligibilityWithoutLocalProofIsUnavailable() async throws {
             let harness = try await makeHarness(
                 eligibility: .terminalUnavailable(.nonGit),
@@ -108,6 +159,69 @@ import XCTest
             let store: WorkspaceFileContextStore
             let rootID: UUID
             let seedFileID: UUID
+            let rootURL: URL
+            let answer: EligibilityAnswer
+        }
+
+        private func assertGitLayoutTerminal(
+            eligibility: WorkspaceCodemapGitEligibilityPreflightResult,
+            reason: WorkspaceCodemapRootStatusUnavailableReason,
+            code: String,
+            textFragments: [String],
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws {
+            let harness = try await makeHarness(eligibility: eligibility, retryPolicy: Self.policy(maximumRetryCount: 3))
+            try await waitForRootStatus(harness) { $0.availability == .unavailable && $0.unavailableReason == reason }
+
+            let aggregate = try await query(harness)
+            let root = try XCTUnwrap(aggregate.roots.first, file: file, line: line)
+            XCTAssertEqual(root.status, .unavailable, file: file, line: line)
+            XCTAssertFalse(root.updatesPending, file: file, line: line)
+            XCTAssertEqual(root.seeds.map(\.state), [.notIndexed], file: file, line: line)
+            let issue = try XCTUnwrap(root.issues.first, file: file, line: line)
+            XCTAssertEqual(issue.code, code, file: file, line: line)
+            XCTAssertNotEqual(issue.code, "git_root_unavailable", "must not look like an ordinary non-Git root", file: file, line: line)
+            XCTAssertFalse(issue.retryable, file: file, line: line)
+            XCTAssertNil(issue.retryAfterMilliseconds, file: file, line: line)
+
+            let reply = Self.reply(aggregate)
+            XCTAssertEqual(reply.status, .unavailable, file: file, line: line)
+            XCTAssertNil(reply.retry, file: file, line: line)
+            let text = try String(describing: ToolOutputFormatter.formatCodeStructure(value: Value(reply)))
+            for fragment in textFragments {
+                XCTAssertTrue(text.contains(fragment), "\(fragment) missing from: \(text)", file: file, line: line)
+            }
+            XCTAssertFalse(text.contains("Retry shortly"), text, file: file, line: line)
+        }
+
+        /// Unloads and reloads the harness root (a new root epoch) in the same store.
+        private func reload(_ harness: Harness) async throws -> Harness {
+            await harness.store.unloadRoot(id: harness.rootID)
+            let store = harness.store
+            let loaded = try await store.loadRoot(path: harness.rootURL.path)
+            addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+            let files = await store.files(inRoot: loaded.id)
+            let seed = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/A.swift" })
+            return Harness(store: store, rootID: loaded.id, seedFileID: seed.id, rootURL: harness.rootURL, answer: harness.answer)
+        }
+
+        /// Waits until a launch started after the latest `prioritizeNow` event has finished `superseded`.
+        private func waitForSupersededLaunchAfterPrioritize(_ harness: Harness, timeout: Duration = .seconds(10)) async throws {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var last: [WorkspaceFileContextStore.CodemapGraphIndexBuildStoreEvent] = []
+            while clock.now < deadline {
+                last = await harness.store.codemapGraphIndexBuildStoreEventsForTesting(rootID: harness.rootID)
+                if let prioritized = last.lastIndex(where: { $0.kind == .prioritizeNow }),
+                   last[(prioritized + 1)...].contains(where: { $0.launchPhase == .superseded })
+                {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTFail("no superseded launch after prioritizeNow; events: \(last.map { "\($0.kind):\($0.launchPhase)" })")
+            throw CancellationError()
         }
 
         private static let budget = WorkspaceCodemapGraphQueryBudget(
@@ -147,10 +261,11 @@ import XCTest
             try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data("struct A { func run() {} }\n".utf8).write(to: file)
             let runtime = try CodemapStoreFixture(name: "retry-exhaustion")
+            let answer = EligibilityAnswer(eligibility)
             let store = WorkspaceFileContextStore(
                 codemapRuntimeProvider: { try runtime.runtime() },
                 codemapLocalGitClassificationProbe: .init { _ in .requiresGitPreflight },
-                codemapGitEligibilityProbe: .init { _ in eligibility },
+                codemapGitEligibilityProbe: .init { _ in answer.value },
                 codemapGraphIndexBuildRetryPolicy: retryPolicy
             )
             let loaded = try await store.loadRoot(path: rootURL.path)
@@ -161,7 +276,7 @@ import XCTest
             }
             let files = await store.files(inRoot: loaded.id)
             let seed = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/A.swift" })
-            return Harness(store: store, rootID: loaded.id, seedFileID: seed.id)
+            return Harness(store: store, rootID: loaded.id, seedFileID: seed.id, rootURL: rootURL, answer: answer)
         }
 
         @discardableResult
@@ -203,6 +318,21 @@ import XCTest
                 size: .medium,
                 worktreeScope: nil
             )
+        }
+    }
+
+    /// The injected eligibility probe's answer, changeable mid-test (lock-protected).
+    private final class EligibilityAnswer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var current: WorkspaceCodemapGitEligibilityPreflightResult
+
+        init(_ initial: WorkspaceCodemapGitEligibilityPreflightResult) {
+            current = initial
+        }
+
+        var value: WorkspaceCodemapGitEligibilityPreflightResult {
+            get { lock.withLock { current } }
+            set { lock.withLock { current = newValue } }
         }
     }
 #endif

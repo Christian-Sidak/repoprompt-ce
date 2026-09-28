@@ -622,7 +622,8 @@ cleared; non-Git eligibility without a local proof is `git_root_unavailable` and
 
 Not changed (recorded): other terminal eligibility reasons (bare repository, invalid layout) finish
 the launch as `superseded`, which root status itself reports as `notInitialized`; making those
-terminal needs a decision about their recovery semantics and is left for a follow-up.
+terminal needs a decision about their recovery semantics and is left for a follow-up. (Bare
+repository and invalid layout: decided and fixed in M8V below.)
 
 Evidence: focused `WorkspaceCodemapRetryExhaustionStructure|MCPBackendParityHarness|MCPCodeStructure|
 CodeStructureToolCard|ToolOutputFormatter` passed 55/55 (conductor `955b7dc5`), including
@@ -630,6 +631,75 @@ CodeStructureToolCard|ToolOutputFormatter` passed 55/55 (conductor `955b7dc5`), 
 (`586d633b`) failed to compile only in the new test (a nonisolated call to the main-actor
 `codeStructureReplyDTO`); the test class is now `@MainActor`. All-products build and lint pending on
 this checkpoint.
+
+### M8V — bare repositories and invalid Git layouts reported as terminal, distinct from non-Git
+
+The M8U recorded gap, verified in source and fixed. `WorkspaceCodemapGitCapabilityService
+.eligibilityPreflight` classifies a root whose Git kind is bare (`git rev-parse --is-bare-repository`,
+after `--show-toplevel` finds no work tree) as `terminalUnavailable(.bareRepository)`, and one Git
+reports as a work tree without a resolvable top level as `terminalUnavailable(.invalidLayout)`. For
+every terminal reason except `nonGit`, the store installs the session setup disposition
+`.unavailable(.gitTerminal(reason))` but finishes the launch as `superseded`. Root status mapped
+`superseded` to `notInitialized` (no unavailable reason), and the M8U structure fallback answered
+`pending` with a retryable `graph_indexing` — so an MCP client was told to retry a root that cannot
+index.
+
+Recovery contract, from source: the Git-terminal disposition is sticky for the root epoch —
+`ensureCodemapSetupTask` replays an existing session's disposition, and `codemapUnavailableIsStable`
+treats every Git-terminal reason except `releasedRootEpoch` as stable — so neither file deltas nor
+`prioritizeCodemapGraphIndexNow` can recover it, even if eligibility later changes. Reloading the root
+(a new root epoch) re-runs eligibility from scratch and is the only recovery.
+
+- `WorkspaceCodemapRootStatusUnavailableReason` gains `bareRepository` and `invalidGitLayout`,
+  derived in the single `codemapRootUnavailableReason` from the session's sticky Git-terminal
+  disposition (after worker-recovery exhaustion and the `terminalNonGit` / `retryExhausted` launch
+  phases). Root status therefore reports `unavailable` with the specific reason.
+- The structure query's no-graph answer is terminal and non-retryable with distinct codes:
+  `git_bare_repository` ("no work tree to index; open a checkout") and `git_layout_invalid` ("repair
+  it, then reload the root"). Neither is `git_root_unavailable`, so a bare repository never looks like
+  an ordinary non-Git directory. The formatter gives each its own cause and action.
+- Unchanged: Git classification itself, launch scheduling and phases, the proof-backed and
+  launch-phase non-Git answer, active transient retries (still pending and retryable), and the other
+  terminal reasons (`unsupportedObjectFormat`, `unsupportedGit`, `invalidLoadedRootContainment`,
+  `namespaceUnavailable`, `rootEpochBindingMismatch`, `releasedRootEpoch`), which keep their current
+  reporting pending a per-reason recovery decision.
+- Headless: unaffected (no code-map graph; never pending or retry guidance).
+
+Regression coverage (`WorkspaceCodemapRetryExhaustionStructureTests`, isolated runtime, injected
+probes): a bare-repository and an invalid-layout eligibility each produce root status
+`unavailable` with their reason, a terminal non-retryable query answer with their distinct code
+(asserted not to be `git_root_unavailable`), a DTO without retry guidance, and formatter text with
+their cause and action; with the bare disposition installed, switching eligibility to an active
+transient condition and re-prioritizing in the same epoch keeps the terminal answer, while reloading
+the root clears it to the ordinary pending, retryable `graph_indexing`.
+
+Evidence (scoped): focused `WorkspaceCodemapRetryExhaustionStructure|MCPCodeStructure|
+CodeStructureToolCard|ToolOutputFormatter|AgentWorkspaceRootsSidebar` passed 40/40 on unchanged source
+(conductor `7e51699f`), including `WorkspaceCodemapRetryExhaustionStructureTests` 7/7. A first run
+(`190e7d65`) failed in two new tests (a formatter fragment containing an apostrophe, which
+`String(describing:)` escapes; and a sticky-epoch test that wrongly expected the eligibility probe to
+re-run in the same epoch — the source replays the sticky disposition without re-probing, which the
+test now asserts). All-products build and lint pending on this checkpoint.
+
+M8T parity gate: NOT passing on this checkpoint — intermittently red, and not claimed. It is outside
+M8V's change (which only affects how an existing Git-terminal disposition is reported; launch
+scheduling, retries, and engine admission are untouched) and passed on the M8T and M8U runs, but
+failed on both M8V focused runs through two distinct app code-map engine paths, recorded with the
+harness's `APP_CODEMAP` diagnostics (now also captured when a settled must-succeed code-structure
+answer fails):
+
+- `190e7d65`: the Git fixture's graph build exhausted its three transient retries (about 1.75 s of
+  backoff) right after activation and answered `graph_retry_exhausted` (honestly, since M8U).
+- `0be123ad`: the store launch completed (`eligibilityEligible` → `setupJoining` → `engineScheduling`
+  → `handedOff`), an earlier launch for the same root was `cancelled` after hand-off and relaunched,
+  and the replacement engine graph-index job stayed in `waitingForAdmission` for the whole 45 s bound
+  (worker present, zero candidates processed); the app kept answering `pending` / `graph_indexing`.
+
+Both are production reliability defects in the app's code-map engine — a freshly opened repository
+can fail to index until reloaded — and are the scope of the next milestone (M8W), not fixed here. The
+admission stall's root cause is unconfirmed (hypothesis: an admission slot not released by, or a
+missed admission reschedule after, the cancelled job); confirming it needs the engine's active-batch
+set, admission queue, and per-root active-batch counts at the stall.
 
 ### Later milestones (not started in this pass)
 
