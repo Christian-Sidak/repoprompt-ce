@@ -116,6 +116,12 @@ package enum MCPDomainCanonicalReadBounds {
     package static let maximumEnumeratedFiles = 200_000
     package static let maximumTreeLines = 20000
     package static let maximumCodeStructureFiles = 256
+    /// Per-file code-map read cap: the syntax engine refuses larger UTF-8 sources as oversize, so
+    /// nothing beyond it (plus a byte-order mark) is ever read.
+    package static let maximumCodeStructureFileBytes = CodeMapSyntaxEngine.parseUTF8Limit + 3
+    /// Aggregate source bytes one `get_code_structure` call may read; files past it are reported
+    /// `budget_exhausted` without being read.
+    package static let maximumCodeStructureSourceBytes = 64_000_000
 }
 
 package enum MCPDomainCanonicalReadError: Error, Equatable, LocalizedError {
@@ -133,6 +139,24 @@ package enum MCPDomainCanonicalReadError: Error, Equatable, LocalizedError {
     case outsideRoot
     /// A path component became a symlink or stopped being a directory after authorization.
     case pathChangedDuringRead
+    /// The caller's aggregate source-byte budget could not admit the file; nothing was read.
+    case readBudgetExhausted
+
+    /// Stable machine-readable code for per-item diagnostics.
+    package var code: String {
+        switch self {
+        case .fileTooLarge: "file_too_large"
+        case .undecodableText: "undecodable_text"
+        case .notARegularFile: "not_a_regular_file"
+        case .ignoreRulesUnavailable: "ignore_rules_unavailable"
+        case .symbolicLinkPath: "symbolic_link_path"
+        case .symlinkComponent: "symlink_component"
+        case .outsideCanonicalRoot: "outside_canonical_root"
+        case .outsideRoot: "outside_root"
+        case .pathChangedDuringRead: "path_changed_during_read"
+        case .readBudgetExhausted: "read_budget_exhausted"
+        }
+    }
 
     package var errorDescription: String? {
         switch self {
@@ -154,6 +178,8 @@ package enum MCPDomainCanonicalReadError: Error, Equatable, LocalizedError {
             "Path is outside the workspace root."
         case .pathChangedDuringRead:
             "Path changed during the read (a component became a symbolic link); the read was refused."
+        case .readBudgetExhausted:
+            "The request's source-byte budget is exhausted; the file was not read."
         }
     }
 }
@@ -233,14 +259,18 @@ package struct MCPDomainCanonicalWorkspaceService {
             ])
         }
         let limit = MCPDomainCanonicalReadBounds.maximumCodeStructureFiles
+        // The adapter's resolution keeps its own path errors; each file's bytes are then read only
+        // through the explicit-read authority (see `codeStructureResults`).
         let resolved = try requested.prefix(limit).map { raw in
-            try adapter.resolvePath(raw, snapshot.roots, false)
+            try (raw: raw, url: adapter.resolvePath(raw, snapshot.roots, false))
         }
         let ignoreContext = try await makeIgnoreContext(roots: snapshot.roots)
+        let skipSymlinks = await adapter.ignoreConfiguration?()?.skipSymlinks ?? true
+        let roots = snapshot.roots
         let (files, truncated) = try await Self.runCancellableBlocking { cancellation in
-            var candidates: [URL] = []
+            var candidates: [CodeStructureCandidate] = []
             var truncated = false
-            for url in resolved {
+            for (raw, url) in resolved {
                 var isDirectory: ObjCBool = false
                 if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
                     let scan = try Self.forEachFile(
@@ -249,23 +279,26 @@ package struct MCPDomainCanonicalWorkspaceService {
                         cancellation: cancellation
                     ) { file, _ in
                         guard CodeMapSyntaxEngine.supportsCodeMap(fileExtension: file.pathExtension) else { return true }
-                        candidates.append(file)
+                        candidates.append(CodeStructureCandidate(authorizationPath: file.path, displayPath: file.path))
                         return candidates.count < limit
                     }
                     truncated = truncated || scan.stoppedEarly
                 } else if CodeMapSyntaxEngine.supportsCodeMap(fileExtension: url.pathExtension) {
-                    candidates.append(url)
+                    candidates.append(CodeStructureCandidate(authorizationPath: raw, displayPath: url.path))
                 }
                 if candidates.count >= limit {
-                    truncated = truncated || url != resolved.last
+                    truncated = truncated || raw != resolved.last?.raw
                     break
                 }
             }
-            let files = try candidates.prefix(limit).map { file -> Value in
-                try cancellation.check()
-                return try Self.codeMapResult(file)
-            }
-            return (files, truncated || requested.count > limit)
+            let results = try Self.codeStructureResults(
+                for: Array(candidates.prefix(limit)),
+                roots: roots,
+                skipSymlinks: skipSymlinks,
+                sourceByteBudget: MCPDomainCanonicalReadBounds.maximumCodeStructureSourceBytes,
+                checkCancellation: { try cancellation.check() }
+            )
+            return (results.files, truncated || results.budgetExhausted || requested.count > limit)
         }
         var result: [String: Value] = [
             "files": .array(files),
@@ -610,8 +643,89 @@ package struct MCPDomainCanonicalWorkspaceService {
         return capability
     }
 
-    private static func codeMapResult(_ url: URL) throws -> Value {
-        let data = try Data(contentsOf: url)
+    /// A code-structure input: the path the read authority checks (the caller's logical path for an
+    /// explicit file, the enumerated logical path for a directory member) and the path reported.
+    struct CodeStructureCandidate: Equatable {
+        let authorizationPath: String
+        let displayPath: String
+    }
+
+    /// Fault-isolated, bounded code maps. Each file is read only through `HeadlessReadAuthority`
+    /// (the `read_file` gates plus the no-follow canonical read), capped at
+    /// `maximumCodeStructureFileBytes`, and charged against `sourceByteBudget` before any byte is
+    /// read. A refusal, a missing or unreadable file, an oversize or undecodable source, or a
+    /// code-map failure becomes that file's diagnostic; only cancellation ends the call. Once the
+    /// budget refuses a file, every later file is reported `budget_exhausted` without being read.
+    static func codeStructureResults(
+        for candidates: [CodeStructureCandidate],
+        roots: [URL],
+        skipSymlinks: Bool,
+        sourceByteBudget: Int,
+        checkCancellation: () throws -> Void
+    ) throws -> (files: [Value], budgetExhausted: Bool) {
+        var remaining = sourceByteBudget
+        var budgetExhausted = false
+        var files: [Value] = []
+        files.reserveCapacity(candidates.count)
+        for candidate in candidates {
+            try checkCancellation()
+            let path = Value.string(candidate.displayPath)
+            func diagnostic(_ code: String, reason: String? = nil) -> Value {
+                var object: [String: Value] = ["path": path, "diagnostic": .string(code)]
+                if let reason { object["reason"] = .string(reason) }
+                return .object(object)
+            }
+            guard !budgetExhausted else {
+                files.append(diagnostic("budget_exhausted"))
+                continue
+            }
+            let data: Data
+            do {
+                let target = try HeadlessReadAuthority.authorize(
+                    rawPath: candidate.authorizationPath,
+                    roots: roots,
+                    skipSymlinks: skipSymlinks
+                )
+                data = try HeadlessReadAuthority.readContained(
+                    target,
+                    limit: MCPDomainCanonicalReadBounds.maximumCodeStructureFileBytes
+                ) { size in
+                    guard size <= remaining else { return false }
+                    remaining -= size
+                    return true
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch MCPDomainCanonicalReadError.fileTooLarge {
+                files.append(diagnostic("source_oversize"))
+                continue
+            } catch MCPDomainCanonicalReadError.readBudgetExhausted {
+                budgetExhausted = true
+                files.append(diagnostic("budget_exhausted"))
+                continue
+            } catch let error as MCPDomainCanonicalReadError {
+                files.append(diagnostic("read_refused", reason: error.code))
+                continue
+            } catch let error as POSIXError where error.code == .ENOENT {
+                files.append(diagnostic("missing"))
+                continue
+            } catch {
+                files.append(diagnostic("unreadable"))
+                continue
+            }
+            do {
+                try files.append(codeMapResult(data: data, displayPath: candidate.displayPath))
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                files.append(diagnostic("codemap_failed"))
+            }
+        }
+        return (files, budgetExhausted)
+    }
+
+    private static func codeMapResult(data: Data, displayPath: String) throws -> Value {
+        let url = URL(fileURLWithPath: displayPath)
         guard let content = String(data: data, encoding: .utf8) else {
             return .object(["path": .string(url.path), "diagnostic": .string("undecodable_source")])
         }

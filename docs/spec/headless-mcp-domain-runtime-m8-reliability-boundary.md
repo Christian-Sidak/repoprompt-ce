@@ -410,6 +410,47 @@ other app-side parity tests do, with no production API widened.
 Remaining residual (not claimed): a swap of the workspace root directory itself, and the app-only
 always-readable external read paths.
 
+### M8R — bounded, fault-isolated headless `get_code_structure`
+
+Before M8R, headless `get_code_structure` read each source with `Data(contentsOf:)` — the whole file,
+before the syntax engine's oversize check — with no aggregate bound (256 files per call), through the
+resolving adapter path and a following read (so an explicit final-component link was code-mapped
+although `read_file` refuses it, and a post-resolution symlink swap could escape the root), and one
+unreadable or vanished file, or a code-map builder error, failed the entire call.
+
+- Every source is read only through `HeadlessReadAuthority` (the M8Q `read_file` gates on the
+  caller's logical path for an explicit file, or on the enumerated logical path for a directory
+  member, plus the no-follow canonical read). `get_code_structure` never reads a byte that `read_file`
+  would refuse. Explicitly named ignored files are code-mapped, as they are readable.
+- Per-file cap: `maximumCodeStructureFileBytes` = `CodeMapSyntaxEngine.parseUTF8Limit` + 3 (a BOM).
+  The engine refuses larger UTF-8 sources as oversize anyway, so a larger file is reported
+  `source_oversize` from its `fstat` size without being read.
+- Per-call budget: `maximumCodeStructureSourceBytes` (64,000,000). Each file's size is charged before
+  any byte is read; once the budget refuses a file, it and every later file are reported
+  `budget_exhausted` unread and the result is marked `truncated`. (A file growing during its read can
+  overshoot the budget by at most the per-file cap.)
+- Fault isolation (`codeStructureResults`): a read refusal (`read_refused` with the stable
+  `MCPDomainCanonicalReadError.code` as `reason`), a vanished file (`missing`), any other I/O failure
+  (`unreadable`), and a code-map builder error (`codemap_failed`) become that file's diagnostic; the
+  existing `undecodable_source`, `unsupported_language`, `no_symbols`, `source_oversize`,
+  `parse_failed`, and `decode_failed` diagnostics are unchanged. Only cancellation ends the call.
+  Adapter path-resolution errors for an explicit path still fail the call, as the app's
+  `exactPathResolutionIssue` does.
+- `MCPDomainCanonicalReadError` gains stable `code` strings and `readBudgetExhausted`;
+  `HeadlessReadAuthority.readContained` gains a size-admission hook evaluated after `fstat`, before
+  any read.
+
+Evidence: `HeadlessCodeStructureResilienceTests` (an unreadable file and an oversize file in the same
+directory batch as a good file are reported per file while the good file is mapped; explicit
+final-component link and symlinked component refused with their reasons while an explicit ignored
+file is mapped, all with a non-resolving adapter; budget exhaustion reports the remainder unread;
+a vanished file is `missing`; cancellation still ends the call), plus the existing code-structure,
+symlink-policy, and bounds suites. Conductor evidence: focused suites passed 87/87 (`f5fd34f7`);
+all products built (`fd8988e4`); lint passed with 0/1602 files needing formatting and strict
+SwiftLint clean (`bbced235`). A first focused run (`f66780f0`) failed one assertion because the
+budget fixture (`struct S {}`) legitimately maps to `no_symbols`; fixtures now carry symbols and the
+assertions require a fully mapped file (language and non-empty signatures, no diagnostic).
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).

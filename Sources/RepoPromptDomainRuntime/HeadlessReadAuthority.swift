@@ -64,7 +64,13 @@ enum HeadlessReadAuthority {
 
     /// Reads `target` by walking its canonical components from the canonical root with
     /// `O_NOFOLLOW`, so no symlink is traversed at read time; a swapped component fails closed.
-    static func readContained(_ target: Target, limit: Int) throws -> Data {
+    /// `admitSize` sees the regular file's size before any byte is read (after the `limit` check);
+    /// returning false refuses the read with `readBudgetExhausted`.
+    static func readContained(
+        _ target: Target,
+        limit: Int,
+        admitSize: (Int) -> Bool = { _ in true }
+    ) throws -> Data {
         var descriptor = open(target.canonicalRoot, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
         guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         for (index, component) in target.canonicalComponents.enumerated() {
@@ -89,6 +95,7 @@ enum HeadlessReadAuthority {
         guard status.st_size <= off_t(limit) else {
             throw MCPDomainCanonicalReadError.fileTooLarge(byteCount: Int(status.st_size), limit: limit)
         }
+        guard admitSize(Int(status.st_size)) else { throw MCPDomainCanonicalReadError.readBudgetExhausted }
         var data = Data()
         var buffer = [UInt8](repeating: 0, count: 64 * 1024)
         while true {
