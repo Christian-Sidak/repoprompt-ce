@@ -39,13 +39,13 @@ Conductor timings (last 3,000 jobs, net of queue):
 | ID | Decision | Status |
 | --- | --- | --- |
 | ADR-01 | Root-package targets first; separate packages only past the §3.4 gate | Accepted (plan) |
-| ADR-07 | Focused-test executor | Open — P0.3 bake-off |
+| ADR-07 | Focused-test executor | Proposed: Swift Build per-target bundles (`conductor test --module`) for test targets that do not depend on `RepoPromptApp`; native aggregate stays the default and CI path. Passes the §3.4 gate on the leaf slice; the agent-adjacent slice is pending (see P0.3) |
 
 ## Phase 0 progress
 
 - [x] P0.1 retroactive timing baseline (structured conductor timing still open)
 - [x] P0.2 prototype graph tool (index-store replacement still open)
-- [ ] P0.3 focused-test executor bake-off
+- [ ] P0.3 focused-test executor bake-off — leaf slice (`RepoPromptMCPCoreTests`, candidates a vs b) done and passes the gate; still open: the workspace/agent-adjacent slice, candidates (c) xcodebuild and (d) local package, peak RSS, CI parity
 - [x] P0.4 fixed per-job overhead root cause and fix (see below)
 - [ ] P0.5 link and type-check levers
 - [ ] P0.6 compatibility inventory golden tests
@@ -76,3 +76,67 @@ Measured through conductor (focused filter `RepoPromptRegexCoreTests`, 7 tests):
 The interface-change row is the monolith cost that per-module test targets must remove: any interface change to `RepoPromptApp` recompiles the entire `@testable` test target.
 
 Follow-up: in the interface-change job about 78 s of execution happened outside SwiftPM (conductor build-cache handling). It is about 1.5 s on no-op jobs. Investigate under P0.1.
+
+## P0.3 focused-test executor — leaf slice (2026-09-28)
+
+Candidates:
+- **(a) native aggregate**: `conductor test --filter RepoPromptMCPCoreTests`. It builds the package test graph and runs the one `RepoPromptCEPackageTests.xctest`.
+- **(b) Swift Build per target**: `conductor test --module RepoPromptMCPCoreTests` (commit `02d97447`). It runs `swift build --build-system swiftbuild --scratch-path .build/swiftbuild --product RepoPromptMCPCoreTests`, lists the bundle with `swiftpm-xctest-helper`, and runs it directly with `xctest` in the sandbox.
+
+Method:
+- The probe edits were made in `Sources/RepoPromptMCPCore/MCPReplayState.swift`:
+  - **body:** `replayFrames()` rewritten to an equivalent `let` plus `return`;
+  - **interface:** an unused top-level `func` appended;
+  - **revert:** the file restored, which is a second interface change.
+- Each scenario ran once per path, from the same warm state. All probes are reverted.
+- Times come from conductor job JSON:
+  - `exec` is `executionSeconds`. It starts after global heavy admission, so queue and heavy-slot waits (up to 35 min here, because other checkouts held the slot) are excluded.
+  - `pre-test` is process start to the first `Test Suite … started` line.
+  - `build` is the build tool's own `Build complete!` time.
+
+| Scenario | Path | Ticket | exec | pre-test | build | What was rebuilt |
+| --- | --- | --- | --- | --- | --- | --- |
+| Cold (new scratch path) | b | `60a66da1` | 651.5 s | 569.4 s | 321.5 s | Dependency resolve/fetch (~227 s) plus the full closure: 57 targets, no `RepoPromptApp` |
+| No-op | b | `18a5de6d` | 81.8 s | 40.1 s | 19.1 s | Nothing compiled; Swift Build re-plans (1,888 planning steps) |
+| No-op (warm) | a | `107a8bca` | 76.2 s | 22.1 s | 3.3 s | Nothing |
+| Body edit | b | `f10b33bf` | **41.3 s** | **22.0 s** | 12.0 s | `RepoPromptMCPCore` plus the module bundle link |
+| Body edit | a | `2a706f79` | 114.5 s | 84.4 s | 66.9 s | 1 file, then relinks `repoprompt-mcp` and the aggregate bundle (app included) |
+| Interface edit | b | `edd41ba4` | **61.3 s** | **34.0 s** | 24.2 s | `RepoPromptMCPCore`, `RepoPromptMCPCoreTests` |
+| Interface edit | a | `5e3f5b83` | 210.5 s | 193.3 s | 116.1 s | MCPCore, the MCP executable, and **360 `RepoPromptTests` files** (two app tests `@testable import RepoPromptMCPCore`), then the aggregate link |
+| Revert (interface) | b | `9d0e7019` | **48.1 s** | **26.7 s** | 18.0 s | As for the interface edit |
+| Revert (interface) | a | `48397249` | 389.8 s | 356.9 s | 166.9 s | As for the interface edit |
+
+Medians over the three edit scenarios:
+
+| Metric | (a) aggregate | (b) module | Reduction |
+| --- | --- | --- | --- |
+| exec (edit → tests finished, excluding queue) | 210.5 s | 48.1 s | 77% |
+| pre-test (edit → first test starts) | 193.3 s | 26.7 s | 86% |
+| build tool only | 116.1 s | 18.0 s | 84% |
+
+Findings:
+
+- **App exclusion.** No (b) log contains `Compiling RepoPromptApp` or `Compiling RepoPromptTests`. The Swift Build target list never includes `RepoPromptApp`; the cold closure is 57 targets, mostly tree-sitter, NIO, and collections through DomainRuntime and CodeMapCore.
+- **Discovery parity.**
+  - `swiftpm-xctest-helper` lists 66 tests in 9 suites from `RepoPromptMCPCoreTests.xctest`.
+  - That equals the 66 `func test…` declarations in `Tests/RepoPromptMCPCoreTests` and the 66 that path (a) executes for the same filter.
+  - The target has no Swift Testing tests.
+  - Every run in both paths passed 66/66.
+- **No swiftbuild blockers** on this package with Swift 6.3.3 / Xcode 26.5 SDK. The only diagnostics were the existing `-Wshorten-64-to-32` warnings in the tree-sitter Python scanner.
+- **Where the win comes from.**
+  - Interface changes no longer recompile the app test target.
+  - Body edits no longer relink the aggregate bundle.
+  - Module runs also skip conductor's seeded `.build` cache handling. On path (a), 17–190 s per edit job ran outside SwiftPM (pre-test minus build), which is the same unexplained overhead as the P0.4 follow-up.
+- **Costs of (b):**
+  - A no-op costs about 18 s more before tests start, because Swift Build re-plans every invocation (19 s versus 3 s).
+  - The first run in a worktree resolves and fetches dependencies again (~227 s) and builds the closure from scratch.
+  - `.build/swiftbuild` is 5.4 GB for this one closure, against 4.2 GB for the whole native `.build/arm64-apple-macosx`. Disk and a cold start are the price of a second scratch path until §5.5 shares caches.
+- **Noise.** Test execution for the same 66 tests ranged from 17 s to 82 s. That target's `DirectHeadlessOracleGroupTests` is timing-sensitive, and other checkouts were building concurrently. `pre-test` is the cleaner comparison; each row is one sample.
+
+**ADR-07 recommendation (leaf slice):** adopt (b) as the focused-test executor for test targets whose closure excludes `RepoPromptApp`, behind `dev-test MODULE=` (P1.3).
+- It clears the §3.4/P0.3 gate: the median edit→owning-test time, excluding queue, is 77% lower (the gate is ≥ 30%), with no discovery loss.
+- Keep the native aggregate as the default `FILTER` path and in CI until:
+  1. the workspace/agent-adjacent slice repeats this result;
+  2. module runs support Swift Testing (the helper path lists XCTest only);
+  3. peak RSS and CI parity are measured.
+- Candidates (c) xcodebuild per-module schemes and (d) local package were not measured. (b) already removes the app from the loop without new packaging, so (d) needs a separate justification under §3.4.
