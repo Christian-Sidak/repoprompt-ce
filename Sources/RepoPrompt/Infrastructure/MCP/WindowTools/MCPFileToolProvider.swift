@@ -658,6 +658,10 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 toolName: MCPWindowToolName.readFile
             )
         }
+        // Encoding suspends this actor while the worker runs, so authority can change before
+        // the value is released; revalidate after the hop.
+        try Task.checkCancellation()
+        try await validate(authority)
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerResultReady)
         return value
     }

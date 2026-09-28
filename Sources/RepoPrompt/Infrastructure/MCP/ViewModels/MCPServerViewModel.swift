@@ -237,6 +237,10 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
+        /// Validates that this authority is still current. The root and lifetime checks suspend
+        /// MainActor, and a catalog advance landing in that window can leave the roots identical,
+        /// so the ticket and lifetime generation are rechecked synchronously after the last await:
+        /// a successful return means authority was current at the point it resumed its caller.
         @MainActor
         func validate(
             workspaceManager: WorkspaceManagerViewModel,
@@ -245,14 +249,7 @@ final class MCPServerViewModel: ObservableObject {
             guard rootCatalogSnapshot.workspaceID == rootCatalogSnapshot.ticket.workspaceID else {
                 throw FileToolAuthorityFailure.superseded
             }
-            do {
-                try workspaceManager.validateWorkspaceSearchReadiness(
-                    rootCatalogSnapshot.ticket,
-                    admission: .rootCatalog
-                )
-            } catch {
-                throw FileToolAuthorityFailure.superseded
-            }
+            try validateRootCatalogTicket(workspaceManager: workspaceManager)
             guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
                 throw FileToolAuthorityFailure.mismatchedProjection
             }
@@ -263,6 +260,24 @@ final class MCPServerViewModel: ObservableObject {
                 guard await sessionRootLifetimeSnapshot.isCurrent() else {
                     throw FileToolAuthorityFailure.worktreeScopeUnavailable
                 }
+            }
+            try validateRootCatalogTicket(workspaceManager: workspaceManager)
+            if lookupContext.bindingProjection != nil,
+               sessionRootLifetimeSnapshot?.isGenerationCurrent() != true
+            {
+                throw FileToolAuthorityFailure.worktreeScopeUnavailable
+            }
+        }
+
+        @MainActor
+        private func validateRootCatalogTicket(workspaceManager: WorkspaceManagerViewModel) throws {
+            do {
+                try workspaceManager.validateWorkspaceSearchReadiness(
+                    rootCatalogSnapshot.ticket,
+                    admission: .rootCatalog
+                )
+            } catch {
+                throw FileToolAuthorityFailure.superseded
             }
         }
 
