@@ -846,6 +846,54 @@ MCP smoke, the live chaos matrix, and packaged-release checks; backend defaults 
 In that run, per-scenario p50 latency for the 21 scenarios both backends answered was 5.7–14.5 ms
 for the app (auto-selection included) and 2.4–6.0 ms for headless; it is reported, not asserted, and not comparable across machines.
 
+### M13 — `file_search` parity closure
+
+M13 closes five hypotheses from the M12 review with added parity scenarios (the fixture gains
+`order/{a.txt,a-z.txt,a/b.txt}`, `docs/blank_line.txt`, `docs/crlf.txt`, `docs/empty.txt`, and
+`docs/call(unclosed.txt`) and owner tests. The source of each app behavior is cited below; the
+"headless before" column is read from the pre-M13 source.
+
+| Hypothesis | App (source) | Headless before | Resolution |
+| --- | --- | --- | --- |
+| Capped selection follows walk order | each stage sorts every admitted file by full path (path stage UTF-8 bytes, `FileSearchActor.pathSearchInputPrecedes`; content stage `String` order) before capping | depth-first walk over `names.sorted()`, early stop at the cap: `order/a/b.txt` is reached before `order/a-z.txt` (`-` < `.` < `/`) | fixed: one bounded walk collects admitted files; each stage sorts and caps like the app |
+| Explicit `regex: true` with `*.swift` | a wildcard-only pattern without strong regex syntax stays a glob; an uncompilable path regex falls back to glob/literal matching | validated `*.swift` as an ICU regex (a leading quantifier does not compile) and rejected the call; also rejected `(unclosed` in path-only mode | fixed: `FileSearchPatternHeuristics.pathStageUsesRegex` (moved from the app, which now delegates) and path-stage fallback |
+| `^$` after a trailing newline | lines end at LF, CR, or CRLF; a trailing terminator starts no line; an empty buffer has no lines (`forEachPCRE2CRLFLine`, `SearchLineIndex`) | `components(separatedBy: .newlines)`: a phantom empty last line in every newline-terminated file, CRLF counted as two lines, and U+0085/U+2028/U+2029 as terminators | fixed: `FileSearchLines` (headless owner of the app's line model) |
+| Invalid-regex gate was vacuous | repairs `(unclosed` and answers | rejected | the scenario now requires the app to find `docs/call(unclosed.txt`, not merely answer; headless still rejects when content is searched (documented divergence) |
+| `max_results` schema said "Maximum total results" | caps path and content stages separately; `count_only` counts content unbounded | same (since M12) | fixed: `FileSearchResultLimits` owns the default (50) and the per-stage description; canonicalization restates the vendored text, and the app provider, headless `searchFiles`, and the generated review snapshot use it |
+
+Path-stage details moved with the app's logic, also pinned by owner tests: the path stage ignores
+`whole_word`, retries a glob with its friendly candidates (`src/*.sw` → `src/*.sw*`, any-depth
+`**/`), and treats only `*` and `?` as wildcards (`[` is literal). Filters keep their M12 semantics.
+The headless walk no longer stops early at the cap, since correct selection needs every admitted
+file; it stays bounded by `maximumEnumeratedFiles`, and content reading still stops at the cap.
+Headless output lists path hits before content hits (the app's stage order).
+
+`WorkspaceCodemapRetryExhaustionStructureTests.testActiveTransientRetryStaysPendingAndRetryable`
+read the launch phase once after root availability became `indexing`. Availability `indexing`
+also covers the launch phases before the first transient answer schedules its retry
+(`eligibilityQueued`, `setupJoining`, `engineScheduling`, `handedOff`), so the one-shot read could
+race. The test now waits, bounded, for `transientRetry`; production code-map code is unchanged.
+
+Still not proven: multi-root ordering and alias candidates, worktree display projection,
+`context_lines`, unanchored regex matches that span lines or are empty (the app's full-buffer scan
+skips empty matches; headless matches line by line), per-line length limits, and regex dialect
+beyond the table (app PCRE2, headless ICU).
+
+Evidence (source-only milestone; nothing compiled or run): `conductor lint` ticket `d4f89eb2`
+passed (format-check 0/1613 files, strict SwiftLint) and `conductor guardrails` ticket `e72b2ea9`
+passed, both on this source. The focused coordinated test tickets `05f27d06` and `5d221b1f`
+(filter: the headless ignore and symlink suites, `MCPDomainCanonicalSearchSemanticsTests`,
+`MCPBackendParityHarnessTests`, `DirectHeadlessCompositionTests`,
+`WorkspaceCodemapRetryExhaustionStructureTests`, the app search suites,
+`MCPDomainCanonicalWorkspaceBoundsTests`, `MCPDomainStandaloneCompositionTests`, and
+`AgentSessionLinkToolCatalogPolicyTests`) both failed before any source compilation. Under Xcode 27.0
+(27A266a, Swift 6.4), SwiftPM reports `Missing path .../Sparkle.xcframework/macos-arm64_x86_64/dSYMs`
+declared by the vendored XCFramework's `DebugSymbolsPath`. That is an environment blocker outside M13.
+M13 claims no compile result, no test result, and no parity runtime result: the drift and fixes above are
+established from source, and the new parity scenarios, owner tests, codemap test synchronization, and
+hand-patched schema review snapshot are unverified until a build succeeds. Not run: the full suite,
+live MCP smoke, and packaged-release checks; backend defaults are unchanged.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).

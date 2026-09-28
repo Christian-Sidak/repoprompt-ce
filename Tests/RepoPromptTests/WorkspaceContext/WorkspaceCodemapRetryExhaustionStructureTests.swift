@@ -45,8 +45,9 @@ import XCTest
                 retryPolicy: Self.policy(maximumRetryCount: 3, sleepsForever: true)
             )
             let rootEpoch = try await waitForRootStatus(harness) { $0.availability == .indexing }.rootEpoch
-            let phase = await harness.store.codemapGraphIndexBuildLaunchPhaseForTesting(rootEpoch: rootEpoch)
-            XCTAssertEqual(phase, .transientRetry)
+            // `.indexing` also covers the launch phases before the first transient answer schedules its
+            // (never-firing) retry, so wait for the launch itself to reach `transientRetry`.
+            try await waitForLaunchPhase(.transientRetry, rootEpoch: rootEpoch, harness)
 
             let active = try await query(harness)
             let root = try XCTUnwrap(active.roots.first)
@@ -253,6 +254,25 @@ import XCTest
             let files = await store.files(inRoot: loaded.id)
             let seed = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Sources/A.swift" })
             return Harness(store: store, rootID: loaded.id, seedFileID: seed.id, rootURL: harness.rootURL, answer: harness.answer)
+        }
+
+        /// Waits until the root epoch's graph-index launch reaches `phase`.
+        private func waitForLaunchPhase(
+            _ phase: WorkspaceCodemapGraphIndexLaunchPhase,
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            _ harness: Harness,
+            timeout: Duration = .seconds(10)
+        ) async throws {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            var last: WorkspaceCodemapGraphIndexLaunchPhase?
+            while clock.now < deadline {
+                last = await harness.store.codemapGraphIndexBuildLaunchPhaseForTesting(rootEpoch: rootEpoch)
+                if last == phase { return }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTFail("launch did not reach \(phase); last: \(String(describing: last))")
+            throw CancellationError()
         }
 
         /// Waits until a launch started after the latest `prioritizeNow` event has finished `superseded`.

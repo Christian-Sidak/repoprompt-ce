@@ -386,73 +386,100 @@ package struct MCPDomainCanonicalWorkspaceService {
         guard !pattern.isEmpty else {
             throw MCPError.invalidParams("pattern cannot be empty")
         }
-        let maxResults = max(1, min(args["max_results"]?.intValue ?? 50, 1000))
+        let maxResults = max(1, min(args["max_results"]?.intValue ?? FileSearchResultLimits.defaultMaxResults, 1000))
         let countOnly = args["count_only"]?.boolValue == true
         // Regex auto-detection and `auto` mode share the app's heuristics.
         let regexEnabled = args["regex"]?.boolValue ?? FileSearchPatternHeuristics.containsRegexSyntax(pattern)
         let wholeWord = args["whole_word"]?.boolValue ?? false
-        let regexPattern = wholeWord ? "\\b(?:\(pattern))\\b" : pattern
-        // The app runs every MCP search case-insensitively, regex included.
-        let regexOptions: NSRegularExpression.Options = .caseInsensitive
-        // Validate once here; the blocking scan compiles its own instance.
-        if regexEnabled { _ = try NSRegularExpression(pattern: regexPattern, options: regexOptions) }
         let mode = (args["mode"]?.stringValue ?? "auto").lowercased()
         guard ["auto", "path", "content", "both"].contains(mode) else {
             throw MCPError.invalidParams("mode must be auto, path, content, or both")
         }
-        let filter = Self.searchFilter(args)
         let inferred = mode == "auto" ? FileSearchPatternHeuristics.inferredAutoMode(pattern) : nil
         let searchesPaths = mode == "path" || mode == "both" || inferred == .path || inferred == .both
         let searchesContent = mode == "content" || mode == "both" || inferred == .content || inferred == .both
+        let contentRegexPattern = wholeWord ? "\\b(?:\(pattern))\\b" : pattern
+        // The app runs every MCP search case-insensitively, regex included. Only the content stage
+        // rejects an uncompilable regex (a documented divergence: the app repairs it); the path stage
+        // falls back to glob/literal matching like the app. Validate once here; the blocking scan
+        // compiles its own instances.
+        if searchesContent, regexEnabled {
+            _ = try NSRegularExpression(pattern: contentRegexPattern, options: .caseInsensitive)
+        }
+        let filter = Self.searchFilter(args)
         let relativeRoots = Self.relativeRoots(snapshot.roots)
         let roots = snapshot.roots
         let ignoreContext = try await makeIgnoreContext(roots: roots)
         let (results, count, enumerationTruncated, skippedLargeFiles) = try await Self.runCancellableBlocking { cancellation in
-            let regex = regexEnabled ? try NSRegularExpression(pattern: regexPattern, options: regexOptions) : nil
-            var results: [Value] = []
-            // Like the app, path and content hits are capped separately at `max_results`, and
-            // `count_only` counts every content match (path hits stay capped).
-            var pathCount = 0
-            var contentCount = 0
-            var skippedLargeFiles = 0
-            func finished() -> Bool {
-                (!searchesPaths || pathCount >= maxResults)
-                    && (!searchesContent || (!countOnly && contentCount >= maxResults))
-            }
+            // Like the app, each stage scans every admitted file in full-path order (the path stage by
+            // UTF-8 bytes, the content stage by `String` order) and keeps the first `max_results` hits,
+            // so a cap never depends on directory walk order. `count_only` counts every content match
+            // (path hits stay capped).
+            var candidates: [SearchCandidate] = []
             let scan = try Self.forEachFile(under: roots, ignore: ignoreContext, cancellation: cancellation) { file, byteCount in
                 let relative = Self.relativePath(file, roots: relativeRoots)
-                guard Self.includes(relativePath: relative, file: file, filter: filter) else {
-                    return true
+                if Self.includes(relativePath: relative, file: file, filter: filter) {
+                    candidates.append(SearchCandidate(
+                        file: file,
+                        fullPath: file.standardizedFileURL.path,
+                        relativePath: relative,
+                        byteCount: byteCount
+                    ))
                 }
-                if searchesPaths, pathCount < maxResults,
-                   Self.matches(pattern, value: relative, regex: regex, wholeWord: wholeWord, globs: true)
-                {
+                return true
+            }
+            var results: [Value] = []
+            var pathCount = 0
+            if searchesPaths {
+                let matcher = PathStageMatcher(pattern: pattern, isRegex: regexEnabled)
+                for candidate in candidates.sorted(by: { $0.fullPath.utf8.lexicographicallyPrecedes($1.fullPath.utf8) }) {
+                    guard pathCount < maxResults else { break }
+                    try cancellation.check()
+                    guard matcher.matches(candidate.relativePath) else { continue }
                     pathCount += 1
-                    if !countOnly { results.append(.object(["path": .string(relative)])) }
+                    if !countOnly { results.append(.object(["path": .string(candidate.relativePath)])) }
                 }
-                guard searchesContent, countOnly || contentCount < maxResults else { return !finished() }
-                if let byteCount, byteCount > MCPDomainCanonicalReadBounds.maximumSearchFileBytes {
-                    skippedLargeFiles += 1
-                    return true
+            }
+            var contentCount = 0
+            var skippedLargeFiles = 0
+            if searchesContent {
+                // A literal whole-word pattern matches as an escaped `\b...\b` regex, compiled once.
+                let regex: NSRegularExpression?
+                if regexEnabled {
+                    regex = try NSRegularExpression(pattern: contentRegexPattern, options: .caseInsensitive)
+                } else if wholeWord {
+                    regex = try? NSRegularExpression(
+                        pattern: "\\b\(NSRegularExpression.escapedPattern(for: pattern))\\b",
+                        options: .caseInsensitive
+                    )
+                } else {
+                    regex = nil
                 }
-                guard let text = try? Self.readText(
-                    at: file,
-                    limit: MCPDomainCanonicalReadBounds.maximumSearchFileBytes
-                ) else { return true }
-                for (index, line) in text.components(separatedBy: .newlines).enumerated() {
-                    guard Self.matches(pattern, value: line, regex: regex, wholeWord: wholeWord, globs: false) else {
+                scanning: for candidate in candidates.sorted(by: { $0.fullPath < $1.fullPath }) {
+                    guard countOnly || contentCount < maxResults else { break }
+                    try cancellation.check()
+                    if let byteCount = candidate.byteCount, byteCount > MCPDomainCanonicalReadBounds.maximumSearchFileBytes {
+                        skippedLargeFiles += 1
                         continue
                     }
-                    contentCount += 1
-                    if countOnly { continue }
-                    results.append(.object([
-                        "path": .string(relative),
-                        "line": .int(index + 1),
-                        "text": .string(line)
-                    ]))
-                    if contentCount >= maxResults { break }
+                    guard let text = try? Self.readText(
+                        at: candidate.file,
+                        limit: MCPDomainCanonicalReadBounds.maximumSearchFileBytes
+                    ) else { continue }
+                    for (index, line) in FileSearchLines.lines(of: text).enumerated() {
+                        guard Self.contentLineMatches(pattern, line: line, regex: regex) else {
+                            continue
+                        }
+                        contentCount += 1
+                        if countOnly { continue }
+                        results.append(.object([
+                            "path": .string(candidate.relativePath),
+                            "line": .int(index + 1),
+                            "text": .string(String(line))
+                        ]))
+                        if contentCount >= maxResults { break scanning }
+                    }
                 }
-                return !finished()
             }
             return (results, pathCount + contentCount, scan.enumerationLimitReached, skippedLargeFiles)
         }
@@ -465,6 +492,54 @@ package struct MCPDomainCanonicalWorkspaceService {
         return try .object(
             ["matches": .array(results), "count": .int(count)].merging(bounds) { current, _ in current }
         )
+    }
+
+    /// A filtered file admitted to both search stages. `fullPath` is the standardized logical path the
+    /// stages sort by, like the app's `fullPath`.
+    private struct SearchCandidate {
+        let file: URL
+        let fullPath: String
+        let relativePath: String
+        let byteCount: Int?
+    }
+
+    /// The app's path stage (`FileSearchActor.searchPaths`): a `regex` request whose pattern is only glob
+    /// wildcards is a glob, an uncompilable path regex falls back to glob/literal matching, a glob is
+    /// retried with its friendly candidates, only `*` and `?` are wildcards, and `whole_word` does not
+    /// apply. Matching is case-insensitive against the root-relative path.
+    private struct PathStageMatcher {
+        private enum Strategy {
+            case regex(NSRegularExpression)
+            case glob([String])
+            case literal
+        }
+
+        private let pattern: String
+        private let strategy: Strategy
+
+        init(pattern: String, isRegex: Bool) {
+            self.pattern = pattern
+            if FileSearchPatternHeuristics.pathStageUsesRegex(pattern, isRegex: isRegex),
+               let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+            {
+                strategy = .regex(regex)
+            } else if FileSearchPatternHeuristics.hasPathWildcards(pattern) {
+                strategy = .glob(FileSearchPatternHeuristics.pathGlobCandidates(for: pattern))
+            } else {
+                strategy = .literal
+            }
+        }
+
+        func matches(_ relativePath: String) -> Bool {
+            switch strategy {
+            case let .regex(regex):
+                regex.firstMatch(in: relativePath, range: NSRange(relativePath.startIndex..., in: relativePath)) != nil
+            case let .glob(candidates):
+                candidates.contains { MCPDomainCanonicalWorkspaceService.globMatches($0, relativePath) }
+            case .literal:
+                relativePath.localizedCaseInsensitiveContains(pattern)
+            }
+        }
     }
 
     private struct SearchFilter {
@@ -997,25 +1072,12 @@ package struct MCPDomainCanonicalWorkspaceService {
         return path
     }
 
-    /// `globs`: whether a literal pattern's wildcards are glob syntax. True for paths only; like the app,
-    /// a literal content pattern matches `*`, `?`, and `[` as characters.
-    private static func matches(
-        _ pattern: String,
-        value: String,
-        regex: NSRegularExpression?,
-        wholeWord: Bool,
-        globs: Bool
-    ) -> Bool {
-        if let regex {
-            return regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
-        }
-        if globs, containsWildcard(pattern) {
-            return globMatches(pattern, value)
-        }
-        guard wholeWord else { return value.localizedCaseInsensitiveContains(pattern) }
-        let escaped = NSRegularExpression.escapedPattern(for: pattern)
-        return (try? NSRegularExpression(pattern: "\\b\(escaped)\\b", options: .caseInsensitive))?
-            .firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
+    /// Content-stage line match. Like the app, a literal content pattern matches `*`, `?`, and `[` as
+    /// characters; wildcards are path syntax only.
+    private static func contentLineMatches(_ pattern: String, line: Substring, regex: NSRegularExpression?) -> Bool {
+        guard let regex else { return line.localizedCaseInsensitiveContains(pattern) }
+        let value = String(line)
+        return regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)) != nil
     }
 }
 

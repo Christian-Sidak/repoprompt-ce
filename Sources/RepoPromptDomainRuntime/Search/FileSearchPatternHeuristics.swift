@@ -116,6 +116,62 @@ package enum FileSearchPatternHeuristics {
         return true
     }
 
+    // MARK: - Path stage
+
+    /// Whether a path pattern has glob wildcards. Only `*` and `?` count: path search matches `[`
+    /// literally.
+    package static func hasPathWildcards(_ pattern: String) -> Bool {
+        pattern.contains("*") || pattern.contains("?")
+    }
+
+    /// Whether the path stage matches the (trimmed) pattern as a regex. A `regex` request whose
+    /// pattern is only glob wildcards (e.g. "*.swift") prefers glob semantics.
+    package static func pathStageUsesRegex(_ trimmedPattern: String, isRegex: Bool) -> Bool {
+        let hasWildcards = hasPathWildcards(trimmedPattern)
+        let strongRegex = containsRegexSyntax(trimmedPattern)
+        if isRegex && hasWildcards && !strongRegex {
+            // Looks like a pure glob (e.g., "*.swift") → prefer glob
+            return false
+        }
+        return isRegex
+    }
+
+    /// Friendly glob candidates for a path pattern, tried in order: the pattern itself, then any
+    /// depth (`**/`) when it has no `/`, then a trailing `*` when it does not already end with a
+    /// wildcard.
+    package static func pathGlobCandidates(for pattern: String) -> [String] {
+        var cands: [String] = [pattern]
+        let hasSlash = pattern.contains("/")
+        let needsSuffixStar = !endsWithWildcard(pattern)
+
+        // Try matching at any depth if user didn't scope with '/'
+        if !hasSlash, !pattern.hasPrefix("**/") {
+            cands.append("**/" + pattern)
+        }
+        // If user forgot a trailing wildcard, try broadening
+        if needsSuffixStar {
+            cands.append(pattern + "*")
+            if !hasSlash, !pattern.hasPrefix("**/") {
+                cands.append("**/" + pattern + "*")
+            }
+        }
+        // Deduplicate while preserving order
+        var seen = Set<String>()
+        var out: [String] = []
+        for c in cands where seen.insert(c).inserted {
+            out.append(c)
+        }
+        return out
+    }
+
+    /// Helper: does a glob end with a wildcard token?
+    private static func endsWithWildcard(_ s: String) -> Bool {
+        guard let last = s.last else { return false }
+        return last == "*" || last == "?"
+    }
+
+    // MARK: - Regex detection
+
     /// Detects if a pattern contains regex syntax that should trigger regex mode
     package static func containsRegexSyntax(_ pattern: String) -> Bool {
         if usesPCREOnlyFeatures(pattern) {

@@ -745,14 +745,65 @@ import XCTest
                     authority: .mustRefuse,
                     headlessRefusal: "pattern cannot be empty"
                 ),
+                // M13: `-` < `.` < `/`, so full-path order puts order/a-z.txt and order/a.txt before
+                // order/a/b.txt; a depth-first walk would reach order/a/b.txt first.
+                search(
+                    "capped content keeps the first hits in full-path order",
+                    ["pattern": "orderMarker", "mode": "content", "max_results": 2],
+                    Expectation(include: ["order/a-z.txt", "order/a.txt"], exclude: ["order/a/b.txt"])
+                ),
+                search(
+                    "capped paths keep the first hits in full-path order",
+                    ["pattern": "order/a", "mode": "path", "max_results": 2],
+                    Expectation(include: ["order/a-z.txt", "order/a.txt"], exclude: ["order/a/b.txt"])
+                ),
+                // Only docs/blank_line.txt has an empty line; every other non-empty fixture file ends with a
+                // newline, which must not start a phantom empty last line, and the empty file has no lines.
+                search(
+                    "empty-line regex matches only real empty lines",
+                    ["pattern": "^$", "mode": "content", "regex": true],
+                    Expectation(
+                        include: ["docs/blank_line.txt"],
+                        exclude: ["src/a.swift", "docs/guide.md", "docs/crlf.txt", "docs/empty.txt"]
+                    )
+                ),
+                search(
+                    "CRLF line numbers",
+                    ["pattern": "crlfMarker", "mode": "content"],
+                    Expectation(include: ["docs/crlf.txt"])
+                ),
+                search(
+                    "explicit regex wildcard path pattern is a glob",
+                    ["pattern": "*.swift", "mode": "path", "regex": true],
+                    Expectation(
+                        include: ["src/a.swift", "src/search_target.swift"],
+                        exclude: ["linkfile.swift", "linkdir/a.swift", "outside/secret.swift"]
+                    )
+                ),
+                search(
+                    "uncompilable path regex falls back to literal matching",
+                    ["pattern": "(unclosed", "mode": "path", "regex": true],
+                    Expectation(include: ["docs/call(unclosed.txt"])
+                ),
+                search(
+                    "path stage ignores whole_word",
+                    ["pattern": "search", "mode": "path", "whole_word": true],
+                    Expectation(include: ["src/search_target.swift"], exclude: ["linkdir/search_target.swift"])
+                ),
+                search(
+                    "path glob retries with a trailing wildcard",
+                    ["pattern": "src/*.sw", "mode": "path"],
+                    Expectation(include: ["src/a.swift", "src/search_target.swift"], exclude: ["linkdir/a.swift"])
+                ),
+                // The app must really answer (its literal fallback finds the file), not merely not refuse.
                 search(
                     "invalid regex",
                     ["pattern": "(unclosed", "mode": "content", "regex": true],
-                    nil,
+                    Expectation(include: ["docs/call(unclosed.txt"]),
                     authority: .mustRefuse,
                     relation: .knownDivergence(
-                        "the app repairs an uncompilable regex (literal fallback) and answers; headless rejects "
-                            + "it with the compile error (stricter, never broader)"
+                        "the app repairs an uncompilable content regex (literal fallback) and answers; headless "
+                            + "rejects it with the compile error whenever content is searched (stricter, never broader)"
                     ),
                     headlessRefusal: "Code=2048",
                     appAuthority: .mustSucceed
@@ -785,6 +836,9 @@ import XCTest
         /// root/.gitignore            *.log
         /// root/src/a.swift, root/src/b.swift, root/src/debug.log (ignored, untracked)
         /// root/src/search_target.swift, root/src/limit.swift, root/docs/guide.md
+        /// root/order/a.txt, root/order/a-z.txt, root/order/a/b.txt (each `orderMarker`)
+        /// root/docs/blank_line.txt (one empty line), root/docs/crlf.txt (CRLF endings), root/docs/empty.txt,
+        /// root/docs/call(unclosed.txt (contains `call(unclosed`)
         /// root/node_modules/pkg/index.js (globally ignored)
         /// root/linkfile.swift -> src/a.swift      root/linkdir -> src
         /// root/outside -> <external>              <external>/secret.swift
@@ -810,6 +864,13 @@ import XCTest
             try git.write("let a = \"limitLine one\"\nlet b = \"limitLine two\"\nlet c = \"limitLine three\"\n", to: "src/limit.swift", at: root)
             try git.write("parityMarker in docs\nwritten long ago\nis it done? yes\n", to: "docs/guide.md", at: root)
             try git.write("// parityMarker in a dependency\n", to: "node_modules/pkg/index.js", at: root)
+            for path in ["order/a.txt", "order/a-z.txt", "order/a/b.txt"] {
+                try git.write("orderMarker\n", to: path, at: root)
+            }
+            try git.write("above\n\nbelow\n", to: "docs/blank_line.txt", at: root)
+            try git.write("first\r\nsecond crlfMarker\r\n", to: "docs/crlf.txt", at: root)
+            try git.write("", to: "docs/empty.txt", at: root)
+            try git.write("value = call(unclosed\n", to: "docs/call(unclosed.txt", at: root)
             for (link, destination) in [("linkfile.swift", "src/a.swift"), ("linkdir", "src"), ("outside", external.path)] {
                 try FileManager.default.createSymbolicLink(
                     atPath: root.appendingPathComponent(link).path,

@@ -728,7 +728,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             ?? Int(args["context_lines"]?.stringValue ?? "")
             ?? MCPWindowWorkspaceToolHelpers.parseContextAlias(args)
             ?? 0
-        let maxResults = args["max_results"]?.intValue ?? 50
+        let maxResults = args["max_results"]?.intValue ?? FileSearchResultLimits.defaultMaxResults
         let countOnly = args["count_only"]?.boolValue ?? false
         let filter = args["filter"]?.objectValue
         let includeExts = filter?["extensions"]?.arrayValue?.compactMap(\.stringValue) ?? []

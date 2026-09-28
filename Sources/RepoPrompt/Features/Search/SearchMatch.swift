@@ -600,36 +600,9 @@ actor FileSearchActor {
     /// ------------------------------------------------------------------
     ///  HELPER METHODS FOR USER-FRIENDLY GLOBS
     /// ------------------------------------------------------------------
-    /// Helper: does a glob end with a wildcard token?
-    private static func endsWithWildcard(_ s: String) -> Bool {
-        guard let last = s.last else { return false }
-        return last == "*" || last == "?"
-    }
-
-    /// Helper: generate friendly fallback candidates for path globs
+    /// Helper: generate friendly fallback candidates for path globs (shared with headless search).
     private static func pathGlobCandidates(for pattern: String) -> [String] {
-        var cands: [String] = [pattern]
-        let hasSlash = pattern.contains("/")
-        let needsSuffixStar = !endsWithWildcard(pattern)
-
-        // Try matching at any depth if user didn't scope with '/'
-        if !hasSlash, !pattern.hasPrefix("**/") {
-            cands.append("**/" + pattern)
-        }
-        // If user forgot a trailing wildcard, try broadening
-        if needsSuffixStar {
-            cands.append(pattern + "*")
-            if !hasSlash, !pattern.hasPrefix("**/") {
-                cands.append("**/" + pattern + "*")
-            }
-        }
-        // Deduplicate while preserving order
-        var seen = Set<String>()
-        var out: [String] = []
-        for c in cands where seen.insert(c).inserted {
-            out.append(c)
-        }
-        return out
+        FileSearchPatternHeuristics.pathGlobCandidates(for: pattern)
     }
 
     /// ------------------------------------------------------------------
@@ -2295,14 +2268,9 @@ actor FileSearchActor {
         let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !files.isEmpty, limit > 0 else { return [] }
 
-        // 1. Decide whether to prefer glob semantics even when isRegex==true
-        let hasWildcards = trimmed.contains("*") || trimmed.contains("?")
-        let strongRegex = Self.containsRegexSyntax(trimmed)
-        var useRegex = isRegex
-        if isRegex && hasWildcards && !strongRegex {
-            // Looks like a pure glob (e.g., "*.swift") → prefer glob
-            useRegex = false
-        }
+        // 1. Decide whether to prefer glob semantics even when isRegex==true: a pure glob such as
+        // "*.swift" stays a glob (shared with headless search).
+        var useRegex = FileSearchPatternHeuristics.pathStageUsesRegex(trimmed, isRegex: isRegex)
 
         let pathSuffixPattern = useRegex ? RepoPromptPCRE2Adapter.pathSuffixPattern(forRegex: trimmed) : nil
 
@@ -2560,9 +2528,7 @@ actor FileSearchActor {
             }
 
             // For non-regex patterns, check if it has wildcards
-            let hasWildcards = plan.trimmedPattern.contains("*") || plan.trimmedPattern.contains("?")
-
-            if hasWildcards {
+            if FileSearchPatternHeuristics.hasPathWildcards(plan.trimmedPattern) {
                 // Try the user's pattern first, then friendly fallbacks
                 for cand in Self.pathGlobCandidates(for: plan.trimmedPattern) {
                     // Enable WILDSTAR only if candidate contains "**" (needs globstar)

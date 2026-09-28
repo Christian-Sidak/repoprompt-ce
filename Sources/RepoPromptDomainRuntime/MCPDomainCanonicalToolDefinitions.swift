@@ -1224,6 +1224,44 @@ package enum MCPDomainCanonicalToolDefinitions {
         )
     }
 
+    /// The vendored `file_search` definition describes `max_results` as a total limit, but both backends
+    /// cap the path and content stages separately; canonicalization restates it from
+    /// `FileSearchResultLimits`, the single owner of that contract. Idempotent.
+    private static func canonicalizeFileSearchResultLimit(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        var inputSchema = definition.inputSchema
+        if case var .object(schema) = inputSchema,
+           case var .object(properties)? = schema["properties"],
+           case var .object(maxResults)? = properties["max_results"]
+        {
+            maxResults["description"] = .string(FileSearchResultLimits.maxResultsPropertyDescription)
+            properties["max_results"] = .object(maxResults)
+            schema["properties"] = .object(properties)
+            inputSchema = .object(schema)
+        }
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: definition.description.replacingOccurrences(
+                of: FileSearchResultLimits.vendoredMaxResultsOptionLine,
+                with: FileSearchResultLimits.maxResultsOptionLine
+            ),
+            inputSchema: inputSchema,
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    package static func test_canonicalizeFileSearchResultLimit(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        canonicalizeFileSearchResultLimit(definition)
+    }
+
+    package static func test_vendoredDefinition(named name: String) -> MCPDomainToolDefinition? {
+        decodeDefinitions(canonicalize: false).first { $0.name == name }
+    }
+
     private static func canonicalizeGlobalSemantics(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
@@ -1239,6 +1277,9 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
         if definition.name == MCPWindowToolName.agentSessionLink {
             return canonicalizeAgentSessionLink(definition)
+        }
+        if definition.name == MCPWindowToolName.search {
+            return canonicalizeFileSearchResultLimit(definition)
         }
         if definition.name == MCPWindowToolName.agentRun {
             let oldWaitDescription = "Returns `interaction_id` when input is pending."
