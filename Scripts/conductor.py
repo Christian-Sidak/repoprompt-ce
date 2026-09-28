@@ -302,6 +302,29 @@ XCTEST_PROGRESS_RE = re.compile(
     r"^Test Case '(.+)' (started|passed|failed|skipped)(?: \([^)]*\))?\.\s*$"
 )
 XCTEST_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9:;]*m")
+# Structured per-job phase timing (build-modularization P0.1). Marks are wall-clock epoch
+# seconds; output-derived marks are the time conductor received the line.
+JOB_TIMING_SCHEMA_VERSION = 1
+JOB_TIMING_RECORD_SUFFIX = ".timing.json"
+JOB_TIMING_MARKS = (
+    "queued",
+    "laneAdmitted",
+    "buildCachePrepareStarted",
+    "buildCachePrepareFinished",
+    "heavySlotWaitStarted",
+    "heavySlotAcquired",
+    "processStarted",
+    "cacheColdRetryStarted",
+    "buildCompleted",
+    "firstTestStarted",
+    "processFinished",
+    "cachePublicationStarted",
+    "cachePublicationFinished",
+    "finished",
+)
+TIMING_BUILD_COMPLETE_RE = re.compile(r"Build complete!\s*\((\d+(?:\.\d+)?)s\)")
+TIMING_FIRST_TEST_RE = re.compile(r"^(?:Test Suite '.+' started\b|.{0,4}Test run started\b)")
+TIMING_COLD_RETRY_TEXT = "seeded build failed; removing the proven seeded .build and retrying cold once"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2427,6 +2450,52 @@ def iso_timestamp(ts: Optional[float]) -> Optional[str]:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
 
 
+def job_timing_record_path(log_path: Path) -> Path:
+    return log_path.with_suffix(JOB_TIMING_RECORD_SUFFIX)
+
+
+def job_timing_record_log_name(name: str) -> Optional[str]:
+    """Return the job log name that owns a `<ticket>.timing.json` record, else None."""
+    if not name.endswith(JOB_TIMING_RECORD_SUFFIX):
+        return None
+    return name[: -len(JOB_TIMING_RECORD_SUFFIX)] + ".log"
+
+
+def phase_timing_segments(marks: Dict[str, float], build_reported_seconds: Optional[float]) -> Dict[str, float]:
+    """Derive per-phase durations (seconds) from phase marks; segments with a missing endpoint are omitted."""
+    segments: Dict[str, float] = {}
+
+    def span(name: str, start: Optional[float], end: Optional[float]) -> None:
+        if start is not None and end is not None:
+            segments[name] = round(max(0.0, end - start), 3)
+
+    get = marks.get
+    span("queueSeconds", get("queued"), get("laneAdmitted"))
+    span("buildCachePrepareSeconds", get("buildCachePrepareStarted"), get("buildCachePrepareFinished"))
+    span("heavySlotWaitSeconds", get("heavySlotWaitStarted"), get("heavySlotAcquired"))
+    launch_from = [
+        value
+        for value in (get("laneAdmitted"), get("buildCachePrepareFinished"), get("heavySlotAcquired"))
+        if value is not None
+    ]
+    span("launchSeconds", max(launch_from) if launch_from else None, get("processStarted"))
+    span("processToBuildCompleteSeconds", get("processStarted"), get("buildCompleted"))
+    if build_reported_seconds is not None:
+        segments["buildReportedSeconds"] = round(build_reported_seconds, 3)
+        if "processToBuildCompleteSeconds" in segments:
+            segments["preBuildSeconds"] = round(
+                max(0.0, segments["processToBuildCompleteSeconds"] - build_reported_seconds), 3
+            )
+    span("buildCompleteToFirstTestSeconds", get("buildCompleted"), get("firstTestStarted"))
+    span("processToFirstTestSeconds", get("processStarted"), get("firstTestStarted"))
+    span("testSeconds", get("firstTestStarted"), get("processFinished"))
+    span("processSeconds", get("processStarted"), get("processFinished"))
+    span("finalizeSeconds", get("processFinished"), get("cachePublicationStarted") or get("finished"))
+    span("cachePublicationSeconds", get("cachePublicationStarted"), get("cachePublicationFinished"))
+    span("totalSeconds", get("queued"), get("finished"))
+    return segments
+
+
 def terminal_exit_code(payload: Dict[str, Any]) -> int:
     state = payload.get("state")
     exit_code = payload.get("exitCode")
@@ -2998,6 +3067,81 @@ class Job:
     tail_bytes: int = 0
     build_cache: Dict[str, Any] = dataclasses.field(default_factory=dict)
     tail: Deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=LOG_TAIL_LINES))
+    phase_marks: Dict[str, float] = dataclasses.field(default_factory=dict)
+    build_reported_seconds: Optional[float] = None
+    build_complete_count: int = 0
+
+    def mark_phase(self, name: str, at: Optional[float] = None) -> None:
+        """Record the first time a timing mark is reached; later calls keep the original time."""
+        if name not in JOB_TIMING_MARKS:
+            raise ConductorError(f"invalid job timing mark '{name}'")
+        self.phase_marks.setdefault(name, now() if at is None else at)
+
+    def observe_output_timing(self, text: str, at: Optional[float] = None) -> None:
+        """Derive build/test marks from process output lines as conductor receives them.
+
+        `buildCompleted` tracks the last `Build complete!` before the first test starts, so a
+        cold cache retry or a second build step reports the build that the tests actually used.
+        """
+        if "firstTestStarted" in self.phase_marks:
+            return
+        if "Build complete!" not in text and "started" not in text and "retrying cold" not in text:
+            return
+        observed_at = now() if at is None else at
+        for raw_line in text.splitlines():
+            line = XCTEST_ANSI_SGR_RE.sub("", raw_line).strip()
+            build = TIMING_BUILD_COMPLETE_RE.search(line)
+            if build is not None:
+                self.phase_marks["buildCompleted"] = observed_at
+                self.build_reported_seconds = float(build.group(1))
+                self.build_complete_count += 1
+            elif TIMING_FIRST_TEST_RE.match(line):
+                self.mark_phase("firstTestStarted", observed_at)
+                return
+            elif TIMING_COLD_RETRY_TEXT in line:
+                self.mark_phase("cacheColdRetryStarted", observed_at)
+
+    def phase_timings(self) -> Dict[str, Any]:
+        marks: Dict[str, float] = {}
+        derived = {
+            "queued": self.created_at,
+            "laneAdmitted": self.started_at,
+            "processStarted": self.process_started_at,
+            "processFinished": self.process_finished_at,
+            "finished": self.finished_at,
+        }
+        for name in JOB_TIMING_MARKS:
+            value = derived.get(name) if name in derived else self.phase_marks.get(name)
+            if value is not None:
+                marks[name] = value
+        return {
+            "schemaVersion": JOB_TIMING_SCHEMA_VERSION,
+            "marks": marks,
+            "segments": phase_timing_segments(marks, self.build_reported_seconds),
+            "buildCompleteCount": self.build_complete_count,
+            "outputMarksAreReceiptTimes": True,
+        }
+
+    def timing_record(self) -> Dict[str, Any]:
+        """Compact persisted record (`<ticket>.timing.json`) for retroactive timing analysis."""
+        build_cache = {
+            key: self.build_cache[key]
+            for key in ("state", "seeded", "cloneSeconds")
+            if key in self.build_cache
+        }
+        publication = self.build_cache.get("publication")
+        if isinstance(publication, dict) and "state" in publication:
+            build_cache["publicationState"] = publication["state"]
+        return {
+            "schemaVersion": JOB_TIMING_SCHEMA_VERSION,
+            "ticket": self.ticket,
+            "operation": self.operation,
+            "operationLabel": operation_display_name(self.operation, self.args),
+            "state": self.state,
+            "exitCode": self.exit_code,
+            "buildCache": build_cache,
+            "phaseTimings": self.phase_timings(),
+        }
 
     def to_payload(self, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
         queue_wait_seconds = None
@@ -3077,6 +3221,7 @@ class Job:
             "lastProgressObservedAt": self.xctest_last_progress_observed_at,
             "diagnosticPaths": [str(path) for path in self.diagnostic_paths],
             "buildCache": dict(self.build_cache),
+            "phaseTimings": self.phase_timings(),
         }
         if self.diagnostics:
             payload["diagnostics"] = list(self.diagnostics)
@@ -4055,6 +4200,7 @@ class DaemonState:
             job = self.jobs.get(ticket)
             if job is None:
                 return None
+            job.mark_phase("heavySlotWaitStarted", wait_start)
             env = dict(job.env)
             lease = self._job_lease(job)
             metadata = display_lock_metadata(
@@ -4124,6 +4270,7 @@ class DaemonState:
                 self._terminalize_canceled_global_heavy_wait_locked(current)
             else:
                 current.global_heavy_slot_wait_seconds = waited
+                current.mark_phase("heavySlotAcquired", wait_start + waited)
                 current.global_heavy_slot_path = str(acquired.lock_path)
                 current.global_heavy_slot_holder = None
                 current.global_heavy_legacy_slot_holder = None
@@ -4255,6 +4402,8 @@ class DaemonState:
             if argv_is_operation_runner(argv):
                 env[CONDUCTOR_JOB_TICKET_ENV] = job.ticket
             if BuildCacheManager.eligible(job.operation, job.args) and (self.paths.repo_root / "Package.swift").is_file():
+                with self.condition:
+                    job.mark_phase("buildCachePrepareStarted")
                 with self._cache_write_lock:
                     cache_manager = self._build_cache_manager(env)
                 cache_context = cache_manager.prepare(job.operation, job.args, env)
@@ -4294,6 +4443,8 @@ class DaemonState:
                             job.build_cache["attemptTimeoutSeconds"] = attempt_timeout
                             job.build_cache["cleanupTimeoutSeconds"] = cleanup_timeout
                             job.build_cache["retryEnvelopeTimeoutSeconds"] = effective_timeout
+                with self.condition:
+                    job.mark_phase("buildCachePrepareFinished")
             if operation_requires_global_heavy_slot(job.operation, job.args):
                 global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
                 if global_heavy_slot is None:
@@ -4523,6 +4674,8 @@ class DaemonState:
                 with contextlib.suppress(FileNotFoundError):
                     cache_context.outcome_path.unlink()
             if job is not None and cache_publish_after_success and cache_context is not None and cache_manager is not None:
+                with self.condition:
+                    job.mark_phase("cachePublicationStarted")
                 try:
                     with self._cache_write_lock:
                         with self.condition:
@@ -4545,6 +4698,7 @@ class DaemonState:
                         self._warn_job_locked(job, "buildCachePublicationFailed", str(exc))
                 finally:
                     with self.condition:
+                        job.mark_phase("cachePublicationFinished")
                         job.state = "completed"
                         job.exit_code = 0
                         job.result_summary = (
@@ -4575,6 +4729,24 @@ class DaemonState:
                 self.condition.notify_all()
             if job is not None and refresh_after_release:
                 threading.Thread(target=self._refresh_output_summary, args=(job,), daemon=True).start()
+            if job is not None:
+                self._submit_job_timing_record(job)
+
+    def _submit_job_timing_record(self, job: Job) -> None:
+        with self.condition:
+            if job.state not in TERMINAL_STATES:
+                return
+            record = job.timing_record()
+            path = job_timing_record_path(job.log_path)
+        if not self._io_worker.submit(_atomic_write_json, path, record):
+            with self.condition:
+                self._daemon_infrastructure_warnings.append(
+                    {
+                        "kind": "timingRecordQueueFull",
+                        "message": f"timing record for {job.ticket} dropped because the state-I/O queue is full",
+                        "observedAt": now(),
+                    }
+                )
 
     def _submit_process_output_chunk(self, ticket: str, chunk: bytes) -> None:
         with self.condition:
@@ -4588,6 +4760,7 @@ class DaemonState:
             job = self.jobs.get(ticket)
             if job:
                 self._append_tail_locked(job, text)
+                job.observe_output_timing(text)
                 self._record_xctest_progress_locked(job, text)
                 self.condition.notify_all()
 
@@ -5512,6 +5685,11 @@ class DaemonState:
                 for path in self.paths.jobs_dir.glob("*.xctest-stall.*")
                 if path.name not in retained_diagnostics
             )
+            candidates.extend(
+                path
+                for path in self.paths.jobs_dir.glob(f"*{JOB_TIMING_RECORD_SUFFIX}")
+                if job_timing_record_log_name(path.name) not in retained_logs
+            )
         for path in candidates:
             try:
                 stale = path.stat().st_mtime < cutoff
@@ -5528,7 +5706,7 @@ class DaemonState:
                     for job in self.jobs.values()
                     for diagnostic_path in job.diagnostic_paths
                 )
-                if path.name in current_names:
+                if path.name in current_names or job_timing_record_log_name(path.name) in current_names:
                     continue
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()

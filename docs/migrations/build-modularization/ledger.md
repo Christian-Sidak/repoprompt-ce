@@ -8,9 +8,10 @@ Living record for [`../build-modularization-2026-09-28.md`](../build-modularizat
 | --- | --- | --- |
 | `Scripts/modularization_metrics.py report [--details]` | Architecture metrics: app size and share, god files, singletons, triage dependency graph (wrong-way edges, largest cycle), test coupling | P0.2 (regex prototype; index-store replacement pending) |
 | `Scripts/modularization_metrics.py check` / `update` | Ratchet gate (run by `make guardrails`) and baseline refresh | P0.7 |
-| `Scripts/conductor_job_timings.py` | Retroactive queue-wait and net job-duration percentiles from conductor logs | P0.1 (structured in-conductor timing pending) |
+| `./conductor job status --json` → `phaseTimings` | Structured per-job phase marks and segments; also persisted as `<ticket>.timing.json` next to the job log | P0.1 |
+| `Scripts/conductor_job_timings.py` | Queue-wait, net job-duration, and per-phase percentiles; prefers `<ticket>.timing.json`, falls back to log parsing | P0.1 |
 
-Self-tests: `make conductor-selftest` (includes `test_modularization_metrics.py` and `test_conductor_job_timings.py`).
+Self-tests: `make conductor-selftest` (includes `test_modularization_metrics.py`, `test_conductor_job_timings.py`, and `test_conductor_job_phases.py`).
 
 ## Ratchet policy
 
@@ -43,7 +44,7 @@ Conductor timings (last 3,000 jobs, net of queue):
 
 ## Phase 0 progress
 
-- [x] P0.1 retroactive timing baseline (structured conductor timing still open)
+- [x] P0.1 timing: retroactive baseline, structured conductor phase timing, and attribution of the two open overheads (see P0.1 below)
 - [x] P0.2 prototype graph tool (index-store replacement still open)
 - [x] P0.3 focused-test executor bake-off — gate holds on both slices (`RepoPromptMCPCoreTests` 77%, `RepoPromptDomainRuntimeTests` 95%); ADR-07 accepted. Not measured, not blockers: candidates (c) and (d), CI parity of module runs (CI stays on the aggregate)
 - [x] P0.4 fixed per-job overhead root cause and fix (see below)
@@ -75,7 +76,7 @@ Measured through conductor (focused filter `RepoPromptRegexCoreTests`, 7 tests):
 
 The interface-change row is the monolith cost that per-module test targets must remove: any interface change to `RepoPromptApp` recompiles the entire `@testable` test target.
 
-Follow-up: in the interface-change job about 78 s of execution happened outside SwiftPM (conductor build-cache handling). It is about 1.5 s on no-op jobs. Investigate under P0.1.
+Follow-up: in the interface-change job about 78 s of execution happened outside SwiftPM (conductor build-cache handling). It is about 1.5 s on no-op jobs. Investigate under P0.1. **Explained in P0.1:** it is SwiftPM emitting the build's diagnostics after its build timer stops, not conductor cache handling.
 
 ## P0.3 focused-test executor — leaf slice (2026-09-28)
 
@@ -219,7 +220,7 @@ Findings:
   - That equals the 258 `func test…()` declarations in `Tests/RepoPromptDomainRuntimeTests`.
   - Every run in both paths executed 258 with 0 failures.
 - **Noise.** The (b) interface (86 s) and revert (34 s) runs rebuilt the same files; each row is one sample.
-- **Unattributed gap on (a).** It spent 11–329 s between `Build complete!` and the first test. This is not conductor's cache publication, which runs after the tests. The gap is unattributed, like the leaf-slice and P0.4 follow-ups.
+- **Unattributed gap on (a).** It spent 11–329 s between `Build complete!` and the first test. This is not conductor's cache publication, which runs after the tests. The gap is unattributed, like the leaf-slice and P0.4 follow-ups. **Explained in P0.1:** only 12–16 s falls after `Build complete!` (runner listing steps); the rest is SwiftPM's post-timer diagnostic output, which this metric counted as part of the gap.
 - **Costs of (b).**
   - A no-op starts tests about 10 s later (Swift Build re-plans: 6.3 s versus 1.1 s).
   - `.build/swiftbuild` is 5.5 GB now that it covers both slices (5.4 GB after the leaf slice), next to 4.2 GB for `.build/arm64-apple-macosx`.
@@ -267,3 +268,87 @@ Gate: at least 30% lower median edit→owning-test time excluding queue, and no 
   - CI parity for module runs (CI stays on the aggregate);
   - the unattributed post-build gap on (a) (P0.1);
   - cross-worktree cache sharing (§5.5).
+
+## P0.1 — structured conductor timing (2026-09-28)
+
+**What conductor records** (`Scripts/conductor.py`; additive, with no change to lanes, admission, or job behavior):
+- The job payload (`job status --json`) gains `phaseTimings`. The same data is written after the job ends to `<ticket>.timing.json` next to the job log, with the operation, state, exit code, and build-cache state. It expires with its log.
+- **Marks** are wall-clock epoch seconds, recorded the first time each point is reached:
+  - `queued`, `laneAdmitted`
+  - `buildCachePrepareStarted` / `Finished` (seed clone, and for seeded jobs the cleanup-deadline scan)
+  - `heavySlotWaitStarted`, `heavySlotAcquired`
+  - `processStarted`
+  - `cacheColdRetryStarted`
+  - `buildCompleted` (the last `Build complete! (Xs)` before the first test; X is kept as `buildReportedSeconds`)
+  - `firstTestStarted` (the first XCTest `Test Suite '…' started` or Swift Testing `Test run started`)
+  - `processFinished`
+  - `cachePublicationStarted` / `Finished`
+  - `finished`
+- **Output marks are receipt times.** They are when conductor read the line from the pipe.
+- **Segments** are derived from the marks and are omitted when an endpoint is missing:
+  - `queueSeconds`, `buildCachePrepareSeconds`, `heavySlotWaitSeconds`, `launchSeconds`
+  - `processToBuildCompleteSeconds`, `buildReportedSeconds`
+  - `preBuildSeconds`: process time before `Build complete!` minus SwiftPM's reported build time
+  - `buildCompleteToFirstTestSeconds`, `processToFirstTestSeconds`, `testSeconds`
+  - `processSeconds` (equals `executionSeconds`)
+  - `finalizeSeconds`, `cachePublicationSeconds`, `totalSeconds`
+- **Consumers:**
+  - `Scripts/conductor_job_timings.py` prefers the record and falls back to log parsing. It adds per-category percentiles for the prepare, pre-build, build, post-build, test, and publication segments.
+  - Tests: `Scripts/test_conductor_job_phases.py` (new, in `make conductor-selftest`) and new cases in `test_conductor_job_timings.py`.
+- **Not in this item:**
+  - the §5.1 compiler-flag measurement lane, which goes with P0.5 type-check budgets;
+  - per-job peak RSS, which goes with P1.3 admission v2.
+
+**Method.**
+- **Jobs:** four `conductor test --filter RepoPromptRegexCoreTests` jobs on the aggregate path, run in sequence after a daemon restart, plus one synthetic output job. Each row is one sample.
+- **Probe file:** `Sources/RepoPrompt/Infrastructure/Utilities/SequenceExtension.swift`.
+  - **body:** `[T]()` became `: [T] = []`;
+  - **interface:** an unused top-level `func` appended.
+  - The probe is reverted. This worktree's `.build` still holds the interface build, so its next build recompiles.
+- **Sampler:** a read-only script (`.build/p01-timing/sampler.py`, not committed).
+  - It polled `ps` every 0.25 s for descendants of this worktree's `ci_app_test_runner.py`, plus the job-log size.
+  - It records which tool runs in each gap.
+
+| Job | Ticket | Heavy wait | Prepare | Process | Build (SwiftPM) | Pre-build | Build complete → first test | Tests | Publication | Total |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| No-op, first after daemon restart | `1cbc9abf` | 0.0 s | 1.4 s | 57.1 s | 37.8 s (re-plan only) | 3.4 s | 15.7 s | 0.2 s | **134.8 s** (published) | 193.5 s |
+| No-op | `7f6a9b46` | 179.3 s | 2.4 s | 18.8 s | 2.4 s | 2.3 s | 13.8 s | 0.3 s | 1.8 s (throttled) | 202.7 s |
+| Body edit (1 app file, relinks) | `9673ee20` | 2,219.9 s | 2.2 s | 293.9 s | 278.2 s | 2.0 s | 13.5 s | 0.2 s | 1.4 s (throttled) | 2,517.7 s |
+| Interface edit (1,059 app + 360 test files) | `c54f1c6c` | 1,793.7 s | 6.1 s | 1,017.2 s | 764.5 s | **240.9 s** | 11.7 s | 0.1 s | **243.9 s** (published) | 3,061.3 s |
+
+Findings:
+
+- **P0.4 follow-up (~78 s outside SwiftPM on large-change jobs): SwiftPM emits diagnostics after its build timer stops. It is not conductor cache handling.**
+  - Cache prepare (1.4–6.1 s) runs before the process starts, and publication runs after it exits, so neither is inside `executionSeconds`.
+  - In the interface job, the sampler shows the last `swift-frontend`, `ld`, and `dsymutil` exiting at about 766 s. That matches SwiftPM's reported 764.5 s.
+  - `swift-build` then ran alone, with no children, for about 238 s. The job log grew from 2.0 MB to 6.5 MB (about 19 KB/s) before `Build complete!` arrived.
+  - The build emitted 72.6k lines, including 15,484 warnings. The top offenders:
+    - 4,608 deprecated MCP `text(_:metadata:)`;
+    - 1,356 "no 'async' operations occur within 'await'";
+    - 630 "no calls to throwing functions occur within 'try'";
+    - 508 main-actor `shared` access.
+  - **Conductor is not the bottleneck.** `conductor diagnostics high-output --lines 20000 --warnings 80000` (`744d7dbf`) pumped 5.3 MB and 100k lines in 1.9 s, about 150 times faster.
+  - The cost scales with diagnostic volume and machine load. In the P0.3 logs, the jobs with 75k lines had gaps of 104 s and 329 s, the jobs with 15k lines had 77 s and 190 s, and the jobs with ≤ 1.3k lines had 3–19 s. The P0.4 78 s (6 app and 370 test files recompiled) fits the same pattern; that job's log was not re-sampled.
+- **P0.3 follow-up (11–329 s between build and first test): only 12–16 s is post-build.**
+  - The old metric was pre-test minus reported build, so it included the diagnostic output above.
+  - With receipt timestamps, the time after `Build complete!` is 11.7–15.7 s in all four jobs. It is spent entirely in the runner's direct path:
+    - `swift build --show-bin-path`: 0.6–3.4 s. It re-evaluates the manifest (`swift-package` and `swift-frontend` children).
+    - `swiftpm-xctest-helper` listing the 415 MB aggregate bundle: 5–12 s.
+    - `xctest` launch: about 0.8 s.
+  - The tests themselves take about 0.2 s.
+- **Cache publication is on the job's critical path, and the seed is 14.8 GB.**
+  - Publication runs after the tests pass but before the job completes, and it keeps the build lane: 134.8 s and 243.9 s here.
+  - It is throttled to once per hour per key, so it hits roughly the first job each hour.
+  - The seed includes `.build/swiftbuild` (5.5 GiB of module-run scratch), next to 4.1 GiB for `.build/arm64-apple-macosx`.
+- **Other observations:**
+  - The first job after a daemon restart re-planned for 37.8 s with nothing compiled.
+  - `dsymutil` takes about 64 s of the body-edit build and about 56 s (two runs) of the interface build. It is inside SwiftPM's time and is a P0.5 link lever.
+
+Proposed fixes (not implemented in P0.1):
+1. **Diagnostic volume, largest win.** Remove the warnings at the source, starting with the single MCP `text(_:metadata:)` API migration (4,608 of 15,484). Measure under P0.5 whether a lower-volume diagnostic style for local test builds shortens the drain without changing binaries.
+2. **Runner listing, simple and safe.**
+   - Cache the `swiftpm-xctest-helper` listing keyed on bundle path, size, and mtime. The listing is a pure function of the binary. This saves 5–12 s per job whose bundle did not relink.
+   - Resolve the bin path once instead of running `swift build --show-bin-path` (0.6–3.4 s).
+3. **Publication, needs a decision.**
+   - Exclude `.build/swiftbuild` from the seed in `_sanitize_seed`. That is about 5.5 GiB less to clone, sanitize, and measure, but new worktrees lose a warm module scratch path.
+   - Alternatively, report the job result before publishing. That changes the deliberate hold on the build lane and needs a design.

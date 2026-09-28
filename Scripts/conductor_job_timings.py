@@ -2,9 +2,11 @@
 """Summarize conductor job logs into build/test/queue timing percentiles.
 
 Phase 0.1 baseline for docs/migrations/build-modularization-2026-09-28.md.
-Durations are approximated from each job log's creation time to its last write,
-minus the parsed global heavy-slot wait. This is a retroactive estimate over the
-existing log format; structured per-phase timing inside conductor supersedes it.
+When conductor wrote a structured `<ticket>.timing.json` record next to the job
+log, durations and the heavy-slot wait come from its phase segments and per-phase
+percentiles are reported. Otherwise durations are approximated from the log's
+creation time to its last write, minus the parsed global heavy-slot wait.
+The job category is always classified from the log text.
 
 Usage:
   conductor_job_timings.py [--state-root DIR] [--limit N] [--json]
@@ -17,9 +19,9 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 
 DEFAULT_STATE_ROOT = Path.home() / "Library" / "Application Support" / "RepoPrompt CE" / "Conductor"
 MAX_READ_BYTES = 400_000
@@ -28,6 +30,18 @@ _WAIT = re.compile(r"acquired fair global heavy slot \S+ after ([^\n]+)")
 _EXECUTED = re.compile(r"Executed (\d+) tests?, with \d+ failures?")
 _APP_COMPILE = re.compile(r"Compiling RepoPromptApp ")
 _TEST_COMPILE = re.compile(r"Compiling RepoPromptTests ")
+
+TIMING_RECORD_SUFFIX = ".timing.json"
+TIMING_SCHEMA_VERSION = 1
+# Structured segments summarized per category (seconds).
+PHASE_SUMMARY_SEGMENTS = (
+    "buildCachePrepareSeconds",
+    "preBuildSeconds",
+    "buildReportedSeconds",
+    "buildCompleteToFirstTestSeconds",
+    "testSeconds",
+    "cachePublicationSeconds",
+)
 
 
 def parse_duration(text: str) -> float:
@@ -47,6 +61,8 @@ class JobSample:
     category: str
     wait_seconds: Optional[float]
     net_seconds: Optional[float]
+    source: str = "log"
+    phases: Mapping[str, float] = field(default_factory=dict)
 
 
 def classify(text: str) -> Optional[str]:
@@ -75,6 +91,34 @@ def sample_log(text: str, elapsed_seconds: float) -> Optional[JobSample]:
     return JobSample(category or "other", wait, net)
 
 
+def load_timing_record(log_path: Path) -> Optional[Dict[str, Any]]:
+    """Return the structured segments conductor persisted for this job log, if valid."""
+    try:
+        record = json.loads(log_path.with_suffix(TIMING_RECORD_SUFFIX).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("schemaVersion") != TIMING_SCHEMA_VERSION:
+        return None
+    timings = record.get("phaseTimings")
+    segments = timings.get("segments") if isinstance(timings, dict) else None
+    if not isinstance(segments, dict):
+        return None
+    return {key: float(value) for key, value in segments.items() if isinstance(value, (int, float))}
+
+
+def sample_structured(text: str, segments: Mapping[str, float]) -> Optional[JobSample]:
+    """Sample from structured segments: net = lane admission to finish, minus heavy-slot wait."""
+    wait = segments.get("heavySlotWaitSeconds")
+    category = classify(text)
+    if category is None and wait is None:
+        return None
+    net: Optional[float] = None
+    total = segments.get("totalSeconds")
+    if total is not None:
+        net = max(0.0, total - segments.get("queueSeconds", 0.0) - (wait or 0.0))
+    return JobSample(category or "other", wait, net, "structured", dict(segments))
+
+
 def file_elapsed(path: Path) -> float:
     stat = path.stat()
     born = getattr(stat, "st_birthtime", stat.st_ctime)
@@ -98,11 +142,16 @@ def percentile(values: Sequence[float], fraction: float) -> float:
 def summarize(samples: Iterable[JobSample]) -> Dict[str, Dict[str, float]]:
     waits: List[float] = []
     by_category: Dict[str, List[float]] = {}
+    by_phase: Dict[str, Dict[str, List[float]]] = {}
     for sample in samples:
         if sample.wait_seconds is not None:
             waits.append(sample.wait_seconds)
         if sample.category != "other" and sample.net_seconds is not None:
             by_category.setdefault(sample.category, []).append(sample.net_seconds)
+        if sample.category != "other" and sample.source == "structured":
+            for segment in PHASE_SUMMARY_SEGMENTS:
+                if segment in sample.phases:
+                    by_phase.setdefault(sample.category, {}).setdefault(segment, []).append(sample.phases[segment])
 
     def stats(values: Sequence[float]) -> Dict[str, float]:
         return {
@@ -115,6 +164,11 @@ def summarize(samples: Iterable[JobSample]) -> Dict[str, Dict[str, float]]:
     summary = {"heavy-slot wait": stats(waits)}
     for category in sorted(by_category):
         summary[f"net {category}"] = stats(by_category[category])
+    for category in sorted(by_phase):
+        for segment in PHASE_SUMMARY_SEGMENTS:
+            values = by_phase[category].get(segment)
+            if values:
+                summary[f"phase {category}: {segment}"] = stats(values)
     return summary
 
 
@@ -124,7 +178,8 @@ def collect(state_root: Path, limit: int, elapsed: Callable[[Path], float] = fil
         try:
             with path.open("r", encoding="utf-8", errors="ignore") as handle:
                 text = handle.read(MAX_READ_BYTES)
-            sample = sample_log(text, elapsed(path))
+            segments = load_timing_record(path)
+            sample = sample_structured(text, segments) if segments is not None else sample_log(text, elapsed(path))
         except OSError:
             continue
         if sample is not None:
@@ -146,6 +201,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(summary, indent=2))
     else:
         for name, row in summary.items():
+            if name.startswith("phase "):
+                print(f"{name:40} n={int(row['n']):5}  p50={row['p50_s']:6.1f}s  "
+                      f"p75={row['p75_s']:6.1f}s  p90={row['p90_s']:6.1f}s")
+                continue
             print(f"{name:40} n={int(row['n']):5}  p50={row['p50_s'] / 60:6.1f}m  "
                   f"p75={row['p75_s'] / 60:6.1f}m  p90={row['p90_s'] / 60:6.1f}m")
     return 0

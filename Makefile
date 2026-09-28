@@ -140,6 +140,7 @@ conductor-selftest:
 	python3 Scripts/test_conductor_diagnostics.py
 	python3 Scripts/test_modularization_metrics.py
 	python3 Scripts/test_conductor_job_timings.py
+	python3 Scripts/test_conductor_job_phases.py
 	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py
 

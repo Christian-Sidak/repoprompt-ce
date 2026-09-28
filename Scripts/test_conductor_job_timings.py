@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -54,6 +55,41 @@ class CollectTests(unittest.TestCase):
         summary = timings.summarize(samples)
         self.assertEqual(summary["heavy-slot wait"]["n"], 2)
         self.assertEqual(summary["net test focused: app recompiled"]["p50_s"], 150.0)
+
+    def test_structured_record_is_preferred(self) -> None:
+        segments = {
+            "queueSeconds": 5.0,
+            "heavySlotWaitSeconds": 60.0,
+            "totalSeconds": 265.0,
+            "preBuildSeconds": 2.0,
+            "buildCompleteToFirstTestSeconds": 13.0,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "repo-hash" / "jobs"
+            jobs.mkdir(parents=True)
+            (jobs / "a.log").write_text(FOCUSED)
+            (jobs / "a.timing.json").write_text(json.dumps(
+                {"schemaVersion": 1, "phaseTimings": {"segments": segments}}
+            ))
+            (jobs / "b.log").write_text(FOCUSED)
+            (jobs / "b.timing.json").write_text(json.dumps({"schemaVersion": 99}))
+            samples = timings.collect(Path(tmp), limit=10, elapsed=lambda _: 400.0)
+        by_source = {sample.source: sample for sample in samples}
+        structured = by_source["structured"]
+        self.assertEqual(structured.wait_seconds, 60.0)
+        self.assertEqual(structured.net_seconds, 200.0)
+        self.assertEqual(structured.phases["buildCompleteToFirstTestSeconds"], 13.0)
+        fallback = by_source["log"]
+        self.assertEqual((fallback.wait_seconds, fallback.net_seconds), (150, 250))
+        summary = timings.summarize(samples)
+        self.assertEqual(summary["net test focused: app recompiled"]["n"], 2)
+        row = summary["phase test focused: app recompiled: buildCompleteToFirstTestSeconds"]
+        self.assertEqual((row["n"], row["p50_s"]), (1, 13.0))
+
+    def test_structured_job_without_heavy_slot(self) -> None:
+        sample = timings.sample_structured("$ Scripts/package_app.sh debug\n", {"totalSeconds": 30.0})
+        self.assertEqual((sample.category, sample.wait_seconds, sample.net_seconds), ("package: no app compile", None, 30.0))
+        self.assertIsNone(timings.sample_structured("unrelated\n", {"totalSeconds": 3.0}))
 
     def test_percentile(self) -> None:
         self.assertEqual(timings.percentile([], 0.5), 0.0)
