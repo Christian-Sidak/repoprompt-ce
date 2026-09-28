@@ -272,6 +272,75 @@ import XCTest
             XCTAssertTrue(report.violations.contains("app outcome changed across iterations"))
         }
 
+        func testSampleStateDigestDistinguishesContentWithoutExposingIt() {
+            func state(_ text: String) -> String {
+                Harness.sampleState(
+                    Harness.Observation(outcome: .mapped([Self.file("a.swift", text)]), detail: "status=ok"),
+                    rootAvailability: "ready"
+                )
+            }
+            let first = state("struct A {}\n")
+            XCTAssertEqual(first, state("struct A {}\n"), "identical content yields an identical state")
+            XCTAssertNotEqual(first, state("struct A { let x = 1 }\n"), "a content change is attributable")
+            XCTAssertFalse(first.contains("struct A"), "the state never carries mapped text: \(first)")
+            XCTAssertTrue(first.hasPrefix("mapped(a.swift)|status=ok|digest="), first)
+            XCTAssertTrue(first.hasSuffix("|roots=ready"), first)
+            let unsettled = Harness.sampleState(
+                Harness.Observation(outcome: .unsettled, detail: "status=pending issues=graph_indexing"),
+                rootAvailability: "indexing"
+            )
+            XCTAssertEqual(unsettled, "unsettled|status=pending issues=graph_indexing|digest=-|roots=indexing")
+        }
+
+        func testIterationInstabilityCarriesEachSampleState() {
+            let states = ["mapped(a.swift)|status=partial|digest=aaa|roots=ready", "mapped(a.swift,b.swift)|status=ok|digest=bbb|roots=ready"]
+            let report = Harness.evaluate(
+                Harness.Scenario(name: "unit", tool: .codeStructure, arguments: [:], authority: .mustSucceed, relation: .equal),
+                app: [
+                    Harness.Observation(outcome: .mapped([Self.file("a.swift", "A")]), detail: "status=partial"),
+                    Harness.Observation(outcome: .mapped([Self.file("a.swift", "A"), Self.file("b.swift", "B")]), detail: "status=ok")
+                ],
+                headless: [Harness.Observation(outcome: .mapped([Self.file("a.swift", "A")]), detail: nil)],
+                appSamples: [1, 1],
+                headlessSamples: [1],
+                appSampleStates: states
+            )
+            XCTAssertTrue(report.violations.contains("app outcome changed across iterations"))
+            XCTAssertEqual(report.appSampleStates, states)
+        }
+
+        func testStoreEventsAreLabelledPerRootWithRelativeTimes() {
+            let first = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+            let second = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+            func event(
+                _ rootEpoch: WorkspaceCodemapRootEpoch,
+                _ kind: WorkspaceFileContextStore.CodemapGraphIndexBuildStoreEventKind,
+                _ phase: WorkspaceCodemapGraphIndexLaunchPhase,
+                atMS milliseconds: UInt64,
+                reason: String? = nil
+            ) -> WorkspaceFileContextStore.CodemapGraphIndexBuildStoreEvent {
+                WorkspaceFileContextStore.CodemapGraphIndexBuildStoreEvent(
+                    ordinal: milliseconds,
+                    rootEpoch: rootEpoch,
+                    kind: kind,
+                    launchPhase: phase,
+                    uptimeNanoseconds: 5_000_000_000 + milliseconds * 1_000_000,
+                    transientReason: reason
+                )
+            }
+            let described = Harness.describeStoreEvents([
+                event(first, .scheduled, .eligibilityQueued, atMS: 0),
+                event(second, .eligibilityTerminal, .terminalNonGit, atMS: 12),
+                event(first, .retryScheduled, .transientRetry, atMS: 40, reason: "setup.registrationFailed")
+            ])
+            XCTAssertEqual(
+                described,
+                "r0+0ms:scheduled:eligibilityQueued>r1+12ms:eligibilityTerminal:terminalNonGit"
+                    + ">r0+40ms:retryScheduled:transientRetry:setup.registrationFailed"
+            )
+            XCTAssertFalse(described.contains(first.rootID.uuidString), "root identifiers never appear")
+        }
+
         func testLatencySummaryUsesLowerMedianAndMax() {
             let summary = Harness.LatencySummary(samples: [4, 1, 3, 2])
             XCTAssertEqual(summary.p50MS, 2)
@@ -437,6 +506,8 @@ import XCTest
                         + " app_detail=\(scenario.appDetail ?? "-")"
                         + " headless_detail=\(scenario.headlessDetail ?? "-")"
                         + (scenario.appDiagnostics.map { " APP_CODEMAP=\($0)" } ?? "")
+                        + (scenario.appSettleTrace.map { " SETTLE_TRACE=\($0.joined(separator: " > "))" } ?? "")
+                        + (scenario.appSampleStates.map { " APP_SAMPLES=\($0.joined(separator: " > "))" } ?? "")
                         + (scenario.violations.isEmpty ? "" : " VIOLATIONS=\(scenario.violations)")
                 )
             }

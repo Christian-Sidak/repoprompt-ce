@@ -9636,6 +9636,12 @@ actor WorkspaceCodemapBindingEngine {
         }
     }
 
+    /// Drops the capability record a failed or cancelled registration attempt resolved, without
+    /// ending the root epoch. A failed attempt (the caller's task cancelled while the store replaces
+    /// the root's authority, a busy or rejected overlay, a manifest writer failure) says nothing about
+    /// whether the root is still loaded, so it must not leave a `releasedRootEpoch` tombstone: that
+    /// tombstone answers every later registration of the same, still-loaded epoch as terminal, so the
+    /// store's retries end in `graph_retry_exhausted`. Only `unloadRoot` and `shutdown` end an epoch.
     private func releaseCapabilityAfterRegistrationFailure(
         _ attempt: RegistrationAttempt,
         rootEpoch: WorkspaceCodemapRootEpoch
@@ -9643,7 +9649,7 @@ actor WorkspaceCodemapBindingEngine {
         if replacementCancelledRegistrationAttemptIDs.remove(attempt.id) != nil {
             return
         }
-        await capabilityService.release(rootEpoch: rootEpoch)
+        await capabilityService.invalidateForAuthorityReplacement(rootEpoch: rootEpoch)
     }
 
     private func registrationAttemptIsCurrent(

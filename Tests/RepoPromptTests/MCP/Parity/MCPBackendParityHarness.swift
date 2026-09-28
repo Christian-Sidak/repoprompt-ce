@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import MCP
 @testable import RepoPromptApp
@@ -139,6 +140,10 @@ import XCTest
             /// App code-map pipeline state, captured only when an app code-structure answer stayed
             /// unsettled (store launch events, engine graph-index accounting, root status).
             let appDiagnostics: String?
+            /// Code structure only: each measured app sample's state (`sampleState`), in order.
+            let appSampleStates: [String]?
+            /// Code structure only: the app state transitions seen while settling (bounded, timestamped).
+            let appSettleTrace: [String]?
             let appLatency: LatencySummary
             let headlessLatency: LatencySummary
             /// Human-readable expectation failures; empty when the scenario passes.
@@ -286,6 +291,7 @@ import XCTest
             var reports: [ScenarioReport] = []
             for scenario in scenarios {
                 let settle = await settleAppIndex(for: scenario)
+                var sampleStates: [String]?
                 var diagnostics: String?
                 if settle?.quiescent == false {
                     diagnostics = await appCodemapDiagnostics()
@@ -306,9 +312,22 @@ import XCTest
                     let (app, appMS) = await Self.timed { await self.observeApp(scenario) }
                     appObservations.append(app)
                     appSamples.append(appMS)
+                    if scenario.tool == .codeStructure {
+                        // Untimed: attributes any change across samples to a concrete app state.
+                        let rootAvailability = await appRootAvailability()
+                        sampleStates = (sampleStates ?? []) + [Self.sampleState(app, rootAvailability: rootAvailability)]
+                    }
                     let (headless, headlessMS) = await Self.timed { await self.observeHeadless(scenario) }
                     headlessObservations.append(headless)
                     headlessSamples.append(headlessMS)
+                }
+                if scenario.tool == .codeStructure, diagnostics == nil,
+                   let first = appObservations.first?.outcome,
+                   appObservations.contains(where: { $0.outcome != first })
+                   || (scenario.effectiveAppAuthority == .mustSucceed && !first.isSuccess)
+                {
+                    // Readiness regressed after quiescence: record which launch path restarted it.
+                    diagnostics = await "post_samples " + appCodemapDiagnostics()
                 }
                 reports.append(Self.evaluate(
                     scenario,
@@ -318,7 +337,9 @@ import XCTest
                     headlessSamples: headlessSamples,
                     appSettleMS: settle?.milliseconds,
                     appQuiescent: settle?.quiescent,
-                    appDiagnostics: diagnostics
+                    appDiagnostics: diagnostics,
+                    appSampleStates: sampleStates,
+                    appSettleTrace: settle?.trace
                 ))
             }
             var stages: [StageSummary]?
@@ -341,26 +362,60 @@ import XCTest
         /// answers settled and every app root reports `ready` (or terminal `unavailable`) through the
         /// store's root status, continuously for `appIndexQuiescenceWindow`. Not reaching quiescence
         /// within `appIndexSettleTimeout` is a violation in `evaluate`, never an exemption.
-        private func settleAppIndex(for scenario: Scenario) async -> (milliseconds: Double, quiescent: Bool)? {
+        private func settleAppIndex(
+            for scenario: Scenario
+        ) async -> (milliseconds: Double, quiescent: Bool, trace: [String])? {
             guard scenario.tool == .codeStructure else { return nil }
             let clock = ContinuousClock()
             let start = clock.now
             var readySince: ContinuousClock.Instant?
+            var trace: [String] = []
+            var lastState: String?
             while clock.now - start < Self.appIndexSettleTimeout {
-                let settled = await observeApp(scenario).outcome != .unsettled
+                let observation = await observeApp(scenario)
+                let settled = observation.outcome != .unsettled
                 let rootsReady = await appRootsAreQuiescent()
+                let rootAvailability = await appRootAvailability()
+                let state = Self.sampleState(observation, rootAvailability: rootAvailability)
+                if state != lastState {
+                    lastState = state
+                    trace.append("\(Int(Self.milliseconds(clock.now - start)))ms:\(state)")
+                    if trace.count > Self.settleTraceLimit { trace.removeFirst(trace.count - Self.settleTraceLimit) }
+                }
                 if settled, rootsReady {
                     let since = readySince ?? clock.now
                     readySince = since
                     if clock.now - since >= Self.appIndexQuiescenceWindow {
-                        return (Self.milliseconds(clock.now - start), true)
+                        return (Self.milliseconds(clock.now - start), true, trace)
                     }
                 } else {
                     readySince = nil
                 }
                 try? await Task.sleep(for: .milliseconds(100))
             }
-            return (Self.milliseconds(clock.now - start), false)
+            return (Self.milliseconds(clock.now - start), false, trace)
+        }
+
+        static let settleTraceLimit = 12
+
+        /// A compact, privacy-safe description of one app observation: the outcome summary (file names
+        /// only), the reply detail (status and issue codes), a short SHA-256 digest of the mapped text
+        /// (never the text), and the app roots' availabilities.
+        static func sampleState(_ observation: Observation, rootAvailability: String) -> String {
+            let digestInput: String? = switch observation.outcome {
+            case let .mapped(files): files.map { "\($0.name)\u{0}\($0.text)" }.joined(separator: "\u{1}")
+            case let .content(text): text
+            case .refused, .unavailable, .unsettled: nil
+            }
+            let digest = digestInput.map { input in
+                SHA256.hash(data: Data(input.utf8)).prefix(6).map { String(format: "%02x", $0) }.joined()
+            } ?? "-"
+            return "\(observation.outcome)|\(observation.detail ?? "-")|digest=\(digest)|roots=\(rootAvailability)"
+        }
+
+        private func appRootAvailability() async -> String {
+            let status = await appWindow.window.workspaceFileContextStore.currentCodemapRootStatusUpdate()
+            return status.roots.map(\.availability.rawValue).sorted().joined(separator: ",")
         }
 
         private func appRootsAreQuiescent() async -> Bool {
@@ -399,7 +454,7 @@ import XCTest
             let store = appWindow.window.workspaceFileContextStore
             var parts: [String] = []
             let events = await store.codemapGraphIndexBuildStoreEventsForTesting()
-            parts.append("store_events=" + events.suffix(40).map { "\($0.kind):\($0.launchPhase)" + ($0.transientReason.map { ":\($0)" } ?? "") }.joined(separator: ">"))
+            parts.append("store_events=" + Self.describeStoreEvents(events))
             do {
                 let accounting = try await codemapRuntime.runtime().bindingEngine().accounting()
                 parts.append("engine_roots=" + accounting.graphIndexRoots.map { root in
@@ -416,6 +471,23 @@ import XCTest
                     + " updates_pending=\(root.updatesPending)"
             }.joined(separator: ";"))
             return parts.joined(separator: " | ")
+        }
+
+        /// The last 40 store launch events, each labelled with its root (`r0`, `r1`, … in order of first
+        /// appearance, never a path or identifier) and its offset in milliseconds from the first event.
+        static func describeStoreEvents(
+            _ events: [WorkspaceFileContextStore.CodemapGraphIndexBuildStoreEvent]
+        ) -> String {
+            var labels: [WorkspaceCodemapRootEpoch: String] = [:]
+            for event in events where labels[event.rootEpoch] == nil {
+                labels[event.rootEpoch] = "r\(labels.count)"
+            }
+            let origin = events.first?.uptimeNanoseconds ?? 0
+            return events.suffix(40).map { event in
+                let offset = event.uptimeNanoseconds >= origin ? (event.uptimeNanoseconds - origin) / 1_000_000 : 0
+                return "\(labels[event.rootEpoch] ?? "r?")+\(offset)ms:\(event.kind):\(event.launchPhase)"
+                    + (event.transientReason.map { ":\($0)" } ?? "")
+            }.joined(separator: ">")
         }
 
         // MARK: - Evaluation
@@ -440,7 +512,9 @@ import XCTest
             headlessSamples: [Double],
             appSettleMS: Double? = nil,
             appQuiescent: Bool? = nil,
-            appDiagnostics: String? = nil
+            appDiagnostics: String? = nil,
+            appSampleStates: [String]? = nil,
+            appSettleTrace: [String]? = nil
         ) -> ScenarioReport {
             var violations: [String] = []
             if appQuiescent == false {
@@ -519,6 +593,8 @@ import XCTest
                 appSettleMS: appSettleMS,
                 appQuiescent: appQuiescent,
                 appDiagnostics: appDiagnostics,
+                appSampleStates: appSampleStates,
+                appSettleTrace: appSettleTrace,
                 appLatency: LatencySummary(samples: appSamples),
                 headlessLatency: LatencySummary(samples: headlessSamples),
                 violations: violations
