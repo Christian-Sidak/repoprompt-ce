@@ -150,14 +150,15 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
-        "RepoPromptMCP",
+        "RepoPromptMCPCore",
         "RepoPromptShared",
+        "RepoPromptTestSupport",
     }
     repo_prompt_tests = targets["RepoPromptTests"]
     if set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies:
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptCodeMapCore, "
-            "RepoPromptDomainRuntime, RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptDomainRuntime, RepoPromptMCPCore, RepoPromptShared, and RepoPromptTestSupport"
         )
 
     domain_runtime = targets["RepoPromptDomainRuntime"]
@@ -558,8 +559,8 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
   `REPOPROMPT_XCODE_TEST_FILTER` before building to run a focused filter.
 
 The root Swift package reference provides source browsing and indexing. Its native Xcode
-test action is not the supported test workflow because Xcode does not expose the
-`RepoPromptMCP` executable dependency as an importable test module. The vendored Sparkle
+test action is not the supported test workflow because conductor owns the sandboxed test environment the root suites
+require. The vendored Sparkle
 XCFramework also declares an omitted dSYMs directory; this generator deliberately does
 not mutate `Vendor/` to compensate. Use the convenience schemes above.
 

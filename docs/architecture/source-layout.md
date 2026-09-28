@@ -52,7 +52,8 @@ Sources/
   RepoPromptDomainRuntime/      # internal AppKit-free MCP runtime, workspace/context persistence, routing, and launch-token authority
   RepoPromptShared/
     MCP/                         # shared app/CLI MCP control protocol definitions
-  RepoPromptMCP/                 # MCP CLI implementation
+  RepoPromptMCP/                 # thin repoprompt-mcp executable; main.swift entry only
+  RepoPromptMCPCore/             # MCP CLI implementation library (tested by RepoPromptMCPCoreTests)
   RepoPromptC/                   # C support target
   CSwiftPCRE2/                   # C PCRE2 target
   TreeSitterScannerSupport/      # narrow exact-snapshot JavaScript/Python scanner ABI fallback
@@ -61,10 +62,11 @@ Tests/
   RepoPromptRegexCoreTests/      # direct reusable regex runtime tests
   RepoPromptWorkspaceCoreTests/  # direct deterministic tests owned by RepoPromptWorkspaceCore
   RepoPromptDomainRuntimeTests/  # direct owner tests for the headless MCP runtime and workspace/context authority
+  RepoPromptMCPCoreTests/        # MCP CLI owner tests; no RepoPromptApp dependency
   RepoPromptTests/               # app integration, persistence, workspace, presentation, UI, and MCP tests
 ```
 
-The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, and `RepoPromptDomainRuntime` are internal dependencies of `RepoPromptApp`, are not exposed as package products, and have direct owning test targets. `RepoPromptDomainRuntime` owns the AppKit-free, Sendable MCP runtime identity/lifecycle values, the canonical 28-tool name/capability/admission/client-policy catalog, immutable definitions and fingerprints, and the actor registry. App registration is process composition over that registry; no app-local registry facade or second schema authority remains. `RepoPromptCodeMapCoreTests` is the sole resource owner for pure CodeMap parser fixtures and goldens. Root app tests import `RepoPromptApp`; the separate `RepoPromptMCP` executable dependency remains unchanged.
+The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, and `RepoPromptDomainRuntime` are internal dependencies of `RepoPromptApp`, are not exposed as package products, and have direct owning test targets. `RepoPromptDomainRuntime` owns the AppKit-free, Sendable MCP runtime identity/lifecycle values, the canonical 28-tool name/capability/admission/client-policy catalog, immutable definitions and fingerprints, and the actor registry. App registration is process composition over that registry; no app-local registry facade or second schema authority remains. `RepoPromptCodeMapCoreTests` is the sole resource owner for pure CodeMap parser fixtures and goldens. Root app tests import `RepoPromptApp`. The MCP CLI follows the same thin-entry pattern: `RepoPromptMCP` is a one-file `main.swift` executable over the internal `RepoPromptMCPCore` library, and CLI owner tests live in `RepoPromptMCPCoreTests` without depending on the app.
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
@@ -106,7 +108,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`. App tool providers receive only the typed physical capability families they require; `MCPAppPhysicalCapabilityAdapters` is a namespace, not an umbrella dependency bag or dynamic-member façade.
 - Reusable AppKit-free physical workspace operations used by direct MCP belong in `RepoPromptDomainRuntime`; `RepoPromptMCP` may adapt them but must not copy read/search/tree/selection implementations. App presentation adapters may add UI-specific policy without becoming domain identity authority.
-- New CLI-only implementation code goes under `Sources/RepoPromptMCP`. Direct backend selection and stdio composition stay here; canonical schemas, workspace state roots, and reusable physical workspace operations do not.
+- New CLI-only implementation code goes under `Sources/RepoPromptMCPCore`; `Sources/RepoPromptMCP` holds only the `main.swift` entry. Tests of CLI behavior go in `Tests/RepoPromptMCPCoreTests` unless they also need the app. Direct backend selection and stdio composition stay in the CLI targets; canonical schemas, workspace state roots, and reusable physical workspace operations do not.
 - App-owned test doubles, integration fixtures, sample projects, benchmark-only data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target. Pure CodeMap parser fixtures/goldens are the documented exception and belong only to `RepoPromptCodeMapCoreTests`.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.

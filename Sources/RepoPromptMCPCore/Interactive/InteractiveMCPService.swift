@@ -11,7 +11,7 @@ import Logging
 import ServiceLifecycle
 
 /// ServiceLifecycle service that runs interactive MCP mode.
-actor InteractiveMCPService: Service {
+package actor InteractiveMCPService: Service {
     private let options: InteractiveOptions
     private let sessionToken: String
     private let clientName: String
@@ -20,7 +20,7 @@ actor InteractiveMCPService: Service {
     private var session: InteractiveMCPClientSession?
     private var repl: InteractiveREPL?
 
-    init(options: InteractiveOptions, logger: Logger? = nil) {
+    package init(options: InteractiveOptions, logger: Logger? = nil) {
         self.options = options
         sessionToken = UUID().uuidString
         clientName = "RepoPrompt CLI (Interactive)"
@@ -29,7 +29,7 @@ actor InteractiveMCPService: Service {
         }
     }
 
-    func run() async throws {
+    package func run() async throws {
         logger.debug("Starting interactive MCP service...")
 
         // Create session

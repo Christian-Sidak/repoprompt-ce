@@ -2413,7 +2413,7 @@ actor InteractiveMCPClientSession {
 
 // MARK: - Errors
 
-enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
+package enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
     case notConnected
     case socketCreationFailed(errno: Int32)
     case descriptorConfigurationFailed(errno: Int32)
@@ -2430,7 +2430,7 @@ enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
     case pollFailed(errno: Int32)
     case cancelled
 
-    var description: String {
+    package var description: String {
         switch self {
         case .notConnected:
             return "Not connected to MCP server"

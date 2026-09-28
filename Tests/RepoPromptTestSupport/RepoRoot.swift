@@ -1,7 +1,9 @@
 import Foundation
 
-enum RepoRoot {
-    static func url(
+/// Locates the repository root from a test source file. Shared by every test target via
+/// `RepoPromptTestSupport`; never a production dependency.
+package enum RepoRoot {
+    package static func url(
         filePath: StaticString = #filePath,
         fileManager: FileManager = .default
     ) throws -> URL {
@@ -31,7 +33,7 @@ enum RepoRoot {
         }
     }
 
-    static func relativePath(for fileURL: URL, relativeTo rootURL: URL) -> String {
+    package static func relativePath(for fileURL: URL, relativeTo rootURL: URL) -> String {
         let rootPath = rootURL.resolvingSymlinksInPath().standardizedFileURL.path
         let filePath = fileURL.resolvingSymlinksInPath().standardizedFileURL.path
         let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
@@ -41,10 +43,10 @@ enum RepoRoot {
     }
 }
 
-enum RepoRootError: Error, CustomStringConvertible {
+package enum RepoRootError: Error, CustomStringConvertible {
     case notFound(startingAt: String)
 
-    var description: String {
+    package var description: String {
         switch self {
         case let .notFound(startingAt):
             "Could not find repository root containing Package.swift and Sources/RepoPrompt when walking upward from \(startingAt)"

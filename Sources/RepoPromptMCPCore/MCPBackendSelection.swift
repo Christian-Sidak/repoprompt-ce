@@ -2,19 +2,19 @@ import Darwin
 import Foundation
 import RepoPromptShared
 
-enum MCPBackend: String, CaseIterable {
+package enum MCPBackend: String, CaseIterable {
     case app
     case headless
     case auto
 }
 
-enum MCPResolvedBackend: String, Equatable {
+package enum MCPResolvedBackend: String, Equatable {
     case app
     case headless
 }
 
-enum MCPBackendSelection {
-    static func resolve(
+package enum MCPBackendSelection {
+    package static func resolve(
         requested: MCPBackend,
         appIsAvailable: () -> Bool = MCPAppSocketAvailabilityProbe.isAvailable
     ) -> MCPResolvedBackend {

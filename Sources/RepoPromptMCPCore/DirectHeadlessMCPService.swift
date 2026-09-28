@@ -5,7 +5,7 @@ import Logging
 import MCP
 import RepoPromptDomainRuntime
 
-actor DirectHeadlessMCPService {
+package actor DirectHeadlessMCPService {
     struct PreparedRuntime {
         let runtime: MCPDomainRuntime
         let scopeID: DomainStandaloneScopeID
@@ -57,7 +57,7 @@ actor DirectHeadlessMCPService {
     private let environment: [String: String]
     private let currentDirectory: URL
 
-    init(
+    package init(
         logger: Logger = Logger(label: "com.repoprompt.ce.mcp.headless"),
         environment: [String: String] = ProcessInfo.processInfo.environment,
         currentDirectory: URL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
@@ -67,7 +67,7 @@ actor DirectHeadlessMCPService {
         self.currentDirectory = currentDirectory
     }
 
-    func run() async throws {
+    package func run() async throws {
         let prepared = try await prepareRuntime()
         let server = Server(
             name: "RepoPrompt CE",

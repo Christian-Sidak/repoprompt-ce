@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptMCP
+@testable import RepoPromptMCPCore
 import XCTest
 
 final class DirectProcessOutputCaptureTests: XCTestCase {

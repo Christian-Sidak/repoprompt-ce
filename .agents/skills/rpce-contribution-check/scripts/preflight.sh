@@ -204,7 +204,7 @@ run_pr_ready_path_validations() {
   local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/)'
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
   local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
-  local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'
+  local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptMCPCore/|Sources/RepoPromptShared/)'
   local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
 
   local has_control_plane_changes=0
