@@ -574,7 +574,7 @@ records `retryExhausted` and stops rescheduling; `makeCodemapRootStatusSnapshot`
 `unavailable`, but the code-structure query's fallback would still answer `pending` with a retryable
 `graph_indexing`. The failing focused runs showed active indexing (`seed_pending`,
 `graph_indexing`), not exhaustion, so this inconsistency was not exercised and is left for a
-follow-up with a deterministic reproduction.
+follow-up with a deterministic reproduction. (Reproduced and fixed in M8U below.)
 
 Not proven by M8T: app graph expansion parity (headless has no graph), code-structure behavior for
 worktrees, submodules, or nested repositories, and anything listed as not proven for M8S.
@@ -584,6 +584,52 @@ consecutive runs of unchanged source (conductor `8b334035` and `3c45e359`). Earl
 (`1e1fa3fb`, `f5a9ef89`, `7f840feb`, `56bab008`) surfaced, in turn, the process-wide code-map
 runtime dependency, the app's `path_not_found` refusal form, and non-monotonic readiness; `7f840feb`
 was green before the quiescence requirement and is not counted.
+
+### M8U — code-map retry exhaustion no longer reported as a retryable pending index
+
+The M8T follow-up, now confirmed with a deterministic reproduction and fixed. A code-map graph-build
+launch whose eligibility check is transiently unavailable retries up to
+`CodemapGraphIndexBuildRetryPolicy.maximumRetryCount` times and then records `retryExhausted`
+(`scheduleCodemapGraphIndexBuildRetry`); `scheduleCodemapGraphIndexBuildAfterRootReady` returns early
+for that phase, so file deltas do not reschedule it — only a root reload or
+`prioritizeCodemapGraphIndexNow` does. Root status already classified the root as `unavailable`
+(`retryExhausted`), but the structure query's no-graph fallback checked only the proof-backed non-Git
+cache and answered `status: pending` with a retryable `graph_indexing` (`retry_after_ms: 100`); the
+reply DTO then carried top-level retry guidance and the text formatter said "Retry shortly". An MCP
+client would retry forever against a root that will not rebuild on its own. The same fallback also
+answered a worker-recovery-exhausted root, and a non-Git root whose eligibility came from the Git
+probe without a local proof, as retryable pending.
+
+- `codemapRootUnavailableReason(rootEpoch:)` is now the single source for root status and the query:
+  worker-recovery exhaustion, `retryExhausted`, and `terminalNonGit` launches.
+- The query's no-graph answer (`codemapNoGraphStructureAnswer`) is terminal — `status: unavailable`,
+  `updates_pending: false`, seeds `not_indexed`, issue `retryable: false` with no `retry_after_ms` —
+  for `git_root_unavailable` (proof-backed cache or `terminalNonGit` launch), `graph_retry_exhausted`,
+  and `graph_worker_recovery_exhausted`. A graph that is still being built or actively retried keeps
+  the pending, retryable `graph_indexing` answer.
+- The text formatter explains the two exhaustion codes and directs a reload ("retrying the same
+  request will not help") instead of a generic retry.
+- Headless contract: unchanged. Headless has no code-map graph; its `get_code_structure` never
+  returns pending or retry guidance (M8R), so there is no headless counterpart to correct.
+
+Regression coverage (`WorkspaceCodemapRetryExhaustionStructureTests`, isolated code-map runtime,
+injected probes): `maximumRetryCount: 0` with a `requiresGitPreflight` local probe and a
+`transientUnavailable(.permissionFailure)` eligibility probe reaches `retryExhausted` deterministically,
+and the query, the reply DTO (no `retry`), and the formatted text all report a terminal, non-retryable
+answer; an active transient retry (a retry sleep that never fires) stays pending and retryable;
+worker-recovery exhaustion toggled through the DEBUG seam is unavailable and returns to pending when
+cleared; non-Git eligibility without a local proof is `git_root_unavailable` and not retryable.
+
+Not changed (recorded): other terminal eligibility reasons (bare repository, invalid layout) finish
+the launch as `superseded`, which root status itself reports as `notInitialized`; making those
+terminal needs a decision about their recovery semantics and is left for a follow-up.
+
+Evidence: focused `WorkspaceCodemapRetryExhaustionStructure|MCPBackendParityHarness|MCPCodeStructure|
+CodeStructureToolCard|ToolOutputFormatter` passed 55/55 (conductor `955b7dc5`), including
+`WorkspaceCodemapRetryExhaustionStructureTests` 4/4 and the M8T parity gate 18/18. A first run
+(`586d633b`) failed to compile only in the new test (a nonisolated call to the main-actor
+`codeStructureReplyDTO`); the test class is now `@MainActor`. All-products build and lint pending on
+this checkpoint.
 
 ### Later milestones (not started in this pass)
 

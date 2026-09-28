@@ -10749,21 +10749,30 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    /// Why a root's code-map graph will not become available without an external action (a root
+    /// reload, or `prioritizeCodemapGraphIndexNow`), or nil while it is still being built or retried.
+    /// The single source for both root status and the structure query's no-graph answer, so the two
+    /// cannot disagree about whether a client should retry.
+    private func codemapRootUnavailableReason(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapRootStatusUnavailableReason? {
+        if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
+            return .workerRecoveryExhausted
+        }
+        return switch codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase {
+        case .terminalNonGit: .notGitRepository
+        case .retryExhausted: .retryExhausted
+        default: nil
+        }
+    }
+
     private func makeCodemapRootStatusSnapshot(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> WorkspaceCodemapRootStatusSnapshot {
         let suspended = codemapGenerationIsSuspended(rootEpoch: rootEpoch)
         let accounting = codemapGraphAccountingByRootEpoch[rootEpoch]
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
-        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
-            .workerRecoveryExhausted
-        } else {
-            switch launchPhase {
-            case .terminalNonGit: .notGitRepository
-            case .retryExhausted: .retryExhausted
-            default: nil
-            }
-        }
+        let unavailableReason = codemapRootUnavailableReason(rootEpoch: rootEpoch)
         let availability: WorkspaceCodemapRootAvailability = if accounting?.revocationReason != nil {
             .revoked
         } else if unavailableReason != nil {
@@ -14057,18 +14066,18 @@ actor WorkspaceFileContextStore {
                     continue
                 }
             } else {
-                let isNonGit = terminalNonGitCodemapCacheByEpoch[rootEpoch] != nil
+                let noGraph = codemapNoGraphStructureAnswer(rootEpoch: rootEpoch)
                 roots.append(WorkspaceCodemapStructureRootResult(
                     rootEpoch: rootEpoch,
                     rootDisplayName: rootName,
-                    status: isNonGit ? .unavailable : .pending,
+                    status: noGraph.isTerminal ? .unavailable : .pending,
                     coverage: nil,
-                    updatesPending: !isNonGit,
+                    updatesPending: !noGraph.isTerminal,
                     seeds: rootSeedIDs.map {
                         WorkspaceCodemapStructureSeedResult(
                             fileID: $0,
                             path: seedPathsByFileID[$0] ?? rootName,
-                            state: isNonGit ? .notIndexed : .pending
+                            state: noGraph.isTerminal ? .notIndexed : .pending
                         )
                     },
                     nodes: [],
@@ -14076,16 +14085,14 @@ actor WorkspaceFileContextStore {
                     unresolved: [],
                     truncation: nil,
                     issues: [WorkspaceCodemapStructureIssueRecord(
-                        code: isNonGit ? "git_root_unavailable" : "graph_indexing",
+                        code: noGraph.code,
                         phase: "graph_snapshot",
                         path: nil,
-                        retryable: !isNonGit,
-                        retryAfterMilliseconds: isNonGit ? nil : 100,
+                        retryable: !noGraph.isTerminal,
+                        retryAfterMilliseconds: noGraph.isTerminal ? nil : 100,
                         attempted: nil,
                         limit: nil,
-                        message: isNonGit
-                            ? "Code structure is unavailable because this root has no Git repository authority."
-                            : "The root-local committed graph is still being initialized."
+                        message: noGraph.message
                     )],
                     receipt: nil
                 ))
@@ -14308,6 +14315,41 @@ actor WorkspaceFileContextStore {
             receipt: nil
         )
     }
+
+    /// The structure query's answer for a root with no usable committed graph. Terminal states — no
+    /// Git authority, exhausted build retries, or exhausted worker recovery — are unavailable and
+    /// not retryable (none recovers without a root reload or an explicit prioritization); only a
+    /// graph that is still being built or retried is pending and retryable.
+    private func codemapNoGraphStructureAnswer(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> (isTerminal: Bool, code: String, message: String) {
+        if terminalNonGitCodemapCacheByEpoch[rootEpoch] != nil {
+            return (true, "git_root_unavailable", Self.codemapNonGitStructureMessage)
+        }
+        switch codemapRootUnavailableReason(rootEpoch: rootEpoch) {
+        case .notGitRepository:
+            return (true, "git_root_unavailable", Self.codemapNonGitStructureMessage)
+        case .retryExhausted:
+            return (
+                true,
+                "graph_retry_exhausted",
+                "Code structure is unavailable because building this root's code-map graph failed after "
+                    + "its automatic retries; it is not retried again until the root is reloaded."
+            )
+        case .workerRecoveryExhausted:
+            return (
+                true,
+                "graph_worker_recovery_exhausted",
+                "Code structure is unavailable because this root's code-map graph worker could not be "
+                    + "recovered; it is not retried again until the root is reloaded."
+            )
+        case .setupFailed, .graphUnavailable, nil:
+            return (false, "graph_indexing", "The root-local committed graph is still being initialized.")
+        }
+    }
+
+    private static let codemapNonGitStructureMessage =
+        "Code structure is unavailable because this root has no Git repository authority."
 
     private func codemapStructureIssueRecord(
         _ issue: WorkspaceCodemapGraphStructureIssue,
