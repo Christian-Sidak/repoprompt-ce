@@ -260,26 +260,27 @@ Each needs a named consumer and a test that substitutes it. Hub types with high 
 
 ## 4. Seam catalog (initial decoupling backlog)
 
-Derived from the graph evidence (Appendix B). Every entry is validated with index-store data (P0.2) before its slice starts.
+Derived from the graph evidence (Appendix B). P0.2 validated every entry against the index store (ledger, P0.2). Rows the index changed (S2, S4, S5, S8, S9, S11, S12, S13, and the new S17) carry index counts. Confirmed rows keep their triage counts; the ledger has their index counts. Each slice re-checks its seam with `modularization_index_graph.py readiness` before it starts.
 
 | ID | Seam | Evidence | Resolution |
 | --- | --- | --- | --- |
 | S1 | Fonts in App | `FontPreset` 85 and `FontScaleManager` 77 wrong-way edges; `FontScaleManager.shared` ×130 | Preset values → DesignSystem; active scale/preset via environment; settings-backed authority stays in composition |
-| S2 | Window composition leakage | `WindowState` 37, `WindowStateManager` 29 edges; `WindowStatesManager.shared` ×115 | Narrow window-registry and active-context capabilities passed explicitly; window-bound tools stay app adapters; `WindowState` split into per-feature assemblies late (W7) |
+| S2 | Window composition leakage | `WindowState` 54 wrong-way edges, mostly through its members; `WindowStateManager` 29; `WindowStatesManager.shared` 116 refs in 35 files | Narrow window-registry and active-context capabilities passed explicitly; window-bound tools stay app adapters; `WindowState` split into per-feature assemblies late (W7) |
 | S3 | Agent VM as runtime hub | 50 lower-layer files use `AgentModeViewModel.*` nested types; 13 hold stored VM references; `AgentModeViewModel+Types` fan-in 55 | Hoist neutral values to F3; runtime-owned session store observed by the VM; runtime never references the VM |
-| S4 | Codex turn identity in `AgentTabSession` | 26 files use nested `Codex*` identity types | Hoist to the Codex runtime target |
-| S5 | MCP request/authority snapshots nested in `MCPServerViewModel` | `RequestMetadata` ×31, `ResolvedTabContextSnapshot` ×18, `TabContextSnapshot`, `ConnectionBindingSnapshot`, `FrozenFileToolAuthority`, `DomainReadAppExecutionContext`; 10 files hold stored VM references | Immutable invocation-context values in `RepoPromptMCPServer`; VM keeps presentation only |
+| S4 | Codex turn state in `AgentTabSession` | The 15 nested `AgentTabSession.Codex*` types are used from only 4 files. Codex-prefixed members and types of the session (156) are used from 19 files, 14 in `AgentMode/Runtime`. `AgentTabSession` 36 wrong-way edges | Move Codex turn state, not just its identity types, into a store owned by the Codex runtime target; the session holds a reference to it |
+| S5 | MCP request/authority snapshots nested in `MCPServerViewModel` | `MCPServerViewModel+TabContext.swift` 25 wrong-way edges. Refs in other files: `RequestMetadata` 63 in 16 files, `TabContextSnapshot` 47/14, `ResolvedTabContextSnapshot` 34/10, `FrozenFileToolAuthority` 25/6, `DomainReadAppExecutionContext` 16/6, `ConnectionBindingSnapshot` 13/3. 10 files hold stored VM references (triage count; not index-derivable) | Immutable invocation-context values in `RepoPromptMCPServer`; VM keeps presentation only |
 | S6 | Ambient dispatch context | `ServerNetworkManager.shared` ×119, including `currentConnectionID` and `currentToolDispatchAuthorization` | Explicit `ToolInvocationContext` threaded through dispatch; fail closed; idempotent against duplicate request IDs and cancellation |
 | S7 | Global settings hub | `GlobalSettingsStore.shared` ×115; `GlobalSettingsManager` fan-in 73 | Storage mechanics in F1; feature-owned typed facets; one document and schema preserved |
-| S8 | Workspace-files VM used below | `WorkspaceFilesViewModel` fan-in 109, 76 wrong-way edges (from WorkspaceContext, Platform, AI, MCP) | Selection/projection contracts owned by WorkspaceContext; VM consumes them |
-| S9 | Misplaced values | `SortingUtils` 27, `WorkspaceModel` 26, `FileSystemItems`, `ChatPreset`, `CopyPresetOverrides`, `ToolCardContainer`'s global `toolIcon(for:)`, `MCPFilesystemConstants`, `ToolResultDTOs` | Move values to the lowest owning family; invert behavior |
+| S8 | Workspace-files VM used below | `WorkspaceFilesViewModel` fan-in 33, 10 wrong-way edges from 8 components (UI/TextField, MCP/WindowTools, WorkspaceContext, UI/Mentions, MCP/ApplyEdits, MCP, Diffing, Search). The triage count of 76 was mostly `relativePath` name collisions | Selection/projection contracts owned by WorkspaceContext; VM consumes them |
+| S9 | Misplaced values | `WorkspaceModel` 37 wrong-way edges; `MCPFilesystemConstants` 6, `ChatPreset` 3, `FileSystemItems` 2, `CopyPresetOverrides` and `ToolResultDTOs` 1 each. `SortingUtils` and `toolIcon(for:)` were dropped: the index finds no wrong-way use | Move values to the lowest owning family; invert behavior |
 | S10 | Provider/model vocabulary inside Agent Mode | AI → AgentMode: 135 edges from 60 files (`ACPAgentProvider`, `AgentRuntimeProviderService`, `AgentModel`, `AgentModelCatalog`, `AgentModelParameter`, `HeadlessAgentProvider`, `AgentACPModelRegistry`) | `RepoPromptAIContracts` owns model identity and neutral runtime DTOs; raw values unchanged |
-| S11 | MCP tool implementations call into features | MCP → AgentRuntime 72, → feature models 68, → VMs 31, → App 27 (`Infrastructure/MCP/WindowTools`) | Placement by required capability (§3.3) |
-| S12 | Diagnostics used by engines | `WorktreeStartupInstrumentation` from 5 layers (18 edges); `MCPToolExecutionDiagnostics`, `AgentSessionLinkCatalogDiagnostics` | Instrumentation contracts in F0; implementations injected |
-| S13 | App notifications used by runtime | `NotificationPreferences`, `AppNotificationPayload`, `AppDeepLinkRoute`, `UserNotificationCenterClient` | Intent values in F0/F3; delivery in App |
+| S11 | MCP tool implementations call into features | `Infrastructure/MCP` outside `MCP/ViewModels`: → `AgentMode/Runtime` 45, → `Features/*/Models` 56, → other view models 83, → `App` 38. `MCP/WindowTools` → layers above MCP: 124 edges from 15 files | Placement by required capability (§3.3) |
+| S12 | Diagnostics used by engines | `AgentModePerfDiagnostics` 39 wrong-way edges; `WorktreeStartupInstrumentation` 20 from 9 components; `WorkspaceRestorePerfLog` 13; `MCPToolExecutionDiagnostics` 8; `AgentSessionLinkCatalogDiagnostics` 3 | Instrumentation contracts in F0; implementations injected |
+| S13 | App notifications used by runtime | `Notification.Name` members: `AppNotifications.swift` 39 wrong-way edges, `WorkspaceNotifications.swift` 6. Also `NotificationPreferences` 10, `AppDeepLinkRoute` 8, `NotificationService` 5, `UserNotificationCenterClient` 4, `AppNotificationPayload` 3, `AppNotificationCategories` 2 | Notification names (raw strings unchanged) and intent values in F0/F3; delivery in App |
 | S14 | Bridging header | `-import-objc-header … -disable-bridging-pch` in `unsafeFlags`; only 5 Swift consumers (`ApplicationSecurity`, `SearchMatch`, `SearchPathFiltering`, `GitignoreCompiler`, `MCPConnectionManager`) | Classify each declaration. Wildmatch/gitignore → `RepoPromptC` (check `wildmatch.h` equivalence); `ptrace`/`sysctl` anti-debug → a narrow C target. Remove the app `unsafeFlags` only when proven equivalent |
 | S15 | Tests depend on an executable | `RepoPromptTests` → `RepoPromptMCP`; 11 `@testable import RepoPromptMCP` files | `RepoPromptMCPCore` library plus a thin executable (the `RepoPromptExecutable` pattern), composed with DomainRuntime, not copied. Also unblocks native Xcode unit testing |
 | S16 | God files | The 17 files over 5k lines (§1.3) | Split responsibilities in place, before any move, one boundary at a time. The three largest are late extraction candidates |
+| S17 | Prompt and workspace-manager VMs used below | `PromptViewModel` 26 and `WorkspaceManagerViewModel` 20 wrong-way edges (triage graph: 13 and 8) | As S8: the lower family owns the contract or state; the VM consumes it. Confirm the consumers with `readiness` before the slice |
 
 ---
 
@@ -487,37 +488,39 @@ Each wave ends when its seams are closed, its tests are owned by module test tar
 - **Toolchain experiment.** A throwaway package with targets A, B, C, test targets ATests and BTests, and a local path package L, built with native SwiftPM and `--build-system swiftbuild` on Swift 6.3.3.
 - **CI.** `gh run view` job and step timings for main run 36332152793.
 
-## Appendix B: Top wrong-way dependency targets (triage graph)
+## Appendix B: Top wrong-way dependency targets (index store)
+
+This table is now index-derived; it replaces the regex triage table. Source: the P0.2 graph, `python3 Scripts/modularization_index_graph.py report --top 40` at HEAD `9e912a86` (ledger, P0.2). The index graph has 1,360 wrong-way file edges into 253 files. The top 20 targets account for 53% and the top 40 for 68%. The triage figures in §1.3 (1,104 edges, 201 files, 58% and 73%) are the regex graph's, kept as the original evidence. The two graphs share components, layer ranks, and the wrong-way rule, so their counts are comparable.
 
 | Wrong-way edges | Target file |
 | --- | --- |
-| 85 | `App/FontPreset.swift` |
+| 92 | `App/FontPreset.swift` |
 | 77 | `App/FontScaleManager.swift` |
-| 76 | `Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift` |
-| 37 | `App/WindowState.swift` |
-| 37 | `Features/AgentMode/ViewModels/AgentModeViewModel.swift` |
-| 33 | `Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` |
-| 33 | `Features/AgentMode/Providers/ACP/ACPAgentProvider.swift` |
+| 54 | `App/WindowState.swift` |
+| 43 | `Features/AgentMode/Runtime/Providers/AgentRuntimeProviderService.swift` |
+| 43 | `Features/AgentMode/ViewModels/AgentModeViewModel.swift` |
+| 39 | `App/Notifications/AppNotifications.swift` |
+| 39 | `Features/Diagnostics/AgentMode/AgentModePerfDiagnostics.swift` |
+| 37 | `Features/Workspaces/WorkspaceModel.swift` |
+| 36 | `Features/AgentMode/ViewModels/AgentTabSession.swift` |
+| 35 | `Features/AgentMode/Providers/ACP/ACPAgentProvider.swift` |
 | 29 | `App/WindowStateManager.swift` |
-| 27 | `Features/WorkspaceFiles/Utilities/SortingUtils.swift` |
-| 26 | `Features/Settings/Models/GlobalSettingsManager.swift` |
-| 26 | `Features/Workspaces/WorkspaceModel.swift` |
-| 24 | `Infrastructure/MCP/ViewModels/MCPServerViewModel.swift` |
-| 21 | `Features/AgentMode/ViewModels/AgentTabSession.swift` |
-| 18 | `Features/AgentMode/Views/ToolCards/ToolCardContainer.swift` |
-| 18 | `Features/Diagnostics/App/WorktreeStartupInstrumentation.swift` |
+| 26 | `Features/Prompt/ViewModels/PromptViewModel.swift` |
+| 26 | `Infrastructure/MCP/ViewModels/MCPServerViewModel.swift` |
+| 25 | `Features/Settings/Models/GlobalSettingsManager.swift` |
+| 25 | `Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift` |
+| 22 | `Features/AgentMode/ViewModels/AgentModeViewModel+Types.swift` |
+| 20 | `Features/Diagnostics/App/WorktreeStartupInstrumentation.swift` |
+| 20 | `Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift` |
+| 17 | `Features/AgentMode/Models/ModelSelection/AgentModelCatalog.swift` |
 | 17 | `Infrastructure/MCP/MCPIntegrationHelper.swift` |
 | 16 | `Features/AgentMode/Models/ModelSelection/AgentModel.swift` |
-| 16 | `Features/AgentMode/Models/ModelSelection/AgentModelCatalog.swift` |
 | 14 | `Features/AgentMode/Models/ModelSelection/AgentModelParameter.swift` |
 | 13 | `App/AppDomainRuntimeComposition.swift` |
-| 13 | `Features/Prompt/ViewModels/PromptViewModel.swift` |
-| 11 | `Infrastructure/MCP/RepoPromptMCPServerConfiguration.swift` |
+| 13 | `Features/Diagnostics/App/WorkspaceRestorePerfLog.swift` |
+| 12 | `Infrastructure/MCP/RepoPromptMCPServerConfiguration.swift` |
+| 10 | `App/Notifications/NotificationPreferences.swift` |
+| 10 | `Features/AgentMode/Models/UserInteractionModels.swift` |
 | 10 | `Features/AgentMode/Providers/HeadlessAgentProvider.swift` |
-| 9 | `App/Notifications/NotificationPreferences.swift` |
-| 9 | `Features/AgentMode/Models/ModelSelection/AgentACPModelRegistry.swift` |
-| 9 | `Infrastructure/MCP/MCPConnectionManager.swift` |
-| 9 | `Infrastructure/WorkspaceContext/Models/WorkspaceRootSeedModels.swift` |
-| 8 | `App/Sparkle/SparkleUpdateManager.swift` |
-| 8 | `Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift` |
-| 8 | `App/AppDeepLinkRoute.swift` |
+| 10 | `Features/WorkspaceFiles/ViewModels/WorkspaceFilesViewModel.swift` |
+| 10 | `Infrastructure/WorkspaceContext/Models/WorkspaceRootSeedModels.swift` |
