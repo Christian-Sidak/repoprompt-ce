@@ -286,7 +286,7 @@ Derived from the graph evidence (Appendix B). Every entry is validated with inde
 ## 5. Build and test infrastructure (parallel track from day one)
 
 1. **Structured timing.** Conductor records per-job phases (queue, plan, compile, emit-module, link, test execution) and peak RSS as structured data, not just logs. A scheduled measurement lane captures `-driver-time-compilation`, `-Xfrontend -debug-time-function-bodies`, and `-stats-output-dir`. Dashboards feed the ratchets.
-2. **No-op relink.** Find why a job with nothing to compile still relinks the aggregate bundle (36–75 s): generated `swift-version` writes, seed-store mtimes, environment changes, or something else. A true no-op must not link.
+2. **Fixed per-job overhead (done).** The per-job conductor ticket defeated SwiftPM's environment-keyed manifest cache, and `swift test` re-planned in the sandbox. Both are fixed: a no-change focused job went from 74.7 s to 2.2 s (ledger, P0.4).
 3. **Focused-test executor.** Build a module index (suite → test target → module) and add `dev-test MODULE=X`. `FILTER` resolves to its owning test target, and only that closure is built, using the executor chosen in P0.3. Until then, conductor reports the whole-graph build cost honestly.
 4. **Admission v2.** Replace the capacity-1 heavy slot with admission weighted by each job's *measured* peak RSS and CPU for its actual build closure. Small module jobs then run concurrently while app packaging stays exclusive, and fairness is kept.
 5. **Cross-worktree reuse.** Extend the existing seed store. Evaluate content-addressed compilation caching (available with Swift Build / Xcode 26) as a cache shared across worktrees. Adopt it only with correctness evidence (clean-vs-cached binary equivalence and test parity).
@@ -401,7 +401,7 @@ Waves proceed bottom-up by dependency closure. P2 and later waves interleave: de
   - (d) a local package for the slice.
 
   Measure cold and warm edit→test, test discovery completeness, resources, peak RSS, disk, and CI parity. This decides ADR-07 and exercises the §3.4 packaging gate.
-- **P0.4 No-op relink** root cause (§5.2).
+- **P0.4 Fixed per-job overhead** (§5.2) — done; see ledger.
 - **P0.5 Link and type-check levers** measured (§5.6, §5.7).
 - **P0.6 Compatibility inventory** (§7.2) captured as golden tests where missing.
 - **P0.7 Ratchets file** with baselines, and a guardrail skeleton that fails only on regression.

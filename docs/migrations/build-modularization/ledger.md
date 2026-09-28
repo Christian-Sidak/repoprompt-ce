@@ -46,7 +46,33 @@ Conductor timings (last 3,000 jobs, net of queue):
 - [x] P0.1 retroactive timing baseline (structured conductor timing still open)
 - [x] P0.2 prototype graph tool (index-store replacement still open)
 - [ ] P0.3 focused-test executor bake-off
-- [ ] P0.4 no-op relink root cause
+- [x] P0.4 fixed per-job overhead root cause and fix (see below)
 - [ ] P0.5 link and type-check levers
 - [ ] P0.6 compatibility inventory golden tests
 - [x] P0.7 ratchets file and guardrail gate
+
+## P0.4 — fixed per-job overhead (2026-09-28)
+
+The "no-op relink" hypothesis was wrong. A no-change focused `dev-test` spent about 75 s (41 s "build" plus a slow `swift test`) because of two causes:
+
+1. **Per-job environment defeats SwiftPM's caches.** SwiftPM keys its manifest cache on the full process environment, since manifests can read it (this `Package.swift` does). Conductor exported a unique `REPOPROMPT_CONDUCTOR_JOB_TICKET` to every job, so each build re-evaluated every package manifest and re-planned: 28–31 s no-op versus 0.7 s with a stable environment (reproduced directly).
+2. **Test execution through SwiftPM.** `swift test --skip-build` ran in the sandboxed environment, which again missed the manifest cache (26–36 s for a 7 ms test with any single sandbox variable changed). Alternating `swift build` and `swift test` also forced the next build to re-plan (about 10–15 s).
+
+Fixes:
+
+- `Scripts/conductor.py`: the job ticket is exported only to conductor's own `__operation_runner`, which pops it on entry (`capture_job_ticket`); readers use `current_job_ticket()`. SwiftPM-facing commands now see a stable, allowlisted environment.
+- `Scripts/ci_app_test_runner.py` local path: build with SwiftPM, list tests with the toolchain's `swiftpm-xctest-helper`, apply `--filter` with SwiftPM's regex-search semantics (whole suites collapsed), then run the bundle directly with `xctest` inside the same sandbox.
+  - It falls back to `swift test --skip-build` when `--test-product` is given, when any test imports Swift Testing, when the bundle or helper is unavailable, or when the filter is not a valid Python regex.
+  - Parity: the helper and `swift test list` report the same 3,599 tests, with no differences.
+
+Measured through conductor (focused filter `RepoPromptRegexCoreTests`, 7 tests):
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| Nothing changed | 74.7 s | **2.2 s** (build 0.6 s) |
+| One app file touched, body only (1 file compiled) | — | 41 s |
+| One unused top-level `func` added to the app (interface change) | — | 246 s (6 app files and **all 370 test files** recompiled; build 168 s) |
+
+The interface-change row is the monolith cost that per-module test targets must remove: any interface change to `RepoPromptApp` recompiles the entire `@testable` test target.
+
+Follow-up: in the interface-change job about 78 s of execution happened outside SwiftPM (conductor build-cache handling). It is about 1.5 s on no-op jobs. Investigate under P0.1.
