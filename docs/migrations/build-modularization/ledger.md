@@ -6,17 +6,18 @@ Living record for [`../build-modularization-2026-09-28.md`](../build-modularizat
 
 | Tool | Purpose | Plan item |
 | --- | --- | --- |
-| `Scripts/modularization_metrics.py report [--details]` | Architecture metrics: app size and share, god files, singletons, triage dependency graph (wrong-way edges, largest cycle), test coupling | P0.2 (regex prototype; index-store replacement pending) |
+| `Scripts/modularization_metrics.py report [--details]` | Architecture metrics: app size and share, god files, singletons, triage dependency graph (wrong-way edges, largest cycle), test coupling. Build-free regex graph; feeds the ratchets | P0.2 prototype, P0.7 |
+| `Scripts/modularization_index_graph.py report\|readiness\|compare\|edge\|dump` | Compiler-grade `RepoPromptApp` file graph from the debug build's index store: wrong-way edges, SCCs, extraction readiness for a candidate file set, regex comparison, the symbols behind one edge. Needs a current debug build | P0.2 |
 | `Scripts/modularization_metrics.py check` / `update` | Ratchet gate (run by `make guardrails`) and baseline refresh | P0.7 |
 | `./conductor job status --json` → `phaseTimings` | Structured per-job phase marks and segments; also persisted as `<ticket>.timing.json` next to the job log | P0.1 |
 | `Scripts/conductor_job_timings.py` | Queue-wait, net job-duration, and per-phase percentiles; prefers `<ticket>.timing.json`, falls back to log parsing | P0.1 |
 
-Self-tests: `make conductor-selftest` (includes `test_modularization_metrics.py`, `test_conductor_job_timings.py`, and `test_conductor_job_phases.py`).
+Self-tests: `make conductor-selftest` (includes `test_modularization_metrics.py`, `test_modularization_index_graph.py`, `test_conductor_job_timings.py`, and `test_conductor_job_phases.py`).
 
 ## Ratchet policy
 
 - **Gated** (CI fails on any increase): `app_files_over_5000_lines`, `app_static_shared_declarations`, `app_largest_cycle_components`, `tests_sleep_calls`. Ordinary feature work never needs to worsen these.
-- **Tracked** (reported, not gated): `app_target_swift_lines`, `app_files_over_2000_lines`, `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, `app_wrong_way_file_edges`, `tests_testable_import_app_files`. Each is promoted to gated when its wave provides an alternative home (a module or an injection seam), or, for wrong-way edges, when the index-store graph replaces the regex graph.
+- **Tracked** (reported, not gated): `app_target_swift_lines`, `app_files_over_2000_lines`, `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, `app_wrong_way_file_edges`, `tests_testable_import_app_files`. Each is promoted to gated when its wave provides an alternative home (a module or an injection seam). Wrong-way edges stay tracked for now: the regex count is too noisy to gate, and the index-store count needs a build that guardrails do not have (P0.2 decision below).
 - Lower a baseline with `update` in the slice that improves it. Raising one requires `update --allow-regression` plus a justification entry here.
 
 ## Baseline — 2026-09-28 (`589cecc5`)
@@ -45,7 +46,7 @@ Conductor timings (last 3,000 jobs, net of queue):
 ## Phase 0 progress
 
 - [x] P0.1 timing: retroactive baseline, structured conductor phase timing, and attribution of the two open overheads (see P0.1 below)
-- [x] P0.2 prototype graph tool (index-store replacement still open)
+- [x] P0.2 graph tool: regex prototype, then the index-store tool, validated against the top 40 and the seam catalog (see P0.2 below)
 - [x] P0.3 focused-test executor bake-off — gate holds on both slices (`RepoPromptMCPCoreTests` 77%, `RepoPromptDomainRuntimeTests` 95%); ADR-07 accepted. Not measured, not blockers: candidates (c) and (d), CI parity of module runs (CI stays on the aggregate)
 - [x] P0.4 fixed per-job overhead root cause and fix (see below)
 - [ ] P0.5 link and type-check levers
@@ -352,3 +353,125 @@ Proposed fixes (not implemented in P0.1):
 3. **Publication, needs a decision.**
    - Exclude `.build/swiftbuild` from the seed in `_sanitize_seed`. That is about 5.5 GiB less to clone, sanitize, and measure, but new worktrees lose a warm module scratch path.
    - Alternatively, report the job result before publishing. That changes the deliberate hold on the build lane and needs a design.
+
+## P0.2 — index-store dependency graph (2026-09-29)
+
+**Tool:** `Scripts/modularization_index_graph.py`, tested by `Scripts/test_modularization_index_graph.py` (16 cases over a synthetic fake store, plus one ctypes binding case against an empty store; in `make conductor-selftest`).
+
+**Reader choice.** Xcode 26.3's default toolchain ships `usr/lib/libIndexStore.dylib` with the stable C API, including the function-pointer `*_apply_f` variants. The tool binds 22 of those functions with `ctypes`, locating the library next to `xcrun --find swift` (override: `--library` or `REPOPROMPT_LIBINDEXSTORE`). No Swift package, pip dependency, or new build step is needed. No store-dumping CLI ships with Xcode 26.3:
+- `sourcekit-lsp` answers per-symbol editor queries.
+- `xcindex-test` is a diagnostic driver for Xcode's build-system index preparation that needs an Xcode project.
+- Neither enumerates units and records.
+
+**Source of truth.** `conductor swift-build --product RepoPrompt` (ticket `5ed14530`, exit 0, 768 s, about 1,060 app files recompiled after the P0.1 probe) populates `.build/arm64-apple-macosx/debug/index/store`. SwiftPM enables the index store for debug builds by default.
+- The store held 6,460 units, including 2,320 `RepoPromptApp` units.
+  - 1,160 point at this worktree's sources.
+  - The other 1,160 point at the worktree whose `.build` conductor seeded this one from (`wt-mcp-headless-reliability-core`).
+- Per file, the tool uses the newest unit whose main file lies under *this* root's `Sources/RepoPrompt`. It ignores seeded units from other checkouts and units for deleted files. A freshly seeded worktree with no build of its own therefore reports every file as unindexed rather than borrowing another checkout's graph.
+- `freshness` in the output reports source files newer than their unit, and source files with no unit. After this build: 1,160 of 1,160 indexed, 0 stale.
+
+**Method.**
+- **Definitions and references.**
+  - A file *defines* every USR it has a declaration or definition occurrence for.
+  - It *references* every USR it has a reference occurrence for, explicit or implicit.
+  - An edge A→B exists when A references a USR that B (B ≠ A) defines.
+  - USRs are unique across files (0 multiply defined), so no ambiguity rule is needed.
+  - Implicit references, such as a getter behind a property read, never create an edge on their own: 0 edges are implicit-only.
+- **Local symbols.** The index skips locals, so shadowing cannot create false edges.
+- **Triage and cost.**
+  - Components, layer ranks, wrong-way rule, and Tarjan SCC are imported from `modularization_metrics.py` unchanged, so both graphs are directly comparable.
+  - Extraction takes 21 s uncontended and 82 s alongside a build. `dump` writes the graph as JSON (85 MB) for repeated queries.
+- **`readiness --files <paths>`** lists, for a candidate set:
+  - app files outside the set that it references, with the symbols involved;
+  - the non-system modules it imports;
+  - the outside files and symbols that reference it, which need `package` access after a move.
+
+  Accessors fold into their property.
+
+**Results (HEAD `9e912a86`).**
+
+| Measure | Regex prototype | Index store |
+| --- | --- | --- |
+| File edges | 6,405 | 7,673 |
+| Cross-layer file edges | 3,692 | 4,484 |
+| Wrong-way file edges | 1,102 | **1,360** (983 shared) |
+| Wrong-way target files | 200 | 253 |
+| Top 20 / top 40 targets' share | 58% / 73% | 53% / 68% |
+| Largest component cycle | 67 of 75 | **66 of 75** |
+| Largest file-level cycle | — | 639 of 1,160 files (19 non-trivial file SCCs) |
+
+Components outside the largest index cycle: `Features/AgentMode` (the root folder's own files), `Infrastructure/Concurrency`, `Diffing`, `Networking`, `Regex`, `SyntaxParsing`, `Infrastructure/UI` (root files), `UI/Services`, `WorkspaceContext/PathResolution`.
+
+**Validation diff** (`modularization_index_graph.py compare`). Of the regex's wrong-way edges, 119 (11%) are false. It misses 377 edges (28% of the index count). Every disagreement was classified.
+
+- **Missed by the regex (377):**
+  - **233 member or extension-member references.** The regex indexes top-level names only.
+    - `App/Views/ContentViewNotificationHandler` → `App/Notifications/AppNotifications.swift` through `Notification.Name.showAPISettingsTab` and other static members.
+    - `App/Views/ContentRootShellView` → `App/WindowState.swift` through the `promptManager` and `agentModeViewModel` properties.
+  - **143 types the regex cannot see:** nested types, types indented under `#if`, or names under 5 characters.
+    - `AgentSessionDataService` → `Diagnostics/App/WorkspaceRestorePerfLog.swift`: `enum WorkspaceRestorePerfLog` is indented under `#if`.
+    - `AgentSessionRestoreModels` → `AgentModeViewModel+Types.swift`: `BuiltTranscriptPresentation` is nested in an extension.
+  - **1 reference inside string interpolation**, which the regex strips: `ACPProviderSupport` uses `"\(RepoPromptMCPServerConfiguration.defaultServerName)"`.
+- **Invented by the regex (119):**
+  - **83 same-name collisions with another app declaration.**
+    - 66 of the 76 regex edges into `WorkspaceFilesViewModel.swift` are `.relativePath` property uses, matched to a file-private top-level `func relativePath(from:rootPath:)` in that file.
+    - `compare` and `insertionIndex` resolve elsewhere, not to the `SortingUtils` globals.
+    - `fileName` resolves elsewhere, not to the `ToolCardContainer` global.
+  - **4 names that resolve to another module:** `compare` in AI provider files is Foundation's.
+  - **32 locals or labels with no indexed symbol:** `if let compare = …` in `AgentToolCardRenderSummary`, `let fileName = …` in `AgentTranscriptServices`.
+- **Top 40 targets:** 34 of 40 agree.
+  - **Entered:** `App/Notifications/AppNotifications.swift` (39, regex 0), `Diagnostics/AgentMode/AgentModePerfDiagnostics.swift` (39, 0), `MCPServerViewModel+TabContext.swift` (25, 0), `AgentModeViewModel+Types.swift` (22, 3), `Diagnostics/App/WorkspaceRestorePerfLog.swift` (13, 0), `OracleViewModel.swift` (8, 6).
+  - **Left:** `SortingUtils.swift` (27 → 0) and `ToolCardContainer.swift` (18 → 0), both collisions. The other four (`AgentPermissionSecureStore`, `CodeMapSelectionGraphContribution`, `MCPFilesystemConstants`, `AgentMonitorPillModels`) sit at the 6–7-edge cutoff.
+  - **Large moves:** `WorkspaceFilesViewModel` 76 → 10 (rank 3 → 29); `WindowState` 37 → 54; `AgentTabSession` 21 → 36; `PromptViewModel` 13 → 26; `WorkspaceManagerViewModel` 8 → 20; `WorkspaceModel` 26 → 37.
+- **Largest cycle:** the only difference is `Infrastructure/Diffing`.
+  - Its 10 inbound regex edges are the identifier `Change` resolving to other declarations.
+  - The index finds no in-app reference to any Diffing file. Only `Tests/RepoPromptTests/Diffing/DiffParserRecoveryTests.swift` uses it, which a text search confirms.
+- **Inherited triage quirk:** `App/Views` ranks as Views (10) and the rest of `App` as 12, so `App/Views` → `App/*` edges count as wrong-way in both graphs.
+
+**Seam catalog (plan §4) against the index.** Counts are file edges unless stated. "refs" means reference occurrences in other files.
+
+| Seam | Plan evidence (regex) | Index evidence | Change |
+| --- | --- | --- | --- |
+| S1 | `FontPreset` 85, `FontScaleManager` 77; `.shared` ×130 | 92 and 77 wrong-way; `FontScaleManager.shared` 129 refs in 80 files | Confirmed |
+| S2 | `WindowState` 37, `WindowStateManager` 29; `.shared` ×115 | 54 and 29; `WindowStatesManager.shared` 116 refs in 35 files | Larger (`WindowState` members) |
+| S3 | 50 lower-layer files use nested types; `+Types` fan-in 55 | `AgentModeViewModel` 43 wrong-way; `+Types` fan-in 56, 22 wrong-way; 144 nested types used from 53 files, 27 of them below the ViewModels rank | Confirmed. Stored-VM-reference counts (13) are not index-derivable |
+| S4 | 26 files use nested `Codex*` identity types | The 15 nested `AgentTabSession.Codex*` types are used from **4** files. Codex-prefixed members and types of `AgentTabSession` (156) are used from 19 files, 14 in `AgentMode/Runtime`. `AgentTabSession` 36 wrong-way | **Reframed:** the seam is Codex turn *state* on the session, not a handful of identity types |
+| S5 | `RequestMetadata` ×31, `ResolvedTabContextSnapshot` ×18 | `MCPServerViewModel+TabContext.swift` 25 wrong-way (regex 0). `RequestMetadata` 63 refs in 16 files; `ResolvedTabContextSnapshot` 34/10; `TabContextSnapshot` 47/14; `FrozenFileToolAuthority` 25/6; `DomainReadAppExecutionContext` 16/6; `ConnectionBindingSnapshot` 13/3 | Confirmed, larger |
+| S6 | `ServerNetworkManager.shared` ×119 | 116 refs in 30 files | Confirmed |
+| S7 | `GlobalSettingsStore.shared` ×115; `GlobalSettingsManager` fan-in 73 | 119 refs in 63 files; fan-in 73, 25 wrong-way | Confirmed |
+| S8 | `WorkspaceFilesViewModel` fan-in 109, 76 wrong-way | Fan-in **33**, **10** wrong-way, from 8 components (UI/TextField 2, MCP/WindowTools 2; WorkspaceContext, UI/Mentions, MCP/ApplyEdits, MCP, Diffing, Search 1 each) | **Much smaller.** 66 edges were the `relativePath` collision |
+| S9 | `SortingUtils` 27, `WorkspaceModel` 26, `ToolCardContainer`'s `toolIcon(for:)`, and others | `SortingUtils` **0**; `ToolCardContainer` **0** (`toolIcon(for:)` is used by 14 files, all in `AgentMode/Views`); `WorkspaceModel` 37; `MCPFilesystemConstants` 6; `ChatPreset` 3; `FileSystemItems` 2; `CopyPresetOverrides`, `ToolResultDTOs`, `FileSystemItemViewModel` 1 each | **Drop `SortingUtils` and `toolIcon(for:)`**; `WorkspaceModel` is the main item |
+| S10 | AI → AgentMode 135 edges from 60 files | 150 from 61 (regex with the same predicate: 139/61). `AgentRuntimeProviderService` 43, `ACPAgentProvider` 35 | Confirmed |
+| S11 | MCP → AgentRuntime 72, → models 68, → VMs 31, → App 27 | Predicate: `Infrastructure/MCP` outside `MCP/ViewModels`. → `AgentMode/Runtime` 45 (regex 36), → `Features/*/Models` 56 (47), → other ViewModels **83** (32), → `App` 38 (27). `MCP/WindowTools` → layers above MCP: 124 edges from 15 files | Confirmed. The VM share is about 2.6× the regex count. The plan's numbers used a different grouping |
+| S12 | `WorktreeStartupInstrumentation` 18 edges from 5 layers | 20 wrong-way from 9 components; **plus `AgentModePerfDiagnostics` 39 and `WorkspaceRestorePerfLog` 13**, both invisible to the regex; `MCPToolExecutionDiagnostics` 8; `AgentSessionLinkCatalogDiagnostics` 3 | **Larger:** add the two perf-diagnostics enums |
+| S13 | `NotificationPreferences`, `AppNotificationPayload`, `AppDeepLinkRoute`, `UserNotificationCenterClient` | **`AppNotifications.swift` 39** and `WorkspaceNotifications.swift` 6 (`Notification.Name` members); `NotificationPreferences` 10, `AppDeepLinkRoute` 8, `NotificationService` 5, `UserNotificationCenterClient` 4, `AppNotificationPayload` 3, `AppNotificationCategories` 2 | **Larger:** notification names are the biggest part |
+| S14, S15 | — | Landed (W1) | — |
+| S16 | God files | Line counts, not graph data | Unchanged |
+
+Not in the catalog:
+- **`PromptViewModel`** (26 wrong-way edges) and **`WorkspaceManagerViewModel`** (20) are view models used from lower layers, like S8.
+- **`Infrastructure/Diffing`** has no in-app consumers.
+
+**Readiness samples**:
+
+| Candidate | Files | Blockers (outbound target files) | Outbound symbols | Inbound files / symbols needing access |
+| --- | --- | --- | --- | --- |
+| `Infrastructure/Concurrency` | 6 | none (**ready**) | 0 | 18 / 19 |
+| `Infrastructure/Diffing` | 6 | `AIMessage` (`FileChange`), `FileViewModel`, `WorkspaceFilesViewModel` | 13 | 0 / 0 |
+| `Infrastructure/Utilities` | 11 | `CustomOpenAIProvider` (error enum), `LineRange`, `SliceRangeMath` | 13 | 52 / 79 |
+| `Infrastructure/Process` | 24 | `AsyncScope`, `TaskSemaphore`, `FileSystemService` (2 files), `MCPConfigExportService`, `MCPIntegrationHelper` | 16 | 46 / 179 |
+
+**Ratchet decision: keep the regex source.** Neither `app_wrong_way_file_edges` nor `app_largest_cycle_components` switches to the index.
+- **The index needs a build.** It is exact only after a current debug build of the app, which took 768 s here. `make guardrails`, the commit preflight, and the CI guardrail step run without one. A stale or absent store would make the gate depend on which worktree ran it.
+- **`app_largest_cycle_components` stays gated on the regex.** The graphs differ by one component (67 vs 66, the Diffing false edge), and the regex value moves with real cycle changes. Gating on it is sound, and conservative by one.
+- **`app_wrong_way_file_edges` stays tracked, not gated.** With 11% false edges and 28% missed, the regex count can move by name collisions alone, for example a new file-private global named like a common property.
+- **Index baseline.** For slice reporting it is **1,360 wrong-way file edges and 66 of 75 components** (HEAD `9e912a86`). Slices that change boundaries record both counts after their conductor build.
+- **When to gate on the index:** promote to an index-backed gate once CI has a build-producing job that can run `report` after building (P1.4 build-once). It is not added to `ratchets.json`, because `update` would drop keys that `collect` does not produce.
+
+**Validation.**
+- `make guardrails` passes, with modularization ratchets ok.
+- `make conductor-selftest`: every suite passes except `test_local_production_installer.py`.
+  - It failed 3 of 18 in the make run, then 5, 1, and 4 in three standalone reruns.
+  - Each run failed a different subset, always with a 15 s `install_local_production.sh` subprocess timeout. The 15-minute load average was about 45 at the start.
+  - This change does not touch the installer or its test. The failures are the known load-sensitive flake.
+- `test_security_inventory.py`, the suite after it, passes standalone.

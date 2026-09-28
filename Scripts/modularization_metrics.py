@@ -6,8 +6,9 @@ docs/migrations/build-modularization-2026-09-28.md.
 
 The dependency graph is a *triage* approximation: comment/string-stripped
 sources, unique top-level declaration names, folder-level aggregation. It is
-deterministic so it can gate regressions, but it is not compiler-grade; an
-index-store backed replacement is a later Phase 0 item.
+deterministic and build-free so it can gate regressions, but it is not
+compiler-grade. For analysis use modularization_index_graph.py, which reads the
+index store of a debug build (P0.2; see the ledger for how the two differ).
 
 Usage:
   modularization_metrics.py report [--root DIR] [--details]
@@ -43,7 +44,8 @@ RATCHETED_METRICS: Tuple[str, ...] = (
     "tests_sleep_calls",
 )
 # Tracked: reported against the baseline but not gated until the owning wave provides an
-# alternative home (a module, an injection seam) or the index-store graph replaces the regex graph.
+# alternative home (a module, an injection seam). Wrong-way edges stay tracked: the regex count is
+# too noisy to gate and the index-store count needs a build (ledger, P0.2).
 TRACKED_METRICS: Tuple[str, ...] = (
     "app_target_swift_lines",
     "app_files_over_2000_lines",
