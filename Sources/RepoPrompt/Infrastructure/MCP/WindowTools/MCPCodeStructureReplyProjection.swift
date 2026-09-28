@@ -6,13 +6,48 @@ import MCP
 
 /// Sendable `get_code_structure` reply assembly used by the MainActor provider path.
 ///
-/// Authority capture, ingress waits, seed resolution, graph query and revalidation, and signature
-/// demand stay with their existing owners (the MainActor tab context, `WorkspaceFileContextStore`,
-/// and `WorkspaceCodemapPresentationCoordinator`). What remains is a pure function of immutable
-/// inputs: root and signature ordering, signature token-budget accounting, issue mapping, status
-/// rollup, and `Value` encoding. It runs on `MCPProviderProjectionWorker`, never on the main actor.
+/// Authority capture, ingress waits, seed resolution, logical-path projection, graph query and
+/// revalidation, and signature demand stay with their existing owners (the MainActor tab context,
+/// `WorkspaceLookupContext`, `WorkspaceFileContextStore`, and
+/// `WorkspaceCodemapPresentationCoordinator`). What remains is a pure function of immutable inputs:
+/// seed ordering over precomputed keys, root and signature ordering, signature token-budget
+/// accounting, issue mapping, status rollup, and `Value` encoding. It runs on
+/// `MCPProviderProjectionWorker`, never on the main actor.
 enum MCPCodeStructureReplyProjection {
     typealias DTO = ToolResultDTOs.CodeStructureReplyDTO
+
+    /// Immutable seed-order key. `logicalPath` is projected once per unique seed on the main actor
+    /// by the existing lookup-context owner; only this value and the file identity cross to the
+    /// worker, so no lookup, window, or binding authority leaves the actor.
+    struct SeedOrderKey: Sendable, Equatable {
+        let logicalPath: String
+        let fileID: UUID
+    }
+
+    /// Orders seed file IDs on the projection worker. Zero or one key is already ordered and returns
+    /// without a hop. Cancellation follows the worker contract.
+    @MainActor
+    static func orderSeedFileIDs(_ keys: [SeedOrderKey]) async throws -> [UUID] {
+        guard keys.count > 1 else { return keys.map(\.fileID) }
+        return try await MCPProviderProjectionWorker.run(
+            toolName: MCPWindowToolName.getCodeStructure,
+            phase: "seed_ordering"
+        ) {
+            orderedSeedFileIDs(keys)
+        }
+    }
+
+    /// The pure seed order: logical path by UTF-8 bytes (paths equal as `String` fall through), then
+    /// file UUID string. This is the former main-actor comparator, which recomputed both logical
+    /// paths on every comparison, applied to keys computed once.
+    static func orderedSeedFileIDs(_ keys: [SeedOrderKey]) -> [UUID] {
+        keys.sorted { lhs, rhs in
+            if lhs.logicalPath != rhs.logicalPath {
+                return lhs.logicalPath.utf8.lexicographicallyPrecedes(rhs.logicalPath.utf8)
+            }
+            return lhs.fileID.uuidString < rhs.fileID.uuidString
+        }.map(\.fileID)
+    }
 
     /// Immutable assembly input. Explicitly `Sendable` so the compiler checks the graph aggregate,
     /// signature presentation, and revalidation values before they cross to the worker.

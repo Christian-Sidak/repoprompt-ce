@@ -419,7 +419,12 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 )
                 try Task.checkCancellation()
                 try await validate(authority)
-                return try await MCPCodeStructureReplyProjection.encodeReply(reply)
+                let value = try await MCPCodeStructureReplyProjection.encodeReply(reply)
+                // Encoding suspends this actor while the worker runs, so authority can change before
+                // the value is released; revalidate after the hop.
+                try Task.checkCancellation()
+                try await validate(authority)
+                return value
             }
         }
     }

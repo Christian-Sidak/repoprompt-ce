@@ -59,6 +59,139 @@ import XCTest
             )])
         }
 
+        /// M10: seed order is UTF-8 logical path, then UUID string. Paths equal as `String`
+        /// (canonically equivalent) fall through to the UUID, and a decomposed `é` orders by its UTF-8
+        /// bytes before `f`, unlike `String` ordering. Nonisolated: the sort stays actor-free.
+        func testSeedOrderIsUTF8LogicalPathThenUUIDString() {
+            let decomposed = "src/e\u{301}.swift"
+            let precomposed = "src/\u{E9}.swift"
+            // The fixture must separate UTF-8 from `String` ordering to prove which one applies.
+            XCTAssertEqual(decomposed, precomposed)
+            XCTAssertTrue(decomposed > "src/f.swift")
+            let keys = [
+                Self.seedKey("src/b.swift", 10),
+                Self.seedKey("src/f.swift", 20),
+                Self.seedKey(decomposed, 30),
+                Self.seedKey(precomposed, 40),
+                Self.seedKey("src/a.swift", 60),
+                Self.seedKey("src/a.swift", 50),
+                Self.seedKey("Beta/src/a.swift", 70),
+                Self.seedKey("Alpha/src/a.swift", 80),
+                Self.seedKey("src/Z.swift", 90)
+            ]
+            let expected = [80, 70, 90, 50, 60, 10, 30, 20, 40].map(Fixture.uuid)
+
+            XCTAssertEqual(MCPCodeStructureReplyProjection.orderedSeedFileIDs(keys), expected)
+            XCTAssertEqual(MCPCodeStructureReplyProjection.orderedSeedFileIDs(keys.reversed()), expected)
+            XCTAssertEqual(MCPCodeStructureReplyProjection.orderedSeedFileIDs(Array(keys[4...] + keys[..<4])), expected)
+        }
+
+        /// M10: keys projected once by the lookup-context owner and ordered by the pure sort give
+        /// exactly the order of the former comparator, which re-projected both logical paths on every
+        /// comparison: single-root relative paths, labelled multi-root paths, and an unlabelled root
+        /// whose relative-path fallback ties with a labelled path and falls through to the UUID.
+        @MainActor
+        func testSeedOrderKeysReproduceFormerComparatorOrder() {
+            let alpha = WorkspaceRootRef(id: Fixture.uuid(901), name: "Alpha", fullPath: "/repo/alpha")
+            let beta = WorkspaceRootRef(id: Fixture.uuid(902), name: "Beta", fullPath: "/repo/beta")
+            let unlabelled = WorkspaceRootRef(id: Fixture.uuid(903), name: "Gamma", fullPath: "/repo/gamma")
+            let labels = [alpha.id: "Alpha", beta.id: "Beta"]
+            let records = [
+                Self.record(1, alpha, "src/b.swift"),
+                Self.record(2, beta, "src/a.swift"),
+                Self.record(3, unlabelled, "Alpha/src/b.swift"),
+                Self.record(4, alpha, "src/e\u{301}.swift"),
+                Self.record(5, alpha, "src/f.swift"),
+                Self.record(6, unlabelled, "src/a.swift"),
+                Self.record(7, beta, "Z.swift")
+            ]
+            let cases: [(roots: [WorkspaceRootRef], files: [WorkspaceFileRecord], expected: [Int])] = [
+                ([alpha, beta, unlabelled], records, [1, 3, 4, 5, 7, 2, 6]),
+                ([alpha], records.filter { $0.rootID == alpha.id }, [1, 4, 5])
+            ]
+
+            for (roots, files, expected) in cases {
+                let keys = files.map {
+                    MCPServerViewModel.codeStructureSeedOrderKey(
+                        for: $0,
+                        roots: roots,
+                        lookupContext: .visibleWorkspace,
+                        logicalRootDisplayNamesByRootID: labels
+                    )
+                }
+                let ordered = MCPCodeStructureReplyProjection.orderedSeedFileIDs(keys)
+
+                XCTAssertEqual(ordered, expected.map(Fixture.uuid), "roots: \(roots.map(\.name))")
+                XCTAssertEqual(
+                    ordered,
+                    Self.formerComparatorOrder(files, roots: roots, labels: labels),
+                    "roots: \(roots.map(\.name))"
+                )
+            }
+        }
+
+        @MainActor
+        func testSeedOrderingHopsToProjectionWorkerOnlyWithMoreThanOneKey() async throws {
+            let recorder = ProjectionExecutionRecorder()
+            MCPProviderProjectionWorker.executionObserverForTesting = recorder.observer
+            defer { MCPProviderProjectionWorker.executionObserverForTesting = nil }
+
+            let none = try await MCPCodeStructureReplyProjection.orderSeedFileIDs([])
+            let single = try await MCPCodeStructureReplyProjection.orderSeedFileIDs([Self.seedKey("src/a.swift", 1)])
+            XCTAssertEqual(none, [])
+            XCTAssertEqual(single, [Fixture.uuid(1)])
+            XCTAssertEqual(recorder.events, [])
+
+            let ordered = try await MCPCodeStructureReplyProjection.orderSeedFileIDs([
+                Self.seedKey("src/b.swift", 2),
+                Self.seedKey("src/a.swift", 1)
+            ])
+
+            XCTAssertEqual(ordered, [Fixture.uuid(1), Fixture.uuid(2)])
+            XCTAssertEqual(recorder.events, [.init(
+                toolName: MCPWindowToolName.getCodeStructure,
+                phase: "seed_ordering",
+                ranOnMainThread: false
+            )])
+        }
+
+        private static func seedKey(_ logicalPath: String, _ id: Int) -> MCPCodeStructureReplyProjection.SeedOrderKey {
+            MCPCodeStructureReplyProjection.SeedOrderKey(logicalPath: logicalPath, fileID: Fixture.uuid(id))
+        }
+
+        private static func record(_ id: Int, _ root: WorkspaceRootRef, _ relativePath: String) -> WorkspaceFileRecord {
+            WorkspaceFileRecord(
+                id: Fixture.uuid(id),
+                rootID: root.id,
+                name: (relativePath as NSString).lastPathComponent,
+                relativePath: relativePath,
+                fullPath: "\(root.fullPath)/\(relativePath)",
+                parentFolderID: nil
+            )
+        }
+
+        /// The pre-M10 main-actor comparator, verbatim apart from its inputs.
+        private static func formerComparatorOrder(
+            _ files: [WorkspaceFileRecord],
+            roots: [WorkspaceRootRef],
+            labels: [UUID: String]
+        ) -> [UUID] {
+            func logicalPath(_ file: WorkspaceFileRecord) -> String {
+                WorkspaceLookupContext.visibleWorkspace.logicalDisplayPath(
+                    for: file,
+                    roots: roots,
+                    rootDisplayNamesByRootID: labels,
+                    display: .relative
+                ) ?? file.standardizedRelativePath
+            }
+            return files.sorted { lhs, rhs in
+                let left = logicalPath(lhs)
+                let right = logicalPath(rhs)
+                if left != right { return left.utf8.lexicographicallyPrecedes(right.utf8) }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }.map(\.id)
+        }
+
         /// Captured from the pre-extraction MainActor `MCPServerViewModel.codeStructureReplyDTO`.
         private static let goldenJSON = #"{"files":[{"content":"a1 signatures","depth":0,"path":"a1.swift","reached_by":[],"role":"seed","tokens":10},{"content":"a3 signatures","depth":1,"path":"a3.swift","reached_by":["used_by","uses"],"role":"related","tokens":4}],"issues":[{"code":"graph_size_limit","message":"The graph was truncated to fit the requested size.","phase":"graph_traversal","retryable":false},{"code":"signature_pending","message":"Signature generation is still pending.","path":"c1.swift","phase":"render_demand","retry_after_ms":100,"retryable":true},{"code":"signature_unavailable","message":"A signature artifact is unavailable; graph data remains usable.","path":"d2.swift","phase":"render_demand","retry_after_ms":100,"retryable":true},{"code":"signature_unavailable","message":"A signature artifact is unavailable; graph data remains usable.","path":"d1.swift","phase":"render_demand","retryable":false},{"code":"signature_freeze_failed","message":"Signatures could not be frozen; graph data remains usable.","phase":"freeze","retryable":false},{"code":"signature_unavailable","message":"A current signature candidate is unavailable.","phase":"render_demand","retryable":false},{"code":"signature_size_limit","message":"Some signatures were omitted to fit the requested output size.","phase":"render","retryable":false}],"retry":{"retry_after_ms":100,"retryable":true},"roots":[{"edges":[{"from":"a1.swift","symbols":["Foo","Bar"],"to":"a2.swift"},{"ambiguous":true,"from":"a3.swift","symbols":["run"],"to":"a1.swift"}],"index":{"indexed":3,"state":"complete","total":3},"issues":[],"nodes":[{"depth":0,"path":"a1.swift","reached_by":[],"seed":true},{"depth":1,"path":"a3.swift","reached_by":["used_by","uses"]},{"depth":1,"path":"a2.swift","reached_by":["uses"]}],"root":"Alpha","seeds":[{"path":"a1.swift","state":"covered"}],"status":"ok","truncated":{"dropped_nodes":2,"reason":"size"},"unresolved":[{"from":"a1.swift","name":"Baz","reason":"missing"},{"from":"a2.swift","name":"Qux","reason":"not_indexed_yet"}]},{"edges":[],"index":{"indexed":3,"state":"indexing","total":4},"issues":[{"attempted":3,"code":"seed_not_indexed","limit":4,"message":"Seed is not indexed yet.","path":"b1.swift","phase":"seed_resolution","retry_after_ms":100,"retryable":true},{"code":"signature_unavailable","message":"One or more signatures could not be rendered; graph data remains usable.","phase":"render","retryable":false}],"nodes":[{"depth":0,"path":"b2.swift","reached_by":[],"seed":true}],"root":"Beta","seeds":[{"path":"b1.swift","state":"not_indexed"},{"path":"b2.swift","state":"pending"}],"status":"partial","unresolved":[],"updates_pending":true},{"edges":[],"index":{"indexed":3,"state":"complete","total":3},"issues":[],"nodes":[{"depth":0,"path":"d1.swift","reached_by":[],"seed":true},{"depth":1,"path":"d2.swift","reached_by":["used_by"]}],"root":"Delta","seeds":[{"path":"d1.swift","state":"excluded"}],"status":"ok","unresolved":[]},{"edges":[],"index":{"indexed":3,"state":"complete","total":3},"issues":[{"code":"graph_revoked","message":"The graph was revoked.","phase":"graph_revalidation","retryable":false}],"nodes":[],"root":"Gamma","seeds":[{"path":"c1.swift","state":"covered"}],"status":"unavailable","unresolved":[]}],"size":"small","status":"partial","summary":{"edges":2,"files":2,"nodes":6,"seeds":5,"tokens":14},"worktree_scope":{"display_identity":"logical","effective_identity":"physical","kind":"session_bound","root_mappings":[]}}"#
 

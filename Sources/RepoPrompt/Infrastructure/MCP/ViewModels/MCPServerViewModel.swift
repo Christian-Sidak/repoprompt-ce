@@ -537,10 +537,17 @@ final class MCPServerViewModel: ObservableObject {
             let coordinatorInvocations: Int
         }
 
+        /// The seed-order keys projected on the main actor and the order the worker returned.
+        struct CodeStructureSeedOrderForTesting: Equatable {
+            let keys: [MCPCodeStructureReplyProjection.SeedOrderKey]
+            let orderedFileIDs: [UUID]
+        }
+
         private var codeStructureUniqueSeedCandidatesVisitedForTesting = 0
         private var codeStructureLogicalPathComputationsForTesting = 0
         private var codeStructureCoordinatorInvocationsForTesting = 0
         private var lastCodeStructureRequestForTesting: CodeStructureRequest?
+        private var lastCodeStructureSeedOrderForTesting: CodeStructureSeedOrderForTesting?
 
         func resetCodeStructureAdmissionWorkCountsForTesting() {
             codeStructureUniqueSeedCandidatesVisitedForTesting = 0
@@ -558,10 +565,15 @@ final class MCPServerViewModel: ObservableObject {
 
         func resetLastCodeStructureRequestForTesting() {
             lastCodeStructureRequestForTesting = nil
+            lastCodeStructureSeedOrderForTesting = nil
         }
 
         func capturedCodeStructureRequestForTesting() -> CodeStructureRequest? {
             lastCodeStructureRequestForTesting
+        }
+
+        func capturedCodeStructureSeedOrderForTesting() -> CodeStructureSeedOrderForTesting? {
+            lastCodeStructureSeedOrderForTesting
         }
     #endif
 
@@ -5993,26 +6005,31 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         let logicalRootNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
-        let orderedFiles = uniqueFilesByStandardizedFullPath.values.sorted { lhs, rhs in
-            let left = Self.logicalCodeStructurePath(
-                for: lhs,
+        // Each unique seed's logical path is projected exactly once, here, by the lookup-context
+        // owner. Only the immutable keys cross to the projection worker for ordering.
+        let seedOrderKeys = uniqueFilesByStandardizedFullPath.values.map { file in
+            #if DEBUG
+                codeStructureLogicalPathComputationsForTesting += 1
+            #endif
+            return Self.codeStructureSeedOrderKey(
+                for: file,
                 roots: roots,
                 lookupContext: lookupContext,
                 logicalRootDisplayNamesByRootID: logicalRootNames
             )
-            let right = Self.logicalCodeStructurePath(
-                for: rhs,
-                roots: roots,
-                lookupContext: lookupContext,
-                logicalRootDisplayNamesByRootID: logicalRootNames
-            )
-            if left != right { return left.utf8.lexicographicallyPrecedes(right.utf8) }
-            return lhs.id.uuidString < rhs.id.uuidString
         }
+        let orderedSeedFileIDs = try await MCPCodeStructureReplyProjection.orderSeedFileIDs(seedOrderKeys)
+        try Task.checkCancellation()
+        #if DEBUG
+            lastCodeStructureSeedOrderForTesting = CodeStructureSeedOrderForTesting(
+                keys: seedOrderKeys,
+                orderedFileIDs: orderedSeedFileIDs
+            )
+        #endif
 
         await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphSnapshot)
         let aggregate = try await store.queryCodemapStructureGraphs(
-            seedFileIDs: orderedFiles.map(\.id),
+            seedFileIDs: orderedSeedFileIDs,
             direction: request.direction,
             maximumDepth: request.maximumDepth,
             budget: request.budget,
@@ -6072,6 +6089,23 @@ final class MCPServerViewModel: ObservableObject {
             size: request.size,
             worktreeScope: worktreeScope
         ))
+    }
+
+    static func codeStructureSeedOrderKey(
+        for file: WorkspaceFileRecord,
+        roots: [WorkspaceRootRef],
+        lookupContext: WorkspaceLookupContext,
+        logicalRootDisplayNamesByRootID: [UUID: String]
+    ) -> MCPCodeStructureReplyProjection.SeedOrderKey {
+        MCPCodeStructureReplyProjection.SeedOrderKey(
+            logicalPath: logicalCodeStructurePath(
+                for: file,
+                roots: roots,
+                lookupContext: lookupContext,
+                logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
+            ),
+            fileID: file.id
+        )
     }
 
     private static func logicalCodeStructurePath(
