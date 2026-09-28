@@ -5427,11 +5427,16 @@ actor WorkspaceCodemapBindingEngine {
         reason: WorkspaceCodemapGraphIndexWorkerCompletionReason
     ) {
         guard var job = graphIndexJobs[rootEpoch], job.id == jobID else {
+            // A cancelled job's worker drained after the job was removed or replaced. Its admitted
+            // batch kept a slot (and counted against its root) until now, so a replacement queued
+            // meanwhile may only now be eligible: wake admissions as normal completion does.
             activeGraphIndexJobIDs.remove(jobID)
             cancelGraphIndexAdmission(jobID: jobID)
             drainingGraphIndexTasks.removeValue(forKey: jobID)
             drainingGraphIndexResources.removeValue(forKey: jobID)
             drainingGraphIndexRootEpochs.removeValue(forKey: jobID)
+            scheduleQueuedRequests()
+            scheduleGraphIndexAdmissions()
             return
         }
         guard job.workerID == workerID else { return }

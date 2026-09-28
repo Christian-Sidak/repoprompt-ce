@@ -701,6 +701,47 @@ admission stall's root cause is unconfirmed (hypothesis: an admission slot not r
 missed admission reschedule after, the cancelled job); confirming it needs the engine's active-batch
 set, admission queue, and per-root active-batch counts at the stall.
 
+### M8W — code-map graph-index admission wake-up after a cancelled active job drains
+
+The admission-stall half of the intermittent M8T gate failure recorded in M8V, root-caused and
+fixed. In `WorkspaceCodemapBindingEngine` an admitted graph-index batch is non-preemptive, so
+`cancelGraphIndexJob` removes a cancelled job that holds an admitted batch from `graphIndexJobs` but
+deliberately keeps its ID in `activeGraphIndexJobIDs` and the draining maps until its worker reaches
+a currentness boundary, and skips `scheduleGraphIndexAdmissions()` for an active job. A replacement
+job for the same root queued meanwhile is ineligible: `activeGraphIndexBatchCount(rootEpoch:)` still
+counts the draining batch against `maximumActiveGraphIndexBatchCountPerRoot` (default 1). When the
+drained batch ends, `releaseGraphIndexAdmission` returns early (the root's job is now the
+replacement), and `finishGraphIndexWorker`'s missing-job branch released the slot and draining state
+but returned without `scheduleQueuedRequests()` / `scheduleGraphIndexAdmissions()`, unlike normal
+completion. The now-eligible replacement then waited in `waitingForAdmission` indefinitely unless an
+unrelated event re-ran admission — matching the `0be123ad` diagnostics (a launch `cancelled` after
+hand-off, then a replacement stuck in `waitingForAdmission` with zero candidates processed).
+
+- Fix: the missing-job branch of `finishGraphIndexWorker` now calls `scheduleQueuedRequests()` and
+  `scheduleGraphIndexAdmissions()` after releasing the drained job's capacity. No other admission,
+  cancellation, or preemption behavior changes.
+- Regression (`WorkspaceCodemapGraphIndexAdmissionTests`, committed Git fixture, isolated runtime): a
+  catalog-build handler gated closed holds job A inside its admitted batch; `cancelGraphIndex` then
+  `scheduleGraphIndex` queues replacement B in `waitingForAdmission` behind one draining batch;
+  opening the gate must let B be admitted and complete. Run before the fix (`cb8878f1`), it failed for
+  exactly the intended reason — after A drained, B stayed `waitingForAdmission` with
+  `queued=true active=0 draining=0`, eligible but never admitted.
+
+Retry exhaustion (the other M8V gate path) is not changed here. Source assessment: transient results
+that consume the store launch's 3-retry budget (250 / 500 / 1000 ms) include not only Git faults
+(`gitProcessUnavailable`, `repositoryChanging`, `permissionFailure`) but supersession — an eligibility
+`CancellationError` maps to `runtimeUnavailable`, and setup `.cancelled` / `.staleCurrentness`
+dispositions are retryable — so activation-time authority churn may exhaust it. Store events record
+the event kind but not the transient reason, so which path the fixture hits is unconfirmed. M8X
+instruments the reason first and decides the fix from evidence; the budget is unchanged.
+
+Evidence: focused `WorkspaceCodemapGraphIndexAdmission|WorkspaceCodemapGraphIncrementalIndex|
+CodemapAutomaticSelectionGraphNative|WorkspaceCodemapRetryExhaustionStructure|
+CodemapGraphStatusDebugDiagnostics|MCPBackendParityHarness` passed 41/41 after the fix (conductor
+`054b218d`). The M8T parity gate was 18/18 in that run, with every code-structure scenario quiescent;
+because the retry-exhaustion path is unfixed, that is an observation, not a claim the gate is
+stable. All-products build and lint pending on this checkpoint.
+
 ### Later milestones (not started in this pass)
 
 - Remaining MainActor/GUI decoupling of the tier-0 read path (per-hop inventory first).
