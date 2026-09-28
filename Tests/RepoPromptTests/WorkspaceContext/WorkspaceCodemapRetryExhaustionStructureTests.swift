@@ -362,7 +362,7 @@ import XCTest
         }
 
         private static func reply(_ aggregate: WorkspaceCodemapStructureAggregateResult) -> ToolResultDTOs.CodeStructureReplyDTO {
-            MCPServerViewModel.codeStructureReplyDTO(
+            MCPCodeStructureReplyProjection.assemble(.init(
                 aggregate: aggregate,
                 presentation: nil,
                 revalidation: [:],
@@ -370,7 +370,7 @@ import XCTest
                 budget: budget,
                 size: .medium,
                 worktreeScope: nil
-            )
+            ))
         }
     }
 

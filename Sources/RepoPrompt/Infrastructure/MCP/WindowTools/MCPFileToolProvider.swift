@@ -419,7 +419,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 )
                 try Task.checkCancellation()
                 try await validate(authority)
-                return try Value(reply)
+                return try await MCPCodeStructureReplyProjection.encodeReply(reply)
             }
         }
     }

@@ -61,6 +61,28 @@ import XCTest
             try assertGate(report, scenarios: scenarios, attachmentName: "mcp-backend-parity-non-git-report.json")
         }
 
+        /// M9: the real app `get_code_structure` path assembles and encodes its reply on the
+        /// projection worker, never on the main thread, in that order.
+        func testAppCodeStructureAssemblesAndEncodesOnProjectionWorker() async throws {
+            let root = try makeNonGitFixture()
+            try await pinGlobalIgnoreDefaults()
+            let harness = try await Harness.make(root: root, globalPatterns: Self.globalPatterns)
+            addTeardownBlock { @MainActor in await harness.close() }
+            let recorder = ProjectionExecutionRecorder()
+            MCPProviderProjectionWorker.executionObserverForTesting = recorder.observer
+            defer { MCPProviderProjectionWorker.executionObserverForTesting = nil }
+
+            let value = try await harness.callApp(
+                .codeStructure,
+                arguments: ["paths": .array([.string("src/a.swift")]), "signatures": .bool(false)]
+            )
+
+            XCTAssertNotNil(value.decode(ToolResultDTOs.CodeStructureReplyDTO.self))
+            let events = recorder.events.filter { $0.toolName == MCPWindowToolName.getCodeStructure }
+            XCTAssertEqual(events.map(\.phase), ["reply_assembly", "value_encoding"])
+            XCTAssertFalse(events.contains(where: \.ranOnMainThread), "\(events)")
+        }
+
         // MARK: - Gate logic (deterministic, no backends)
 
         func testEqualRelationFlagsDifferingOutcomes() {

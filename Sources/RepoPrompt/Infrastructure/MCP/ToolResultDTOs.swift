@@ -300,7 +300,9 @@ enum ToolResultDTOs {
 
     // MARK: - Code Structure
 
-    struct CodeStructureReplyDTO: Codable, Equatable {
+    // Explicit checked conformance: the reply crosses the projection worker boundary.
+    // swiftformat:disable:next redundantSendable
+    struct CodeStructureReplyDTO: Codable, Equatable, Sendable {
         enum Status: String, Codable {
             case ok
             case partial

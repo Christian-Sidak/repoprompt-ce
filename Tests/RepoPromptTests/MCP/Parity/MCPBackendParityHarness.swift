@@ -214,6 +214,14 @@ import XCTest
             self.headless = headless
         }
 
+        /// Calls one app window tool once, without settling or sampling.
+        func callApp(_ tool: Tool, arguments: [String: Value]) async throws -> Value {
+            guard let appTool = appTools[tool] else {
+                throw MCPError.internalError("app tool \(tool.rawValue) is not exposed")
+            }
+            return try await appTool(arguments)
+        }
+
         /// Closes and unregisters the app window, then shuts down its code-map runtime.
         func close() async {
             await InProcessMCPWindowServerFixture.close(appWindow)
