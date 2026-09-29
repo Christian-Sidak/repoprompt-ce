@@ -2,8 +2,6 @@
 import Foundation
 import PackageDescription
 
-let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
-
 // Telemetry (Sentry) is resolved deterministically but linked only when explicitly
 // requested. The official Developer ID release pipeline sets
 // REPOPROMPT_ENABLE_SENTRY=1; local builds use the same gate for intentional
@@ -69,11 +67,7 @@ var repoPromptAppDependencies: [Target.Dependency] = [
 
 var repoPromptAppSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug)),
-    .enableUpcomingFeature("BareSlashRegexLiterals"),
-    .unsafeFlags([
-        "-import-objc-header", "\(packageRoot)/Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h",
-        "-disable-bridging-pch"
-    ])
+    .enableUpcomingFeature("BareSlashRegexLiterals")
 ]
 
 var repoPromptTestDependencies: [Target.Dependency] = [

@@ -221,7 +221,7 @@ See `docs/architecture/source-layout.md` for the full ownership map and document
 - App lifecycle, launch/configuration, command, and composition-root wiring stays under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
 - Cross-cutting service/platform substrate stays under `Sources/RepoPrompt/Infrastructure/<Area>` in the `RepoPromptApp` target.
 - App-wide notification names and root app views/view models belong under `Sources/RepoPrompt/App`.
-- Bridging-header-sensitive support stays under `Sources/RepoPrompt/Support` and is owned by `RepoPromptApp` unless `Package.swift` is updated in the same change.
+- No first-party target uses an Objective-C bridging header. C declarations live in a C target (for example `Sources/RepoPromptC/include`) and Swift files `import` that module explicitly.
 - Reusable UI, diffing, regex, networking, process, security, and utility substrate should use the narrowest `Sources/RepoPrompt/Infrastructure/<Area>` owner.
 - App-integrated diagnostics belong under `Sources/RepoPrompt/Features/Diagnostics` and need a documented entry point/purpose.
 - App/CLI protocol code shared by both products belongs under `Sources/RepoPromptShared`.
