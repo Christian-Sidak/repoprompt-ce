@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptC
 #if os(macOS)
     import Darwin
     import RepoPromptC
