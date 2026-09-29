@@ -390,6 +390,14 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
     func agentSessionLinkPublishPersistencePresentation(
         _ presentation: AgentSessionOversightPersistencePresentation
     )
+
+    /// Passively loads the persisted state of the described compose tabs bound to these sessions.
+    ///
+    /// Used only by launch restoration for the endpoints of saved oversight pairs. A conforming host
+    /// must load in the background without selecting, focusing, or activating any tab or window, and
+    /// without starting or reconnecting any provider; readiness then re-enters restoration through
+    /// the ordinary candidate-readiness signal.
+    func agentSessionLinkRequestRestorationHydration(sessionIDs: Set<UUID>)
 }
 
 /// Defaults for the launch-restoration surface.
@@ -463,6 +471,8 @@ extension AgentSessionLinkEndpointHost {
     func agentSessionLinkPublishPersistencePresentation(
         _: AgentSessionOversightPersistencePresentation
     ) {}
+
+    func agentSessionLinkRequestRestorationHydration(sessionIDs _: Set<UUID>) {}
 
     /// Fail-closed defaults for the auto-wake setting.
     ///
@@ -2240,6 +2250,10 @@ final class AgentSessionLinkRuntimeBridge {
             assertedAt: assertionGeneration,
             expectedEndpoints: expectedEndpoints
         )
+        // An Add that joined a still-saved pair (for example one whose launch restore had not run
+        // yet) gets that pair's saved delegation back. A freshly inserted row has none, so this is a
+        // no-op for a genuinely new relationship.
+        await reapplySavedDelegation(pair: pair, after: establishment)
         let outcome = establishment.outcome
         guard !establishment.preservesDurableIntentOnFailure else { return outcome }
         // An idempotent `.unchanged` insertion reasserted a row that predates this attempt. A later
@@ -4389,9 +4403,32 @@ final class AgentSessionLinkRuntimeBridge {
             && AgentSessionLinkEndpointEligibility.targetResolveFailure(for: target) == nil
     }
 
-    /// Changes only the captured active grant. This setting is deliberately not persisted: durable
-    /// Auto-wake selection is UUID-keyed and cannot safely carry permission authority across relink.
+    /// Changes only the captured active grant, and records the user's choice on the saved
+    /// observer → target intent so a relaunch (or a re-add of the still-saved pair) re-applies it to
+    /// the fresh grant through this same eligibility check. Auto-wake selection is unrelated and
+    /// carries no permission authority.
     func setAutoApproval(
+        _ enabled: Bool,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        expectedReference: DomainAgentSessionLinkReference
+    ) async -> Bool {
+        guard await applyAutoApproval(
+            enabled,
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint,
+            expectedReference: expectedReference
+        ) else { return false }
+        await persistDelegation(
+            observerEndpoint: observerEndpoint,
+            targetEndpoint: targetEndpoint,
+            autoApprovePermissions: enabled
+        )
+        return true
+    }
+
+    /// The in-memory half of `setAutoApproval`, shared with restore re-application.
+    private func applyAutoApproval(
         _ enabled: Bool,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
@@ -4429,6 +4466,7 @@ final class AgentSessionLinkRuntimeBridge {
               let host = self.host,
               host.agentSessionLinkCandidates().contains(where: { $0.domainEndpoint == observerEndpoint })
         else { return false }
+        var changedTargets: [DomainAgentSessionLinkEndpointIdentity] = []
         for item in inputs.outbound.items {
             guard let target = inputs.outboundTargetEndpoints[item.linkID] else { continue }
             let key = AutoApprovalLink(
@@ -4442,9 +4480,91 @@ final class AgentSessionLinkRuntimeBridge {
             } else {
                 autoApprovalLinks.remove(key)
             }
+            changedTargets.append(target)
         }
         requestMonitorProjectionRefresh(forExactObserverEndpoints: [observerEndpoint])
+        for target in changedTargets {
+            await persistDelegation(
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: target,
+                autoApprovePermissions: enabled
+            )
+        }
         return true
+    }
+
+    // MARK: Saved delegation
+
+    /// Records one field of the user's delegation on the saved intent for this endpoint pair.
+    ///
+    /// Best effort by design: the live toggle already took effect, and a pair that is not saved (no
+    /// durable layer, a suppressed launch, or a pair Stop just removed) simply has nothing to record.
+    /// Removal of the pair — Stop, lifecycle end, deletion — drops the delegation with it.
+    private func persistDelegation(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        manage: Bool? = nil,
+        autoApprovePermissions: Bool? = nil
+    ) async {
+        guard !isFrozenForTermination, let intentStore else { return }
+        let pair = AgentSessionOversightIntent(
+            observerSessionID: observerEndpoint.sessionID,
+            targetSessionID: targetEndpoint.sessionID
+        )
+        guard !pair.isSelfPair else { return }
+        _ = await intentStore.setDelegation(
+            for: pair,
+            manage: manage,
+            autoApprovePermissions: autoApprovePermissions
+        )
+    }
+
+    /// Re-applies the user's saved delegation to a grant this process just created for `pair`.
+    ///
+    /// Only a freshly `.added` grant qualifies: it always starts watch-only, whereas an
+    /// `.alreadyLinked` grant already carries whatever the user set on it this launch. Each field goes
+    /// through the very setter the user's toggle uses, so eligibility is re-proved against the exact
+    /// live incarnations and an ineligible endpoint simply stays watch-only. The saved value is kept
+    /// either way — it is the user's preference, not a record of what was applied.
+    private func reapplySavedDelegation(
+        pair: AgentSessionOversightIntent,
+        after result: EstablishmentResult
+    ) async {
+        guard case .added = result.outcome,
+              !isFrozenForTermination,
+              let intentStore,
+              let observerEndpoint = result.observerEndpoint,
+              let targetEndpoint = result.targetEndpoint,
+              let reference = result.reference
+        else { return }
+        let delegation = await intentStore.delegation(for: pair)
+        guard !delegation.isEmpty, !isFrozenForTermination else { return }
+        if delegation.manage {
+            _ = await setManagementReporting(
+                true,
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: targetEndpoint,
+                expectedReference: reference,
+                persistsDelegation: false
+            )
+        }
+        if delegation.autoApprovePermissions, !isFrozenForTermination {
+            _ = await applyAutoApproval(
+                true,
+                observerEndpoint: observerEndpoint,
+                targetEndpoint: targetEndpoint,
+                expectedReference: reference
+            )
+        }
+        #if DEBUG
+            WorkspaceRestorePerfLog.event(
+                "oversight.delegation.reapplied",
+                fields: [
+                    "manage": delegation.manage ? "1" : "0",
+                    "autoApprove": delegation.autoApprovePermissions ? "1" : "0"
+                ]
+            )
+        #endif
     }
 
     /// Observation-time filter only: a prompt seen while selection is off must not become
@@ -4483,11 +4603,12 @@ final class AgentSessionLinkRuntimeBridge {
     /// management operation already in flight, and the observer's next accepted turn is re-owed a
     /// fresh inventory because the authority advances its link-set revision.
     ///
-    /// Not persisted, for the same reason as auto-approval: durable oversight intent is UUID-keyed
-    /// and cannot safely carry authority to act for the user across relink or relaunch. Unlink,
-    /// relink, endpoint replacement, and restart all return the link to watch-only. Granting requires
-    /// both exact endpoints to be live and eligible now; withdrawing only requires the grant to exist,
-    /// so turning management off is never refused while the link is live.
+    /// The user's choice is also recorded on the saved observer → target intent, so a relaunch (or a
+    /// re-add of the still-saved pair) re-applies it to the fresh grant through this same setter and
+    /// its eligibility check. Stop, lifecycle end, and deletion remove the saved pair and its
+    /// delegation together, returning any later link to watch-only. Granting requires both exact
+    /// endpoints to be live and eligible now; withdrawing only requires the grant to exist, so
+    /// turning management off is never refused while the link is live.
     func setManagement(
         _ enabled: Bool,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
@@ -4507,11 +4628,15 @@ final class AgentSessionLinkRuntimeBridge {
     /// Authority changes first and unconditionally: by the time this pushes anything, every
     /// management fence already reads the new grant. The push is awareness only, and its failure is
     /// reported rather than hidden — the notice then stays owed to the next oversight result or turn.
+    ///
+    /// - Parameter persistsDelegation: `false` only when re-applying a delegation that is already
+    ///   saved; every user toggle records its value on the saved intent.
     func setManagementReporting(
         _ enabled: Bool,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        expectedReference: DomainAgentSessionLinkReference
+        expectedReference: DomainAgentSessionLinkReference,
+        persistsDelegation: Bool = true
     ) async -> AgentSessionLinkManagementChangeReport {
         guard !isFrozenForTermination, let host else { return .failed }
         if enabled {
@@ -4535,8 +4660,22 @@ final class AgentSessionLinkRuntimeBridge {
                 observerEndpoint.sessionID,
                 targetEndpoint.sessionID
             ]))
+            if persistsDelegation {
+                await persistDelegation(
+                    observerEndpoint: observerEndpoint,
+                    targetEndpoint: targetEndpoint,
+                    manage: enabled
+                )
+            }
             return await .changed(notice: pushCapabilityNotices(to: observerEndpoint))
         case .unchanged:
+            if persistsDelegation {
+                await persistDelegation(
+                    observerEndpoint: observerEndpoint,
+                    targetEndpoint: targetEndpoint,
+                    manage: enabled
+                )
+            }
             return .unchanged
         case .notFound, .shuttingDown:
             return .failed
@@ -6555,12 +6694,16 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
                     outcome: .rejected(message: AgentSessionOversightPersistenceCopy.shutdownBeforeInsert)
                 )
             }
-            return await establish(
+            let result = await establish(
                 pair: pair,
                 token: token,
                 assertedAt: generation,
                 proof: proof
             )
+            // Still inside the pair lane, so a concurrent Add or Stop of this pair cannot interleave
+            // with restoring the user's delegation onto the grant just created.
+            await reapplySavedDelegation(pair: pair, after: result)
+            return result
         }
     }
 
@@ -6592,6 +6735,11 @@ extension AgentSessionLinkRuntimeBridge: AgentSessionOversightLaunchCoordinatorD
 
     func launchCoordinatorReportWarning(id: String, message: String) {
         reportPersistenceWarning(id: id, message: message)
+    }
+
+    func launchCoordinatorRequestHydration(sessionIDs: Set<UUID>) {
+        guard !isFrozenForTermination, !sessionIDs.isEmpty else { return }
+        host?.agentSessionLinkRequestRestorationHydration(sessionIDs: sessionIDs)
     }
 }
 

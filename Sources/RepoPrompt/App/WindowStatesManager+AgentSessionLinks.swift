@@ -443,6 +443,16 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         agentSessionOversightRestoreTopologyState
     }
 
+    /// Fans a restoration hydration request out to every non-closing window. Each window loads only
+    /// the compose tabs of its own active workspace that are bound to one of these sessions, in the
+    /// background; nothing is selected, focused, or activated.
+    func agentSessionLinkRequestRestorationHydration(sessionIDs: Set<UUID>) {
+        guard !isTerminating, !sessionIDs.isEmpty else { return }
+        for window in allWindows where !window.isClosing {
+            window.agentModeViewModel.agentSessionLinkRequestRestorationHydration(sessionIDs: sessionIDs)
+        }
+    }
+
     /// Repaints every non-closing window with the process-wide durable-oversight level.
     ///
     /// Broadcast rather than addressed to an endpoint: a tab with no links at all never receives an
