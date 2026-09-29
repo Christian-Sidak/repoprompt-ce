@@ -10,3 +10,4 @@ cd "$ROOT_DIR"
 ./Scripts/codex_vendor_guardrails.sh
 ./Scripts/headless_runtime_guardrails.sh
 ./Scripts/xcframework_declared_paths_guardrails.sh
+python3 Scripts/modularization_metrics.py check
