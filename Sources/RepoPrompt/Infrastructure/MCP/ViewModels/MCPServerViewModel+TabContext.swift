@@ -1,6 +1,7 @@
 import RepoPromptFoundation
 import Combine
 import Foundation
+import RepoPromptWorkspaceCore
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptShared

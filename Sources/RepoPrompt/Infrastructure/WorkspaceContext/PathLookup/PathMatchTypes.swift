@@ -1,5 +1,6 @@
 import RepoPromptFoundation
 import Foundation
+import RepoPromptWorkspaceCore
 
 // MARK: - Path Match Result Types
 

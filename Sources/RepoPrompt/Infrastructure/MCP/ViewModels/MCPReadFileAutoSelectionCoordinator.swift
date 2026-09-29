@@ -1,5 +1,6 @@
 import RepoPromptFoundation
 import Foundation
+import RepoPromptWorkspaceCore
 
 /// Window-scoped response-lane coordinator for Agent Mode `read_file` and eligible `file_search`
 /// automatic selection.

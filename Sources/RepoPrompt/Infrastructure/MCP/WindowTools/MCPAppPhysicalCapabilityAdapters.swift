@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 import MCP
 import RepoPromptDomainRuntime
 

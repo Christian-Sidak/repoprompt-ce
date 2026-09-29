@@ -2,6 +2,7 @@ import RepoPromptProcess
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptWorkspaceCore
 import OSLog
 import RepoPromptDomainRuntime
 

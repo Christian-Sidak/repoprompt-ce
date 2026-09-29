@@ -1,5 +1,6 @@
 import RepoPromptFoundation
 import Foundation
+import RepoPromptWorkspaceCore
 
 /// Background actor that handles all VCS (git/jj) operations off the main thread.
 /// Communicates with `GitViewModel` via `AsyncStream<GitStatusSnapshot>`.

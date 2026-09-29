@@ -1,5 +1,6 @@
 import RepoPromptRegexCore
 import Foundation
+import RepoPromptWorkspaceCore
 import MCP
 
 /// Shared pure helpers for workspace-oriented MCP window tools.

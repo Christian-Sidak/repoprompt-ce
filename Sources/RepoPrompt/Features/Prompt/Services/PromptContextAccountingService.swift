@@ -1,5 +1,6 @@
 import RepoPromptFoundation
 import Foundation
+import RepoPromptWorkspaceCore
 
 /// Dormant value-based orchestration for resolving persisted workspace selections into prompt-entry
 /// snapshots and token-accounting inputs. This service intentionally has no PromptViewModel or

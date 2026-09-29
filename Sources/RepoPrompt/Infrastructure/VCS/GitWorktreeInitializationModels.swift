@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import RepoPromptWorkspaceCore
 
 struct GitWorkspaceAuthorityRepositoryKey: Hashable {
     let standardizedCommonDirectoryPath: String

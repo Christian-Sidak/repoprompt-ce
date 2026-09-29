@@ -1,6 +1,7 @@
 import RepoPromptFoundation
 import CryptoKit
 import Foundation
+import RepoPromptWorkspaceCore
 
 #if DEBUG
     enum WorkspaceSelectionDebugSignature {

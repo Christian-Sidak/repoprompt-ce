@@ -3,6 +3,7 @@ import Combine
 import CoreServices
 import Dispatch
 import Foundation
+import RepoPromptWorkspaceCore
 import RepoPromptCodeMapCore
 #if DEBUG
     import CryptoKit

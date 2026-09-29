@@ -2,6 +2,7 @@ import RepoPromptFoundation
 import AppKit
 import Combine
 import Foundation
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 enum GitDiffInclusionMode: String, CaseIterable, Codable {

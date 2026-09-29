@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptWorkspaceCore
 import RepoPromptDomainRuntime
 
 enum GitWorktreeIncludeCopier {

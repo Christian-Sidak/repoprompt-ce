@@ -10,6 +10,7 @@ import RepoPromptRegexCore
 import AppKit
 import Combine
 import Foundation
+import RepoPromptWorkspaceCore
 import JSONSchema
 import Logging
 import MCP

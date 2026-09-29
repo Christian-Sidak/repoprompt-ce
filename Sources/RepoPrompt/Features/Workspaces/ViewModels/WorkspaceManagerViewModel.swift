@@ -1,6 +1,7 @@
 import RepoPromptFoundation
 import Combine
 import Foundation
+import RepoPromptWorkspaceCore
 import os
 import RepoPromptDomainRuntime
 import SwiftUI

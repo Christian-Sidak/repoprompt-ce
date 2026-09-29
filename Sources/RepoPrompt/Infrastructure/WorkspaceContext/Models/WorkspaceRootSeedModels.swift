@@ -1,3 +1,4 @@
+import RepoPromptWorkspaceCore
 import CryptoKit
 import Foundation
 

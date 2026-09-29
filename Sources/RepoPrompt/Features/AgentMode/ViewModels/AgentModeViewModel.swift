@@ -2,6 +2,7 @@ import RepoPromptFoundation
 import Combine
 import CryptoKit
 import Foundation
+import RepoPromptWorkspaceCore
 import MCP
 import SwiftUI
 
