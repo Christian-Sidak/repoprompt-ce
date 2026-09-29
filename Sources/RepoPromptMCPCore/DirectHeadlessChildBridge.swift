@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import RepoPromptDomainRuntime
 
-enum DirectHeadlessChildBridge {
+package enum DirectHeadlessChildBridge {
     private enum PumpDirection {
         case upstream
         case downstream
@@ -19,12 +19,12 @@ enum DirectHeadlessChildBridge {
         case writeTimeout
     }
 
-    static func isRequested(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+    package static func isRequested(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
         environment[DomainChildLaunchCarrier.endpointEnvironmentKey] != nil
             || environment[DomainChildLaunchCarrier.launchTokenEnvironmentKey] != nil
     }
 
-    static func run(environment: [String: String] = ProcessInfo.processInfo.environment) async throws {
+    package static func run(environment: [String: String] = ProcessInfo.processInfo.environment) async throws {
         guard let endpoint = environment[DomainChildLaunchCarrier.endpointEnvironmentKey],
               let launchToken = environment[DomainChildLaunchCarrier.launchTokenEnvironmentKey],
               let principal = environment[DomainChildLaunchCarrier.clientPrincipalEnvironmentKey],

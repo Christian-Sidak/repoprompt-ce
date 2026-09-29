@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
-@testable import RepoPromptMCP
+@testable import RepoPromptMCPCore
 import XCTest
 
 final class DirectHeadlessOracleGroupTests: XCTestCase {

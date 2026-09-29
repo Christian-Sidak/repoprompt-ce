@@ -194,9 +194,15 @@ else:
 app_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_app_dependencies if dependency.get("byName")]
 if app_by_name_dependencies.count("RepoPromptWorkspaceCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptWorkspaceCore")
-for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptShared", "RepoPromptTests"):
+for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptMCPCore", "RepoPromptShared", "RepoPromptTests"):
     dependencies = [dependency["byName"][0] for dependency in targets.get(forbidden_consumer, {}).get("dependencies", []) if dependency.get("byName")]
     if "RepoPromptWorkspaceCore" in dependencies: errors.append(f"{forbidden_consumer} must not directly depend on RepoPromptWorkspaceCore")
+for target_name, target in targets.items():
+    if target.get("type") == "test" or target_name == "RepoPromptTestSupport":
+        continue
+    target_dependencies = [dependency["byName"][0] for dependency in target.get("dependencies", []) if dependency.get("byName")]
+    if "RepoPromptTestSupport" in target_dependencies:
+        errors.append(f"production target {target_name} must not depend on RepoPromptTestSupport")
 for product in package.get("products", []):
     if "RepoPromptWorkspaceCore" in product.get("targets", []): errors.append("RepoPromptWorkspaceCore must not be exposed as a package product")
 

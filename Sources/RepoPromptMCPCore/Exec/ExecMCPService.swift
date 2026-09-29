@@ -11,7 +11,7 @@ import Logging
 import ServiceLifecycle
 
 /// ServiceLifecycle service that runs exec mode (non-interactive command execution).
-actor ExecMCPService: Service {
+package actor ExecMCPService: Service {
     private let options: ExecOptions
     private let logger: Logger
     private let sessionToken: String
@@ -20,7 +20,7 @@ actor ExecMCPService: Service {
     private var session: InteractiveMCPClientSession?
     private var exitCode: Int32 = 0
 
-    init(options: ExecOptions, logger: Logger? = nil) {
+    package init(options: ExecOptions, logger: Logger? = nil) {
         self.options = options
         sessionToken = UUID().uuidString
         clientName = "RepoPrompt CLI (Exec)"
@@ -33,7 +33,7 @@ actor ExecMCPService: Service {
         self.logger = configuredLogger
     }
 
-    func run() async throws {
+    package func run() async throws {
         logger.debug("Starting exec MCP service...")
 
         // Create session
@@ -386,7 +386,7 @@ actor ExecMCPService: Service {
 
 // MARK: - Errors
 
-enum ExecError: Swift.Error {
+package enum ExecError: Swift.Error {
     case commandFailed
     case scriptNotFound(String)
     case scriptReadError(any Swift.Error)

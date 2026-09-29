@@ -2,8 +2,9 @@ import Darwin
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
-@testable import RepoPromptMCP
+@testable import RepoPromptMCPCore
 import RepoPromptShared
+import RepoPromptTestSupport
 import XCTest
 
 final class DirectHeadlessCompositionTests: XCTestCase {

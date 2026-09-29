@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import RepoPromptDomainRuntime
 
-enum RuntimePolicyAdministration {
+package enum RuntimePolicyAdministration {
     enum CommandError: Error, LocalizedError {
         case ttyRequired
         case invalidArguments(String)
@@ -20,7 +20,7 @@ enum RuntimePolicyAdministration {
         }
     }
 
-    static func run(arguments: [String]) async -> Int32 {
+    package static func run(arguments: [String]) async -> Int32 {
         do {
             guard isatty(STDIN_FILENO) != 0, isatty(STDERR_FILENO) != 0 else {
                 throw CommandError.ttyRequired

@@ -8,7 +8,7 @@
 import Foundation
 
 /// Options for exec mode (non-interactive batch execution).
-struct ExecOptions {
+package struct ExecOptions {
     /// Window ID to pre-select for tool calls.
     var windowID: Int?
 
@@ -59,7 +59,7 @@ struct ExecOptions {
 }
 
 /// Exit codes for exec mode.
-enum ExecExitCode: Int32 {
+package enum ExecExitCode: Int32 {
     case success = 0
     case commandFailed = 1
     case connectionFailed = 73

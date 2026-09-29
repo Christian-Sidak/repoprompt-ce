@@ -321,6 +321,26 @@ Gate: at least 30% lower median edit→owning-test time excluding queue, and no 
 
 Follow-up (style lane): SwiftFormat `--lint` took 930 s in this fresh worktree. Investigate cache reuse across worktrees under P0.1/§5.5; it lengthens every agent's pre-handoff check.
 
+## W1 slice S15 — `RepoPromptMCPCore` library plus a thin MCP executable (2026-09-28)
+
+**Manifest:**
+- All `Sources/RepoPromptMCP` files except `main.swift` moved to `Sources/RepoPromptMCPCore` (`git mv`).
+- The declarations and globals from the old 3,759-line `main.swift` moved to `RepoPromptMCPCore/MCPCLIProcess.swift`. `main.swift` keeps only the entry script (about 180 lines).
+- **Eager-initialization parity:** `main.swift` globals initialize in source order at launch; library globals are lazy. The new `bootstrapMCPCLIProcess()` is the entry's first statement and forces `log`, then `debugLogURL`, whose initializer truncates the socket debug log at startup, as before. No other moved global has an initialization side effect.
+- **Access:** only what the entry script uses became `package`. That is the CLI mode and option types, exit-code and error enums, the four service types' initializers and `run()` requirements, `DirectHeadlessChildBridge.isRequested/run`, `MCPBackendSelection.resolve`, `RuntimePolicyAdministration.run`, the stdin probes, `cliDisplayCommand`, `handleRuntimeError`, and `log`. Nothing is `public`.
+- **Tests:** the 9 CLI test files that did not import the app moved to the new `RepoPromptMCPCoreTests` target (dependencies: MCPCore, DomainRuntime, Shared, MCP). The 2 that also need the app (`OracleGroupBoundaryTests`, `MCPExportWatchdogContractTests`) stay in `RepoPromptTests` and `@testable import RepoPromptMCPCore`. `RepoPromptTests` no longer depends on an executable target.
+- **Tooling:** `sync_mcp_cli_version.sh` now points at `MCPCLIProcess.swift`; the `let CLI_VERSION` form is unchanged and `--check` passes. Also updated: the headless guardrails (array of CLI source roots; core-owned files checked in the core), the workspace-core guardrail consumer list, style and lint paths, the preflight MCP path pattern, the conductor diagnostics target map, the Xcode generator's test-dependency topology and README text, `AGENTS.md`, `xcode-workspace.md`, and `source-layout.md`.
+
+**Why:** CLI owner tests no longer compile or link the 648k-line app, and the root test target stops depending on an executable, which was the stated blocker for native Xcode test bundles.
+
+**Evidence:**
+- `conductor swift-build --product repoprompt-mcp` passes.
+- `make guardrails` passes; the gated `tests_sleep_calls` ratchet improved from 49 to 48 as one test left the app target (47 to 46 before the rebase onto main).
+- Xcode generator `generate` and `validate` pass; `make conductor-selftest` passes.
+- Full suite through conductor (`s15-full-2`): exit 0, **3,599 tests executed**, 2 skipped, 0 failures. The first attempt failed because one moved test used the `RepoRoot` helper from `RepoPromptTests/Helpers`. That helper now lives in a new shared `RepoPromptTestSupport` library target under `Tests/`, the first TestSupport target per plan §3.6; a guardrail rejects any production target that depends on it.
+- CLI smoke on the built binary: `--version`, `--help`, and the no-argument usage path are unchanged. With `MCP_SOCKET_DEBUG=1`, a pre-seeded socket debug log is truncated to 0 bytes at launch even for `--version`, which confirms eager-initialization parity.
+- Ratchet baseline lowered: `tests_sleep_calls` 49 → 48 (47 → 46 before the rebase onto main).
+
 ## P0.1 — structured conductor timing (2026-09-28)
 
 **What conductor records** (`Scripts/conductor.py`; additive, with no change to lanes, admission, or job behavior):

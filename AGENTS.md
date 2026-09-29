@@ -81,8 +81,8 @@ make xcode-clean            # remove generated workspace metadata
 
 Xcode 26.3 exposes the native `RepoPrompt` and `repoprompt-mcp` product schemes.
 Use `RepoPrompt CE App` and `RepoPrompt CE MCP` for conductor-coordinated debug
-products. `RepoPrompt CE Tests` delegates to conductor because `RepoPromptMCP`
-is executable-only and cannot back a native Xcode unit-test dependency. Do not
+products. `RepoPrompt CE Tests` delegates to conductor, which owns the sandboxed
+test environment the root suites require. Do not
 edit or commit `.build/xcode`, use these schemes for release/archive work, or
 assume canceling Xcode cancels a queued conductor job; inspect
 `./conductor job list` after cancellation. See

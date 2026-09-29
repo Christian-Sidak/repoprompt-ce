@@ -10,7 +10,7 @@ import Foundation
 import MCP
 
 /// Options for interactive mode
-struct InteractiveOptions {
+package struct InteractiveOptions {
     var snapshotPath: String?
     var initialWindowID: Int?
     var tabID: String?
