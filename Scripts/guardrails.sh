@@ -9,3 +9,4 @@ cd "$ROOT_DIR"
 ./Scripts/swiftpm_notice_guardrails.sh
 ./Scripts/codex_vendor_guardrails.sh
 ./Scripts/headless_runtime_guardrails.sh
+./Scripts/xcframework_declared_paths_guardrails.sh
