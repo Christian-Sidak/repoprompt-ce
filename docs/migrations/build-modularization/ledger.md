@@ -20,10 +20,21 @@ Self-tests: `make conductor-selftest` (includes `test_modularization_metrics.py`
 
 Added a fail-closed Git move audit (manifest, normalized SHA-256, similarity, import/access-only and discovery checks), dry-run diagnostics-driven `package` access lift, dry-run test-import retarget helper, and `make new-module` checklist. The helpers make no Swift changes in this slice. T0's Python regressions use temporary Git repositories and run in `make conductor-selftest`. The audit's first-party import allowlist is derived from first-party source/test targets and `Package.swift` at the compared revisions; unchanged external imports remain valid.
 
+## T1–T5 — PR 2 tooling half (2026-09-30)
+
+Checkpoint `f80ae16a` adds the append-friendly first-party target catalog (`Scripts/modularization/modules.json`) and allowed-edge/import/placement guardrails. The T1 gates are `tests_testable_import_app_files` and `app_files_over_2000_lines` (non-increasing), plus `app_target_swift_lines` with fixed 2,000-line headroom. CI's root test build uses SwiftPM's `--explicit-target-dependency-import-check error`.
+
+T2 routes `make dev-test MODULE=<TestTarget>` through conductor's app-free module executor. Exact, unambiguous `FILTER=<Suite>` values resolve to an owning app-free target; ambiguous/regex filters retain the aggregate path or require an explicit module. `modularization_metrics.py edit-locality` measures trailing 60-day Swift touches on `origin/main` by current module ownership. T3 compares source SHA-256 values against the conductor build attestation; missing or changed fingerprints fail the index gate instead of trusting mtimes.
+
+T4 changes machine-wide heavy admission to FIFO weighted reservations. Per-class observed `peakRss` samples set a nearest-rank p90 reservation with headroom; unknown app/aggregate work reserves conservatively, and legacy queue records are exclusive. T5 has one CI root test-bundle build and artifact handoff to four no-build shards, affected app-free module-test jobs, main-only Sentry validation, and build-produced index/type-check ratchets. The CI artifact carries source/test hash attestations and refuses missing or changed inputs. Hosted CI and runtime speedups are **not established** by local source inspection or selftests; record those separately when a PR run exists.
+
+Local tooling-half validation on 2026-09-30: `make conductor-selftest` passed; `make guardrails` passed after rerunning outside the restricted SwiftPM sandbox; `make xcode-validate` passed after the same sandbox accommodation. `make dev-test MODULE=RepoPromptRegexCoreTests` completed with 7 tests and 0 failures (conductor ticket `84bbe116-8b0c-4da9-b389-70de298a2de8`, exit 0; 3m 59s global-heavy wait, 2m 10s execution). The initial sandbox-denied guardrails and Xcode attempts were not source failures.
+
 ## Ratchet policy
 
-- **Gated** (CI fails on any increase): `app_files_over_5000_lines`, `app_static_shared_declarations`.
-- **Tracked** (reported, not gated): `app_target_swift_lines`, `app_files_over_2000_lines`, `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, `app_wrong_way_file_edges`, `app_largest_cycle_components`, `tests_sleep_calls`, `tests_testable_import_app_files`. The lexical graph can add false edges from identifier collisions; the sleep regex also counts fake-clock declarations. Do not gate these counts until their semantics are corrected.
+- **Gated by build-free guardrails:** `app_files_over_5000_lines`, `app_files_over_2000_lines`, `app_static_shared_declarations`, and `tests_testable_import_app_files` are non-increasing; `app_target_swift_lines` has a fixed 2,000-line allowance over its recorded baseline.
+- **Gated by the build-producing CI job:** index wrong-way edges and largest cycle; type-check body and expression budgets. Index freshness must be proven by source hashes before comparing counts.
+- **Tracked, not gated:** `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, lexical `app_wrong_way_file_edges`, lexical `app_largest_cycle_components`, and `tests_sleep_calls`. The lexical graph can add false edges from identifier collisions; the sleep regex also counts fake-clock declarations.
 - Lower a baseline with `update` in the slice that improves it. Raising one requires `update --allow-regression` plus a justification entry here.
 
 ## Baseline — 2026-09-28 (`589cecc5`)
@@ -61,7 +72,7 @@ Conductor timings (last 3,000 jobs, net of queue):
 | ADR-05 | Logic/UI split (plan §3.1 principle 6) | Accepted (2026-09-29) as written. Evidence: P0.5 type-check data (SwiftUI is 58 of 104 function bodies ≥ 200 ms and 74% of their time) |
 | ADR-06 | Test ownership and hermeticity (plan §3.6) | Accepted (2026-09-29) as written. Evidence: P0.3 bake-off (module-owned test targets cut median edit→test by 77% and 95%; an app interface change recompiles 360 app test files) |
 | ADR-07 | Focused-test executor | Accepted (2026-09-28): Swift Build per-target bundles (`conductor test --module`) for test targets whose closure excludes `RepoPromptApp`, including Swift Testing; native aggregate stays the default `FILTER` path, the path for app-dependent targets, and the CI path. Passed the gate on both P0.3 slices (77% and 95% lower median edit→test, no discovery loss) |
-| ADR-08 | Admission and caching (plan §5.4–5.5) | Proposed. Deferred to P1.3 (admission v2 from measured per-job peak RSS, P0.5) and §5.5 (cross-worktree caching needs clean-vs-cached correctness evidence) |
+| ADR-08 | Admission and caching (plan §5.4–5.5) | Admission v2 accepted in T4: FIFO weighted reservations use measured per-class peak RSS with conservative app/aggregate fallback and legacy exclusivity. Cross-worktree caching remains conditional T6 and requires clean-vs-cached correctness evidence |
 | ADR-09 | Per-module concurrency (plan §3.7) | Accepted (2026-09-29) as written. Evidence: the existing [Swift 6.2 concurrency migration ledger](../swift-6-2-concurrency/migration-ledger.md), which each extraction extends |
 
 ## Phase 0 progress
