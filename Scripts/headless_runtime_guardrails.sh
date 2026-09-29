@@ -152,9 +152,14 @@ fi
 # M18: discovery plans mint no child-launch carrier until the post-commit Oracle handoff, and the
 # Oracle step after a commit is always settled with what was committed.
 if [[ "$(grep -c 'preparation: .atHandoff' Sources/RepoPromptMCP/DirectHeadlessOracleAdapter.swift)" -lt 2 ]] \
-  || ! grep -q 'handoff.prepare()' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
+  || ! grep -q 'handoff.prepare(pinnedTo: Self.committedContextPin(outcome))' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
   || ! grep -q 'settlementAfterDiscovery' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift; then
   echo "error: discovery must prepare Oracle carriers at the post-commit handoff and settle post-commit failures" >&2
+  exit 1
+fi
+# M19: handoff carriers are minted only for the exact committed context authority.
+if ! grep -q 'try pin?.validate(handle)' Sources/RepoPromptMCP/DirectHeadlessChildEndpoint.swift; then
+  echo "error: the child-launch coordinator must refuse a handoff whose current context is not the pinned one" >&2
   exit 1
 fi
 

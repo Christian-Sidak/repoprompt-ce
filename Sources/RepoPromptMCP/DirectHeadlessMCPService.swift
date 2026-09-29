@@ -164,12 +164,13 @@ actor DirectHeadlessMCPService {
                 arguments: arguments,
                 securityContext: securityContext
             )
-        }, prepareChildLaunches: { plan, toolName, arguments, securityContext in
+        }, prepareChildLaunches: { plan, toolName, arguments, securityContext, pin in
             try await childLaunchCoordinator.prepare(
                 plan: plan,
                 toolName: toolName,
                 arguments: arguments,
-                securityContext: securityContext
+                securityContext: securityContext,
+                pinnedTo: pin
             )
         }, revokeChildLaunches: { plan, bundle in
             await childLaunchCoordinator.revoke(plan: plan, bundle: bundle)

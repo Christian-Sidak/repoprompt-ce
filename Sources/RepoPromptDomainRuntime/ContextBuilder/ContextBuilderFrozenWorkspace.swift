@@ -22,8 +22,10 @@ package struct ContextBuilderDiscoveryAuthorizedPath: Equatable, Sendable {
 /// Path spellings round-trip. Every path discovery shows (search results, tree headings, the staged
 /// selection, selected paths, pack provenance) is accepted back by `authorize` and by the read
 /// tools, and names the same file. With several roots, a relative spelling may lead with a root's
-/// label (its folder name, or its full path when another root shares the folder name). A spelling
-/// that could name two different entries is refused as `ambiguous_across_roots`, never guessed.
+/// label (its folder name, or its full path when another root shares the folder name). A root itself
+/// is shown by its label only when the label alone names it, and by its absolute path otherwise. A
+/// spelling that could name two different entries is refused as `ambiguous_across_roots`, never
+/// guessed.
 package struct ContextBuilderFrozenWorkspace: Sendable {
     package static let readToolNames: Set<String> = [
         "get_file_tree",
@@ -211,10 +213,15 @@ package struct ContextBuilderFrozenWorkspace: Sendable {
         }
     }
 
-    /// Display names for the frozen roots, as shown to the provider.
-    package var rootDisplayNames: [String] {
-        guard snapshot.roots.count > 1 else { return snapshot.roots.map(\.path) }
-        return snapshot.roots.indices.map { rootLabel($0) }
+    /// How each frozen root is spelled to the provider: its `label`, the prefix of
+    /// `<label>/<relative path>` spellings, and its `heading`, the spelling of the root directory
+    /// itself (tree headings, `file_search` results, `get_file_tree(path:)`). With several roots the
+    /// heading is the label only when the label alone resolves back to exactly this root, and the
+    /// root's absolute path otherwise (another root holds an entry named like the label). With one
+    /// root both are the root's path.
+    package var rootSpellings: [(label: String, heading: String)] {
+        guard snapshot.roots.count > 1 else { return snapshot.roots.map { ($0.path, $0.path) } }
+        return snapshot.roots.indices.map { (rootLabel($0), rootHeading($0)) }
     }
 
     /// The discovery spelling of an enumerated file or directory, or nil outside every root.
@@ -224,7 +231,7 @@ package struct ContextBuilderFrozenWorkspace: Sendable {
         for (index, root) in snapshot.roots.enumerated()
             where HeadlessPathSpelling.equivalentPaths(root).contains(logical)
         {
-            return rootLabel(index)
+            return rootHeading(index)
         }
         guard let owner = owningRoot(of: logical) else { return nil }
         return displayPath(rootIndex: owner.rootIndex, relativePath: owner.relativePath)
@@ -318,6 +325,15 @@ package struct ContextBuilderFrozenWorkspace: Sendable {
             break
         }
         return arguments
+    }
+
+    /// The spelling of the root directory itself: its label when that resolves back to exactly this
+    /// root (the rule `displayPath` applies to files), else its absolute path.
+    private func rootHeading(_ index: Int) -> String {
+        let label = rootLabel(index)
+        guard !label.hasPrefix("/") else { return label }
+        let root = URL(fileURLWithPath: snapshot.roots[index].path).standardizedFileURL.path
+        return (try? resolveSpelling(label)) == root ? label : snapshot.roots[index].path
     }
 
     /// The root's folder name, or its full path when another root shares the folder name.

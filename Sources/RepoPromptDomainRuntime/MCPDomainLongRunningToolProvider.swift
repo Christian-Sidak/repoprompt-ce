@@ -10,12 +10,64 @@ package enum DomainChildLaunchContext {
     @TaskLocal package static var handoff: DomainChildLaunchHandoff?
 }
 
+/// The exact context authority a handoff's carriers must be minted against: the context a tool
+/// committed to, at the workspace and context revisions its commit produced.
+///
+/// Preparation resolves the connection's current read context and refuses, before minting anything,
+/// when it is not this pin (the connection was rebound, or either revision moved). Launch tokens are
+/// then issued for the pinned context and revision, so issuance re-checks the revision too.
+package struct DomainChildLaunchContextPin: Equatable, Sendable {
+    package let context: DomainContextIdentity
+    package let workspaceRevision: UInt64
+    package let contextRevision: UInt64
+
+    package init(context: DomainContextIdentity, workspaceRevision: UInt64, contextRevision: UInt64) {
+        self.context = context
+        self.workspaceRevision = workspaceRevision
+        self.contextRevision = contextRevision
+    }
+
+    package enum Mismatch: Error, Equatable, LocalizedError {
+        /// The connection is now bound to a different context.
+        case rebound(current: DomainContextIdentity)
+        case workspaceRevisionChanged(expected: UInt64, actual: UInt64)
+        case contextRevisionChanged(expected: UInt64, actual: UInt64)
+
+        package static let code = "child_launch_context_changed"
+
+        package var errorDescription: String? {
+            let detail = switch self {
+            case let .rebound(current):
+                "the connection was rebound to context \(current.contextID.uuidString)"
+            case let .workspaceRevisionChanged(expected, actual):
+                "the workspace revision moved from \(expected) to \(actual)"
+            case let .contextRevisionChanged(expected, actual):
+                "the context revision moved from \(expected) to \(actual)"
+            }
+            return "\(Self.code): \(detail) after the committed context was pinned; no carrier was minted."
+        }
+    }
+
+    /// Throws unless `handle` is exactly this pin's context at this pin's revisions.
+    package func validate(_ handle: DomainReadContextHandle) throws {
+        guard handle.context == context else { throw Mismatch.rebound(current: handle.context) }
+        guard handle.contextRevision == contextRevision else {
+            throw Mismatch.contextRevisionChanged(expected: contextRevision, actual: handle.contextRevision)
+        }
+        // The workspace revision covers the roots the carriers' context resolves to.
+        guard handle.workspaceRevision == workspaceRevision else {
+            throw Mismatch.workspaceRevisionChanged(expected: workspaceRevision, actual: handle.workspaceRevision)
+        }
+    }
+}
+
 /// Single-use, invocation-scoped preparation of a `.atHandoff` plan's carriers.
 ///
-/// Before `prepare()` the invocation holds no carrier, so nothing it runs can redeem the private
-/// endpoint. `prepare()` revalidates the admission authorizations, then mints the plan's carriers
-/// against the context as it is at that moment, with a full launch-token lifetime. The provider
-/// revokes whatever was minted when the invocation ends (`close()`).
+/// Before `prepare(pinnedTo:)` the invocation holds no carrier, so nothing it runs can redeem the
+/// private endpoint. `prepare(pinnedTo:)` revalidates the admission authorizations, then mints the
+/// plan's carriers against the pinned context (failing closed when the connection's context no
+/// longer matches it), with a full launch-token lifetime. The provider revokes whatever was minted
+/// when the invocation ends (`close()`).
 package actor DomainChildLaunchHandoff {
     package enum HandoffError: Error, Equatable, LocalizedError {
         case alreadyPrepared
@@ -31,7 +83,7 @@ package actor DomainChildLaunchHandoff {
         }
     }
 
-    package typealias Prepare = @Sendable () async throws -> DomainChildLaunchCarrierBundle
+    package typealias Prepare = @Sendable (DomainChildLaunchContextPin) async throws -> DomainChildLaunchCarrierBundle
     package typealias Revoke = @Sendable (DomainChildLaunchCarrierBundle) async -> Void
 
     private enum State {
@@ -53,7 +105,7 @@ package actor DomainChildLaunchHandoff {
         self.revokeLate = revokeLate
     }
 
-    package func prepare() async throws -> DomainChildLaunchCarrierBundle {
+    package func prepare(pinnedTo pin: DomainChildLaunchContextPin) async throws -> DomainChildLaunchCarrierBundle {
         switch state {
         case .ready:
             break
@@ -65,7 +117,7 @@ package actor DomainChildLaunchHandoff {
         state = .preparing
         let bundle: DomainChildLaunchCarrierBundle
         do {
-            bundle = try await prepareBundle()
+            bundle = try await prepareBundle(pin)
         } catch {
             if case .preparing = state { state = .spent }
             throw error
@@ -123,7 +175,9 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
         _ plan: DomainChildLaunchPlan,
         _ toolName: String,
         _ arguments: [String: Value],
-        _ securityContext: DomainToolInvocationSecurityContext
+        _ securityContext: DomainToolInvocationSecurityContext,
+        /// Nil at admission; at a `.atHandoff` handoff, the committed context to mint against.
+        _ pin: DomainChildLaunchContextPin?
     ) async throws -> DomainChildLaunchCarrierBundle
 
     package typealias RevokeChildLaunches = @Sendable (
@@ -285,7 +339,7 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                         let policyStore = policyStore
                         let revokeChildLaunches = revokeChildLaunches
                         handoff = DomainChildLaunchHandoff(
-                            prepare: {
+                            prepare: { pin in
                                 // Cancellation is checked first: a revalidation interrupted by it
                                 // must read as cancellation, not as a changed policy.
                                 try Task.checkCancellation()
@@ -302,7 +356,8 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                                     launchPlan,
                                     toolName,
                                     arguments,
-                                    securityContext
+                                    securityContext,
+                                    pin
                                 )
                             },
                             revokeLate: { bundle in await revokeChildLaunches?(launchPlan, bundle) }
@@ -314,7 +369,8 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                                 launchPlan,
                                 toolName,
                                 arguments,
-                                securityContext
+                                securityContext,
+                                nil
                             )
                         } catch {
                             await revokeChildLaunches?(launchPlan, nil)

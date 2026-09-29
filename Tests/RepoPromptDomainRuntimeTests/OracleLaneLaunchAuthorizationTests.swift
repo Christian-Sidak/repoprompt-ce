@@ -49,7 +49,8 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
             interactionBroker: runtime.interactionBroker,
             activityCenter: runtime.activityCenter,
             resolveChildLaunchPlan: { _, _, _ in plan },
-            prepareChildLaunches: { preparedPlan, _, _, _ in
+            prepareChildLaunches: { preparedPlan, _, _, _, pin in
+                XCTAssertNil(pin, "an admission-time preparation is not pinned")
                 await recorder.record("prepared:\(preparedPlan.approvalMetadata["lane_count"] ?? "missing")")
                 let carriers = preparedPlan.lanes.map { lane in
                     DomainChildLaunchCarrier(
@@ -108,7 +109,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
             interactionBroker: runtime.interactionBroker,
             activityCenter: runtime.activityCenter,
             resolveChildLaunchPlan: { _, _, _ in nil },
-            prepareChildLaunches: { _, _, _, _ in
+            prepareChildLaunches: { _, _, _, _, _ in
                 await recorder.record("unexpected-prepare")
                 throw DomainChildLaunchPlanError.carrierMismatch
             },
@@ -159,7 +160,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
             interactionBroker: runtime.interactionBroker,
             activityCenter: runtime.activityCenter,
             resolveChildLaunchPlan: { _, _, _ in plan },
-            prepareChildLaunches: { _, _, _, _ in
+            prepareChildLaunches: { _, _, _, _, _ in
                 throw DomainChildLaunchPlanError.carrierMismatch
             },
             revokeChildLaunches: { _, bundle in
@@ -209,8 +210,8 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
             interactionBroker: runtime.interactionBroker,
             activityCenter: runtime.activityCenter,
             resolveChildLaunchPlan: { _, _, _ in plan },
-            prepareChildLaunches: { preparedPlan, _, _, _ in
-                await recorder.record("prepared")
+            prepareChildLaunches: { preparedPlan, _, _, _, pin in
+                await recorder.record("prepared:\(pin.map { "\($0.workspaceRevision).\($0.contextRevision)" } ?? "unpinned")")
                 return try Self.bundle(for: preparedPlan)
             },
             revokeChildLaunches: { _, bundle in await recorder.record("revoked:\(bundle?.carriers.count ?? 0)") }
@@ -227,10 +228,10 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
             XCTAssertNil(DomainChildLaunchContext.current)
             let handoff = try XCTUnwrap(DomainChildLaunchContext.handoff)
             await recorder.record("discovery")
-            let bundle = try await handoff.prepare()
+            let bundle = try await handoff.prepare(pinnedTo: Self.pin)
             XCTAssertEqual(bundle.carriers.map(\.launchID), plan.lanes.map(\.launchID))
             do {
-                _ = try await handoff.prepare()
+                _ = try await handoff.prepare(pinnedTo: Self.pin)
                 XCTFail("A handoff prepares once")
             } catch {
                 XCTAssertEqual(error as? DomainChildLaunchHandoff.HandoffError, .alreadyPrepared)
@@ -244,7 +245,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
 
         XCTAssertEqual(value, .string("ok"))
         let recorded = await recorder.values()
-        XCTAssertEqual(recorded, ["discovery", "prepared", "revoked:2"])
+        XCTAssertEqual(recorded, ["discovery", "prepared:3.7", "revoked:2"], "the handoff forwards its pin")
     }
 
     func testHandoffObservesCancellationBeforeMintingAndIsClosedAfterTheInvocation() async throws {
@@ -263,7 +264,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
             interactionBroker: runtime.interactionBroker,
             activityCenter: runtime.activityCenter,
             resolveChildLaunchPlan: { _, _, _ in plan },
-            prepareChildLaunches: { preparedPlan, _, _, _ in
+            prepareChildLaunches: { preparedPlan, _, _, _, _ in
                 await recorder.record("unexpected-prepare")
                 return try Self.bundle(for: preparedPlan)
             },
@@ -281,7 +282,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
             await escaped.store(handoff)
             // Cancellation lands exactly at the handoff: nothing may be minted.
             withUnsafeCurrentTask { $0?.cancel() }
-            _ = try await handoff.prepare()
+            _ = try await handoff.prepare(pinnedTo: Self.pin)
             return .string("unexpected")
         }
         let security = makeSecurityContext(identity: runtime.identity, toolName: "context_builder")
@@ -301,7 +302,7 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         let stored = await escaped.value
         let handoff = try XCTUnwrap(stored)
         await XCTAssertOracleLaunchThrowsErrorAsync {
-            try await handoff.prepare()
+            try await handoff.prepare(pinnedTo: Self.pin)
         } verify: {
             XCTAssertEqual($0 as? DomainChildLaunchHandoff.HandoffError, .closed, "an ended invocation cannot mint carriers")
         }
@@ -561,6 +562,47 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         let snapshot = await fixture.runtime.routingCoordinator.snapshot()
         XCTAssertEqual(snapshot.pendingRunContexts[runID], fixture.alternateContext)
     }
+
+    func testContextPinAdmitsOnlyTheExactPinnedContextAndRevisions() throws {
+        let pinned = Self.pin
+        func handle(
+            context: DomainContextIdentity = OracleLaneLaunchAuthorizationTests.pin.context,
+            workspaceRevision: UInt64 = 3,
+            contextRevision: UInt64 = 7
+        ) -> DomainReadContextHandle {
+            DomainReadContextHandle(
+                runtimeID: UUID(),
+                runtimeGeneration: 1,
+                connectionID: UUID(),
+                connectionGeneration: 1,
+                context: context,
+                workspaceRevision: workspaceRevision,
+                contextRevision: contextRevision,
+                routingRevision: 99,
+                bindingKind: .explicit
+            )
+        }
+        // Routing churn that does not touch the pinned authority is admitted.
+        XCTAssertNoThrow(try pinned.validate(handle()))
+        let other = DomainContextIdentity(workspaceID: pinned.context.workspaceID, contextID: UUID())
+        let refusals: [(DomainReadContextHandle, DomainChildLaunchContextPin.Mismatch)] = [
+            (handle(context: other), .rebound(current: other)),
+            (handle(workspaceRevision: 4), .workspaceRevisionChanged(expected: 3, actual: 4)),
+            (handle(contextRevision: 8), .contextRevisionChanged(expected: 7, actual: 8))
+        ]
+        for (current, expected) in refusals {
+            XCTAssertThrowsError(try pinned.validate(current)) { error in
+                XCTAssertEqual(error as? DomainChildLaunchContextPin.Mismatch, expected)
+                XCTAssertTrue(error.localizedDescription.hasPrefix("child_launch_context_changed: "))
+            }
+        }
+    }
+
+    fileprivate static let pin = DomainChildLaunchContextPin(
+        context: DomainContextIdentity(workspaceID: UUID(), contextID: UUID()),
+        workspaceRevision: 3,
+        contextRevision: 7
+    )
 
     private func makeRuntime(mode: DomainRuntimeMode, profile: String) -> MCPDomainRuntime {
         let root = FileManager.default.temporaryDirectory

@@ -629,11 +629,15 @@ final class ContextBuilderDiscoveryTests: XCTestCase {
             XCTAssertTrue(outcome.pack.content.contains("<file path=\"\(display)\">\nlet value = \"\(marker)_MARKER\""), display)
         }
 
-        // Read tools accept the same spellings, and tree headings are the root labels.
+        // Read tools accept the same spellings. Tree headings are root spellings that round-trip:
+        // the bare label `lib` also names the first root's `lib` directory, so that root's heading
+        // is absolute even though `lib/Only.swift` stays short.
         XCTAssertTrue(prompts[1].contains("tool=\"read_file\" status=\"ok\">\nlet value = \"ONLY_MARKER\""))
         XCTAssertTrue(prompts[1].contains("\n" + fixture.appOne.path + "/\n"))
         XCTAssertTrue(prompts[1].contains("\n" + fixture.appTwo.path + "/\n"))
-        XCTAssertTrue(prompts[1].contains("\nlib/\n"))
+        XCTAssertTrue(prompts[1].contains("\n" + fixture.lib.path + "/\n"))
+        XCTAssertFalse(prompts[1].contains("\nlib/\n"))
+        XCTAssertTrue(prompts[0].contains("- lib: \(fixture.lib.path) (write the root itself as \(fixture.lib.path))"))
         // A bare path under two roots, and a short spelling another root also holds, are refused.
         XCTAssertEqual(prompts[1].components(separatedBy: "ambiguous_across_roots").count - 1, 2)
         XCTAssertTrue(prompts[1].contains("No files are staged."))
@@ -651,6 +655,48 @@ final class ContextBuilderDiscoveryTests: XCTestCase {
                     .invalidSelectedPath(path: ambiguous, reason: "ambiguous_across_roots")
                 )
             }
+        }
+    }
+
+    func testDisplayedRootHeadingsRoundTripThroughGetFileTree() async throws {
+        let fixture = try MultiRootFixture()
+        defer { fixture.cleanup() }
+        // Three roots with the app/lib collision: every heading is absolute. Two roots without a
+        // collision (`app` and `lib`): both headings are the short labels.
+        let cases: [([URL], [String])] = [
+            ([fixture.appOne, fixture.appTwo, fixture.lib], [fixture.appOne.path, fixture.appTwo.path, fixture.lib.path]),
+            ([fixture.appTwo, fixture.lib], ["app", "lib"])
+        ]
+        for (roots, expectedHeadings) in cases {
+            let workspace = fixture.workspace(roots: roots)
+            XCTAssertEqual(workspace.rootSpellings.map(\.heading), expectedHeadings)
+            let overview = try await workspace.executeRead(
+                tool: "get_file_tree",
+                arguments: ["max_depth": .int(1)],
+                stagedSelection: []
+            )
+            for (root, heading) in zip(roots, expectedHeadings) {
+                // The heading the overview shows is the one `get_file_tree(path:)` accepts back.
+                XCTAssertTrue(overview.contains(heading + "/\n"), "\(heading) in \(overview)")
+                let subtree = try await workspace.executeRead(
+                    tool: "get_file_tree",
+                    arguments: ["path": .string(heading), "max_depth": .int(1)],
+                    stagedSelection: []
+                )
+                XCTAssertTrue(subtree.contains(heading + "/\n"), "\(heading) in \(subtree)")
+                XCTAssertEqual(subtree.contains("Only.swift"), root == fixture.lib, "\(heading) names its own root: \(subtree)")
+            }
+        }
+        // The label the collision makes ambiguous is refused, never guessed.
+        do {
+            _ = try await fixture.workspace().executeRead(
+                tool: "get_file_tree",
+                arguments: ["path": .string("lib")],
+                stagedSelection: []
+            )
+            XCTFail("Expected the bare `lib` label to be ambiguous")
+        } catch {
+            XCTAssertTrue("\(error)".contains("ambiguous_across_roots"), "\(error)")
         }
     }
 
@@ -857,13 +903,13 @@ private struct MultiRootFixture {
         lib = root("lib")
     }
 
-    func workspace() -> ContextBuilderFrozenWorkspace {
+    func workspace(roots: [URL]? = nil) -> ContextBuilderFrozenWorkspace {
         ContextBuilderFrozenWorkspace(
             snapshot: ContextBuilderDiscoverySnapshot(
                 identity: DomainContextIdentity(workspaceID: UUID(), contextID: UUID()),
                 workspaceRevision: 1,
                 contextRevision: 1,
-                roots: [appOne, appTwo, lib],
+                roots: roots ?? [appOne, appTwo, lib],
                 prompt: "",
                 selection: []
             ),

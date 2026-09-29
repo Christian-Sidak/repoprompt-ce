@@ -1290,8 +1290,9 @@ M18 repairs three M17 defects found in independent review. No feature scope was 
   `child_launch_handoff_closed`, and the provider revokes whatever was minted when the invocation
   ends. The direct-headless discovery plan (direct and grouped) is `.atHandoff`, and the backend
   prepares it only after the commit, then runs the Oracle step with that bundle (or its single
-  carrier). The carriers are therefore bound to the committed context revision with a full
-  lifetime, however long discovery took, and discovery itself never holds a carrier. `clarify`
+  carrier). The carriers get a full lifetime, however long discovery took, and discovery itself
+  never holds a carrier. (M18 minted them for the connection's context at the handoff, which is not
+  necessarily the committed one; M19 pins the handoff to the commit.) `clarify`
   mints none. `DirectHeadlessChildLaunchCoordinator` takes an injectable `carrierLifetime`
   (default 60 seconds).
 - **Multi-root spellings.** M17 showed `<root>/<path>` display paths, but `authorize` read that
@@ -1354,6 +1355,68 @@ live MCP smoke with a real `codex` provider; `file_search` filter spellings acro
 artifact collection for unreferenced packs. The policy store's behaviour when revalidation runs
 under a cancelled task (it can degrade to `policy_changed`) predates M18. M18 only avoids
 triggering it at the handoff.
+
+### M19 — handoff pinned to the committed context, round-tripping root headings
+
+M19 repairs two M18 gaps found in independent review. No feature scope was added.
+
+- **Pinned handoff.** M18's handoff resolved the connection's *current* context and minted the
+  Oracle carriers for it. A concurrent `bind_context`, or an edit to the committed context between
+  the commit and the handoff, could therefore give the Oracle authority (and working directory) for
+  a context other than the one the frozen pack came from. `DomainChildLaunchHandoff.prepare` is now
+  `prepare(pinnedTo:)` and takes a `DomainChildLaunchContextPin`: the committed context identity and
+  the workspace and context revisions the commit produced (`committedContextPin(outcome)`, from the
+  commit receipt). `PrepareChildLaunches` gains the pin as a fifth argument. It is nil at admission,
+  so every `.atAdmission` route is unchanged. `DirectHeadlessChildLaunchCoordinator.prepare` resolves
+  the connection's read context as before. With a pin it refuses, before minting anything, when that
+  context is not the pinned one: `.rebound`, then `.contextRevisionChanged`, then
+  `.workspaceRevisionChanged`, all rendered as `child_launch_context_changed`. It then issues the
+  launch tokens for the pinned context and revision, so token issuance re-checks the revision too.
+  The refusal settles through `settlementAfterDiscovery` like any post-commit failure
+  (`oracle_failed_after_discovery`, the commit's `mutation_state`, `settlement`
+  `discovery_committed`). Its message says the Oracle step was not started and why, and `details`
+  gains `handoff` with the code and the committed context ID and revisions. After a rebind, the
+  message names the pack's context and says to resume while bound to it. A refused handoff over a
+  no-op commit is `retryable`.
+- **Root headings.** A root's label prefixes `<label>/<path>` spellings, but the bare label can also
+  name an entry inside another root. In the M18 three-root fixture, `lib` is also `one/app/lib`,
+  so the `lib/` tree heading was refused by `get_file_tree(path:)` as `ambiguous_across_roots`.
+  `ContextBuilderFrozenWorkspace.rootSpellings` (replacing `rootDisplayNames`) gives each root a
+  `label` and a `heading`. The heading applies the same rule as file display paths: the label when
+  it resolves back to exactly that root, otherwise the root's absolute path. Tree headings and
+  `file_search` results for a root use the heading. The protocol preamble keeps the label legend
+  and, for a root whose bare label is ambiguous, says to write the root itself by its path.
+- **Guardrail.** `headless_runtime_guardrails.sh` requires the pinned handoff call and the
+  coordinator's pin validation.
+
+Conductor evidence. The first focused run of the three suites below (`c5a01812`) passed 46/46. A
+broader direct-headless, Context Builder, and Oracle filter (`8ab5d551`) passed 376/376:
+`RepoPromptTests` 249 and `RepoPromptDomainRuntimeTests` 127. The first lint run flagged one
+single-line function body in a test. After that fix, `conductor lint` (`aa1ac301`) passed, and the
+final focused rerun (`ebc89eb0`) passed 46/46. `conductor guardrails` (`d46ef1c9`) and
+`swift-build --product all` (`ac3d7b91`) passed. Builds used the locally restored, untracked
+official Sparkle dSYMs for Xcode 27, which were removed before commit. Not run: the full root
+suite, a live MCP smoke, and a release build.
+
+- `OracleLaneLaunchAuthorizationTests`: the handoff forwards its pin, an admission-time preparation
+  is unpinned, and `DomainChildLaunchContextPin.validate` admits only the exact context and revisions
+  (a routing-only change is admitted).
+- `DirectHeadlessContextDiscoveryTests`: through the real long-running provider, coordinator, and
+  routing tokens, with a barrier inside the handoff's preparation (after the commit and the policy
+  revalidation, before the coordinator resolves the context):
+  - a rebind to another context mints nothing and issues no token, and no Oracle runs; the
+    failure reports the committed context, and the selection is in that context, not the one now
+    bound;
+  - an edit to the committed context (same binding) is refused the same way, as a context-revision
+    change.
+
+  The M18 slow-discovery test now also exercises a matching pin end to end.
+- `ContextBuilderDiscoveryTests`: every displayed root heading round-trips through
+  `get_file_tree(path:)`, both with the app/lib collision (all headings absolute) and without it
+  (short `app`/`lib` headings). The bare colliding label is refused.
+
+Not claimed or changed: a `context_pack_ref` resume still runs under the connection's binding at
+resume time. The pack's provenance is not compared with that binding.
 
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 

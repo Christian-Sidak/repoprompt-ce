@@ -308,17 +308,24 @@ actor DirectHeadlessChildLaunchCoordinator {
         )
     }
 
+    /// Mints the plan's carriers. Without a pin (admission) they are bound to the connection's
+    /// current context. With a pin (a `.atHandoff` handoff) the current context must be exactly the
+    /// pinned one, else nothing is minted; the tokens are issued for the pinned context and revision.
     func prepare(
         plan: DomainChildLaunchPlan,
         toolName: String,
         arguments: [String: MCP.Value],
-        securityContext: DomainToolInvocationSecurityContext
+        securityContext: DomainToolInvocationSecurityContext,
+        pinnedTo pin: DomainChildLaunchContextPin? = nil
     ) async throws -> DomainChildLaunchCarrierBundle {
         guard let runtime, let harness else { throw CoordinatorError.unavailable }
         let registration = try await runtime.routingCoordinator.currentRegistration(
             connectionID: securityContext.connectionID
         )
         let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
+        try pin?.validate(handle)
+        let context = pin?.context ?? handle.context
+        let contextRevision = pin?.contextRevision ?? handle.contextRevision
         var carriers: [DomainChildLaunchCarrier] = []
         do {
             for lane in plan.lanes {
@@ -328,8 +335,8 @@ actor DirectHeadlessChildLaunchCoordinator {
                     oracleGroupID: plan.oracleGroupID,
                     oracleLaneID: lane.oracleLaneID,
                     oracleGroupClaimID: plan.oracleGroupClaimID,
-                    context: handle.context,
-                    expectedContextRevision: handle.contextRevision,
+                    context: context,
+                    expectedContextRevision: contextRevision,
                     windowID: nil,
                     clientPrincipal: securityContext.principal.stableKey ?? securityContext.principal.displayName,
                     providerIdentifier: lane.providerIdentifier,

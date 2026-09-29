@@ -483,8 +483,11 @@ package enum ContextBuilderDiscoveryPrompt {
     }
 
     private static func preamble(workspace: ContextBuilderFrozenWorkspace, limits: ContextBuilderDiscoveryLimits) -> String {
-        let roots = zip(workspace.rootDisplayNames, workspace.snapshot.roots).map { name, root in
-            name == root.path ? "- \(root.path)" : "- \(name): \(root.path)"
+        let roots = zip(workspace.rootSpellings, workspace.snapshot.roots).map { spelling, root in
+            if spelling.label == root.path { return "- \(root.path)" }
+            if spelling.heading == spelling.label { return "- \(spelling.label): \(root.path)" }
+            // The label still prefixes paths inside the root, but alone it names another entry too.
+            return "- \(spelling.label): \(root.path) (write the root itself as \(root.path))"
         }.joined(separator: "\n")
         let pathRule = if workspace.snapshot.roots.count > 1 {
             "Paths are written as tool results show them: `<root label>/<path in that root>` (labels are listed in <workspace_roots>), or absolute under a root. A path without its root label is accepted only when it exists under exactly one root, and a path that could name two different files is rejected as ambiguous."

@@ -849,7 +849,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     /// cancellation included, is reported as `oracle_*_after_discovery` with what was committed
     /// (see `settlementAfterDiscovery`); it is never a bare cancellation. The Oracle step's
     /// child-launch carriers are prepared only here, after the commit, through the invocation's
-    /// single-use handoff.
+    /// single-use handoff, pinned to the committed context and the revisions the commit produced: if
+    /// the connection was rebound or either revision moved since, nothing is minted and no Oracle
+    /// runs, so the Oracle never gets another context's authority for this context's pack.
     private func buildDiscoveredContext(
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         arguments: [String: Value],
@@ -873,7 +875,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         var fields = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
         guard route.oracle != .none, let handoff else { return try .object(fields) }
         do {
-            let bundle = try await handoff.prepare()
+            let bundle = try await handoff.prepare(pinnedTo: Self.committedContextPin(outcome))
             let oracleFields = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
                 try await DomainChildLaunchContext.$current.withValue(bundle.singleCarrier) {
                     try await self.runDiscoveredOracle(
@@ -896,6 +898,15 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                 request: request
             )
         }
+    }
+
+    /// The exact authority discovery committed to: its context at the post-commit revisions.
+    static func committedContextPin(_ outcome: ContextBuilderDiscoveryOutcome) -> DomainChildLaunchContextPin {
+        DomainChildLaunchContextPin(
+            context: outcome.context,
+            workspaceRevision: outcome.receipt.workspaceRevision,
+            contextRevision: outcome.receipt.contextRevision
+        )
     }
 
     private func runDiscoveredOracle(
@@ -945,13 +956,27 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         request: DomainPhysicalToolRequest
     ) -> MCPDomainToolFailure {
-        let cancelled = taskCancelled || MCPToolExecutionCancelledError.matches(error)
-        let underlying = cancelled
-            ? "The Oracle step was cancelled."
-            : "The Oracle step failed: " + ((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+        let contextMoved = error as? DomainChildLaunchContextPin.Mismatch
+        let cancelled = contextMoved == nil && (taskCancelled || MCPToolExecutionCancelledError.matches(error))
+        let underlying = if cancelled {
+            "The Oracle step was cancelled."
+        } else if let contextMoved {
+            "The Oracle step was not started: " + (contextMoved.errorDescription ?? String(describing: contextMoved))
+        } else {
+            "The Oracle step failed: " + ((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+        }
         let committed = outcome.receipt.applied
         var details = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
         details["status"] = .string(cancelled ? "oracle_cancelled" : "oracle_failed")
+        if contextMoved != nil {
+            // The handoff refused before minting: say which authority the pack belongs to.
+            details["handoff"] = .object([
+                "code": .string(DomainChildLaunchContextPin.Mismatch.code),
+                "committed_context_id": .string(outcome.context.contextID.uuidString),
+                "committed_workspace_revision": .int(Int(clamping: outcome.receipt.workspaceRevision)),
+                "committed_context_revision": .int(Int(clamping: outcome.receipt.contextRevision))
+            ])
+        }
         let resume: String
         if case .group = route.oracle {
             var resumeArguments: [String: Value] = ["context_pack_ref": .string(outcome.packReference.rawValue)]
@@ -967,14 +992,19 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         } else {
             resume = "Replaying the raw instructions reruns discovery over the committed selection."
         }
+        let rebindAdvice = if case .rebound = contextMoved {
+            " The pack was built from context \(outcome.context.contextID.uuidString); resume while bound to it."
+        } else {
+            ""
+        }
         let selectionText = committed
             ? "Discovery committed \(outcome.selection.count) selected file(s)"
             : "The context already held the \(outcome.selection.count) discovered file(s)"
         return MCPDomainToolFailure(
             toolName: "context_builder",
             code: cancelled ? "oracle_cancelled_after_discovery" : "oracle_failed_after_discovery",
-            message: "\(underlying) \(selectionText) and persisted \(outcome.packReference.rawValue). \(resume)",
-            retryability: committed ? .indeterminate : (cancelled ? .retryable : .permanent),
+            message: "\(underlying) \(selectionText) and persisted \(outcome.packReference.rawValue). \(resume)\(rebindAdvice)",
+            retryability: committed ? .indeterminate : (cancelled || contextMoved != nil ? .retryable : .permanent),
             mutationState: committed
                 ? DomainProtectedMutationState.applied.rawValue
                 : DomainProtectedMutationState.notApplied.rawValue,
