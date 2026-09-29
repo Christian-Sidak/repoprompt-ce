@@ -8,11 +8,15 @@ import difflib
 import re
 from pathlib import Path
 
+from modularization_move_audit import code_line_mask
+
 IMPORT = re.compile(r"(?m)^([ \t]*@testable[ \t]+import[ \t]+)RepoPromptApp([ \t]*)$")
 
 
 def retarget(text: str, module: str) -> str:
-    return IMPORT.sub(lambda match: match.group(1) + module + match.group(2), text)
+    return "".join(IMPORT.sub(lambda match: match.group(1) + module + match.group(2), line)
+                   if code else line
+                   for line, code in zip(text.splitlines(keepends=True), code_line_mask(text)))
 
 
 def main() -> int:

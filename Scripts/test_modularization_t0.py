@@ -106,6 +106,112 @@ class GitFixture(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(json.loads(destination.read_text())["violations"], [])
 
+    def test_f1_modified_multiline_string_is_not_an_access_change(self) -> None:
+        path = "Sources/OldModule/Client.swift"
+        write(self.root, path, 'let text = """\npublic struct Thing {}\n"""\n')
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "string base")
+        write(self.root, path, 'let text = """\npackage struct Thing {}\n"""\n')
+        self.assertTrue(self.commit()["violations"])
+
+    def test_f1_moved_multiline_string_and_import_text_fail(self) -> None:
+        path = self.root / "Sources/OldModule/Thing.swift"
+        path.write_text('let text = """\nimport OldModule\npublic struct Thing {}\n"""\n')
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "string base")
+        path.unlink()
+        write(self.root, "Sources/NewModule/Thing.swift",
+              'let text = """\nimport NewModule\npackage struct Thing {}\n"""\n')
+        self.assertTrue(self.commit()["violations"])
+
+    def test_f1_import_text_inside_raw_string_is_not_dropped(self) -> None:
+        path = "Sources/OldModule/Client.swift"
+        write(self.root, path, 'let text = #"""\nimport OldModule\n"""#\n')
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "raw string base")
+        write(self.root, path, 'let text = #"""\nimport NewModule\n"""#\n')
+        self.assertTrue(self.commit()["violations"])
+
+    def test_f2_diverged_base_uses_merge_base_blobs(self) -> None:
+        git(self.root, "checkout", "-qb", "main-tip")
+        write(self.root, "Sources/OldModule/Thing.swift", "internal struct Thing {\n    let value = 2\n}\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "main body edit")
+        git(self.root, "checkout", "-qb", "topic", "HEAD~1")
+        (self.root / "Sources/OldModule/Thing.swift").unlink()
+        write(self.root, "Sources/NewModule/Thing.swift", "internal struct Thing {\n    let value = 2\n}\n")
+        self.assertTrue(self.commit()["violations"])
+        git(self.root, "checkout", "-qb", "pure", "HEAD~1")
+        target = self.root / "Sources/NewModule/Thing.swift"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        (self.root / "Sources/OldModule/Thing.swift").rename(target)
+        self.commit()
+        report = audit.audit("main-tip", "HEAD", self.root)
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["comparison_base"], subprocess.check_output(
+            ["git", "rev-parse", "HEAD~1"], cwd=self.root, text=True).strip())
+
+    def test_f3_binary_classified_modified_swift_fails_closed(self) -> None:
+        path = self.root / "Sources/OldModule/Client.swift"
+        path.write_bytes(b"// nul\0\nprint(1)\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "binary base")
+        path.write_bytes(b"// nul\0\nprint(2)\n")
+        self.assertTrue(self.commit()["violations"])
+
+    def test_f3_disabled_git_diff_still_fails_body_edit(self) -> None:
+        write(self.root, ".gitattributes", "*.swift -diff\n")
+        write(self.root, "Sources/OldModule/Client.swift", "print(1)\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "diff disabled")
+        write(self.root, "Sources/OldModule/Client.swift", "print(2)\n")
+        self.assertTrue(self.commit()["violations"])
+
+    def test_f3_byte_identical_binary_r100_move_passes(self) -> None:
+        source = self.root / "Sources/OldModule/Thing.swift"
+        source.write_bytes(b"\xff\0unchanged")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "binary base")
+        target = self.root / "Sources/NewModule/Thing.swift"
+        target.parent.mkdir(parents=True)
+        source.rename(target)
+        report = self.commit()
+        self.assertEqual(report["violations"], [])
+        self.assertEqual(report["moves"][0]["hash_kind"], "raw")
+
+    def test_f7_package_manifest_edit_is_allowlisted(self) -> None:
+        target = self.root / "Sources/NewModule/Thing.swift"
+        target.parent.mkdir(parents=True)
+        (self.root / "Sources/OldModule/Thing.swift").rename(target)
+        write(self.root, "Package.swift", '.target(name: "NewModule"),\n.target(name: "Other"),\n')
+        self.assertEqual(self.commit()["violations"], [])
+
+    def test_f8_class_method_access_modifier_is_normalized(self) -> None:
+        write(self.root, "Sources/OldModule/Thing.swift",
+              "package class Thing {\n    class internal func value() -> Int { 1 }\n}\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "method base")
+        (self.root / "Sources/OldModule/Thing.swift").unlink()
+        write(self.root, "Sources/NewModule/Thing.swift",
+              "package class Thing {\n    class package func value() -> Int { 1 }\n}\n")
+        self.assertEqual(self.commit()["violations"], [])
+
+    def test_f9_quoted_unicode_path_is_parsed_as_raw_git_path(self) -> None:
+        git(self.root, "config", "core.quotePath", "true")
+        names = ("日本.swift", "tab\tfile.swift", "line\nbreak.swift", 'quote"file.swift')
+        for name in names:
+            write(self.root, f"Sources/OldModule/{name}", "internal struct Japanese {}\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "quoted paths base")
+        target_dir = self.root / "Sources/NewModule"
+        target_dir.mkdir(parents=True)
+        for name in names:
+            (self.root / "Sources/OldModule" / name).rename(target_dir / name)
+        report = self.commit()
+        self.assertEqual(report["violations"], [])
+        self.assertEqual({move["to"] for move in report["moves"]},
+                         {f"Sources/NewModule/{name}" for name in names})
+
 
 class NormalizationTests(unittest.TestCase):
     def test_access_head_only_and_whitespace_preserved(self) -> None:
@@ -130,15 +236,15 @@ class NormalizationTests(unittest.TestCase):
 class HelperTests(unittest.TestCase):
     def test_lift_balances_nested_attributes_and_quoted_parentheses(self) -> None:
         cases = (
-            '@available(*, renamed: "foo(bar:)") struct Foo {}\n',
-            '@available(*, message: "close ) now") struct Foo {}\n',
-            '@available(*, message: "public ) struct Foo") struct Foo {}\n',
-            '@Some(arg: nested(foo())) struct Foo {}\n',
-            '@available(*, message: "close \\" ) later") struct Foo {}\n',
+            '@available(*, renamed: "foo(bar:)") internal struct Foo {}\n',
+            '@available(*, message: "close ) now") internal struct Foo {}\n',
+            '@available(*, message: "public ) struct Foo") internal struct Foo {}\n',
+            '@Some(arg: nested(foo())) internal struct Foo {}\n',
+            '@available(*, message: "close \\" ) later") internal struct Foo {}\n',
         )
         for before in cases:
             with self.subTest(before=before):
-                expected = before.removesuffix('struct Foo {}\n') + 'package struct Foo {}\n'
+                expected = before.removesuffix('internal struct Foo {}\n') + 'package struct Foo {}\n'
                 self.assertEqual(access.lift_line(before, 'Foo'), expected)
                 self.assertEqual(audit.normalized(before.encode()), audit.normalized(expected.encode()))
         self.assertIsNone(access.lift_line('@available(*, message: "unfinished) struct Foo {}\n', 'Foo'))
@@ -156,13 +262,14 @@ class HelperTests(unittest.TestCase):
             root = Path(tmp)
             write(root, "Sources/One/Thing.swift", "@MainActor internal struct Thing {}\n")
             write(root, "Sources/Two/Client.swift", "let thing = Thing()\n")
-            log = f"{root}/Sources/Two/Client.swift:1:13: error: 'Thing' is inaccessible due to 'internal' protection level\n"
+            log = (f"{root}/Sources/Two/Client.swift:1:13: error: 'Thing' is inaccessible due to 'internal' protection level\n"
+                   f"{root}/Sources/One/Thing.swift:1:21: note: 'Thing' declared here\n")
             changes, notes = access.proposals(log, root)
             self.assertEqual(notes, [])
             self.assertEqual(changes[root / "Sources/One/Thing.swift"], "@MainActor package struct Thing {}\n")
             self.assertEqual((root / "Sources/One/Thing.swift").read_text(), "@MainActor internal struct Thing {}\n")
 
-    def test_access_lift_missing_scope_and_ambiguous_skip(self) -> None:
+    def test_access_lift_missing_scope_without_declaration_note_skips(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write(root, "Sources/One/Foo.swift", "struct Foo {}\n")
@@ -173,8 +280,8 @@ class HelperTests(unittest.TestCase):
             self.assertEqual(len(notes), 1)
             (root / "Sources/Three/Foo.swift").unlink()
             changes, notes = access.proposals("Sources/Two/Client.swift:1:13: error: cannot find 'Foo' in scope\n", root)
-            self.assertEqual(notes, [])
-            self.assertEqual(changes[root / "Sources/One/Foo.swift"], "package struct Foo {}\n")
+            self.assertEqual(changes, {})
+            self.assertEqual(len(notes), 1)
 
     def test_access_cli_dry_run_then_apply_in_git_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,7 +292,8 @@ class HelperTests(unittest.TestCase):
             git(root, "add", ".")
             git(root, "-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-qm", "base")
             log = root / "build.log"
-            log.write_text("Sources/Two/Client.swift:1:13: error: 'Thing' is inaccessible due to 'internal' protection level\n")
+            log.write_text("Sources/Two/Client.swift:1:13: error: 'Thing' is inaccessible due to 'internal' protection level\n"
+                           "Sources/One/Thing.swift:1:17: note: 'Thing' declared here\n")
             command = [sys.executable, str(SCRIPT_DIR / "modularization_access_lift.py"), str(log), "--root", str(root)]
             dry = subprocess.run(command, cwd=root, capture_output=True, text=True)
             self.assertEqual(dry.returncode, 0, dry.stderr)
@@ -207,7 +315,8 @@ class HelperTests(unittest.TestCase):
             write(root, 'Sources/Two/Client.swift', 'let value = Foo()\n')
             git(root, 'add', '.')
             git(root, 'commit', '-qm', 'base')
-            log = "Sources/Two/Client.swift:1:13: error: 'Foo' is inaccessible due to 'internal' protection level\n"
+            log = ("Sources/Two/Client.swift:1:13: error: 'Foo' is inaccessible due to 'internal' protection level\n"
+                   "Sources/One/Foo.swift:1:51: note: 'Foo' declared here\n")
             changes, notes = access.proposals(log, root)
             self.assertEqual(notes, [])
             old_path.unlink()
@@ -243,6 +352,62 @@ class HelperTests(unittest.TestCase):
         after = retarget.retarget(before, "NewModule")
         self.assertIn("@testable import NewModule\n", after)
         self.assertIn("// @testable import RepoPromptApp", after)
+
+    def test_f4_access_lift_refuses_literal_and_comment_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "Sources/One/Thing.swift", 'let text = """\ninternal struct Thing {}\n"""\n')
+            write(root, "Sources/Two/Client.swift", "let value = Thing()\n")
+            log = ("Sources/Two/Client.swift:1:13: error: 'Thing' is inaccessible due to 'internal' protection level\n"
+                   "Sources/One/Thing.swift:2:17: note: 'Thing' declared here\n")
+            changes, notes = access.proposals(log, root)
+            self.assertEqual(changes, {})
+            self.assertEqual(len(notes), 1)
+            write(root, "Sources/One/Thing.swift", "// internal struct Thing {}\n")
+            changes, notes = access.proposals(log.replace(":2:17:", ":1:17:"), root)
+            self.assertEqual(changes, {})
+            self.assertEqual(len(notes), 1)
+            write(root, "Sources/One/Thing.swift", "/*\ninternal struct Thing {}\n*/\n")
+            changes, notes = access.proposals(log, root)
+            self.assertEqual(changes, {})
+            self.assertEqual(len(notes), 1)
+
+    def test_f5_access_lift_refuses_unproven_provider_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "Sources/One/Service.swift", "struct Service {\ninternal func\nsecret() {}\n}\n")
+            write(root, "Sources/Unrelated/Other.swift", "struct Other {\ninternal func secret() {}\n}\n")
+            write(root, "Sources/Client/Use.swift", "Service().secret()\n")
+            log = ("Sources/Client/Use.swift:1:11: error: 'secret' is inaccessible due to 'internal' protection level\n"
+                   "One.Service.secret:2:15: note: 'secret()' declared here\n")
+            changes, notes = access.proposals(log, root)
+            self.assertEqual(changes, {})
+            self.assertIn("requires one exact first-party declaration note", notes[0])
+
+    def test_f6_access_lift_refuses_implicit_or_enclosing_access(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "Sources/One/Thing.swift",
+                  "public struct Thing {}\npublic extension Thing {\n    func thing() -> Int { 1 }\n}\n")
+            write(root, "Sources/Client/Use.swift", "thing()\n")
+            log = ("Sources/Client/Use.swift:1:1: error: cannot find 'thing' in scope\n"
+                   "Sources/One/Thing.swift:3:10: note: 'thing' declared here\n")
+            changes, notes = access.proposals(log, root)
+            self.assertEqual(changes, {})
+            self.assertIn("not explicitly internal", notes[0])
+            write(root, "Sources/One/Thing.swift", "private\nfunc thing() {}\n")
+            changes, notes = access.proposals(log.replace(":3:10:", ":2:6:"), root)
+            self.assertEqual(changes, {})
+            self.assertIn("not explicitly internal", notes[0])
+
+    def test_f10_retarget_changes_only_real_import_lines(self) -> None:
+        before = ('@testable import RepoPromptApp\n'
+                  'let fixture = """\n@testable import RepoPromptApp\n"""\n'
+                  '/*\n@testable import RepoPromptApp\n*/\n'
+                  'let raw = #"""\n@testable import RepoPromptApp\n"""#\n')
+        after = retarget.retarget(before, "NewModule")
+        self.assertEqual(after.count("@testable import NewModule"), 1)
+        self.assertEqual(after.count("@testable import RepoPromptApp"), 3)
 
 
 if __name__ == "__main__":
