@@ -59,6 +59,18 @@ actor DirectHeadlessProviderCoordinator {
         let updatedAt: Date
     }
 
+    /// What one provider process launches under.
+    enum ProviderLaunch {
+        /// A carrier-bearing launch: it acquires the lane's launch-scoped root authority itself.
+        case lane(DirectHeadlessLaunchAuthority.Lane)
+        /// A carrier-bearing launch whose authority the caller already acquired (an agent start,
+        /// before it returned); the launch takes over the lease and releases it on every exit.
+        case acquired(DirectHeadlessLaunchRootLease, DirectHeadlessLaunchAuthority.Lane)
+        /// A Context Builder discovery turn: no carrier (no child token and no child tools), run in
+        /// the active root of discovery's frozen snapshot.
+        case discoveryTurn(workingDirectory: URL?)
+    }
+
     private struct Conversation {
         let id: UUID
         let providerID: String
@@ -76,10 +88,10 @@ actor DirectHeadlessProviderCoordinator {
     private var providerTasks: [UUID: Task<String, Error>] = [:]
     private var conversations: [UUID: Conversation] = [:]
     private var isShuttingDown = false
-    /// Test seam: runs at a pinned lane launch's boundary, after its carriers were minted and before
-    /// the launch acquires its root authority (and so its working directory). Receives the lane's
-    /// carrier.
-    private var pinnedLaunchProbe: (@Sendable (DomainChildLaunchCarrier) async throws -> Void)?
+    /// Test seam: runs at every carrier-bearing launch's boundary, after its carriers were minted and
+    /// before the launch acquires its root authority (and so its working directory). Receives the
+    /// lane's carrier.
+    private var launchProbe: (@Sendable (DomainChildLaunchCarrier) async throws -> Void)?
 
     init(
         runtime: MCPDomainRuntime,
@@ -138,20 +150,50 @@ actor DirectHeadlessProviderCoordinator {
         }
     }
 
-    func installPinnedLaunchProbe(_ probe: (@Sendable (DomainChildLaunchCarrier) async throws -> Void)?) {
-        pinnedLaunchProbe = probe
+    func installLaunchProbe(_ probe: (@Sendable (DomainChildLaunchCarrier) async throws -> Void)?) {
+        launchProbe = probe
     }
 
-    /// Runs one provider process. Without `pinnedLane` it runs in the connection's current context.
+    /// Acquires the launch-scoped root authority `lane` launches under
+    /// (`DirectHeadlessDomainContext.acquireLaunchRootLease`), or throws
+    /// `DomainChildLaunchContextPin.Mismatch` (nothing may be launched). The caller owns the returned
+    /// lease and must release it on every path, spawned or not.
+    func acquireLaunchAuthority(
+        _ lane: DirectHeadlessLaunchAuthority.Lane,
+        kind: DirectHeadlessLaunchRootRegistry.Holder.Kind,
+        connectionID: UUID,
+        sessionID: UUID?
+    ) async throws -> DirectHeadlessLaunchRootLease {
+        guard !isShuttingDown else { throw CancellationError() }
+        guard lane.authority.ledger.begin(lane.carrier.launchID) else {
+            throw MCPError.internalError("A child-launch carrier was launched twice.")
+        }
+        try await launchProbe?(lane.carrier)
+        let lease = try await context.acquireLaunchRootLease(
+            lane,
+            kind: kind,
+            connectionID: connectionID,
+            sessionID: sessionID
+        )
+        if isShuttingDown || Task.isCancelled {
+            await context.releaseLaunchRootLease(lease)
+            throw CancellationError()
+        }
+        return lease
+    }
+
+    /// Runs one provider process.
     ///
-    /// With one (a discovered Oracle lane whose carrier was minted for the committed context), the
-    /// launch first acquires the lane's launch-scoped root authority
-    /// (`DirectHeadlessDomainContext.acquireLaunchRootLease`): the connection must still resolve to
-    /// the pin and the roots to the committed ones, else it fails closed with
-    /// `DomainChildLaunchContextPin.Mismatch` and no process starts. The process then runs in the
-    /// lease's working directory with the lane's carrier, whose token redemption attaches the child
-    /// connection to the same lease, and the lease is released when the process exits, fails to
-    /// spawn, or is cancelled. The lane's ledger records whether the process actually started.
+    /// A carrier-bearing launch (`.lane`, or `.acquired` from an agent start) runs under its lane's
+    /// launch-scoped root authority: the connection must still resolve to the lane's context (the
+    /// pin, or the context its carrier was minted for) and the roots to the step's, else it fails
+    /// closed with `DomainChildLaunchContextPin.Mismatch` and no process starts. The process then
+    /// runs in the lease's working directory with the lane's carrier, whose token redemption
+    /// attaches the child connection to the same lease, and the lease (with the token it owns) is
+    /// released when the process exits, fails to spawn, or is cancelled, and on every exit before
+    /// the spawn. The lane's ledger records whether the process actually started.
+    ///
+    /// A discovery turn has no carrier and runs in its frozen snapshot's active root.
     func runProviderOnce(
         message: String,
         providerID: String?,
@@ -159,55 +201,62 @@ actor DirectHeadlessProviderCoordinator {
         request: DomainPhysicalToolRequest,
         sessionID: UUID? = nil,
         purpose: ExecutionPurpose,
-        carrierEnvironment: [String: String]? = nil,
-        pinnedLane: DirectHeadlessPinnedLaunch.Lane? = nil
+        launch: ProviderLaunch
     ) async throws -> String {
-        guard !isShuttingDown else { throw CancellationError() }
-        let descriptor = try resolveProvider(providerID)
-        guard let executable = descriptor.executable else {
-            throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
-        }
-        guard let connectionID = request.securityContext?.connectionID else {
-            throw DirectHeadlessDomainContext.Error.routingUnavailable
-        }
-        let effectiveSessionID = sessionID ?? request.securityContext?.principal.runID
+        let executable: String
         let workingDirectory: URL?
         let carrier: [String: String]
         let lease: DirectHeadlessLaunchRootLease?
-        if let pinnedLane {
-            guard pinnedLane.launch.ledger.begin(pinnedLane.carrier.launchID) else {
-                throw MCPError.internalError("An Oracle lane carrier was launched twice.")
-            }
-            try await pinnedLaunchProbe?(pinnedLane.carrier)
-            let acquired = try await context.acquireLaunchRootLease(
-                pinnedLane,
-                connectionID: connectionID,
-                sessionID: effectiveSessionID
-            )
-            if isShuttingDown || Task.isCancelled {
-                await context.releaseLaunchRootLease(acquired)
-                throw CancellationError()
-            }
-            lease = acquired
-            workingDirectory = acquired.workingDirectory
-            carrier = pinnedLane.carrier.environment
-        } else {
-            let snapshot = try await context.snapshot(
-                connectionID: connectionID,
-                sessionID: effectiveSessionID
-            )
+        let lane: DirectHeadlessLaunchAuthority.Lane?
+        do {
             guard !isShuttingDown else { throw CancellationError() }
-            try Task.checkCancellation()
-            lease = nil
-            workingDirectory = snapshot.activeRoot
-            carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
+            let descriptor = try resolveProvider(providerID)
+            guard let resolved = descriptor.executable else {
+                throw MCPError.invalidRequest(
+                    "Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")"
+                )
+            }
+            executable = resolved
+            switch launch {
+            case let .lane(launchLane):
+                guard let connectionID = request.securityContext?.connectionID else {
+                    throw DirectHeadlessDomainContext.Error.routingUnavailable
+                }
+                let acquired = try await acquireLaunchAuthority(
+                    launchLane,
+                    kind: purpose == .agent ? .agent : .oracle,
+                    connectionID: connectionID,
+                    sessionID: sessionID ?? request.securityContext?.principal.runID
+                )
+                lease = acquired
+                lane = launchLane
+                workingDirectory = acquired.workingDirectory
+                carrier = launchLane.carrier.environment
+            case let .acquired(acquired, launchLane):
+                lease = acquired
+                lane = launchLane
+                guard !isShuttingDown else { throw CancellationError() }
+                try Task.checkCancellation()
+                workingDirectory = acquired.workingDirectory
+                carrier = launchLane.carrier.environment
+            case let .discoveryTurn(frozenRoot):
+                lease = nil
+                lane = nil
+                try Task.checkCancellation()
+                workingDirectory = frozenRoot
+                carrier = [:]
+            }
+        } catch {
+            // An authority handed over by the caller is released here if the launch never begins.
+            if case let .acquired(acquired, _) = launch { await context.releaseLaunchRootLease(acquired) }
+            throw error
         }
         let arguments = Self.codexExecArguments(model: model, purpose: purpose)
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }
         let taskID = UUID()
         let domainContext = context
-        let ledger = pinnedLane?.launch.ledger
+        let ledger = lane?.authority.ledger
         let leasedLaunchID = lease?.launchID
         let task = Task {
             // The process's lifetime bounds the lease's: it is released on every exit from here,
@@ -240,7 +289,17 @@ actor DirectHeadlessProviderCoordinator {
         }
     }
 
-    func startAgent(args: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
+    /// Starts one agent session. Its provider process launches under the carrier's launch-scoped
+    /// root authority, acquired here, after the session's worktree overlay was prepared and before
+    /// the session exists: a refused launch is this call's typed `child_launch_context_changed`
+    /// failure with nothing registered, and a detached start returns only once its process's roots,
+    /// working directory, and child token are fixed. The lease then passes to the session's provider
+    /// task, which releases it when the process exits, fails to spawn, or is cancelled.
+    func startAgent(
+        args: [String: Value],
+        request: DomainPhysicalToolRequest,
+        toolName: String = "agent_run"
+    ) async throws -> Value {
         guard !isShuttingDown else { throw CancellationError() }
         await settingsStore.bootstrap()
         let cleanupGuidance = try await settingsStore.effectiveValue(
@@ -258,7 +317,10 @@ actor DirectHeadlessProviderCoordinator {
         guard descriptor.executable != nil else {
             throw MCPError.invalidRequest("Provider '\(descriptor.id)' is unavailable: \(descriptor.unavailableReason ?? "not configured")")
         }
-        let sessionID = DomainChildLaunchContext.current?.runID ?? UUID()
+        guard let carrier = DomainChildLaunchContext.current else {
+            throw MCPError.internalError("child_launch_carrier_missing: an agent start has no child-launch carrier")
+        }
+        let sessionID = carrier.runID
         let runID = sessionID
         guard let connectionID = request.securityContext?.connectionID else {
             throw DirectHeadlessDomainContext.Error.routingUnavailable
@@ -271,23 +333,39 @@ actor DirectHeadlessProviderCoordinator {
             arguments: args,
             connectionID: connectionID
         )
+        let lane = DirectHeadlessLaunchAuthority.admitted().lane(carrier)
+        let lease: DirectHeadlessLaunchRootLease
+        do {
+            lease = try await acquireLaunchAuthority(
+                lane,
+                kind: .agent,
+                connectionID: connectionID,
+                sessionID: sessionID
+            )
+        } catch {
+            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
+            throw DirectHeadlessLaunchAuthority.launchFailure(error, toolName: toolName, lane: lane)
+        }
+        // Until the provider task owns the lease, every exit releases it and undoes the start.
         let registration = await runtime.agentSessionStore.register(sessionID: sessionID)
-        let activationID = UUID()
         let epoch: DomainAgentRunTurnEpoch
-        switch await beginEpoch(registration, activationID) {
-        case let .accepted(value): epoch = value
-        case let .rejected(reason):
+        do {
+            switch await beginEpoch(registration, UUID()) {
+            case let .accepted(value): epoch = value
+            case let .rejected(reason):
+                throw MCPError.internalError(reason)
+            case .stale:
+                throw MCPError.internalError("agent epoch changed during start")
+            }
+            guard !isShuttingDown else { throw CancellationError() }
+            try Task.checkCancellation()
+        } catch {
+            await context.releaseLaunchRootLease(lease)
             await context.rollbackSessionRootOverlay(rootOverlayPreparation)
             await runtime.agentSessionStore.cleanup(registration: registration)
-            throw MCPError.internalError(reason)
-        case .stale:
-            await context.rollbackSessionRootOverlay(rootOverlayPreparation)
-            await runtime.agentSessionStore.cleanup(registration: registration)
-            throw MCPError.internalError("agent epoch changed during start")
+            throw error
         }
         let name = args["session_name"]?.stringValue
-        guard !isShuttingDown else { throw CancellationError() }
-        try Task.checkCancellation()
         let record = AgentRecord(
             registration: registration,
             epoch: epoch,
@@ -309,25 +387,29 @@ actor DirectHeadlessProviderCoordinator {
             failure: nil
         )
         runningRecord.latestSnapshot = running
-        agents[sessionID] = runningRecord
         await runtime.agentSessionStore.noteSnapshot(
             running,
             cursor: DomainAgentSessionWaitCursor(registration: registration, epoch: epoch)
         )
+        // The record becomes visible together with its provider task (no suspension between), so a
+        // cancel can never find the session without the task that holds its launch.
         let capturedRequest = request
-        let capturedCarrierEnvironment = DomainChildLaunchContext.current?.environment ?? [:]
+        let domainContext = context
         let task = Task { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                await domainContext.releaseLaunchRootLease(lease)
+                return
+            }
             let report = await DomainAgentRunExecutionCore.execute {
                 do {
-                    let text = try await runProviderOnce(
+                    let text = try await self.runProviderOnce(
                         message: message,
                         providerID: descriptor.id,
                         model: args["model"]?.stringValue,
                         request: capturedRequest,
                         sessionID: sessionID,
                         purpose: .agent,
-                        carrierEnvironment: capturedCarrierEnvironment
+                        launch: .acquired(lease, lane)
                     )
                     return .completed(assistantText: text)
                 } catch {
@@ -338,7 +420,8 @@ actor DirectHeadlessProviderCoordinator {
             guard case let .terminal(outcome) = report.result else { return }
             await finishAgent(sessionID: sessionID, outcome: outcome)
         }
-        agents[sessionID]?.task = task
+        runningRecord.task = task
+        agents[sessionID] = runningRecord
         await runtime.agentSessionStore.installCancellationHandler(registration: registration) { [weak self] in
             await self?.cancelAgent(sessionID: sessionID)
         }
@@ -445,22 +528,31 @@ actor DirectHeadlessProviderCoordinator {
         return current.toValue()
     }
 
+    /// One direct Oracle turn launched under `lane` (see `runProviderOnce`). An ordinary lane's
+    /// pre-start refusal is `toolName`'s typed failure; a discovered lane's passes through for
+    /// discovery's settlement.
     func createConversation(
         providerID: String?,
         message: String,
         model: String?,
         request: DomainPhysicalToolRequest,
-        pinnedLane: DirectHeadlessPinnedLaunch.Lane? = nil
+        lane: DirectHeadlessLaunchAuthority.Lane,
+        toolName: String
     ) async throws -> (UUID, String) {
         let descriptor = try resolveProvider(providerID)
-        let text = try await runProviderOnce(
-            message: message,
-            providerID: descriptor.id,
-            model: model,
-            request: request,
-            purpose: .directOracle,
-            pinnedLane: pinnedLane
-        )
+        let text: String
+        do {
+            text = try await runProviderOnce(
+                message: message,
+                providerID: descriptor.id,
+                model: model,
+                request: request,
+                purpose: .directOracle,
+                launch: .lane(lane)
+            )
+        } catch {
+            throw DirectHeadlessLaunchAuthority.launchFailure(error, toolName: toolName, lane: lane)
+        }
         let id = UUID()
         conversations[id] = Conversation(
             id: id,
@@ -475,20 +567,28 @@ actor DirectHeadlessProviderCoordinator {
     func continueConversation(
         id: UUID,
         message: String,
-        request: DomainPhysicalToolRequest
+        request: DomainPhysicalToolRequest,
+        lane: DirectHeadlessLaunchAuthority.Lane,
+        toolName: String
     ) async throws -> String {
         guard var conversation = conversations[id] else {
             throw MCPError.invalidParams("unknown chat_id")
         }
         let history = conversation.messages.map { "\($0.role): \($0.text)" }.joined(separator: "\n\n")
         let prompt = history + "\n\nuser: " + message
-        let text = try await runProviderOnce(
-            message: prompt,
-            providerID: conversation.providerID,
-            model: conversation.model,
-            request: request,
-            purpose: .directOracle
-        )
+        let text: String
+        do {
+            text = try await runProviderOnce(
+                message: prompt,
+                providerID: conversation.providerID,
+                model: conversation.model,
+                request: request,
+                purpose: .directOracle,
+                launch: .lane(lane)
+            )
+        } catch {
+            throw DirectHeadlessLaunchAuthority.launchFailure(error, toolName: toolName, lane: lane)
+        }
         conversation.messages.append(("user", message))
         conversation.messages.append(("assistant", text))
         conversation.updatedAt = Date()

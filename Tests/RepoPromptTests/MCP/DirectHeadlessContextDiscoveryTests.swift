@@ -672,7 +672,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         // The barrier lands after the handoff validated the pin and minted the Oracle's carrier for
         // the committed context, and before the Oracle process launches: a concurrent
         // bind_context moves the connection to `other`.
-        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+        await prepared.providerCoordinator.installLaunchProbe { _ in
             _ = try await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
             await rebound.set()
         }
@@ -743,7 +743,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
         // Same binding, but the workspace's roots are replaced between the handoff and the launch:
         // resolving the working directory now would name `movedRoot`, not the committed root.
-        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+        await prepared.providerCoordinator.installLaunchProbe { _ in
             try await Self.replaceRoots(of: prepared, with: [movedRoot])
         }
         let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend)
@@ -795,7 +795,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let rebind = OnceBarrier {
             _ = try await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
         }
-        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in try await rebind.pass() }
+        await prepared.providerCoordinator.installLaunchProbe { _ in try await rebind.pass() }
         let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend)
         let security = try await verifiedSecurityContext(prepared)
 
@@ -1016,7 +1016,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
         let atLaunch = AsyncGate()
         let proceed = AsyncGate()
-        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+        await prepared.providerCoordinator.installLaunchProbe { _ in
             await atLaunch.open()
             await proceed.wait()
         }
@@ -1083,7 +1083,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let routing = prepared.runtime.routingCoordinator
         // The launch's first resolution of the connection is overtaken by a bind to `other`: it
         // lands after the binding was read and before the context read returns.
-        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+        await prepared.providerCoordinator.installLaunchProbe { _ in
             await routing.testSetAfterReadTargetCaptured {
                 await routing.testSetAfterReadTargetCaptured(nil)
                 _ = try? await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
@@ -1128,7 +1128,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let runID = try XCTUnwrap(prepared.principal.runID)
         // Lane 2 reaches its launch only when the test lets it.
         let laneTwoMayLaunch = AsyncGate()
-        await prepared.providerCoordinator.installPinnedLaunchProbe { carrier in
+        await prepared.providerCoordinator.installLaunchProbe { carrier in
             if carrier.oracleLaneID?.index == 2 { await laneTwoMayLaunch.wait() }
         }
         let (wrapped, _) = await realHandoffTool(prepared: prepared, backend: Self.backend(prepared))
@@ -1202,7 +1202,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         try await Self.setRoster(prepared, primary: "lane-0", additional: [])
         let executable = fixture.executable
         // The provider was resolved; the executable stops being executable before the spawn.
-        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+        await prepared.providerCoordinator.installLaunchProbe { _ in
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: executable.path)
         }
         let (wrapped, _) = await realHandoffTool(prepared: prepared, backend: Self.backend(prepared))
@@ -1288,7 +1288,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let runID = try XCTUnwrap(prepared.principal.runID)
         // Discovery commits over the root itself; the session then moves onto a linked worktree
         // before the launch.
-        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+        await prepared.providerCoordinator.installLaunchProbe { _ in
             _ = try await prepared.context.prepareSessionRootOverlay(
                 sessionID: runID,
                 sourceSessionID: nil,
@@ -1325,7 +1325,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
             arguments: ["worktree": .string(worktree.path)],
             connectionID: prepared.connectionID
         )
-        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+        await prepared.providerCoordinator.installLaunchProbe { _ in
             try FileManager.default.removeItem(at: worktree)
         }
         let failure = try await refusedLaunch(prepared: prepared)
@@ -1760,7 +1760,8 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         await coordinator.configure(
             runtime: prepared.runtime,
             endpointDescriptor: prepared.childEndpoint.socketURL.path,
-            oracleAdapter: prepared.oracleAdapter
+            oracleAdapter: prepared.oracleAdapter,
+            launchRoots: prepared.context.launchRoots
         )
         let preparations = BundleRecorder()
         let provider = MCPDomainLongRunningToolProvider(
@@ -1890,9 +1891,9 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         )
         if plan.preparation == .atHandoff {
             let handoff = DomainChildLaunchHandoff(
-                prepare: { _ in
+                prepare: { pin in
                     try await atHandoff?()
-                    return try Self.syntheticBundle(for: plan)
+                    return try Self.syntheticBundle(for: plan, mintedFor: pin.context)
                 },
                 revokeLate: { _ in }
             )
@@ -1910,7 +1911,8 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
             _ = await handoff.close()
             return try XCTUnwrap(JSONSerialization.jsonObject(with: result.json) as? [String: Any])
         }
-        let bundle = try Self.syntheticBundle(for: plan)
+        let bound = try await prepared.context.snapshot(connectionID: prepared.connectionID).identity
+        let bundle = try Self.syntheticBundle(for: plan, mintedFor: bound)
         let result = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
             try await DomainChildLaunchContext.$current.withValue(bundle.singleCarrier) {
                 try await backend.buildContext(request)
@@ -1919,7 +1921,11 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: result.json) as? [String: Any])
     }
 
-    private static func syntheticBundle(for plan: DomainChildLaunchPlan) throws -> DomainChildLaunchCarrierBundle {
+    /// Carriers shaped like the coordinator's, minted for `context` (without redeemable tokens).
+    private static func syntheticBundle(
+        for plan: DomainChildLaunchPlan,
+        mintedFor context: DomainContextIdentity
+    ) throws -> DomainChildLaunchCarrierBundle {
         let carriers = plan.lanes.map { lane in
             var environment: [String: String] = [
                 DomainChildLaunchCarrier.runIDEnvironmentKey: plan.runID.uuidString,
@@ -1944,7 +1950,8 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
                 oracleGroupClaimID: plan.oracleGroupClaimID,
                 launchTokenID: UUID(),
                 credentialEnvelope: nil,
-                environment: environment
+                environment: environment,
+                context: context
             )
         }
         return try DomainChildLaunchCarrierBundle(plan: plan, carriers: carriers)

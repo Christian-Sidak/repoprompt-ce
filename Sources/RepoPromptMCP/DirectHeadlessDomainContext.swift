@@ -34,7 +34,7 @@ actor DirectHeadlessDomainContext {
             case let .stateConflict(reason): "Workspace state conflict: \(reason)"
             case let .pathOutsideWorkspace(path): "Path is outside the bound workspace roots: \(path)"
             case .launchRootAuthorityReleased:
-                "launch_root_authority_released: the Oracle launch this connection belongs to has ended"
+                "launch_root_authority_released: the provider launch this connection belongs to has ended"
             case let .launchRootAuthorityChanged(reason):
                 "launch_root_authority_changed: \(reason); this launch's roots are not resolved against other roots"
             }
@@ -72,8 +72,9 @@ actor DirectHeadlessDomainContext {
     private let processRootOverlay: DirectHeadlessRootOverlay
     private var sessionRootOverlays: [UUID: DirectHeadlessRootOverlay] = [:]
     /// Launch-scoped root authorities, root-mutation claims, leased child connections, and their
-    /// in-flight invocations (M21). Synchronous, so the host's provider entry/return callbacks can
-    /// hold a lease's root exclusion for exactly the life of a child invocation.
+    /// in-flight invocations (M21, every carrier-bearing launch since M22). Synchronous, so the
+    /// host's provider entry/return callbacks can hold a lease's root exclusion for exactly the life
+    /// of a child invocation.
     nonisolated let launchRoots = DirectHeadlessLaunchRootRegistry()
 
     init(
@@ -120,7 +121,7 @@ actor DirectHeadlessDomainContext {
     }
 
     /// `identity` as `connectionID` reads it: through the connection's launch-scoped root authority
-    /// when it redeemed a pinned lane's token, else with the session's (or process's) live overlay.
+    /// when it is a launched child's connection, else with the session's (or process's) live overlay.
     private func snapshot(
         identity: DomainContextIdentity,
         sessionID: UUID?,
@@ -152,7 +153,7 @@ actor DirectHeadlessDomainContext {
         return snapshot
     }
 
-    // MARK: - Launch-scoped root authority (M21)
+    // MARK: - Launch-scoped root authority (M21, every carrier-bearing launch since M22)
 
     /// Acquires the root authority `lane` launches under, or throws
     /// `DomainChildLaunchContextPin.Mismatch` and nothing may be launched.
@@ -160,22 +161,37 @@ actor DirectHeadlessDomainContext {
     /// The lease is registered, pending, before anything is read. From then on a roots change made
     /// through `withRootMutationClaim`, or an overlay change for the lease's session, is refused
     /// instead of landing under the launch; a claim already in flight refuses the launch
-    /// (`rootsChanging`). Then the connection must resolve to exactly the pin, the pinned context
-    /// must be at the pinned revisions, the physical roots it resolves to must be the committed
-    /// ones, and the connection must still resolve to the pin after those reads. Only then is the
-    /// lease active. The caller releases it when the process exits or if it never starts.
+    /// (`rootsChanging`). Then:
+    ///
+    /// - the connection must resolve to the lane's context: exactly the pin (context and revisions)
+    ///   for a discovered lane, the context its carrier's token was minted for otherwise (`rebound`);
+    /// - a launching connection that is itself a leased child must still hold an active authority
+    ///   over the live canonical roots;
+    /// - the pinned context must still be at the pinned revisions (discovered lanes only);
+    /// - the physical roots the launch resolves through `sessionID`'s overlay must be the step's
+    ///   roots (`DirectHeadlessLaunchAuthority.admitRoots`: the committed roots, or those of the
+    ///   step's first lane);
+    /// - the connection must still resolve to the lane's context after those reads.
+    ///
+    /// Only then is the lease active. The caller releases it when the process exits or if it never
+    /// starts.
     func acquireLaunchRootLease(
-        _ lane: DirectHeadlessPinnedLaunch.Lane,
+        _ lane: DirectHeadlessLaunchAuthority.Lane,
+        kind: DirectHeadlessLaunchRootRegistry.Holder.Kind,
         connectionID: UUID,
         sessionID: UUID?
     ) async throws -> DirectHeadlessLaunchRootLease {
-        let pin = lane.launch.pin
+        typealias Mismatch = DomainChildLaunchContextPin.Mismatch
         let carrier = lane.carrier
+        // The lease's context is the one the carrier's token redeems to, so the two cannot differ.
+        guard let context = lane.context, carrier.context.map({ $0 == context }) ?? true else {
+            throw Mismatch.contextUnavailable
+        }
         let leaseID = UUID()
         switch launchRoots.registerPending(
             launchID: carrier.launchID,
             leaseID: leaseID,
-            holder: .init(context: pin.context, runID: carrier.runID, launchID: carrier.launchID),
+            holder: .init(context: context, runID: carrier.runID, launchID: carrier.launchID, kind: kind),
             overlaySessionID: sessionID
         ) {
         case .registered:
@@ -183,34 +199,34 @@ actor DirectHeadlessDomainContext {
         case .duplicateLaunch:
             throw Error.stateConflict("launch \(carrier.launchID.uuidString) already holds a root authority")
         case .rootsChanging:
-            throw DomainChildLaunchContextPin.Mismatch.rootsChanging
+            throw Mismatch.rootsChanging
         }
         do {
-            try await pin.validate(resolvedHandle(connectionID: connectionID))
-            let snapshot = try await snapshot(identity: pin.context, sessionID: sessionID, connectionID: connectionID)
-            guard snapshot.context.revisions.workingRevision == pin.contextRevision else {
-                throw DomainChildLaunchContextPin.Mismatch.contextRevisionChanged(
-                    expected: pin.contextRevision,
-                    actual: snapshot.context.revisions.workingRevision
-                )
+            try await Self.requireLaneContext(lane, context: context, resolvedHandle(connectionID: connectionID))
+            let snapshot = try await launchSnapshot(identity: context, sessionID: sessionID, connectionID: connectionID)
+            if let pin = lane.authority.pin {
+                guard snapshot.context.revisions.workingRevision == pin.contextRevision else {
+                    throw Mismatch.contextRevisionChanged(
+                        expected: pin.contextRevision,
+                        actual: snapshot.context.revisions.workingRevision
+                    )
+                }
+                guard snapshot.workspace.revisions.workingRevision == pin.workspaceRevision else {
+                    throw Mismatch.workspaceRevisionChanged(
+                        expected: pin.workspaceRevision,
+                        actual: snapshot.workspace.revisions.workingRevision
+                    )
+                }
             }
-            guard snapshot.workspace.revisions.workingRevision == pin.workspaceRevision else {
-                throw DomainChildLaunchContextPin.Mismatch.workspaceRevisionChanged(
-                    expected: pin.workspaceRevision,
-                    actual: snapshot.workspace.revisions.workingRevision
-                )
-            }
-            guard snapshot.roots.map(\.path) == lane.launch.committedRoots else {
-                throw DomainChildLaunchContextPin.Mismatch.rootsChanged
-            }
-            // Revalidated after the reads: the connection still resolves to exactly the pin.
-            try await pin.validate(resolvedHandle(connectionID: connectionID))
+            try lane.authority.admitRoots(snapshot.roots.map(\.path))
+            // Revalidated after the reads: the connection still resolves to the lane's context.
+            try await Self.requireLaneContext(lane, context: context, resolvedHandle(connectionID: connectionID))
             let lease = try DirectHeadlessLaunchRootLease(
                 leaseID: leaseID,
                 launchID: carrier.launchID,
                 runID: carrier.runID,
                 launchTokenID: carrier.launchTokenID,
-                context: pin.context,
+                context: context,
                 canonicalRoots: Self.canonicalRoots(of: snapshot.workspace).map(\.path),
                 rootOverlay: snapshot.rootOverlay,
                 overlaySessionID: sessionID
@@ -223,8 +239,45 @@ actor DirectHeadlessDomainContext {
         }
     }
 
-    /// Ends `lease` when its process exited (idempotent) and revokes its lane's launch token, so a
-    /// token never redeemed by the exited process cannot admit a connection later. From here the
+    /// A discovered lane's connection must resolve to exactly its pin; any other lane's to the
+    /// context its carrier's token was minted for.
+    private static func requireLaneContext(
+        _ lane: DirectHeadlessLaunchAuthority.Lane,
+        context: DomainContextIdentity,
+        _ handle: DomainReadContextHandle
+    ) throws {
+        if let pin = lane.authority.pin {
+            try pin.validate(handle)
+        } else if handle.context != context {
+            throw DomainChildLaunchContextPin.Mismatch.rebound(current: handle.context)
+        }
+    }
+
+    /// The roots a launch from `connectionID` runs in: `identity` through `sessionID`'s overlay (or
+    /// the process's). A launching connection that is itself a leased child (an agent starting a
+    /// sub-agent or an Oracle) must still hold an active authority whose canonical roots are the
+    /// live ones, so the launch's canonical roots are its launcher's. Its physical roots come from
+    /// its own session's overlay: the launcher's (inherited by default) or an explicitly selected
+    /// existing linked worktree of those canonical roots, fixed for the new launch by its own lease.
+    private func launchSnapshot(
+        identity: DomainContextIdentity,
+        sessionID: UUID?,
+        connectionID: UUID
+    ) async throws -> Snapshot {
+        switch launchRoots.lookup(connectionID: connectionID) {
+        case .unleased:
+            break
+        case .released:
+            throw Error.launchRootAuthorityReleased
+        case let .active(parent):
+            _ = try await leasedSnapshot(parent, context: identity)
+        }
+        return try await snapshot(identity: identity, sessionID: sessionID, lease: nil)
+    }
+
+    /// Ends `lease` when its process exited (idempotent) and revokes its launch token (the lease owns
+    /// it from acquisition on), so a token never redeemed by the exited process cannot admit a
+    /// connection later. From here the
     /// lease admits no new child invocation and resolves no new snapshot (attached connections fail
     /// closed with `launchRootAuthorityReleased`), but its root exclusion lasts until every child
     /// invocation that entered under it has settled, so no write captured under it can land after
@@ -234,7 +287,7 @@ actor DirectHeadlessDomainContext {
         await runtime.routingCoordinator.revokeLaunchToken(lease.launchTokenID)
     }
 
-    /// Binds a child connection that redeemed a launch-scoped-roots token to its lane's active
+    /// Binds a child connection that redeemed a launch-scoped-roots token to its launch's active
     /// lease; throws (the connection must be refused) when there is none for that run and context.
     func attachLaunchConnection(_ connectionID: UUID, redemption: DomainRunLaunchRedemption) throws {
         guard case let .runScoped(runID, context) = redemption.binding.binding,
@@ -255,9 +308,9 @@ actor DirectHeadlessDomainContext {
     }
 
     /// Runs `body` (a workspace-roots change, or with `contextID` the removal of one context) under
-    /// a root-mutation claim. A pinned launch holding or validating a root authority over the same
-    /// roots refuses it with a typed, retryable `root_authority_leased` failure before anything is
-    /// written; while the claim is held, pinned launches over those roots are refused instead.
+    /// a root-mutation claim. A launch holding or validating a root authority over the same roots
+    /// refuses it with a typed, retryable `root_authority_leased` failure before anything is
+    /// written; while the claim is held, launches over those roots are refused instead.
     func withRootMutationClaim<T: Sendable>(
         toolName: String,
         workspaceID: UUID,
@@ -285,23 +338,29 @@ actor DirectHeadlessDomainContext {
         toolName: String,
         holder: DirectHeadlessLaunchRootRegistry.Holder
     ) -> MCPDomainToolFailure {
-        MCPDomainToolFailure(
+        let launch = switch holder.kind {
+        case .agent: "agent"
+        case .oracle: "Oracle"
+        }
+        return MCPDomainToolFailure(
             toolName: toolName,
             code: "root_authority_leased",
-            message: "A running Oracle launch holds the roots of context \(holder.context.contextID.uuidString) "
-                + "until its process exits; nothing was changed. Retry once it has ended.",
+            message: "A running \(launch) launch holds the roots of context \(holder.context.contextID.uuidString) "
+                + "until its process exits and its in-flight child calls settle; nothing was changed. "
+                + "Retry once it has ended.",
             retryability: .retryable,
             mutationState: DomainProtectedMutationState.notApplied.rawValue,
             details: [
                 "workspace_id": .string(holder.context.workspaceID.uuidString),
                 "context_id": .string(holder.context.contextID.uuidString),
                 "run_id": .string(holder.runID.uuidString),
-                "launch_id": .string(holder.launchID.uuidString)
+                "launch_id": .string(holder.launchID.uuidString),
+                "launch_kind": .string(holder.kind.rawValue)
             ]
         )
     }
 
-    /// Every refusal of a pinned launch before its process starts is a typed pin mismatch;
+    /// Every refusal of a launch before its process starts is a typed launch-context mismatch;
     /// cancellation and unrelated failures pass through.
     private static func launchRefusal(_ error: Swift.Error) -> Swift.Error {
         typealias Mismatch = DomainChildLaunchContextPin.Mismatch
@@ -558,8 +617,17 @@ actor DirectHeadlessDomainContext {
 
     /// Freezes the context bound to `request` for one Context Builder discovery run.
     func discoverySnapshot(for request: DomainPhysicalToolRequest) async throws -> ContextBuilderDiscoverySnapshot {
+        try await discoveryFreeze(for: request).snapshot
+    }
+
+    /// The frozen discovery snapshot plus the active root of the same resolution: the working
+    /// directory of discovery's provider turns, so a turn's process never runs in roots other than
+    /// the ones its protocol tools read.
+    func discoveryFreeze(
+        for request: DomainPhysicalToolRequest
+    ) async throws -> (snapshot: ContextBuilderDiscoverySnapshot, workingDirectory: URL?) {
         let current = try await snapshot(for: request)
-        return ContextBuilderDiscoverySnapshot(
+        let frozen = ContextBuilderDiscoverySnapshot(
             identity: current.identity,
             workspaceRevision: current.workspace.revisions.workingRevision,
             contextRevision: current.context.revisions.workingRevision,
@@ -567,6 +635,7 @@ actor DirectHeadlessDomainContext {
             prompt: current.prompt,
             selection: current.selection
         )
+        return (frozen, current.activeRoot)
     }
 
     /// Compare-and-set commit of a discovered selection. It writes only when the connection is still

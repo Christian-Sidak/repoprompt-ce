@@ -220,6 +220,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         await prepared.oracleAdapter.shutdown()
         do {
             _ = try await executePrepared(
+                prepared: prepared,
                 backend: backend,
                 toolName: "ask_oracle",
                 arguments: arguments,
@@ -274,6 +275,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
 
         do {
             _ = try await executePrepared(
+                prepared: prepared,
                 backend: backend,
                 toolName: "oracle_send",
                 arguments: arguments,
@@ -481,6 +483,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         await barrierStore.release()
         let plan = try await planningTask.value
         let continued = try await executePrepared(
+            prepared: prepared,
             backend: barrierBackend,
             toolName: "oracle_send",
             arguments: arguments,
@@ -573,7 +576,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         await prepared.childLaunchCoordinator.configure(
             runtime: prepared.runtime,
             endpointDescriptor: prepared.childEndpoint.socketURL.path,
-            oracleAdapter: adapter
+            oracleAdapter: adapter,
+            launchRoots: prepared.context.launchRoots
         )
         let started = try await invoke(
             prepared: prepared,
@@ -729,7 +733,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         await prepared.childLaunchCoordinator.configure(
             runtime: prepared.runtime,
             endpointDescriptor: prepared.childEndpoint.socketURL.path,
-            oracleAdapter: adapter
+            oracleAdapter: adapter,
+            launchRoots: prepared.context.launchRoots
         )
         try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
 
@@ -782,7 +787,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         await prepared.childLaunchCoordinator.configure(
             runtime: prepared.runtime,
             endpointDescriptor: prepared.childEndpoint.socketURL.path,
-            oracleAdapter: adapter
+            oracleAdapter: adapter,
+            launchRoots: prepared.context.launchRoots
         )
         try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
 
@@ -862,7 +868,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         await prepared.childLaunchCoordinator.configure(
             runtime: prepared.runtime,
             endpointDescriptor: prepared.childEndpoint.socketURL.path,
-            oracleAdapter: adapter
+            oracleAdapter: adapter,
+            launchRoots: prepared.context.launchRoots
         )
         try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
 
@@ -1200,7 +1207,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         await prepared.childLaunchCoordinator.configure(
             runtime: prepared.runtime,
             endpointDescriptor: prepared.childEndpoint.socketURL.path,
-            oracleAdapter: adapter
+            oracleAdapter: adapter,
+            launchRoots: prepared.context.launchRoots
         )
         try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
         return (adapter, backend)
@@ -1236,6 +1244,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             securityContext: security
         )
         return try await executePrepared(
+            prepared: prepared,
             backend: backend,
             toolName: toolName,
             arguments: arguments,
@@ -1246,6 +1255,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
     }
 
     private func executePrepared(
+        prepared: DirectHeadlessMCPService.PreparedRuntime,
         backend: DirectHeadlessConversationBackend,
         toolName: String,
         arguments: [String: Value],
@@ -1268,6 +1278,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         } else {
             plan
         }
+        // As the real coordinator mints them: for the context the connection is bound to.
+        let mintedFor = try await prepared.context.snapshot(connectionID: prepared.connectionID).identity
         let carriers = bundlePlan.lanes.map { lane in
             var environment: [String: String] = [
                 DomainChildLaunchCarrier.runIDEnvironmentKey: bundlePlan.runID.uuidString,
@@ -1292,7 +1304,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
                 oracleGroupClaimID: bundlePlan.oracleGroupClaimID,
                 launchTokenID: UUID(),
                 credentialEnvelope: nil,
-                environment: environment
+                environment: environment,
+                context: mintedFor
             )
         }
         let bundle = try DomainChildLaunchCarrierBundle(plan: bundlePlan, carriers: carriers)

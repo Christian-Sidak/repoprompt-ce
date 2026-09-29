@@ -276,7 +276,8 @@ actor DirectHeadlessMCPService {
             await childLaunchCoordinator.configure(
                 runtime: runtime,
                 endpointDescriptor: childEndpoint.socketURL.path,
-                oracleAdapter: oracleAdapter
+                oracleAdapter: oracleAdapter,
+                launchRoots: context.launchRoots
             )
             let parentProcessID = getppid()
             let verifiedFingerprint = Self.verifiedExecutableFingerprint(processID: parentProcessID)
@@ -519,11 +520,12 @@ actor DirectHeadlessMCPService {
         )
     }
 
-    /// Redeems a private child's launch token as connection `connectionID`. A launch-scoped-roots
-    /// token (a pinned discovery Oracle lane) must also attach to its lane's live root authority, so
-    /// every tool call on the connection resolves the lane's roots; once that authority is released
-    /// (the lane's process exited) the connection is refused. Returns nil for a refused child, with
-    /// nothing of it left registered.
+    /// Redeems a private child's launch token as connection `connectionID`. Every token this runtime
+    /// issues is launch-scoped (M22), so the redemption must also attach to the live root authority
+    /// its provider process launched under, and every tool call on the connection resolves that
+    /// authority's roots; once it is released (the process exited), or for a token that is not
+    /// launch-scoped, the connection is refused. Returns nil for a refused child, with nothing of it
+    /// left registered.
     func admitPrivateChild(
         connectionID: UUID,
         peerPID: Int32?,
@@ -557,17 +559,17 @@ actor DirectHeadlessMCPService {
             )
             return nil
         }
-        if accepted.launchScopedRoots {
-            do {
-                try await prepared.context.attachLaunchConnection(connectionID, redemption: accepted)
-            } catch {
-                logger.warning("Rejected private child: its launch root authority is gone", metadata: ["error": "\(error)"])
-                _ = await prepared.runtime.routingCoordinator.unregisterConnection(
-                    accepted.binding.registration,
-                    operationID: UUID()
-                )
-                return nil
-            }
+        do {
+            // A child that would resolve the workspace's live roots is never admitted.
+            guard accepted.launchScopedRoots else { throw DirectHeadlessDomainContext.Error.launchRootAuthorityReleased }
+            try await prepared.context.attachLaunchConnection(connectionID, redemption: accepted)
+        } catch {
+            logger.warning("Rejected private child: its launch root authority is gone", metadata: ["error": "\(error)"])
+            _ = await prepared.runtime.routingCoordinator.unregisterConnection(
+                accepted.binding.registration,
+                operationID: UUID()
+            )
+            return nil
         }
 
         let principal = DomainClientPrincipal(

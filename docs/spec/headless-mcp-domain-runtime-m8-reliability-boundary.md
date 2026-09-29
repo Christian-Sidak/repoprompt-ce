@@ -1675,6 +1675,173 @@ Tests:
   - a normal run reports once;
   - a spawn failure never reports.
 
+### M22 — one launch-scoped root authority for every carrier-bearing direct-headless launch
+
+M22 closes the remaining source-confirmed P1 cross-root authority split. M21 leased only pinned
+discovery Oracle lanes. It extends the M21 launch authority to every direct-headless provider
+process that receives a child-launch carrier: ordinary agents, direct Oracle turns, and unpinned
+grouped lanes. The app backend and the default (app) route are unchanged.
+
+- **The gap (P1).** Ordinary launches (`agent_run`/`agent_explore` start, direct `ask_oracle`,
+  `oracle_send`, `context_builder`, and grouped Oracle start, continuation, and `context_pack_ref`
+  lanes) had three disconnected steps:
+  1. The carrier was minted at admission for the connection's then-current context.
+  2. At the launch, the process working directory was snapshotted once, with no lease, from the
+     connection's *current* binding.
+  3. The child's tools later resolved the carrier context's live roots and worktree overlay.
+
+  So a `manage_workspaces` roots change or an overlay change after the spawn could point a
+  writable agent's child tools at root B while its working directory stayed A. A rebind between
+  admission and launch could also start the process in one context's roots while its token redeemed
+  to another context.
+- **Invariant.** Every carrier-bearing provider process launches under exactly one
+  `DirectHeadlessLaunchRootLease`, held from its launch until its process exits and its in-flight
+  child invocations settle. As in M21, three things derive from that lease: the working directory,
+  the token's redemption, and every tool call on the child connection.
+  - `DirectHeadlessLaunchAuthority` replaces `DirectHeadlessPinnedLaunch` as the authority of one
+    launch step. A step is either `pinned` (M21: discovery's pin plus its committed roots) or
+    `admitted` (M22: the context the lane's carrier was minted for). Every lane of one step launches
+    over the same physical roots: the committed ones, or the roots the step's first lane resolved
+    (`admitRoots`). A later lane that resolves other roots is refused with `roots_changed`.
+  - `DomainChildLaunchCarrier.context` (new, set by the harness from the reservation) records the
+    context the carrier's token was reserved for. The lease takes that context, so the lease and
+    the token can never name different contexts.
+- **Acquisition** (`acquireLaunchRootLease(_:kind:connectionID:sessionID:)`, generalized). The lease
+  is registered pending before any read, then validated:
+  - the connection must resolve to the lane's context: exactly the pin for a pinned lane, or the
+    carrier's context for an admitted one (otherwise `rebound`);
+  - a launching connection that is itself a leased child (an agent starting a sub-agent or an
+    Oracle) must still hold an active authority over the live canonical roots (otherwise
+    `roots_unavailable`);
+  - the pinned revisions (pinned lanes only);
+  - the step's roots, resolved through the launch session's overlay;
+  - the lane's context again, after those reads.
+- **Where each route acquires.**
+  - **Agent start** (`startAgent`) prepares the session's worktree overlay first; inheritance is
+    unchanged. It then acquires the lease *before* the session is registered.
+    - A refusal is the start's own typed failure: `child_launch_context_changed`, with `reason`,
+      `process_started: false`, `retryable`, and `not_applied`. The overlay is rolled back and
+      nothing is registered.
+    - After acquisition and before the provider task owns the lease, every exit (epoch rejected or
+      stale, shutdown, cancellation) releases the lease, rolls back the overlay, and cleans up the
+      registration.
+    - The lease then passes to the session's provider task (`ProviderLaunch.acquired`). The task
+      releases it when the process exits, fails to spawn or resolve, or is cancelled, including
+      shutdown before the spawn.
+    - So a detached start returns only once its roots, working directory, and token are fixed.
+    - The session record becomes visible together with its provider task, with no suspension in
+      between. Before this, the record was published first and the task was installed after the
+      running snapshot's store write, so a cancel landing in that window found no task and was
+      lost; the provider then launched anyway.
+    - A sub-agent started through a leased child connection gets the launcher's canonical roots:
+      the parent lease must still be active over the live canonical roots. Its physical roots come
+      from its own session's overlay: the parent's, inherited by default, or an explicitly selected
+      existing linked worktree of those roots (direct-headless never creates worktrees). That is the
+      designed delegation, and the sub-agent's working directory, token, and child tools all derive
+      from its own lease.
+  - **Direct Oracle turns** launch the invocation's carrier as their own admitted step. A pre-start
+    refusal is the tool's typed failure.
+  - **Grouped lanes** share one admitted step per invocation. A refused lane is its typed lane
+    failure (`child_launch_context_changed`, worded in admitted terms).
+  - **Discovered lanes** are unchanged (M21).
+- **Token lifecycle.**
+  - Every direct-headless token is issued with `launchScopedRoots`. `admitPrivateChild` refuses,
+    and unregisters, any redemption that is not launch-scoped, so no child connection of this
+    runtime ever resolves live roots.
+  - A lease owns its token's revocation from acquisition. When the minting invocation ends,
+    `DirectHeadlessChildLaunchCoordinator.revoke` skips carriers whose launch holds a lease
+    (`holdsLease(launchID:)`); the lease revokes the token when it is released. Carriers whose
+    launch never acquired a lease are revoked at the end of the invocation, as before.
+  - **Behavior change (fix).** Previously a detached agent's token was revoked as soon as
+    `agent_run start` returned, normally before its codex child could redeem it. A detached agent
+    therefore ran without RepoPrompt tools. Its child is now admitted, anchored to the agent's
+    lease.
+- **Discovery turns.** These are carrier-less (no token, no child tools) and read-only. They now run
+  in the active root of discovery's frozen snapshot (`discoveryFreeze`) rather than re-resolving
+  live roots each turn, so a turn's process runs in the roots its protocol tools read. They take no
+  lease; the selection commit is still a compare-and-set against the frozen roots.
+- **Mutations.** The claims are unchanged. `root_authority_leased` now also reports `launch_kind`
+  (`agent` or `oracle`) and holds until in-flight child calls settle. As a consequence, while any
+  agent or Oracle of a workspace is running, the following are refused (retryable, `not_applied`):
+  `add_folder`, `remove_folder`, workspace `delete`, `close_tab` of the launch's context, and an
+  overlay change for the launch's session.
+- **Not claimed** (as in M21).
+  - Writers this runtime does not serialize (another process replacing the workspace file) are
+    detected, and a leased child fails closed, but they are not blocked.
+  - Plain roots replaced on disk (a rename or symlink swap) are not detected.
+  - A hung process holds its roots until it exits, is cancelled, or the runtime shuts down. There
+    is no wall-clock expiry.
+- **Guardrail.** `headless_runtime_guardrails.sh` now requires:
+  - the pinned authority construction;
+  - admitted lanes on the direct, grouped, and agent routes;
+  - the agent's `acquired` handoff and the discovery-turn launch;
+  - no `carrierEnvironment` launch path in the coordinator;
+  - `launchScopedRoots: true`, the lease-owned revocation skip, and admission's refusal of tokens
+    that are not launch-scoped.
+
+Tests (`DirectHeadlessLaunchAuthorityTests`, 13, deterministic). Each runs through the real
+long-running provider, the child-launch coordinator, routing tokens, and the child admission path:
+
+- **Agents.**
+  - A detached agent returns `running`, runs in root A, and its child is admitted after the start
+    returned, anchored to A.
+    - `add_folder` B and `close_tab` of its context are refused: `root_authority_leased`,
+      `launch_kind: agent`, retryable, `not_applied`. The roots and the workspace revision are
+      untouched.
+    - At exit the session completes, the child fails closed, and `add_folder` applies.
+  - A roots change parked in the store commit at the agent's launch refuses the start
+    (`roots_changing`, typed). No session and no process exist; the change then applies.
+  - Cancel releases the lease and revokes the token.
+  - A child `apply_edits` parked at `willCommit` across the agent's exit keeps the roots excluded
+    and writes only into A (B stays empty). The roots change once the write settles.
+  - A sub-agent started through the parent agent's child connection inherits the parent's linked
+    worktree (`direct-headless-inherited-overlay`) and runs there under its own lease, while the
+    parent keeps its own.
+  - Shutdown releases a running agent's lease.
+- **Direct Oracle.**
+  - A running Oracle anchors its child and refuses both a roots change and an overlay change for its
+    session until it exits.
+  - A rebind before the launch is a typed `rebound` refusal, with no process started.
+  - An overlay change before the launch becomes the launch's one authority: the working directory,
+    the child's roots, and the child's active root are all the worktree.
+  - A spawn failure releases the lease and revokes the token.
+  - An expired token admits no child while the lease is held until exit.
+- **Grouped lanes.**
+  - Lane 1's token is revoked at its exit, and lane 0's child keeps its context across a parent
+    rebind.
+  - Lane 2 launches after the rebind and is refused as a typed lane failure; lanes 0 and 1 complete.
+  - Every process ran in root A.
+- **Invariant.** A redemption of a token that is not launch-scoped is refused and unregistered.
+
+The M21 suites were updated for the API changes: `installLaunchProbe`, which now applies to every
+carrier-bearing launch, `configure(launchRoots:)`, and synthetic carriers minted for their context.
+
+Negative control (`132c2eb5`). With two fixes temporarily reverted, the targeted tests fail:
+- the invocation-end revocation also revoking leased tokens: the detached agent's child is refused;
+- the admitted lane's rebind check removed: neither the direct Oracle nor lane 2 of the grouped
+  turn is refused.
+
+Independent review (Oracle, final state) raised three points:
+- A leased child can start a sub-agent on another existing worktree of the same canonical roots.
+  This is the designed delegation: the sub-agent runs consistently under its own lease. It is now
+  documented above and in `launchSnapshot`.
+- A refused start could leave a created worktree behind. Not applicable: direct-headless refuses
+  `worktree_create` and never creates worktrees.
+- A cancel could be lost while the start was suspended before installing its task. This window
+  predates M22 and is fixed structurally, as described above.
+
+Conductor evidence:
+- `swift-build --product repoprompt-mcp` (`8d18b571`).
+- Focused `DirectHeadless|DirectProcess|DomainRoutingBindingCAS` on the final code (`88d4c247`):
+  91/91, comprising the 13 new tests, 31 discovery, 24 Oracle group, and the DirectProcess,
+  composition, and routing CAS suites.
+- `format` (a no-op on the final code), `lint` (`3c5a621c`), and `headless_runtime_guardrails.sh`
+  passed.
+- Full root suite (`35fe4987`): 3,955 tests (3,942 before M22 plus 13 new), 2 opt-in skips, 0
+  failures.
+- Not run: a live MCP smoke with a real `codex` child (admission is covered through
+  `admitPrivateChild`, not a socket-connected bridge), and a release build.
+
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 
 The M8A–M13 branch was merged onto `origin/main` `a5586936`, which had independently landed #1081

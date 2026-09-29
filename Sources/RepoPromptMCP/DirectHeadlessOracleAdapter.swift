@@ -200,7 +200,7 @@ actor DirectHeadlessOracleAdapter {
         arguments: [String: Value],
         request: DomainPhysicalToolRequest,
         discoveredInput: OracleInput,
-        launch: DirectHeadlessPinnedLaunch
+        launch: DirectHeadlessLaunchAuthority
     ) async throws -> Value {
         var plan = try await consumePlan(toolName: "context_builder", arguments: arguments, request: request)
         guard let discovery = plan.discovery, discovery.consumesOracle, discovery.mode == discoveredInput.mode,
@@ -558,7 +558,7 @@ actor DirectHeadlessOracleAdapter {
     private func execute(
         _ plan: InvocationPlan,
         request: DomainPhysicalToolRequest,
-        launch: DirectHeadlessPinnedLaunch? = nil
+        launch: DirectHeadlessLaunchAuthority? = nil
     ) async throws -> Value {
         guard let input = plan.input else { throw AdapterError.missingPreparedInvocation }
         switch plan.route {
@@ -617,13 +617,18 @@ actor DirectHeadlessOracleAdapter {
         }
     }
 
+    /// Runs every lane of one grouped turn under one launch step: the discovered step's pinned
+    /// authority, or an admitted one for this invocation's carriers. Each lane acquires its own
+    /// launch-scoped root authority, over the step's roots; a lane refused before its process started
+    /// is that lane's typed `child_launch_context_changed` failure.
     private func executeGrouped(
         _ request: OracleGroupRuntime.Request,
         bundle: DomainChildLaunchCarrierBundle,
         request physicalRequest: DomainPhysicalToolRequest,
-        launch: DirectHeadlessPinnedLaunch?
+        launch: DirectHeadlessLaunchAuthority?
     ) async throws -> OracleGroupRuntime.Completion {
         let provider = provider
+        let authority = launch ?? DirectHeadlessLaunchAuthority.admitted()
         do {
             return try await groupRuntime.execute(
                 request,
@@ -645,14 +650,13 @@ actor DirectHeadlessOracleAdapter {
                                 model: invocation.member.model.modelID,
                                 request: physicalRequest,
                                 purpose: .oracleGroup,
-                                carrierEnvironment: carrier.environment,
-                                pinnedLane: launch?.lane(carrier)
+                                launch: .lane(authority.lane(carrier))
                             )
                         } catch let refusal as DomainChildLaunchContextPin.Mismatch {
                             // The lane's launch was refused before its process started.
                             throw OracleLaneFailure(
                                 code: DomainChildLaunchContextPin.Mismatch.code,
-                                message: refusal.errorDescription ?? String(describing: refusal)
+                                message: authority.refusalMessage(refusal)
                             )
                         }
                         return OracleLaneExecutionResponse(response: response)

@@ -256,6 +256,9 @@ actor DirectHeadlessChildLaunchCoordinator {
     private var runtime: MCPDomainRuntime?
     private var harness: DomainPrivateChildLaunchHarness?
     private var oracleAdapter: DirectHeadlessOracleAdapter?
+    /// The runtime's launch-scoped root authorities: a carrier whose launch holds one has handed
+    /// its token's revocation to that lease.
+    private var launchRoots: DirectHeadlessLaunchRootRegistry?
     /// Test seam: runs in a pinned preparation after the pin was validated, before any token is
     /// issued.
     private let pinnedIssuanceProbe: (@Sendable () async throws -> Void)?
@@ -271,10 +274,12 @@ actor DirectHeadlessChildLaunchCoordinator {
     func configure(
         runtime: MCPDomainRuntime,
         endpointDescriptor: String,
-        oracleAdapter: DirectHeadlessOracleAdapter
+        oracleAdapter: DirectHeadlessOracleAdapter,
+        launchRoots: DirectHeadlessLaunchRootRegistry
     ) {
         self.runtime = runtime
         self.oracleAdapter = oracleAdapter
+        self.launchRoots = launchRoots
         harness = DomainPrivateChildLaunchHarness(
             endpointDescriptor: endpointDescriptor,
             credentialStore: runtime.credentialEnvelopeStore,
@@ -317,8 +322,10 @@ actor DirectHeadlessChildLaunchCoordinator {
 
     /// Mints the plan's carriers. Without a pin (admission) they are bound to the connection's
     /// current context. With a pin (a `.atHandoff` handoff) the current context must be exactly the
-    /// pinned one, else nothing is minted; the tokens are issued for the pinned context and revision
-    /// with `launchScopedRoots`, so each redeems only onto its lane's launch-scoped root authority.
+    /// pinned one, else nothing is minted, and the tokens are issued for the pinned context and
+    /// revision. Every token is issued with `launchScopedRoots`: each redeems only onto the
+    /// launch-scoped root authority its own provider process launched under (M22), so no child
+    /// connection of this runtime ever resolves the workspace's live roots.
     func prepare(
         plan: DomainChildLaunchPlan,
         toolName: String,
@@ -355,7 +362,7 @@ actor DirectHeadlessChildLaunchCoordinator {
                     additionalTools: Set(arguments["additional_tools"]?.arrayValue?.compactMap(\.stringValue) ?? []),
                     expectedProcessID: nil,
                     lifetime: carrierLifetime,
-                    launchScopedRoots: pin != nil
+                    launchScopedRoots: true
                 )
                 try await carriers.append(harness.prepare(request: request))
             }
@@ -371,10 +378,16 @@ actor DirectHeadlessChildLaunchCoordinator {
         }
     }
 
+    /// The invocation that minted `bundle` ended. Its carriers' tokens are revoked, except those of
+    /// launches that hold a launch-scoped root authority: that lease owns its token from acquisition
+    /// and revokes it when its process exits (a detached agent's process outlives the invocation that
+    /// started it, and its child redeems the token after the invocation returned).
     func revoke(plan: DomainChildLaunchPlan, bundle: DomainChildLaunchCarrierBundle?) async {
         if let runtime {
             for carrier in bundle?.carriers ?? [] {
-                await runtime.routingCoordinator.revokeLaunchToken(carrier.launchTokenID)
+                if launchRoots?.holdsLease(launchID: carrier.launchID) != true {
+                    await runtime.routingCoordinator.revokeLaunchToken(carrier.launchTokenID)
+                }
                 if let envelopeID = carrier.credentialEnvelope?.envelopeID {
                     await runtime.credentialEnvelopeStore.revoke(envelopeID)
                 }

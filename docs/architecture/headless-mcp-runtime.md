@@ -32,6 +32,8 @@ Direct mode installs one MCP SDK `Server` over `MCPStdioServerTransport`; it doe
 
 Long-running Agent and Context Builder providers receive an explicit run-scoped carrier. The carrier contains a private Unix endpoint, single-use launch token, verified principal/provider identity, and run ID. The endpoint directory is owner-only, the socket is identity-fenced, and token redemption checks runtime generation, peer PID, expiry, scope, and replay before registering a child connection. App-spawned provider children receive explicit `--backend app`; direct-runtime children use the private run-scoped endpoint and never auto-probe the app.
 
+In the direct runtime, every provider process that receives a carrier (an agent, a direct Oracle turn, each grouped or discovered Oracle lane) launches under one launch-scoped root authority (`DirectHeadlessLaunchRootLease`, M21/M22). The process working directory, the token's redemption, and every tool call on the child's connection take their roots from that lease, never from the workspace's live roots. The lease also owns the token's revocation. `manage_workspaces` root and context changes, and overlay changes for the launch's session, are refused with a typed, retryable `root_authority_leased` failure until the process exits and its in-flight child calls settle. A conflicting change that is already in flight, or a rebind, refuses the launch before it starts (`child_launch_context_changed`).
+
 ## Consumer reliability contract
 
 These rules hold at the host ↔ `repoprompt-mcp` stdio boundary. See `docs/spec/headless-mcp-domain-runtime-m8-reliability-boundary.md` for the evidence.

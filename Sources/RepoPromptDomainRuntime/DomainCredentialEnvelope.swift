@@ -578,6 +578,9 @@ package struct DomainChildLaunchCarrier: Sendable {
     package let launchTokenID: UUID
     package let credentialEnvelope: DomainCredentialEnvelopeDescriptor?
     package let environment: [String: String]
+    /// The context the carrier's launch token was reserved for (its redemption binds the child
+    /// connection run-scoped to it). Nil only for a carrier this harness did not mint.
+    package let context: DomainContextIdentity?
 
     package init(
         runID: UUID,
@@ -588,8 +591,10 @@ package struct DomainChildLaunchCarrier: Sendable {
         oracleGroupClaimID: UUID? = nil,
         launchTokenID: UUID,
         credentialEnvelope: DomainCredentialEnvelopeDescriptor?,
-        environment: [String: String]
+        environment: [String: String],
+        context: DomainContextIdentity? = nil
     ) {
+        self.context = context
         self.runID = runID
         self.launchID = launchID
         self.providerIdentifier = providerIdentifier
@@ -703,7 +708,8 @@ package struct DomainPrivateChildLaunchHarness: Sendable {
             oracleGroupClaimID: request.oracleGroupClaimID,
             launchTokenID: token.tokenID,
             credentialEnvelope: descriptor,
-            environment: environment
+            environment: environment,
+            context: request.context
         )
     }
 }

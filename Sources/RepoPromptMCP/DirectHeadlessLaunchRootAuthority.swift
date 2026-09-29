@@ -1,55 +1,167 @@
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 
-// M21: one launch-scoped root authority per pinned discovery Oracle lane.
+// M21/M22: one launch-scoped root authority per direct-headless provider process that carries a
+// child-launch carrier.
 //
-// Discovery commits its selection over one context, at known revisions, and over known physical
-// roots, then mints the Oracle step's carriers for that context (`DomainChildLaunchContextPin`).
-// Each lane's launch turns that authority into a `DirectHeadlessLaunchRootLease`
-// (`DirectHeadlessDomainContext.acquireLaunchRootLease`), and everything that names a root for the
-// lane derives from that one lease until its process exits:
+// Every provider process this runtime starts with a private launch carrier (an ordinary agent, a
+// direct Oracle turn, each grouped Oracle lane, and each discovered Oracle lane) launches under a
+// `DirectHeadlessLaunchRootLease` (`DirectHeadlessDomainContext.acquireLaunchRootLease`), and
+// everything that names a root for that process derives from the one lease until it exits:
 //
 // - the provider process's working directory is the lease's active root;
-// - the lane's launch token is issued with `launchScopedRoots`, so its redemption attaches the
-//   child connection to the lease and is refused when the lease is gone;
+// - the carrier's launch token is issued with `launchScopedRoots`, so its redemption attaches the
+//   child connection to the lease and is refused when the lease is gone; the lease, not the tool
+//   invocation that minted it, owns the token's revocation once it is acquired;
 // - every tool call on that connection resolves roots and worktree overlay from the lease, never
 //   from the workspace's live roots, and fails closed if the live canonical roots drifted.
 //
 // Workspace-root mutations made through this runtime take a root-mutation claim and are serialized
 // against leases in `DirectHeadlessDomainContext`: a claim that wins refuses the launch, a lease
 // that wins refuses the mutation with a typed, retryable `root_authority_leased` failure until the
-// lease is released. External writers (another process replacing the workspace file) are not
-// serialized; a leased connection detects their root change and fails closed instead.
+// lease is released and its in-flight child invocations settled. External writers (another
+// process replacing the workspace file) are not serialized; a leased connection detects their
+// root change and fails closed instead. Plain roots replaced on disk are not detected.
+//
+// Context Builder discovery turns carry no carrier (no child token, no child tools); they run in
+// the active root of discovery's frozen snapshot, which is also what discovery's protocol tools
+// read, and discovery's selection commit is a compare-and-set against those frozen roots.
 
-/// The authority one pinned discovery Oracle step launches under: its token authority, the
-/// physical roots the commit was made over, and the ledger of which lanes actually started.
-struct DirectHeadlessPinnedLaunch {
-    /// The committed context at the revisions the commit produced (what the carriers authorize).
-    let pin: DomainChildLaunchContextPin
-    /// The physical roots (worktree overlays applied) discovery read and committed over.
-    let committedRoots: [String]
-    let ledger: DirectHeadlessLaunchLedger
+/// The root authority every lane of one launch step launches under.
+///
+/// A step is the set of provider launches of one tool invocation: a discovered Oracle step
+/// (`pinned`, M21), or an ordinary agent start, direct Oracle turn, or grouped Oracle turn
+/// (`admitted`, M22). Each lane acquires its own lease from the step's authority, and every lane of
+/// one step launches over the same physical roots.
+final class DirectHeadlessLaunchAuthority: @unchecked Sendable {
+    typealias Mismatch = DomainChildLaunchContextPin.Mismatch
 
-    init(pin: DomainChildLaunchContextPin, committedRoots: [URL]) {
-        self.pin = pin
-        self.committedRoots = committedRoots.map(\.path)
-        ledger = DirectHeadlessLaunchLedger()
+    enum Basis {
+        /// Discovery's commit: the pinned context at the revisions the commit produced, over the
+        /// physical roots (worktree overlays applied) discovery read and committed over.
+        case pinned(DomainChildLaunchContextPin, committedRoots: [String])
+        /// An ordinary launch: the context the lane's carrier was minted for at admission (its token
+        /// redeems run-scoped to exactly that context). Its roots are the ones the step's first lane
+        /// resolved at its launch.
+        case admitted
+    }
+
+    let basis: Basis
+    /// Which lanes began and which processes actually started (settlement reads it).
+    let ledger = DirectHeadlessLaunchLedger()
+    private let lock = NSLock()
+    /// Admitted: the physical roots of the step's first lane that got past its reads.
+    private var establishedRoots: [String]?
+
+    private init(basis: Basis) {
+        self.basis = basis
+    }
+
+    /// A discovered Oracle step's authority: `pin` over `committedRoots`.
+    static func pinned(_ pin: DomainChildLaunchContextPin, committedRoots: [URL]) -> DirectHeadlessLaunchAuthority {
+        DirectHeadlessLaunchAuthority(basis: .pinned(pin, committedRoots: committedRoots.map(\.path)))
+    }
+
+    /// An ordinary launch step's authority (one per tool invocation's launches).
+    static func admitted() -> DirectHeadlessLaunchAuthority {
+        DirectHeadlessLaunchAuthority(basis: .admitted)
+    }
+
+    var pin: DomainChildLaunchContextPin? {
+        if case let .pinned(pin, _) = basis { return pin }
+        return nil
     }
 
     func lane(_ carrier: DomainChildLaunchCarrier) -> Lane {
-        Lane(launch: self, carrier: carrier)
+        Lane(authority: self, carrier: carrier)
     }
 
     /// One lane's launch: the step's authority plus the carrier minted for this lane.
     struct Lane {
-        let launch: DirectHeadlessPinnedLaunch
+        let authority: DirectHeadlessLaunchAuthority
         let carrier: DomainChildLaunchCarrier
+
+        /// The context the lane's token authorizes: the pin's, or the one its carrier was minted for.
+        var context: DomainContextIdentity? {
+            authority.pin?.context ?? carrier.context
+        }
+    }
+
+    /// Requires `roots` (the physical roots a lane resolved) to be the step's roots: the committed
+    /// roots of a pinned step, or the roots the first lane of an admitted step resolved (which this
+    /// call establishes). Throws `rootsChanged` otherwise.
+    func admitRoots(_ roots: [String]) throws {
+        switch basis {
+        case let .pinned(_, committedRoots):
+            guard roots == committedRoots else { throw Mismatch.rootsChanged }
+        case .admitted:
+            lock.lock()
+            defer { lock.unlock() }
+            if let establishedRoots {
+                guard establishedRoots == roots else { throw Mismatch.rootsChanged }
+            } else {
+                establishedRoots = roots
+            }
+        }
+    }
+
+    /// Why a lane of this step was refused before its process started.
+    func refusalMessage(_ mismatch: Mismatch) -> String {
+        switch basis {
+        case .pinned:
+            mismatch.errorDescription ?? String(describing: mismatch)
+        case .admitted:
+            "\(Mismatch.code): \(Self.admittedDetail(mismatch)); no provider process was started."
+        }
+    }
+
+    /// An ordinary launch refused before its process started, as the invocation's typed failure:
+    /// retryable, and nothing was launched or written under it. A pinned refusal and every other
+    /// error pass through unchanged (discovery settles its own refusals).
+    static func launchFailure(_ error: Error, toolName: String, lane: Lane) -> Error {
+        guard case .admitted = lane.authority.basis, let mismatch = error as? Mismatch else { return error }
+        var details: [String: Value] = [
+            "reason": .string(mismatch.reason),
+            "process_started": .bool(false),
+            "run_id": .string(lane.carrier.runID.uuidString),
+            "launch_id": .string(lane.carrier.launchID.uuidString)
+        ]
+        if let context = lane.context {
+            details["workspace_id"] = .string(context.workspaceID.uuidString)
+            details["context_id"] = .string(context.contextID.uuidString)
+        }
+        return MCPDomainToolFailure(
+            toolName: toolName,
+            code: Mismatch.code,
+            message: "The launch was refused before its provider process started: \(admittedDetail(mismatch)). "
+                + "Nothing was launched or changed.",
+            retryability: .retryable,
+            mutationState: DomainProtectedMutationState.notApplied.rawValue,
+            details: details
+        )
+    }
+
+    private static func admittedDetail(_ mismatch: Mismatch) -> String {
+        switch mismatch {
+        case let .rebound(current):
+            "the connection was rebound to context \(current.contextID.uuidString) after the launch's carrier was minted"
+        case .contextUnavailable:
+            "the connection no longer resolves to the context the launch's carrier was minted for"
+        case .rootsChanged:
+            "the roots the launch would run in are not the roots its step's earlier launches ran over"
+        case let .rootsUnavailable(detail):
+            "the launch's roots no longer resolve (\(detail))"
+        case .rootsChanging:
+            "a change of the workspace's roots was in flight"
+        case .workspaceRevisionChanged, .contextRevisionChanged:
+            mismatch.errorDescription ?? String(describing: mismatch)
+        }
     }
 }
 
-/// Which lane launches of one pinned Oracle step began and which processes actually started.
-/// A lane launches at most once; settlement reports `oracle_started` from here, never from the
-/// shape of an error.
+/// Which lane launches of one step began and which processes actually started. A lane launches at
+/// most once; settlement reports `oracle_started` from here, never from the shape of an error.
 final class DirectHeadlessLaunchLedger: @unchecked Sendable {
     private let lock = NSLock()
     private var begun: Set<UUID> = []
@@ -96,9 +208,15 @@ final class DirectHeadlessLaunchLedger: @unchecked Sendable {
 final class DirectHeadlessLaunchRootRegistry: @unchecked Sendable {
     /// Who holds roots a refused mutation wanted (reported in `root_authority_leased`).
     struct Holder {
+        enum Kind: String {
+            case agent
+            case oracle
+        }
+
         let context: DomainContextIdentity
         let runID: UUID
         let launchID: UUID
+        let kind: Kind
     }
 
     enum Lookup {
@@ -238,9 +356,15 @@ final class DirectHeadlessLaunchRootRegistry: @unchecked Sendable {
         locked { records[launchID]?.leaseID == leaseID }
     }
 
+    /// Whether `launchID` holds a lease in any state. A leased launch owns its token's revocation
+    /// (at release), so the invocation that minted the carrier leaves the token alone.
+    func holdsLease(launchID: UUID) -> Bool {
+        locked { records[launchID] != nil }
+    }
+
     // MARK: Leased connections and their invocations
 
-    /// Binds a child connection that redeemed a launch-scoped-roots token to its lane's active
+    /// Binds a child connection that redeemed a launch-scoped-roots token to its launch's active
     /// lease; false (the connection must be refused) when there is none for that run and context.
     func attach(connectionID: UUID, launchID: UUID, runID: UUID, context: DomainContextIdentity) -> Bool {
         locked {
@@ -369,8 +493,10 @@ final class DirectHeadlessLaunchRootRegistry: @unchecked Sendable {
     }
 }
 
-/// The launch-scoped root authority of one pinned Oracle lane, held from its launch until its
-/// process exits (or until the launch fails before the process starts).
+/// The launch-scoped root authority of one carrier-bearing provider launch (an agent, a direct
+/// Oracle turn, or an Oracle lane), held from its launch until its process exits (or until the
+/// launch fails before the process starts), and past that while a child invocation that entered
+/// under it has not settled.
 struct DirectHeadlessLaunchRootLease: Equatable {
     let leaseID: UUID
     let launchID: UUID

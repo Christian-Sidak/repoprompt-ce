@@ -11,8 +11,8 @@ import RepoPromptDomainRuntime
 ///
 /// The adapter supplies the engine's host ports only: the frozen snapshot capture, the provider
 /// (one read-only `codex exec` per turn with no child-launch carrier, so the provider has no path to
-/// RepoPrompt tools other than the frozen protocol tools), the compare-and-set selection commit, and
-/// the durable pack store.
+/// RepoPrompt tools other than the frozen protocol tools, run in the frozen snapshot's active root),
+/// the compare-and-set selection commit, and the durable pack store.
 struct DirectHeadlessContextDiscovery {
     static let environmentKey = "REPOPROMPT_MCP_HEADLESS_CONTEXT_DISCOVERY"
 
@@ -49,7 +49,7 @@ struct DirectHeadlessContextDiscovery {
         model: OracleModelReference,
         request: DomainPhysicalToolRequest
     ) async throws -> ContextBuilderDiscoveryOutcome {
-        let frozen = try await context.discoverySnapshot(for: request)
+        let (frozen, frozenRoot) = try await context.discoveryFreeze(for: request)
         let ignoreConfiguration: DomainCanonicalWorkspaceAdapter.IgnoreConfigurationProvider? = settingsStore.map { store in
             { @Sendable in await DirectHeadlessWorkspaceBackend.ignoreConfiguration(from: store) }
         }
@@ -67,7 +67,8 @@ struct DirectHeadlessContextDiscovery {
                 coordinator: providerCoordinator,
                 providerID: model.providerID,
                 modelID: model.modelID,
-                request: request
+                request: request,
+                workingDirectory: frozenRoot
             ),
             committer: Committer(context: context, request: request),
             packStore: packStore
@@ -108,6 +109,8 @@ struct DirectHeadlessContextDiscovery {
         let providerID: String?
         let modelID: String
         let request: DomainPhysicalToolRequest
+        /// The frozen snapshot's active root: every turn runs in the roots its protocol tools read.
+        let workingDirectory: URL?
 
         func complete(prompt: String, turn _: Int) async throws -> String {
             try await coordinator.runProviderOnce(
@@ -116,8 +119,8 @@ struct DirectHeadlessContextDiscovery {
                 model: modelID,
                 request: request,
                 purpose: .contextDiscovery,
-                // An explicit empty carrier: discovery turns never inherit the Oracle lane carrier.
-                carrierEnvironment: [:]
+                // No carrier: discovery turns never inherit the Oracle lane carrier.
+                launch: .discoveryTurn(workingDirectory: workingDirectory)
             )
         }
     }

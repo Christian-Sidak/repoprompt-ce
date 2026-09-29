@@ -163,16 +163,28 @@ if ! grep -q 'try pin.validate(handle)' Sources/RepoPromptMCP/DirectHeadlessChil
   echo "error: the child-launch coordinator must refuse a handoff whose current context is not the pinned one" >&2
   exit 1
 fi
-# M20/M21: every discovered Oracle lane launches under one launch-scoped root authority, acquired at
-# the launch from the committed pin and physical roots. The process working directory, the lane
-# token's redemption, and the child connection's roots all derive from it; workspace-root
-# mutations serialize against it; and read-context resolution never pairs one binding's context
+# M20/M21/M22: every carrier-bearing provider launch (an ordinary agent, a direct Oracle turn, each
+# grouped lane, each discovered lane) runs under one launch-scoped root authority acquired at the
+# launch: from the committed pin and physical roots for a discovered lane, from the context its
+# carrier was minted for otherwise. The process working directory, the token's redemption (every
+# token is launch-scoped, and a leased launch owns its token's revocation), and the child
+# connection's roots all derive from it; workspace-root mutations serialize against it; discovery
+# turns run in their frozen root; and read-context resolution never pairs one binding's context
 # with another's revisions.
-if ! grep -q 'let launch = DirectHeadlessPinnedLaunch(pin: pin, committedRoots: outcome.roots)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
-  || ! grep -q 'pinnedLane: launch.lane(carrier)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
-  || ! grep -q 'pinnedLane: launch?.lane(carrier)' Sources/RepoPromptMCP/DirectHeadlessOracleAdapter.swift \
+if ! grep -q 'let launch = DirectHeadlessLaunchAuthority.pinned(pin, committedRoots: outcome.roots)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
+  || ! grep -q 'lane: launch.lane(carrier)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
+  || [[ "$(grep -c 'lane: Self.directLane()' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift)" -lt 2 ]] \
+  || ! grep -q 'let lane = try Self.directLane()' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
+  || ! grep -q 'let authority = launch ?? DirectHeadlessLaunchAuthority.admitted()' Sources/RepoPromptMCP/DirectHeadlessOracleAdapter.swift \
+  || ! grep -q 'launch: .lane(authority.lane(carrier))' Sources/RepoPromptMCP/DirectHeadlessOracleAdapter.swift \
   || ! grep -q 'context.acquireLaunchRootLease(' Sources/RepoPromptMCP/DirectHeadlessProviderCoordinator.swift \
-  || ! grep -q 'launchScopedRoots: pin != nil' Sources/RepoPromptMCP/DirectHeadlessChildEndpoint.swift \
+  || ! grep -q 'let lane = DirectHeadlessLaunchAuthority.admitted().lane(carrier)' Sources/RepoPromptMCP/DirectHeadlessProviderCoordinator.swift \
+  || ! grep -q 'launch: .acquired(lease, lane)' Sources/RepoPromptMCP/DirectHeadlessProviderCoordinator.swift \
+  || grep -q 'carrierEnvironment' Sources/RepoPromptMCP/DirectHeadlessProviderCoordinator.swift \
+  || ! grep -q 'launch: .discoveryTurn(workingDirectory: workingDirectory)' Sources/RepoPromptMCP/DirectHeadlessContextDiscovery.swift \
+  || ! grep -q 'launchScopedRoots: true' Sources/RepoPromptMCP/DirectHeadlessChildEndpoint.swift \
+  || ! grep -q 'launchRoots?.holdsLease(launchID: carrier.launchID)' Sources/RepoPromptMCP/DirectHeadlessChildEndpoint.swift \
+  || ! grep -q 'guard accepted.launchScopedRoots else' Sources/RepoPromptMCP/DirectHeadlessMCPService.swift \
   || ! grep -q 'attachLaunchConnection(connectionID, redemption: accepted)' Sources/RepoPromptMCP/DirectHeadlessMCPService.swift \
   || [[ "$(grep -c 'withRootMutationClaim(' Sources/RepoPromptMCP/DirectHeadlessWorkspaceBackends.swift)" -lt 3 ]] \
   || ! grep -q 'guard try readTarget(registration) == target else { continue }' Sources/RepoPromptDomainRuntime/DomainRoutingCoordinator.swift \
@@ -180,7 +192,7 @@ if ! grep -q 'let launch = DirectHeadlessPinnedLaunch(pin: pin, committedRoots: 
   || ! grep -q 'launchRoots.endInvocation(invocationID)' Sources/RepoPromptMCP/DirectHeadlessMCPService.swift \
   || [[ "$(grep -c 'reportStartOnce()' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift)" -lt 2 ]] \
   || ! grep -q 'Mismatch(pinnedLaunchError: error)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift; then
-  echo "error: discovered Oracle lanes must launch under one launch-scoped root authority and settle pre-launch changes" >&2
+  echo "error: every carrier-bearing provider launch must run under one launch-scoped root authority and settle pre-launch changes" >&2
   exit 1
 fi
 

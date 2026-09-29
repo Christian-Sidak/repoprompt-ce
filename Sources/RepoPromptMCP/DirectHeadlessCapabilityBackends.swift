@@ -728,7 +728,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                 providerID: args["provider"]?.stringValue,
                 message: message,
                 model: modelID,
-                request: request
+                request: request,
+                lane: Self.directLane(),
+                toolName: "ask_oracle"
             )
             return try .object([
                 "chat_id": .string(id.uuidString),
@@ -736,6 +738,15 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                 "backend": .string("headless")
             ])
         }
+    }
+
+    /// A direct (single-lane) Oracle turn's launch: its own admitted step, under the carrier this
+    /// invocation minted at admission.
+    private static func directLane() throws -> DirectHeadlessLaunchAuthority.Lane {
+        guard let carrier = DomainChildLaunchContext.current else {
+            throw MCPError.internalError("child_launch_carrier_missing: a direct Oracle turn has no child-launch carrier")
+        }
+        return DirectHeadlessLaunchAuthority.admitted().lane(carrier)
     }
 
     func continueOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -750,12 +761,15 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
             return try await .mcp(oracleAdapter.continue(arguments: args, request: request))
         case let .direct(modelID, implicitConversationID):
             let result: (id: UUID, response: String)
+            let lane = try Self.directLane()
             if args["new_chat"]?.boolValue == true {
                 result = try await providerCoordinator.createConversation(
                     providerID: nil,
                     message: message,
                     model: modelID,
-                    request: request
+                    request: request,
+                    lane: lane,
+                    toolName: "oracle_send"
                 )
             } else if let chatID = args["chat_id"]?.stringValue?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -768,7 +782,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                     providerCoordinator.continueConversation(
                         id: id,
                         message: message,
-                        request: request
+                        request: request,
+                        lane: lane,
+                        toolName: "oracle_send"
                     )
                 )
             } else if let implicitConversationID {
@@ -777,7 +793,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                     providerCoordinator.continueConversation(
                         id: implicitConversationID,
                         message: message,
-                        request: request
+                        request: request,
+                        lane: lane,
+                        toolName: "oracle_send"
                     )
                 )
             } else {
@@ -785,7 +803,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                     providerID: nil,
                     message: message,
                     model: modelID,
-                    request: request
+                    request: request,
+                    lane: lane,
+                    toolName: "oracle_send"
                 )
             }
             return try .object([
@@ -827,7 +847,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                 providerID: args["provider"]?.stringValue,
                 message: instructions,
                 model: modelID,
-                request: request
+                request: request,
+                lane: Self.directLane(),
+                toolName: "context_builder"
             )
             return try .object([
                 "chat_id": .string(id.uuidString),
@@ -879,7 +901,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         var fields = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
         guard route.oracle != .none, let handoff else { return try .object(fields) }
         let pin = Self.committedContextPin(outcome)
-        let launch = DirectHeadlessPinnedLaunch(pin: pin, committedRoots: outcome.roots)
+        let launch = DirectHeadlessLaunchAuthority.pinned(pin, committedRoots: outcome.roots)
         var preparedBundle: DomainChildLaunchCarrierBundle?
         do {
             let bundle = try await handoff.prepare(pinnedTo: pin)
@@ -924,7 +946,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     private func runDiscoveredOracle(
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         outcome: ContextBuilderDiscoveryOutcome,
-        launch: DirectHeadlessPinnedLaunch,
+        launch: DirectHeadlessLaunchAuthority,
         bundle: DomainChildLaunchCarrierBundle,
         arguments: [String: Value],
         request: DomainPhysicalToolRequest
@@ -941,7 +963,8 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                 message: outcome.pack.content,
                 model: modelID,
                 request: request,
-                pinnedLane: launch.lane(carrier)
+                lane: launch.lane(carrier),
+                toolName: "context_builder"
             )
             return [
                 "chat_id": .string(id.uuidString),
@@ -965,7 +988,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     /// as the launch ledger recorded it (a lane refused at its launch, or failing to spawn, did not).
     static func annotatingLaneLaunches(
         _ fields: [String: Value],
-        launch: DirectHeadlessPinnedLaunch,
+        launch: DirectHeadlessLaunchAuthority,
         bundle: DomainChildLaunchCarrierBundle
     ) -> [String: Value] {
         guard case let .array(lanes)? = fields["oracle_results"] else { return fields }
@@ -999,7 +1022,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         outcome: ContextBuilderDiscoveryOutcome,
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         request: DomainPhysicalToolRequest,
-        launch: DirectHeadlessPinnedLaunch? = nil,
+        launch: DirectHeadlessLaunchAuthority? = nil,
         bundle: DomainChildLaunchCarrierBundle? = nil
     ) -> MCPDomainToolFailure {
         let contextMoved = DomainChildLaunchContextPin.Mismatch(pinnedLaunchError: error)
@@ -1080,12 +1103,17 @@ actor DirectHeadlessAgentBackend: DomainAgentCapabilityBackend {
 
     func explore(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
-        return try await dispatchLifecycle(args: args, request: request, defaultAgent: "explore")
+        return try await dispatchLifecycle(
+            args: args,
+            request: request,
+            defaultAgent: "explore",
+            toolName: "agent_explore"
+        )
     }
 
     func run(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
-        return try await dispatchLifecycle(args: args, request: request, defaultAgent: "pair")
+        return try await dispatchLifecycle(args: args, request: request, defaultAgent: "pair", toolName: "agent_run")
     }
 
     func manage(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -1163,14 +1191,15 @@ actor DirectHeadlessAgentBackend: DomainAgentCapabilityBackend {
     private func dispatchLifecycle(
         args: [String: Value],
         request: DomainPhysicalToolRequest,
-        defaultAgent: String
+        defaultAgent: String,
+        toolName: String
     ) async throws -> DomainPhysicalToolResult {
         let op = args["op"]?.stringValue ?? "start"
         switch op {
         case "start":
             var normalized = args
             if normalized["model_id"] == nil { normalized["model_id"] = .string(defaultAgent) }
-            return try await .mcp(coordinator.startAgent(args: normalized, request: request))
+            return try await .mcp(coordinator.startAgent(args: normalized, request: request, toolName: toolName))
         case "poll":
             let sessionID = try Self.sessionID(args)
             return try await .mcp(coordinator.pollAgent(
