@@ -1,6 +1,7 @@
 #if DEBUG
     import CryptoKit
     import Foundation
+    import RepoPromptInstrumentation
     import RepoPromptWorkspaceCore
 
     enum DebugWorktreeStartupBenchmarkError: Error, Equatable {

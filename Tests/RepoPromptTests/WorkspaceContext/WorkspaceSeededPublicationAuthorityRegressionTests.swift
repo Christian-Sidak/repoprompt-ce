@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptInstrumentation
 import RepoPromptWorkspaceCore
 import XCTest
 

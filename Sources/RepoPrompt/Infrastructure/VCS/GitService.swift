@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import OSLog
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import RepoPromptProcess
 import RepoPromptWorkspaceCore
 

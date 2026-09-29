@@ -846,3 +846,156 @@ For every slice that moves code, before the move PR merges:
 - Tracked metrics grew (not gated): `app_target_swift_lines` 648,098 → 648,100 (the constant's doc comment) and `tests_testable_import_app_files` 319 → 320 (the new golden suite, which tests app-owned types). Baselines unchanged.
 - `make conductor-selftest`: every suite passes except `test_local_production_installer.py`, which hit the known load-sensitive flake (6 of 18 errors, each a 15 s installer subprocess timeout; this change does not touch the installer). `test_security_inventory.py`, the suite after it, passes standalone.
 - SwiftFormat `--lint` and SwiftLint `--strict` are clean on the two changed Swift files.
+
+## PR 2 foundations A1–A5 (2026-09-30)
+
+### Ownership and move evidence
+
+| Slice | Former app family | New production owner | Owning tests |
+| --- | --- | --- | --- |
+| A1 | `Infrastructure/Concurrency`, `Infrastructure/Utilities`, `Infrastructure/Networking`, `Infrastructure/SyntaxParsing`, selected notification names | `RepoPromptFoundation` | `RepoPromptFoundationTests` |
+| A2 | diagnostic event and sink contracts; concrete recorders remain in `RepoPromptApp` | `RepoPromptInstrumentation` | `RepoPromptInstrumentationTests` |
+| A3 | `Infrastructure/Regex` adapters | `RepoPromptRegexCore` | `RepoPromptRegexCoreTests` |
+| A4 | `Infrastructure/Process` including `CLI/` | `RepoPromptProcess` | `RepoPromptProcessTests` |
+| A5 | `Infrastructure/Security` | `RepoPromptSecureStorage` (app-only) | `RepoPromptSecureStorageTests` |
+
+The mechanical move commit `d681cbbd` is reproducibly audited with
+`python3 Scripts/modularization_move_audit.py --base 3aed2da3 --head d681cbbd`:
+**PASS, 76 moves, 0 violations**. The complete old-to-new path manifest is
+below. All 76 pairs are R100; the audit command verifies their normalized
+SHA-256 equality. The separate
+`8ca85819` checkpoint contains the necessary target access and import changes,
+including test retargets, rather than hiding them in the byte-identical move.
+The subsequent A2 instrumentation checkpoints are `c93500a3`, `3775cd3e`,
+`864e23b4`, `abe9bad3`, and `40205042`.
+
+### Byte-identical move manifest
+
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLI/CLIPathInstaller.swift` → `Sources/RepoPrompt/App/CLI/CLIPathInstaller.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLI/CLISymlinkManager.swift` → `Sources/RepoPrompt/App/CLI/CLISymlinkManager.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/Shortcuts.swift` → `Sources/RepoPrompt/App/Shortcuts.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/ErrorExtensions.swift` → `Sources/RepoPrompt/Infrastructure/AI/ErrorExtensions.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Concurrency/AsyncMutex.swift` → `Sources/RepoPromptFoundation/Concurrency/AsyncMutex.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Concurrency/AsyncScope.swift` → `Sources/RepoPromptFoundation/Concurrency/AsyncScope.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Concurrency/BoundedOrderedConcurrentMap.swift` → `Sources/RepoPromptFoundation/Concurrency/BoundedOrderedConcurrentMap.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Concurrency/CancellableProbe.swift` → `Sources/RepoPromptFoundation/Concurrency/CancellableProbe.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Concurrency/SameThreadReentryCheckedLock.swift` → `Sources/RepoPromptFoundation/Concurrency/SameThreadReentryCheckedLock.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Concurrency/TaskSemaphore.swift` → `Sources/RepoPromptFoundation/Concurrency/TaskSemaphore.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Networking/HTTPClient.swift` → `Sources/RepoPromptFoundation/Networking/HTTPClient.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Networking/HTTPDecoding.swift` → `Sources/RepoPromptFoundation/Networking/HTTPDecoding.swift`
+R100 `Sources/RepoPrompt/Infrastructure/WorkspaceContext/Slices/LineRange.swift` → `Sources/RepoPromptFoundation/Slices/LineRange.swift`
+R100 `Sources/RepoPrompt/Infrastructure/WorkspaceContext/Slices/SliceRangeMath.swift` → `Sources/RepoPromptFoundation/Slices/SliceRangeMath.swift`
+R100 `Sources/RepoPrompt/Infrastructure/SyntaxParsing/SyntaxManager.swift` → `Sources/RepoPromptFoundation/SyntaxParsing/SyntaxManager.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/CheckoutPathIdentity.swift` → `Sources/RepoPromptFoundation/Utilities/CheckoutPathIdentity.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/Collections/BoundedArray.swift` → `Sources/RepoPromptFoundation/Utilities/Collections/BoundedArray.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/Collections/PersistentHashMap.swift` → `Sources/RepoPromptFoundation/Utilities/Collections/PersistentHashMap.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/FriendlyErrorRepresentable.swift` → `Sources/RepoPromptFoundation/Utilities/FriendlyErrorRepresentable.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/JSONDictionaryHelpers.swift` → `Sources/RepoPromptFoundation/Utilities/JSONDictionaryHelpers.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/RelativePath.swift` → `Sources/RepoPromptFoundation/Utilities/RelativePath.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/SequenceExtension.swift` → `Sources/RepoPromptFoundation/Utilities/SequenceExtension.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/String+Sanitize.swift` → `Sources/RepoPromptFoundation/Utilities/String+Sanitize.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/String+Slug.swift` → `Sources/RepoPromptFoundation/Utilities/String+Slug.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Utilities/WorkspacePathNormalizations.swift` → `Sources/RepoPromptFoundation/Utilities/WorkspacePathNormalizations.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Telemetry/SentryTelemetryModel.swift` → `Sources/RepoPromptInstrumentation/SentryTelemetryModel.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLI/ManagedCLIPathPolicy.swift` → `Sources/RepoPromptProcess/CLI/ManagedCLIPathPolicy.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLIEnvironmentCache.swift` → `Sources/RepoPromptProcess/CLIEnvironmentCache.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLILaunchProfile.swift` → `Sources/RepoPromptProcess/CLILaunchProfile.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLINativePathDefaults.swift` → `Sources/RepoPromptProcess/CLINativePathDefaults.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLIOutputFormat.swift` → `Sources/RepoPromptProcess/CLIOutputFormat.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLIProcessConfiguration+AdditionalPaths.swift` → `Sources/RepoPromptProcess/CLIProcessConfiguration+AdditionalPaths.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLIProcessConfiguration.swift` → `Sources/RepoPromptProcess/CLIProcessConfiguration.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLIProcessLogCollector.swift` → `Sources/RepoPromptProcess/CLIProcessLogCollector.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CLIProcessRunner.swift` → `Sources/RepoPromptProcess/CLIProcessRunner.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ChildProcessExitObserver.swift` → `Sources/RepoPromptProcess/ChildProcessExitObserver.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/CommandPathResolver.swift` → `Sources/RepoPromptProcess/CommandPathResolver.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ExecutableFileIdentity.swift` → `Sources/RepoPromptProcess/ExecutableFileIdentity.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/FDWriteSupport.swift` → `Sources/RepoPromptProcess/FDWriteSupport.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/FileHandleChunkChannel.swift` → `Sources/RepoPromptProcess/FileHandleChunkChannel.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ProcessDebugLogging.swift` → `Sources/RepoPromptProcess/ProcessDebugLogging.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ProcessEnvironmentBuilder.swift` → `Sources/RepoPromptProcess/ProcessEnvironmentBuilder.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ProcessEnvironmentSanitizer.swift` → `Sources/RepoPromptProcess/ProcessEnvironmentSanitizer.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ProcessLaunchContext.swift` → `Sources/RepoPromptProcess/ProcessLaunchContext.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ProcessLauncher.swift` → `Sources/RepoPromptProcess/ProcessLauncher.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ProcessRegistry.swift` → `Sources/RepoPromptProcess/ProcessRegistry.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ProcessStreamFraming.swift` → `Sources/RepoPromptProcess/ProcessStreamFraming.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Process/ProcessTermination.swift` → `Sources/RepoPromptProcess/ProcessTermination.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Regex/PCRE2RegexAdapter.swift` → `Sources/RepoPromptRegexCore/PCRE2RegexAdapter.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Regex/PCRE2SearchFastPlans.swift` → `Sources/RepoPromptRegexCore/PCRE2SearchFastPlans.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Regex/RegexToolkit.swift` → `Sources/RepoPromptRegexCore/RegexToolkit.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/BundleIdentityDefaultsMigration.swift` → `Sources/RepoPromptSecureStorage/BundleIdentityDefaultsMigration.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/EphemeralSecureKeyValueStore.swift` → `Sources/RepoPromptSecureStorage/EphemeralSecureKeyValueStore.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/IdentityTransitionDiagnostics.swift` → `Sources/RepoPromptSecureStorage/IdentityTransitionDiagnostics.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/KeyManager.swift` → `Sources/RepoPromptSecureStorage/KeyManager.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/KeychainService.swift` → `Sources/RepoPromptSecureStorage/KeychainService.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/LocalSigningIdentityRegistry.swift` → `Sources/RepoPromptSecureStorage/LocalSigningIdentityRegistry.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/RuntimeCodeSigningDetector.swift` → `Sources/RepoPromptSecureStorage/RuntimeCodeSigningDetector.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/RuntimeCodeSigningPolicy.swift` → `Sources/RepoPromptSecureStorage/RuntimeCodeSigningPolicy.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/SecureKeyService.swift` → `Sources/RepoPromptSecureStorage/SecureKeyService.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/SecureKeyValueStorageBackend.swift` → `Sources/RepoPromptSecureStorage/SecureKeyValueStorageBackend.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/SecureStorageAccountCatalog.swift` → `Sources/RepoPromptSecureStorage/SecureStorageAccountCatalog.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/SecureStorageIdentityMigration.swift` → `Sources/RepoPromptSecureStorage/SecureStorageIdentityMigration.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/SecureStorageRepairService.swift` → `Sources/RepoPromptSecureStorage/SecureStorageRepairService.swift`
+R100 `Sources/RepoPrompt/Infrastructure/Security/SecurityObfuscation.swift` → `Sources/RepoPromptSecureStorage/SecurityObfuscation.swift`
+R100 `Tests/RepoPromptTests/Infrastructure/Concurrency/AsyncMutexCancellationHandoffTests.swift` → `Tests/RepoPromptFoundationTests/AsyncMutexCancellationHandoffTests.swift`
+R100 `Tests/RepoPromptTests/AgentMode/SessionLinks/AgentSessionLinkDiagnosticsRedactionGuardTests.swift` → `Tests/RepoPromptInstrumentationTests/AgentSessionLinkDiagnosticsRedactionGuardTests.swift`
+R100 `Tests/RepoPromptTests/AI/CLIProcessRunnerCancellationTests.swift` → `Tests/RepoPromptProcessTests/CLIProcessRunnerCancellationTests.swift`
+R100 `Tests/RepoPromptTests/Infrastructure/Process/ExecutableFileIdentityTests.swift` → `Tests/RepoPromptProcessTests/ExecutableFileIdentityTests.swift`
+R100 `Tests/RepoPromptTests/Services/ProcessLauncherSignalDispositionTests.swift` → `Tests/RepoPromptProcessTests/ProcessLauncherSignalDispositionTests.swift`
+R100 `Tests/RepoPromptTests/Security/DebugSecureStorageRuntimePolicyTests.swift` → `Tests/RepoPromptSecureStorageTests/DebugSecureStorageRuntimePolicyTests.swift`
+R100 `Tests/RepoPromptTests/Security/KeychainServiceTests.swift` → `Tests/RepoPromptSecureStorageTests/KeychainServiceTests.swift`
+R100 `Tests/RepoPromptTests/Security/LocalSigningIdentityRegistryTests.swift` → `Tests/RepoPromptSecureStorageTests/LocalSigningIdentityRegistryTests.swift`
+R100 `Tests/RepoPromptTests/Security/SecureStorageAccountCatalogTests.swift` → `Tests/RepoPromptSecureStorageTests/SecureStorageAccountCatalogTests.swift`
+R100 `Tests/RepoPromptTests/Security/SecureStorageIdentityMigrationTests.swift` → `Tests/RepoPromptSecureStorageTests/SecureStorageIdentityMigrationTests.swift`
+R100 `Tests/RepoPromptTests/Security/SecureStorageRepairServiceTests.swift` → `Tests/RepoPromptSecureStorageTests/SecureStorageRepairServiceTests.swift`
+
+### P0.6 compatibility inventory for moved sites
+
+1. `RepoPromptSecureStorage` is explicitly app-only and is in
+   `bundle_main_allowed_roots`; no CLI-linked target is allowlisted.
+2. The moved-file identity scans find one `String(reflecting:)` in
+   `RepoPromptRegexCore/SwiftPCRE2/PCRE2Error.swift`, applied to a **String pattern**
+   for diagnostic quoting, not to a type or a persisted/sorted key. They find no
+   `#fileID`, metatype description, keyed-archive, runtime class-name, or Objective-C
+   selector site in the five target trees and their owning test trees.
+3. Three `Bundle.main` reads remain in `RepoPromptSecureStorage`:
+   `BundleIdentityDefaultsMigration` and `RuntimeCodeSigningPolicy` (two reads).
+   `RepoPromptProcess` contains neither `Bundle.main` nor
+   `UserDefaults.standard`; no CLI-linked process-identity semantics changed.
+4. The moved Swift error types have no `NSError` domain/code comparison or
+   persistence site in the new target trees or their owning tests. Secure-storage
+   `decision.domain` is its own typed enum, not an `NSError` domain. No new
+   `CustomNSError.errorDomain` is needed by this move.
+5. `SecureStorageAccountCatalogTests` continues to pin persisted Keychain
+   account names. The existing `ModularizationCompatibilityGoldenTests` pins
+   the identity-sensitive values catalogued above; neither the moved literal
+   values nor those goldens were edited by the pure move.
+
+The startup phase-event seam carries only closed enums, identifiers, and flags;
+its app adapter delegates to the pre-existing recorder. The module supplies a
+no-op sink so an uncomposed consumer cannot start logging or change policy.
+
+### Local validation evidence
+
+| Check | Conductor ticket | Result |
+| --- | --- | --- |
+| `make dev-swift-build PRODUCT=all` | `e0145fa8` | Completed successfully; app and MCP products, 4m 9s execution |
+| `./conductor test --module RepoPromptFoundationTests` | `8ae537a3` | Completed successfully; 5 tests, 0 failures |
+| `./conductor test --module RepoPromptInstrumentationTests` | `eb7376c3` | Completed successfully; 4 tests, 0 failures |
+| `./conductor test --module RepoPromptRegexCoreTests` | `78f23d39` | Completed successfully; 7 tests, 0 failures |
+| `./conductor test --module RepoPromptProcessTests` | `fcd86898` | Completed successfully; 13 tests, 0 failures |
+| `./conductor test --module RepoPromptSecureStorageTests` | `c925fd8e` | Completed successfully; 73 tests, 0 failures |
+| `./conductor test --filter ModularizationCompatibilityGoldenTests` | `c066843c` | Completed successfully; 3 tests, 0 failures |
+| `make dev-lint` after the app-test import repair | `4e227173` | Completed successfully; 0 files require formatting; SwiftLint strict passed |
+| `make guardrails` | — | Exit 0, source layout and modularization ratchets passed (the initial sandboxed attempt failed in SwiftPM manifest sandboxing; rerun with process access passed) |
+
+The first full-suite ticket `41e27478` failed at compilation because one app
+regression test lacked `import RepoPromptInstrumentation`; commit `4662c7f1`
+adds that direct import. The second full-suite ticket `eae6a0de` compiled and
+ran 3,224 app tests, but one timing-sensitive `ContentReadCancellationTests`
+case timed out waiting for overwrite reconciliation. Its owner source and test
+body have no behavioral diff in this slice; focused class ticket `5cdd9078`
+then passed all 36 cases, including the timed-out case. The final full
+`make dev-test` ticket `b35e427e` **completed successfully**: 3,224 app tests,
+2 skipped, 0 failures, plus the other test products; 11m 6s execution.
+These timings are post-move observations only, not a before/after performance
+claim.
