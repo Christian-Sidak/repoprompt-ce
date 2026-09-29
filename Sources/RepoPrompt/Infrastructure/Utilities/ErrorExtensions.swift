@@ -11,28 +11,9 @@ import SwiftOpenAI
 extension Error {
     /// Converts this Error to a user-friendly message, accounting for known custom error types.
     func asFriendlyString() -> String {
-        // 1. Check for CustomOpenAIProviderError
-        if let openAIError = self as? CustomOpenAIProviderError {
-            switch openAIError {
-            case let .invalidToken(code, message):
-                return "Request failed with code \(code): \(message)"
-            case let .invalidModel(code, message):
-                return "Model invalid (code \(code)): \(message)"
-            case let .requestFailed(code, message):
-                return "Request failed (code \(code)): \(message)"
-            case let .invalidResponse(code, message):
-                return "Invalid response (code \(code)): \(message)"
-            case let .streamingNotSupported(code, message):
-                return "Streaming not supported (code \(code)): \(message)"
-            case let .rateLimitExceeded(code, message):
-                return "Rate limit exceeded (code \(code)): \(message)"
-            case let .serverError(code, message):
-                return "Server error (code \(code)): \(message)"
-            case let .serviceUnavailable(code, message):
-                return "Service unavailable (code \(code)): \(message)"
-            case let .requestTooLarge(code, message):
-                return "Request too large (code \(code)): \(message)"
-            }
+        // 1. Ask provider-specific errors for their stable user-facing message.
+        if let friendlyError = self as? FriendlyErrorRepresentable {
+            return friendlyError.friendlyErrorString
         }
 
         // 2. Check if this is a struct conforming to Error like OpenAIErrorResponse
