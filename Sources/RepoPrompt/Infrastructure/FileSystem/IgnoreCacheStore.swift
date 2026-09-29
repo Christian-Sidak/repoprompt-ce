@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct IgnoreCacheStore {
     static let finalIgnoreCacheCapacity = 50000

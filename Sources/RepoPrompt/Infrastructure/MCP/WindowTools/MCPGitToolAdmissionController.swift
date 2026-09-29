@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Tool-level Git admission keyed by canonical repository identity. The lower-level WI-9
 /// GitProcessAdmissionController remains the global/per-repository subprocess budget.

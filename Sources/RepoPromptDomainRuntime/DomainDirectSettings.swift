@@ -1,7 +1,7 @@
 import Foundation
 import MCP
 
-package enum DomainSettingValue: Codable, Equatable, Sendable {
+package enum DomainSettingValue: Codable, Equatable {
     case bool(Bool)
     case integer(Int)
     case number(Double)
@@ -38,7 +38,7 @@ package enum DomainSettingValue: Codable, Equatable, Sendable {
     }
 }
 
-package enum DomainSettingValueKind: String, Codable, Sendable {
+package enum DomainSettingValueKind: String, Codable {
     case boolean
     case integer
     case number
@@ -46,7 +46,7 @@ package enum DomainSettingValueKind: String, Codable, Sendable {
     case stringArray = "string[]"
 }
 
-package struct DomainSettingDescriptor: Codable, Equatable, Sendable {
+package struct DomainSettingDescriptor: Codable, Equatable {
     package let key: String
     package let group: String
     package let valueKind: DomainSettingValueKind
@@ -86,7 +86,7 @@ package struct DomainSettingDescriptor: Codable, Equatable, Sendable {
 /// Protocol-neutral catalog shared by app and standalone settings adapters.
 package enum DomainAppSettingsCatalog {
     package static let groups = [
-        "ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode",
+        "ui", "prompt_packaging", "models", "context_builder", "mcp", "code_maps", "file_system", "agent_mode"
     ]
 
     package static let descriptors: [DomainSettingDescriptor] = [
@@ -118,13 +118,16 @@ package enum DomainAppSettingsCatalog {
         bool("file_system.respect_cursorignore", "file_system", true, "Whether .cursorignore files are honored."),
         DomainSettingDescriptor(key: "file_system.global_ignore_defaults", group: "file_system", valueKind: .string, defaultValue: .string(""), description: "App-wide gitignore-style patterns."),
         bool("file_system.enable_hierarchical_ignores", "file_system", true, "Whether nested ignore files are honored."),
-        bool("file_system.skip_symlinks", "file_system", false, "Whether symbolic links are skipped."),
-        bool("file_system.show_empty_folders", "file_system", true, "Whether empty folders are shown."),
+        // Matches the app's `GlobalSettingsManager.skipSymlinks()` fallback.
+        bool("file_system.skip_symlinks", "file_system", true, "Whether symbolic links are skipped."),
+        bool("file_system.show_empty_folders", "file_system", true, "Whether empty folders are shown.")
     ]
 
     private static let byKey = Dictionary(uniqueKeysWithValues: descriptors.map { ($0.key, $0) })
 
-    package static func descriptor(for key: String) -> DomainSettingDescriptor? { byKey[key] }
+    package static func descriptor(for key: String) -> DomainSettingDescriptor? {
+        byKey[key]
+    }
 
     package static func descriptors(in group: String?) throws -> [DomainSettingDescriptor] {
         guard let group else { return descriptors }
@@ -155,8 +158,8 @@ package enum DomainAppSettingsCatalog {
         switch value {
         case let .string(value):
             if descriptor.maximumStringLength != nil {
-                normalized = .string(
-                    try normalizeString(value, descriptor: descriptor, rejectsEmpty: true)
+                normalized = try .string(
+                    normalizeString(value, descriptor: descriptor, rejectsEmpty: true)
                 )
             } else {
                 normalized = .string(value)
@@ -165,8 +168,8 @@ package enum DomainAppSettingsCatalog {
             if let maximum = descriptor.maximumArrayCount, values.count > maximum {
                 throw DomainDirectSettingsError.invalidValue(descriptor.key)
             }
-            normalized = .stringArray(
-                try values.map { try normalizeString($0, descriptor: descriptor, rejectsEmpty: true) }
+            normalized = try .stringArray(
+                values.map { try normalizeString($0, descriptor: descriptor, rejectsEmpty: true) }
             )
         default:
             normalized = value
@@ -221,7 +224,7 @@ package enum DomainAppSettingsCatalog {
     }
 }
 
-package enum DomainDirectSettingsError: Error, LocalizedError, Equatable, Sendable {
+package enum DomainDirectSettingsError: Error, LocalizedError, Equatable {
     case unknownKey(String)
     case unknownGroup(String)
     case invalidValue(String)
@@ -230,6 +233,7 @@ package enum DomainDirectSettingsError: Error, LocalizedError, Equatable, Sendab
     case corruptDocument
     case readOnlyDegraded(String)
     case stateConflict
+    case appAuthorityReadOnly(String)
 
     package var errorDescription: String? {
         switch self {
@@ -241,11 +245,12 @@ package enum DomainDirectSettingsError: Error, LocalizedError, Equatable, Sendab
         case .corruptDocument: "Direct settings document is corrupt."
         case let .readOnlyDegraded(reason): "Direct settings are read-only degraded: \(reason)."
         case .stateConflict: "Direct settings changed in another process; retry after reading current state."
+        case let .appAuthorityReadOnly(key): "App setting '\(key)' is owned by the RepoPrompt CE app (globalSettings.json) and is read-only with --backend headless; change it in the app or through app_settings on the app backend."
         }
     }
 }
 
-private struct DomainDirectSettingsDocument: Codable, Sendable {
+private struct DomainDirectSettingsDocument: Codable {
     static let version = 2
     let version: Int
     let profileIdentifier: String
@@ -254,7 +259,7 @@ private struct DomainDirectSettingsDocument: Codable, Sendable {
     let updatedAt: Date
 }
 
-enum DomainDirectSettingsBootstrapEvent: Equatable, Sendable {
+enum DomainDirectSettingsBootstrapEvent: Equatable {
     case loadStarted
     case waiterJoined
     case loadPublished
@@ -271,9 +276,30 @@ package actor DomainDirectSettingsStore {
     private var bootstrapTask: Task<Void, Never>?
     private var bootstrapEventHandler: (@Sendable (DomainDirectSettingsBootstrapEvent) async -> Void)?
 
-    package init(persistence: DomainPersistenceCoordinator, profileIdentifier: String) {
+    /// Read-only view of settings owned by the app (currently the global ignore defaults).
+    /// Re-resolved on every read so app changes are visible; never written by this store.
+    private let appGlobalIgnoreDefaults: (@Sendable () -> DomainGlobalIgnoreDefaultsView.Resolution)?
+
+    package init(
+        persistence: DomainPersistenceCoordinator,
+        profileIdentifier: String,
+        appGlobalIgnoreDefaults: (@Sendable () -> DomainGlobalIgnoreDefaultsView.Resolution)? = nil
+    ) {
         self.persistence = persistence
         self.profileIdentifier = profileIdentifier
+        self.appGlobalIgnoreDefaults = appGlobalIgnoreDefaults
+    }
+
+    /// Status of an app-owned setting (for example `settings`, `file_missing`, or
+    /// `blocked_unsupported_future_schema`), or nil when the key is headless-owned.
+    package func appAuthorityStatus(for key: String) -> String? {
+        guard key == DomainGlobalIgnoreDefaults.settingKey, let appGlobalIgnoreDefaults else { return nil }
+        return appGlobalIgnoreDefaults().status
+    }
+
+    private func appOwnedValue(for key: String) -> DomainSettingValue? {
+        guard key == DomainGlobalIgnoreDefaults.settingKey, let appGlobalIgnoreDefaults else { return nil }
+        return .string(appGlobalIgnoreDefaults().effectivePatterns)
     }
 
     package func bootstrap() async {
@@ -325,15 +351,18 @@ package actor DomainDirectSettingsStore {
         guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else {
             throw DomainDirectSettingsError.unknownKey(key)
         }
-        return values[key] ?? descriptor.defaultValue
+        return appOwnedValue(for: key) ?? values[key] ?? descriptor.defaultValue
     }
 
     package func effectiveValues(for descriptors: [DomainSettingDescriptor]) -> [String: DomainSettingValue] {
-        Dictionary(uniqueKeysWithValues: descriptors.map { ($0.key, values[$0.key] ?? $0.defaultValue) })
+        Dictionary(uniqueKeysWithValues: descriptors.map {
+            ($0.key, appOwnedValue(for: $0.key) ?? values[$0.key] ?? $0.defaultValue)
+        })
     }
 
     package func set(key: String, value: DomainSettingValue) async throws -> UInt64 {
         await bootstrap()
+        if appAuthorityStatus(for: key) != nil { throw DomainDirectSettingsError.appAuthorityReadOnly(key) }
         if let healthReason { throw DomainDirectSettingsError.readOnlyDegraded(healthReason) }
         guard let descriptor = DomainAppSettingsCatalog.descriptor(for: key) else {
             throw DomainDirectSettingsError.unknownKey(key)

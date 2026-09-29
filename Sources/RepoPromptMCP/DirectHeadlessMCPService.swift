@@ -77,7 +77,7 @@ actor DirectHeadlessMCPService {
             capabilities: .init(tools: .init(listChanged: false)),
             configuration: .init(strict: true, responseSendTimeout: .seconds(5))
         )
-        await installHandlers(
+        let topLevelLimiters = await installHandlers(
             server: server,
             prepared: prepared,
             connection: ConnectionContext(
@@ -118,10 +118,12 @@ actor DirectHeadlessMCPService {
             }
             await server.stop()
             await server.waitUntilCompleted()
+            await topLevelLimiters.cancelAll()
             guard terminal == .stdinEOF else { throw terminal }
             await teardown(prepared)
         } catch {
             await server.stop()
+            await topLevelLimiters.cancelAll()
             await teardown(prepared)
             throw error
         }
@@ -196,11 +198,17 @@ actor DirectHeadlessMCPService {
                 scopeID: scopeID,
                 processRootOverlay: initialRoute.rootOverlay
             )
+            let appSettingsFileURL = DomainGlobalIgnoreDefaultsView.settingsFileURL(
+                storageDirectory: locations.storageDirectory
+            )
             let settingsStore = DomainDirectSettingsStore(
                 persistence: runtime.persistenceCoordinator,
-                profileIdentifier: runtime.configuration.profileIdentifier
+                profileIdentifier: runtime.configuration.profileIdentifier,
+                appGlobalIgnoreDefaults: {
+                    DomainGlobalIgnoreDefaultsView.resolve(settingsFileURL: appSettingsFileURL)
+                }
             )
-            let workspace = DirectHeadlessWorkspaceBackend(context: context)
+            let workspace = DirectHeadlessWorkspaceBackend(context: context, settingsStore: settingsStore)
             let global = DirectHeadlessGlobalBackend(
                 runtime: runtime,
                 scopeID: scopeID,
@@ -292,11 +300,14 @@ actor DirectHeadlessMCPService {
         }
     }
 
+    /// Installs list/call handlers for one connection and returns its lane limiters, which the
+    /// caller closes when the connection ends.
+    @discardableResult
     private func installHandlers(
         server: Server,
         prepared: PreparedRuntime,
         connection: ConnectionContext
-    ) async {
+    ) async -> MCPDomainConnectionCallLimiters {
         let classification = MCPClientToolPolicyCatalog.classification(for: connection.policyProfile)
         let restrictedNames = MCPDomainToolCatalog
             .toolNames(for: classification.restrictedCapabilities)
@@ -338,40 +349,67 @@ actor DirectHeadlessMCPService {
             return ListTools.Result(tools: tools)
         }
 
+        let limiters = MCPDomainInvocationPipeline.makeConnectionLimiters()
+        let pipeline = MCPDomainInvocationPipeline(
+            host: prepared.runtime.domainHost,
+            limiters: limiters
+        )
+        let policy = MCPDomainClientPolicySnapshot(
+            restrictedToolNames: restrictedNames,
+            additionalToolNames: additionalNames,
+            role: classification.role,
+            allowsAgentExternalControlTools: classification.allowsAgentExternalControlTools
+        )
         await server.withMethodHandler(CallTool.self) { params in
             guard visibleNames.contains(params.name) else {
                 return Self.errorResult("Tool is unavailable for this client policy: \(params.name)")
             }
+            let arguments: [String: Value]
             do {
-                let arguments = try Self.validatedCallArguments(
+                arguments = try Self.validatedCallArguments(
                     toolName: params.name,
                     arguments: params.arguments ?? [:]
                 )
-                let scope: MCPDomainToolRegistrationScope = MCPGlobalToolName.orderedToolNames.contains(params.name)
-                    ? .application
-                    : .standalone(id: prepared.scopeID)
-                let resolution = try await prepared.runtime.domainHost.resolve(
-                    toolName: params.name,
-                    scope: scope
-                )
-                let invocationID = UUID()
-                let security = await Self.securityContext(
-                    prepared: prepared,
-                    connection: connection,
-                    invocationID: invocationID
-                )
-                let result = try await prepared.runtime.domainHost.invoke(MCPDomainHostInvocation(
-                    invocationID: invocationID,
-                    connectionID: connection.connectionID,
-                    resolution: resolution,
-                    arguments: arguments,
-                    securityContext: security
-                ))
-                return Self.successResult(result)
             } catch {
-                return Self.errorResult(String(describing: error))
+                return Self.errorResult(MCPDomainToolFailureClassifier.classify(
+                    error,
+                    toolName: params.name,
+                    admissionClass: nil,
+                    contract: nil,
+                    mutation: nil
+                ))
+            }
+            let isGlobal = MCPGlobalToolName.orderedToolNames.contains(params.name)
+            let outcome = await pipeline.execute(MCPDomainInvocationPipeline.Invocation(
+                toolName: params.name,
+                arguments: arguments,
+                scope: isGlobal ? .application : .standalone(id: prepared.scopeID),
+                policy: policy,
+                resource: isGlobal ? .appWide : .standaloneScope(prepared.scopeID.rawValue),
+                makeHostInvocation: { resolution in
+                    let invocationID = UUID()
+                    let security = await Self.securityContext(
+                        prepared: prepared,
+                        connection: connection,
+                        invocationID: invocationID
+                    )
+                    return MCPDomainHostInvocation(
+                        invocationID: invocationID,
+                        connectionID: connection.connectionID,
+                        resolution: resolution,
+                        arguments: arguments,
+                        securityContext: security
+                    )
+                }
+            ))
+            switch outcome {
+            case let .success(value):
+                return Self.successResult(value)
+            case let .failure(failure):
+                return Self.errorResult(failure)
             }
         }
+        return limiters
     }
 
     private func servePrivateChild(
@@ -434,7 +472,7 @@ actor DirectHeadlessMCPService {
             capabilities: .init(tools: .init(listChanged: false)),
             configuration: .init(strict: true, responseSendTimeout: .seconds(5))
         )
-        await installHandlers(server: server, prepared: prepared, connection: connection)
+        let childLimiters = await installHandlers(server: server, prepared: prepared, connection: connection)
         let transport = MCPStdioServerTransport(
             stdinFD: fd,
             stdoutFD: fd,
@@ -456,6 +494,7 @@ actor DirectHeadlessMCPService {
             logger.warning("Private child MCP connection failed", metadata: ["error": "\(error)"])
         }
         await server.stop()
+        await childLimiters.cancelAll()
         await prepared.runtime.domainHost.cancelInvocations(
             connectionID: connectionID,
             connectionGeneration: accepted.binding.registration.generation
@@ -609,6 +648,10 @@ actor DirectHeadlessMCPService {
             content: [.text(text: message, annotations: nil, _meta: nil)],
             isError: true
         )
+    }
+
+    private static func errorResult(_ failure: MCPDomainToolFailure) -> CallTool.Result {
+        errorResult(failure.renderedText)
     }
 
     nonisolated static func validatedCallArguments(

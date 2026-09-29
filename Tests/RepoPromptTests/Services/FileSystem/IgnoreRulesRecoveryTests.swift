@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class IgnoreRulesRecoveryTests: XCTestCase {
@@ -48,7 +49,7 @@ final class IgnoreRulesRecoveryTests: XCTestCase {
 
         // Git's mandatory floor is unaffected by the same secondary override.
         let gitRoot = try IgnoreRules(
-            policy: .gitRoot(repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix(""))
+            policy: .gitRoot(repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix("").ignorePrefix)
         )
         gitRoot.addCompiledLayer(
             GitignoreCompiler.compile(content: "!.git/\n!.jj/\n"),
@@ -58,7 +59,7 @@ final class IgnoreRulesRecoveryTests: XCTestCase {
         XCTAssertFalse(gitRoot.isIgnored(relativePath: ".jj", isDirectory: true))
 
         let unmodifiedGitRoot = try IgnoreRules(
-            policy: .gitRoot(repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix(""))
+            policy: .gitRoot(repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix("").ignorePrefix)
         )
         XCTAssertFalse(unmodifiedGitRoot.isIgnored(relativePath: ".jj", isDirectory: true))
     }

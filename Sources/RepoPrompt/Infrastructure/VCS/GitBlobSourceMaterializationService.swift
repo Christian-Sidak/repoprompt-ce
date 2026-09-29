@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct ValidatedGitBlobSourceSnapshot {
     let rawBytes: Data

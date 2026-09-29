@@ -339,7 +339,7 @@ protocol CodexHookApprovalSettingsProviding {
 /// Windows use WindowSettingsManager to maintain local overlays.
 @MainActor
 class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding {
-    static let shared = GlobalSettingsStore()
+    static let shared = GlobalSettingsStore(ignoreDefaultsAuthority: .processWide)
     private static let defaultUserDefaults: UserDefaults = {
         if AppLaunchConfiguration.isUnitTestProcess {
             return UserDefaults(suiteName: "RepoPromptCE.unit-settings.\(UUID().uuidString)")!
@@ -349,6 +349,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
 
     private let defaults: UserDefaults
     private let fileStore: GlobalSettingsFileStoring
+    /// Receives the effective global ignore defaults so the crawl reads this store's value.
+    /// Only the process-wide store publishes; other instances (tests, previews) never do.
+    private let ignoreDefaultsAuthority: GlobalIgnoreDefaultsAuthority?
     private let invalidAgentModelsProfileAssertion: (String) -> Void
 
     @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
@@ -387,10 +390,12 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     init(
         defaults: UserDefaults? = nil,
         fileStore: GlobalSettingsFileStoring = GlobalSettingsFileStore(),
+        ignoreDefaultsAuthority: GlobalIgnoreDefaultsAuthority? = nil,
         invalidAgentModelsProfileAssertion: @escaping (String) -> Void = { assertionFailure($0) }
     ) {
         self.defaults = defaults ?? Self.defaultUserDefaults
         self.fileStore = fileStore
+        self.ignoreDefaultsAuthority = ignoreDefaultsAuthority
         self.invalidAgentModelsProfileAssertion = invalidAgentModelsProfileAssertion
         load()
         reconcilePersistenceBlockDismissal()
@@ -1335,6 +1340,29 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         updateFileSystemScalar(commit: commit) { settings in
             settings.globalIgnoreDefaults = content
         }
+        publishGlobalIgnoreDefaultsAuthority()
+    }
+
+    /// Makes this store's value the one the workspace crawl applies.
+    private func publishGlobalIgnoreDefaultsAuthority() {
+        ignoreDefaultsAuthority?.publish(globalIgnoreDefaults())
+    }
+
+    /// Carries a customized legacy `UserDefaults` value (what the crawl used before this store
+    /// became its authority) into an uncustomized JSON value, once, when it can be persisted.
+    private func migrateLegacyGlobalIgnoreDefaultsIfNeeded() -> Bool {
+        guard fileStore.blockReason == nil,
+              !IgnoreSettingsDefaults.isSettingsAuthorityMigrated(defaults: defaults)
+        else { return false }
+        defer { IgnoreSettingsDefaults.markSettingsAuthorityMigrated(defaults: defaults) }
+        guard let legacy = IgnoreSettingsDefaults.legacyValueToMigrate(
+            jsonValue: scalarPreferences.fileSystem?.globalIgnoreDefaults,
+            defaults: defaults
+        ) else { return false }
+        var settings = scalarPreferences.fileSystem ?? GlobalScalarPreferences.FileSystemSettings()
+        settings.globalIgnoreDefaults = legacy
+        scalarPreferences.fileSystem = settings
+        return true
     }
 
     func enableHierarchicalIgnores() -> Bool {
@@ -2687,6 +2715,8 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         globalDefaults = migratedContextBuilderState.globalDefaults
         scalarPreferences = migratedContextBuilderState.scalarPreferences
         let seededFileSystemDefaults = Self.seedFileSystemGlobalIgnoreDefaults(in: &scalarPreferences)
+        let migratedLegacyIgnoreDefaults = migrateLegacyGlobalIgnoreDefaultsIfNeeded()
+        publishGlobalIgnoreDefaultsAuthority()
         let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
         if shouldSyncTelemetryMirror {
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
@@ -2697,6 +2727,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         if persistenceBlockReason == nil,
            migratedContextBuilderState.didChange
            || seededFileSystemDefaults
+           || migratedLegacyIgnoreDefaults
            || disabledInvalidSync
            || needsSchemaVersionUpgrade
         {
@@ -2790,6 +2821,8 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             globalDefaults = migratedContextBuilderState.globalDefaults
             scalarPreferences = migratedContextBuilderState.scalarPreferences
             let seededFileSystemDefaults = Self.seedFileSystemGlobalIgnoreDefaults(in: &scalarPreferences)
+            let migratedLegacyIgnoreDefaults = migrateLegacyGlobalIgnoreDefaultsIfNeeded()
+            publishGlobalIgnoreDefaultsAuthority()
             let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
@@ -2798,6 +2831,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             if persistenceBlockReason == nil,
                migratedContextBuilderState.didChange
                || seededFileSystemDefaults
+               || migratedLegacyIgnoreDefaults
                || disabledInvalidSync
                || needsSchemaVersionUpgrade
             {

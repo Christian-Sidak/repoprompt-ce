@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct GitObjectID: Hashable {
     let objectFormat: GitObjectFormat
@@ -19,26 +20,27 @@ struct GitObjectID: Hashable {
 }
 
 struct GitRepositoryRelativeRootPrefix: Hashable {
-    let value: String
+    /// Validated domain value shared with ignore-rule policies.
+    let ignorePrefix: IgnoreRepositoryRootPrefix
 
+    var value: String {
+        ignorePrefix.value
+    }
+
+    /// Validation is owned by `IgnoreRepositoryRootPrefix` (domain runtime) so the app crawl and
+    /// headless enumeration accept the same prefixes; errors keep this type's existing cases.
     init(_ value: String, maximumUTF8Bytes: Int = 16 * 1024, maximumDepth: Int = 512) throws {
-        guard value.utf8.count <= maximumUTF8Bytes else {
+        do {
+            ignorePrefix = try IgnoreRepositoryRootPrefix(
+                value,
+                maximumUTF8Bytes: maximumUTF8Bytes,
+                maximumDepth: maximumDepth
+            )
+        } catch IgnoreRepositoryRootPrefix.ValidationError.pathLimitExceeded {
             throw GitWorktreeInitializationError.pathLimitExceeded
-        }
-        if value.isEmpty {
-            self.value = ""
-            return
-        }
-        guard !value.hasPrefix("/"), !value.hasSuffix("/"), !value.utf8.contains(0) else {
+        } catch {
             throw GitWorktreeInitializationError.invalidRootPrefix
         }
-        let components = value.split(separator: "/", omittingEmptySubsequences: false)
-        guard components.count <= maximumDepth,
-              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
-        else {
-            throw GitWorktreeInitializationError.invalidRootPrefix
-        }
-        self.value = value
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {

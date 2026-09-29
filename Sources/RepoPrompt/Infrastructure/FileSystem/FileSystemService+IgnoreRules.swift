@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 extension FileSystemService {
     // MARK: - Ignore rules change consumption
@@ -396,9 +397,11 @@ extension FileSystemService {
             return parentRules
         }
 
-        // Clone parent rules and add new layers
-        let effectiveRules = parentRules.clone()
-        let repositoryRelativeDirectory = ignoreRulePolicy.repositoryRelativePath(appending: parentRelPath)
+        // Load this directory's ignore files (per-file error policy below), then extend the parent
+        // rules through the assembly shared with headless enumeration.
+        var gitignoreContent: String?
+        var repoIgnoreContent: String?
+        var cursorignoreContent: String?
 
         if hasGitignore {
             let gitignoreURL = dirURL.appendingPathComponent(".gitignore")
@@ -418,11 +421,7 @@ extension FileSystemService {
                         content = try String(contentsOf: gitignoreURL, encoding: .utf8)
                     #endif
                 }
-                let compiled = GitignoreCompiler.compile(
-                    content: content,
-                    directoryPath: repositoryRelativeDirectory
-                )
-                effectiveRules.addCompiledLayer(compiled, authority: .mandatoryGit)
+                gitignoreContent = content
             } catch {
                 if ignoreRulePolicy.enforcesGitIgnoreFloor { throw error }
                 print("Failed to compile .gitignore at \(gitignoreURL.path): \(error)")
@@ -445,11 +444,7 @@ extension FileSystemService {
                 #else
                     let content = try String(contentsOf: repoIgnoreURL, encoding: .utf8)
                 #endif
-                let compiled = GitignoreCompiler.compile(
-                    content: content,
-                    directoryPath: repositoryRelativeDirectory
-                )
-                effectiveRules.addCompiledLayer(compiled, authority: .secondary)
+                repoIgnoreContent = content
             } catch {
                 print("Failed to compile .repo_ignore at \(repoIgnoreURL.path): \(error)")
             }
@@ -471,15 +466,20 @@ extension FileSystemService {
                 #else
                     let content = try String(contentsOf: cursorignoreURL, encoding: .utf8)
                 #endif
-                let compiled = GitignoreCompiler.compile(
-                    content: content,
-                    directoryPath: repositoryRelativeDirectory
-                )
-                effectiveRules.addCompiledLayer(compiled, authority: .secondary)
+                cursorignoreContent = content
             } catch {
                 print("Failed to compile .cursorignore at \(cursorignoreURL.path): \(error)")
             }
         }
+
+        let effectiveRules = IgnoreLayerAssembly.appendingDirectoryLayers(
+            to: parentRules,
+            policy: ignoreRulePolicy,
+            directoryRelativePath: parentRelPath,
+            gitignoreContent: gitignoreContent,
+            repoIgnoreContent: repoIgnoreContent,
+            cursorignoreContent: cursorignoreContent
+        )
 
         // Cache and return
         cacheIgnoreRules(effectiveRules, for: parentRelPath)

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct SelectedGitArtifactAuthorizationRequest {
     let physicalSelection: StoredSelection

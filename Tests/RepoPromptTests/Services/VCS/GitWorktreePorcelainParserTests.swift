@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class GitWorktreePorcelainParserTests: XCTestCase {

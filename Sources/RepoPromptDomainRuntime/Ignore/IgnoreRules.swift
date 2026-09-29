@@ -2,36 +2,67 @@ import Foundation
 
 // Holds multiple "layers" of compiled patterns (from .gitignore, .repo_ignore, etc.), combined.
 
-enum IgnoreRuleAuthority {
+/// Validated repository-relative root prefix for a loaded root inside a Git work tree.
+/// The app's `GitRepositoryRelativeRootPrefix` delegates its validation here.
+package struct IgnoreRepositoryRootPrefix: Hashable {
+    package enum ValidationError: Error, Equatable {
+        case pathLimitExceeded
+        case invalidRootPrefix
+    }
+
+    package let value: String
+
+    package init(_ value: String, maximumUTF8Bytes: Int = 16 * 1024, maximumDepth: Int = 512) throws {
+        guard value.utf8.count <= maximumUTF8Bytes else {
+            throw ValidationError.pathLimitExceeded
+        }
+        if value.isEmpty {
+            self.value = ""
+            return
+        }
+        guard !value.hasPrefix("/"), !value.hasSuffix("/"), !value.utf8.contains(0) else {
+            throw ValidationError.invalidRootPrefix
+        }
+        let components = value.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count <= maximumDepth,
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." })
+        else {
+            throw ValidationError.invalidRootPrefix
+        }
+        self.value = value
+    }
+}
+
+package enum IgnoreRuleAuthority {
     case mandatoryGit
     case secondary
 }
 
-enum IgnoreRulePolicy {
-    case gitRoot(repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix)
+package enum IgnoreRulePolicy {
+    case gitRoot(repositoryRelativeRootPrefix: IgnoreRepositoryRootPrefix)
     case nonGitRoot
 
-    var enforcesGitIgnoreFloor: Bool {
+    package var enforcesGitIgnoreFloor: Bool {
         if case .gitRoot = self { return true }
         return false
     }
 
-    func repositoryRelativeComponents(appending components: [Substring]) -> [Substring] {
+    package func repositoryRelativeComponents(appending components: [Substring]) -> [Substring] {
         guard case let .gitRoot(prefix) = self, !prefix.value.isEmpty else { return components }
         let suffix = components.isEmpty ? "" : "/" + components.joined(separator: "/")
         return (prefix.value + suffix).split(separator: "/")
     }
 
-    func repositoryRelativePath(appending path: String) -> String {
+    package func repositoryRelativePath(appending path: String) -> String {
         guard case let .gitRoot(prefix) = self, !prefix.value.isEmpty else { return path }
         return path.isEmpty ? prefix.value : prefix.value + "/" + path
     }
 }
 
-final class IgnoreRules {
+package final class IgnoreRules {
     // MARK: - Internal persistent node
 
-    fileprivate final class RulesNode {
+    fileprivate final class RulesNode: Sendable {
         let compiled: CompiledIgnoreRules
         let authority: IgnoreRuleAuthority
         let parent: RulesNode?
@@ -91,7 +122,7 @@ final class IgnoreRules {
     // MARK: - Initialisers
 
     /// Creates a new instance that starts with the shared default ignore layer.
-    init(policy: IgnoreRulePolicy) {
+    package init(policy: IgnoreRulePolicy) {
         tail = switch policy {
         case .nonGitRoot: IgnoreRules.nonGitBaseNode
         case .gitRoot: IgnoreRules.baseNode
@@ -107,7 +138,7 @@ final class IgnoreRules {
 
     // MARK: - Public API
 
-    func addCompiledLayer(
+    package func addCompiledLayer(
         _ compiled: CompiledIgnoreRules,
         authority: IgnoreRuleAuthority
     ) {
@@ -118,21 +149,21 @@ final class IgnoreRules {
     /// Return `true` if, after consulting all layers from highest to lowest,
     /// the path should be ignored.  (String-based entry point – kept for
     /// backward compatibility, now delegates to the component-based fast path.)
-    func isIgnored(relativePath: String, isDirectory: Bool) -> Bool {
+    package func isIgnored(relativePath: String, isDirectory: Bool) -> Bool {
         let comps = relativePath.split(separator: "/")
         return matchOutcome(relativePathComponents: comps, isDirectory: isDirectory) == .ignore
     }
 
     /// Fast overload that accepts **pre-split** path components to avoid the
     /// repeated allocation from `split(separator:)` in tight loops.
-    func isIgnored(relativePathComponents comps: [Substring], isDirectory: Bool) -> Bool {
+    package func isIgnored(relativePathComponents comps: [Substring], isDirectory: Bool) -> Bool {
         matchOutcome(relativePathComponents: comps, isDirectory: isDirectory) == .ignore
     }
 
     /// Returns the highest-priority match outcome for the given path, or nil if
     /// no pattern matches. This is used by hierarchical evaluators that need to
     /// understand whether a match was produced by an ignore or negation rule.
-    func matchOutcome(relativePathComponents comps: [Substring], isDirectory: Bool) -> CompiledIgnoreRules.MatchOutcome? {
+    package func matchOutcome(relativePathComponents comps: [Substring], isDirectory: Bool) -> CompiledIgnoreRules.MatchOutcome? {
         let repositoryComponents = policy.repositoryRelativeComponents(appending: comps)
         if policy.enforcesGitIgnoreFloor {
             let gitOutcome = matchOutcome(
@@ -181,13 +212,13 @@ final class IgnoreRules {
     }
 
     /// Fast aggregate check used by directory traversal code.
-    func hasAnyNegativePatterns() -> Bool {
+    package func hasAnyNegativePatterns() -> Bool {
         tail.hasNegative
     }
 
     /// Returns true if any negative rule requires us to keep scanning the
     /// directory located at `path` (relative to the repository root).
-    func requiresTraversal(for path: String) -> Bool {
+    package func requiresTraversal(for path: String) -> Bool {
         #if DEBUG
             IgnoreDebugMetricsRecorder.recordTraversalRequiresCheck()
         #endif
@@ -221,22 +252,22 @@ final class IgnoreRules {
         return false
     }
 
-    var traversalDiagnostics: NegationTraversalDiagnostics {
+    package var traversalDiagnostics: NegationTraversalDiagnostics {
         tail.traversalDiagnostics
     }
 
     /// Returns a shallow clone that *shares* all rule layers with the original.
-    func clone() -> IgnoreRules {
+    package func clone() -> IgnoreRules {
         IgnoreRules(tail: tail, policy: policy)
     }
 
     /// The number of rule layers (including defaults).
-    var depth: Int {
+    package var depth: Int {
         tail.depth
     }
 
     /// Immutable snapshot safe to send off-actor.
-    func snapshot() -> IgnoreRulesSnapshot {
+    package func snapshot() -> IgnoreRulesSnapshot {
         if let cached = cachedSnapshot {
             return cached
         }
@@ -305,7 +336,7 @@ final class IgnoreRules {
     }()
 }
 
-struct IgnoreRulesSnapshot {
+package struct IgnoreRulesSnapshot {
     fileprivate let layers: [CompiledIgnoreRules]
     fileprivate let gitLayers: [CompiledIgnoreRules]
     fileprivate let secondaryLayers: [CompiledIgnoreRules]
@@ -315,7 +346,7 @@ struct IgnoreRulesSnapshot {
     private let traversalPatterns: Set<NegationTraversalPattern>
     private let gitTraversalPrefixes: Set<String>
     private let gitTraversalPatterns: Set<NegationTraversalPattern>
-    let traversalDiagnostics: NegationTraversalDiagnostics
+    package let traversalDiagnostics: NegationTraversalDiagnostics
 
     fileprivate init(
         layers: [CompiledIgnoreRules],
@@ -341,16 +372,16 @@ struct IgnoreRulesSnapshot {
         self.traversalDiagnostics = traversalDiagnostics
     }
 
-    func isIgnored(relativePath: String, isDirectory: Bool) -> Bool {
+    package func isIgnored(relativePath: String, isDirectory: Bool) -> Bool {
         let comps = relativePath.split(separator: "/")
         return matchOutcome(relativePathComponents: comps, isDirectory: isDirectory) == .ignore
     }
 
-    func isIgnored(relativePathComponents comps: [Substring], isDirectory: Bool) -> Bool {
+    package func isIgnored(relativePathComponents comps: [Substring], isDirectory: Bool) -> Bool {
         matchOutcome(relativePathComponents: comps, isDirectory: isDirectory) == .ignore
     }
 
-    func matchOutcome(
+    package func matchOutcome(
         relativePathComponents comps: [Substring],
         isDirectory: Bool
     ) -> CompiledIgnoreRules.MatchOutcome? {
@@ -390,11 +421,11 @@ struct IgnoreRulesSnapshot {
         return nil
     }
 
-    func hasAnyNegativePatterns() -> Bool {
+    package func hasAnyNegativePatterns() -> Bool {
         hasNegative
     }
 
-    func requiresTraversal(for path: String) -> Bool {
+    package func requiresTraversal(for path: String) -> Bool {
         #if DEBUG
             IgnoreDebugMetricsRecorder.recordTraversalRequiresCheck()
         #endif

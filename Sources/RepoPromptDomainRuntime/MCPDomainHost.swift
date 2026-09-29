@@ -440,6 +440,28 @@ package actor MCPDomainHost {
         )
     }
 
+    /// Acquires the cross-connection resource lease that the tool's admission class requires, or
+    /// returns nil for classes bounded by their connection lane alone (`control`, `git_read`,
+    /// `file_search`). App window resources and standalone scopes share the same controllers.
+    package func acquireResourceAdmission(
+        for admissionClass: MCPToolAdmissionClass,
+        resource: MCPDomainToolResourceAdmissionController.Resource,
+        admissionDeadline: MCPDomainAdmissionDeadline? = nil
+    ) async throws -> MCPDomainToolResourceAdmissionController.Lease? {
+        guard lifecycle == .accepting else { throw MCPDomainHostError.draining }
+        let controller: MCPDomainToolResourceAdmissionController? = switch admissionClass {
+        case .exclusive:
+            mutationAdmissionController
+        case .smallRead:
+            smallReadAdmissionController
+        case .fileRead:
+            fileReadAdmissionController
+        case .control, .gitRead, .fileSearch:
+            nil
+        }
+        return try await controller?.acquire(resource, admissionDeadline: admissionDeadline)
+    }
+
     package func cancelInvocations(
         connectionID: UUID,
         connectionGeneration: UInt64

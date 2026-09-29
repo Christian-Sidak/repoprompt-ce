@@ -39,6 +39,9 @@
 #ifndef _WILDMATCH_H_
 #define _WILDMATCH_H_
 
+/* Gitignore helpers implemented alongside repo_wildmatch (repo_wildmatch_wrapper.c). */
+#include "repo_gitignore.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif

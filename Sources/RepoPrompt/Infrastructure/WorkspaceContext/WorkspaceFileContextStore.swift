@@ -3,6 +3,7 @@ import CoreServices
 import Dispatch
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 #if DEBUG
     import CryptoKit
 #endif
@@ -200,6 +201,8 @@ actor WorkspaceFileContextStore {
         case retryExhausted
         case prioritizeNow
         case repositoryAuthorityDetached
+        /// A root's code-map session, launch, eligibility flight, or retry was detached.
+        case sessionDetached
     }
 
     #if DEBUG
@@ -213,6 +216,25 @@ actor WorkspaceFileContextStore {
             let rootEpoch: WorkspaceCodemapRootEpoch
             let kind: CodemapGraphIndexBuildStoreEventKind
             let launchPhase: WorkspaceCodemapGraphIndexLaunchPhase
+            let uptimeNanoseconds: UInt64
+            /// Why a launch was retried: `eligibility.<reason>` or `setup.<reason>`. Set on
+            /// `eligibilityTransient`, `retryScheduled`, and `retryExhausted`; case names only, never
+            /// paths or payload values.
+            let transientReason: String?
+            /// Which store path cancelled, superseded, or detached the launch
+            /// (`CodemapLaunchCancellationOrigin.label`). Set on `cancelled`, `superseded`, and
+            /// `sessionDetached`; case and checkpoint names only.
+            var origin: String?
+        }
+
+        /// One artifact-demand transition for a file, for attributing a signature that went missing
+        /// from a single answer. `label` is built from case names only (`request.<ownership>.<result>`,
+        /// `publish.<result>`, `release.retained`, `release.cancelled`); never paths or payloads.
+        struct CodemapDemandEvent: Hashable {
+            let ordinal: UInt64
+            let rootEpoch: WorkspaceCodemapRootEpoch
+            let fileID: UUID
+            let label: String
             let uptimeNanoseconds: UInt64
         }
 
@@ -539,6 +561,70 @@ actor WorkspaceFileContextStore {
         var unloadsRoot: Bool {
             if case .unload = self { return true }
             return false
+        }
+
+        /// The command's case name only, never its paths.
+        var caseLabel: String {
+            switch self {
+            case .modified: "modified"
+            case .deleted: "deleted"
+            case .renamed: "renamed"
+            case .securityExcluded: "securityExcluded"
+            case .watcherGap: "watcherGap"
+            case .checkout: "checkout"
+            case .repositoryAuthority: "repositoryAuthority"
+            case .catalogAdvanced: "catalogAdvanced"
+            case .unload: "unload"
+            }
+        }
+    }
+
+    /// Which store path detached a root's code-map session or cancelled/superseded its graph-index
+    /// launch. Recorded on the store's launch events so a relaunch can be attributed to its initiator.
+    /// Built from case names and fixed checkpoint names only, never paths or identifiers.
+    private struct CodemapLaunchCancellationOrigin: Hashable {
+        let label: String
+
+        private init(_ label: String) {
+            self.label = label
+        }
+
+        static let generationSuspended = Self("generationSuspended")
+        static let rootUnloaded = Self("rootUnloaded")
+        static let retryableSetupRetry = Self("retryableSetupRetry")
+        static let demandAuthorityMismatch = Self("demandAuthorityMismatch")
+        static let demandRetryableSetup = Self("demandRetryableSetup")
+        static let watcherGapWithoutEngine = Self("watcherGapWithoutEngine")
+        /// The non-Git Code Maps opt-in changed, which revokes every non-Git root's session.
+        static let nonGitCodeMapsSettingChanged = Self("nonGitCodeMapsSettingChanged")
+        /// The engine reported that the root authority behind the session's registration moved.
+        static let engineRootAuthorityInvalidated = Self("engineRootAuthorityInvalidated")
+
+        /// `site` is the fixed name of the store operation that fenced the root; `commandLabel` is
+        /// `CodemapInvalidationCommand.caseLabel`.
+        static func rootAuthorityFence(site: String, commandLabel: String) -> Self {
+            Self("rootAuthorityFence.\(site).\(commandLabel)")
+        }
+
+        /// `commandLabels` are `CodemapInvalidationCommand.caseLabel` values.
+        static func pathInvalidation(commandLabels: [String]) -> Self {
+            Self("pathInvalidation." + Set(commandLabels).sorted().joined(separator: "+"))
+        }
+
+        /// `reasonLabels` are `CatalogInvalidationReason` raw values.
+        static func catalogAdvance(reasonLabels: [String]) -> Self {
+            Self("catalogAdvance." + Set(reasonLabels).sorted().joined(separator: "+"))
+        }
+
+        /// A running launch found itself no longer current at `checkpoint` without having been
+        /// detached; `cause` names the first failing currency condition.
+        static func launchNotCurrent(checkpoint: String, cause: String) -> Self {
+            Self("launchNotCurrent.\(checkpoint).\(cause)")
+        }
+
+        /// A launch ended at `checkpoint` for a fixed `cause` other than losing currency.
+        static func launchEnded(checkpoint: String, cause: String) -> Self {
+            Self("launchEnded.\(checkpoint).\(cause)")
         }
     }
 
@@ -1405,6 +1491,10 @@ actor WorkspaceFileContextStore {
             _ handler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
         ) {
             codemapGraphIndexCatalogBuildHandler = handler
+        }
+
+        func codemapDemandEventsForTesting() -> [CodemapDemandEvent] {
+            codemapDemandEvents
         }
 
         func codemapGraphIndexBuildStoreEventsForTesting(
@@ -3153,6 +3243,8 @@ actor WorkspaceFileContextStore {
         ] = [:]
         private var debugCodemapGraphIndexHoldExpiryTasks: [UUID: Task<Void, Never>] = [:]
         private var codemapGraphIndexBuildStoreEvents: [CodemapGraphIndexBuildStoreEvent] = []
+        private var codemapDemandEvents: [CodemapDemandEvent] = []
+        private var nextCodemapDemandEventOrdinal: UInt64 = 0
         private var nextCodemapGraphIndexBuildStoreEventOrdinal: UInt64 = 0
         private var codemapGraphIndexBuildStartHandler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
         private var codemapGraphIndexCatalogBuildHandler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
@@ -10276,7 +10368,8 @@ actor WorkspaceFileContextStore {
         for rootID in Set(eligibleFiles.map(\.rootID)) {
             if let fence = await beginCodemapRootMutationFence(
                 rootID: rootID,
-                command: .catalogAdvanced
+                command: .catalogAdvanced,
+                site: "ensureIndexedFiles"
             ) {
                 codemapFencesByRootID[rootID] = fence
             }
@@ -10810,7 +10903,7 @@ actor WorkspaceFileContextStore {
             publishCodemapRootStatusesIfChanged()
             if inserted {
                 let engine = codemapSessionsByRootEpoch[rootEpoch]?.engine
-                _ = detachCodemapSession(rootEpoch: rootEpoch)
+                _ = detachCodemapSession(rootEpoch: rootEpoch, origin: .generationSuspended)
                 if let engine {
                     await engine.cancelGraphIndex(rootEpoch: rootEpoch)
                 }
@@ -10904,7 +10997,7 @@ actor WorkspaceFileContextStore {
                   nonGitCodeMapsEnabled == enabled
             else { continue }
             let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
-            _ = detachCodemapSession(rootEpoch: rootEpoch)
+            _ = detachCodemapSession(rootEpoch: rootEpoch, origin: .nonGitCodeMapsSettingChanged)
             filesystemCodemapEvidenceByRootEpoch.removeValue(forKey: rootEpoch)
             affectedRootIDs.append(rootID)
         }
@@ -10977,23 +11070,56 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    /// Why a root's code-map graph will not become available without an external action (a root
+    /// reload, or `prioritizeCodemapGraphIndexNow`), or nil while it is still being built or retried.
+    /// The single source for both root status and the structure query's no-graph answer, so the two
+    /// cannot disagree about whether a client should retry.
+    ///
+    /// Every terminal eligibility result finishes its launch as `terminalUnavailable` and installs a
+    /// `rootTerminal` setup disposition that is sticky for the root epoch (`ensureCodemapSetupTask`
+    /// replays it, and `codemapUnavailableIsStable` treats it as stable), so it cannot recover until
+    /// the root is reloaded. A bare repository or an invalid Git layout is reported from that
+    /// disposition, distinct from a root with no usable source authority, and also when no launch
+    /// recorded the terminal phase.
+    private func codemapRootUnavailableReason(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapRootStatusUnavailableReason? {
+        if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
+            return .retryExhausted
+        }
+        if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
+            return .workerRecoveryExhausted
+        }
+        let gitLayoutReason = codemapTerminalGitLayoutUnavailableReason(rootEpoch: rootEpoch)
+        switch codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase {
+        case .terminalUnavailable: return gitLayoutReason ?? .sourceRootUnavailable
+        case .retryExhausted: return .retryExhausted
+        default: return gitLayoutReason
+        }
+    }
+
+    /// `bareRepository` or `invalidGitLayout` when the root's sticky terminal setup disposition names
+    /// one of those Git layouts, otherwise nil.
+    private func codemapTerminalGitLayoutUnavailableReason(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> WorkspaceCodemapRootStatusUnavailableReason? {
+        guard case let .unavailable(.rootTerminal(reason))? =
+            codemapSessionsByRootEpoch[rootEpoch]?.setupDisposition
+        else { return nil }
+        switch reason {
+        case .bareRepository: return .bareRepository
+        case .invalidLayout: return .invalidGitLayout
+        default: return nil
+        }
+    }
+
     private func makeCodemapRootStatusSnapshot(
         rootEpoch: WorkspaceCodemapRootEpoch
     ) -> WorkspaceCodemapRootStatusSnapshot {
         let suspended = codemapGenerationIsSuspended(rootEpoch: rootEpoch)
         let accounting = codemapGraphAccountingByRootEpoch[rootEpoch]
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
-        let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
-            .retryExhausted
-        } else if codemapGraphIndexWorkerRecoveryExhaustedRootEpochs.contains(rootEpoch) {
-            .workerRecoveryExhausted
-        } else {
-            switch launchPhase {
-            case .terminalUnavailable: .sourceRootUnavailable
-            case .retryExhausted: .retryExhausted
-            default: nil
-            }
-        }
+        let unavailableReason = codemapRootUnavailableReason(rootEpoch: rootEpoch)
         let availability: WorkspaceCodemapRootAvailability = if accounting?.revocationReason != nil {
             .revoked
         } else if unavailableReason != nil {
@@ -11747,6 +11873,7 @@ actor WorkspaceFileContextStore {
             publishCodemapRootStatusesIfChanged()
             if let cleanup = detachCodemapSession(
                 rootEpoch: rootEpoch,
+                origin: .rootUnloaded,
                 invalidationCommands: [.unload],
                 graphInvalidationReason: .rootUnloaded
             ),
@@ -13251,7 +13378,9 @@ actor WorkspaceFileContextStore {
     private func recordCodemapGraphIndexBuildStoreEvent(
         _ kind: CodemapGraphIndexBuildStoreEventKind,
         rootEpoch: WorkspaceCodemapRootEpoch,
-        phase: WorkspaceCodemapGraphIndexLaunchPhase
+        phase: WorkspaceCodemapGraphIndexLaunchPhase,
+        transientReason: String? = nil,
+        origin: CodemapLaunchCancellationOrigin? = nil
     ) {
         #if DEBUG
             nextCodemapGraphIndexBuildStoreEventOrdinal &+= 1
@@ -13260,7 +13389,9 @@ actor WorkspaceFileContextStore {
                 rootEpoch: rootEpoch,
                 kind: kind,
                 launchPhase: phase,
-                uptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
+                uptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds(),
+                transientReason: transientReason,
+                origin: origin?.label
             ))
             if codemapGraphIndexBuildStoreEvents.count > 2048 {
                 codemapGraphIndexBuildStoreEvents.removeFirst(
@@ -13268,6 +13399,65 @@ actor WorkspaceFileContextStore {
                 )
             }
         #endif
+    }
+
+    private func recordCodemapDemandEvent(
+        _ label: @autoclosure () -> String,
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        fileID: UUID
+    ) {
+        #if DEBUG
+            nextCodemapDemandEventOrdinal &+= 1
+            codemapDemandEvents.append(CodemapDemandEvent(
+                ordinal: nextCodemapDemandEventOrdinal,
+                rootEpoch: rootEpoch,
+                fileID: fileID,
+                label: label(),
+                uptimeNanoseconds: codemapGraphIndexBuildRetryPolicy.nowNanoseconds()
+            ))
+            if codemapDemandEvents.count > 2048 {
+                codemapDemandEvents.removeFirst(codemapDemandEvents.count - 2048)
+            }
+        #endif
+    }
+
+    /// A privacy-safe label for a demand result: `pending`, `ready`, or `unavailable.<reason>`.
+    private static func codemapDemandResultLabel(_ result: WorkspaceCodemapArtifactDemandResult) -> String {
+        switch result {
+        case .pending: "pending"
+        case .ready: "ready"
+        case let .unavailable(reason): "unavailable.\(codemapUnavailableReasonLabel(reason))"
+        }
+    }
+
+    /// The case name of an unavailable reason, with nested case names but never payload values.
+    private static func codemapUnavailableReasonLabel(
+        _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
+    ) -> String {
+        switch reason {
+        case .rootNotLoaded: "rootNotLoaded"
+        case .fileNotCataloged: "fileNotCataloged"
+        case .unsupportedFileType: "unsupportedFileType"
+        case let .rootTerminal(terminal): "rootTerminal.\(terminal.rawValue)"
+        case let .rootTransient(transient): "rootTransient.\(transient.rawValue)"
+        case let .demandUnavailable(unavailable):
+            switch unavailable {
+            case .unsupportedFileType: "demandUnavailable.unsupportedFileType"
+            case .missing: "demandUnavailable.missing"
+            case .securityExcluded: "demandUnavailable.securityExcluded"
+            case .nonRegular: "demandUnavailable.nonRegular"
+            case .oversized: "demandUnavailable.oversized"
+            case .transient: "demandUnavailable.transient"
+            case .terminalArtifact: "demandUnavailable.terminalArtifact"
+            }
+        case .busy: "busy"
+        case let .rejected(rejection): "rejected.\(rejection)"
+        case .routeConflict: "routeConflict"
+        case .registrationFailed: "registrationFailed"
+        case .runtimeFailure: "runtimeFailure"
+        case .staleCurrentness: "staleCurrentness"
+        case .cancelled: "cancelled"
+        }
     }
 
     private func recordCodemapRootReadyForGraphIndexBuild(
@@ -13361,7 +13551,11 @@ actor WorkspaceFileContextStore {
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
-                phase: .cancelled
+                phase: .cancelled,
+                origin: .launchNotCurrent(
+                    checkpoint: "start",
+                    cause: codemapGraphIndexBuildLaunchStaleCause(launchID: launchID, authority: authority)
+                )
             )
             return
         }
@@ -13382,7 +13576,11 @@ actor WorkspaceFileContextStore {
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
-                phase: .cancelled
+                phase: .cancelled,
+                origin: .launchNotCurrent(
+                    checkpoint: "eligibility",
+                    cause: codemapGraphIndexBuildLaunchStaleCause(launchID: launchID, authority: authority)
+                )
             )
             return
         }
@@ -13410,11 +13608,13 @@ actor WorkspaceFileContextStore {
                 phase: phase
             )
             return
-        case .transient:
+        case let .transient(reason):
+            let transientReason = "eligibility.\(reason.rawValue)"
             recordCodemapGraphIndexBuildStoreEvent(
                 .eligibilityTransient,
                 rootEpoch: authority.rootEpoch,
-                phase: .transientRetry
+                phase: .transientRetry,
+                transientReason: transientReason
             )
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
@@ -13423,21 +13623,24 @@ actor WorkspaceFileContextStore {
             )
             scheduleCodemapGraphIndexBuildRetry(
                 launchID: launchID,
-                authority: authority
+                authority: authority,
+                transientReason: transientReason
             )
             return
         case .stale:
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
-                phase: .superseded
+                phase: .superseded,
+                origin: .launchEnded(checkpoint: "eligibility", cause: "staleEligibility")
             )
             return
         case .cancelled:
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
-                phase: .cancelled
+                phase: .cancelled,
+                origin: .launchEnded(checkpoint: "eligibility", cause: "eligibilityCancelled")
             )
             return
         }
@@ -13449,7 +13652,8 @@ actor WorkspaceFileContextStore {
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
-                phase: .superseded
+                phase: .superseded,
+                origin: .launchEnded(checkpoint: "setup", cause: "setupUnavailable")
             )
             return
         }
@@ -13470,7 +13674,11 @@ actor WorkspaceFileContextStore {
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
-                phase: .cancelled
+                phase: .cancelled,
+                origin: .launchNotCurrent(
+                    checkpoint: "setup",
+                    cause: codemapGraphIndexBuildLaunchStaleCause(launchID: launchID, authority: authority)
+                )
             )
             return
         }
@@ -13482,12 +13690,17 @@ actor WorkspaceFileContextStore {
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
-                phase: phase
+                phase: phase,
+                origin: .launchEnded(
+                    checkpoint: "setup",
+                    cause: Self.codemapSetupTransientReasonLabel(setupDisposition)
+                )
             )
             if retryable {
                 scheduleCodemapGraphIndexBuildRetry(
                     launchID: launchID,
-                    authority: authority
+                    authority: authority,
+                    transientReason: Self.codemapSetupTransientReasonLabel(setupDisposition)
                 )
             }
             return
@@ -13496,7 +13709,8 @@ actor WorkspaceFileContextStore {
             finishCodemapGraphIndexBuildLaunch(
                 launchID: launchID,
                 authority: authority,
-                phase: .superseded
+                phase: .superseded,
+                origin: .launchEnded(checkpoint: "engineScheduling", cause: "engineMissing")
             )
             return
         }
@@ -13717,6 +13931,7 @@ actor WorkspaceFileContextStore {
         // worker must never wait on its own drain.
         let cleanup = detachCodemapSession(
             rootEpoch: rootEpoch,
+            origin: .engineRootAuthorityInvalidated,
             invalidationCommands: [.repositoryAuthority]
         )
         // A revoked root authority means the physical binding moved, so the loaded catalog can no
@@ -13984,6 +14199,23 @@ actor WorkspaceFileContextStore {
         return true
     }
 
+    /// The first currency condition a running launch fails, as a fixed case name, for its
+    /// cancellation event.
+    private func codemapGraphIndexBuildLaunchStaleCause(
+        launchID: UUID,
+        authority: CodemapRootAuthority
+    ) -> String {
+        if Task.isCancelled { return "taskCancelled" }
+        guard let launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch] else {
+            return "launchRemoved"
+        }
+        if launch.id != launchID { return "launchReplaced" }
+        if launch.authority != authority { return "authorityReplaced" }
+        if codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch) { return "generationSuspended" }
+        if !codemapPreflightAuthorityIsCurrent(authority) { return "preflightAuthorityStale" }
+        return "current"
+    }
+
     private func updateCodemapGraphIndexBuildLaunchPhase(
         _ phase: WorkspaceCodemapGraphIndexLaunchPhase,
         launchID: UUID,
@@ -14004,7 +14236,8 @@ actor WorkspaceFileContextStore {
     private func finishCodemapGraphIndexBuildLaunch(
         launchID: UUID,
         authority: CodemapRootAuthority,
-        phase: WorkspaceCodemapGraphIndexLaunchPhase
+        phase: WorkspaceCodemapGraphIndexLaunchPhase,
+        origin: CodemapLaunchCancellationOrigin? = nil
     ) {
         guard var launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch],
               launch.id == launchID,
@@ -14019,7 +14252,8 @@ actor WorkspaceFileContextStore {
             recordCodemapGraphIndexBuildStoreEvent(
                 phase == .cancelled ? .cancelled : .superseded,
                 rootEpoch: authority.rootEpoch,
-                phase: phase
+                phase: phase,
+                origin: origin
             )
         }
     }
@@ -14031,9 +14265,18 @@ actor WorkspaceFileContextStore {
         return !codemapUnavailableIsStable(reason)
     }
 
+    /// A privacy-safe label for a retryable setup disposition: `setup.<case>` with case names only.
+    private static func codemapSetupTransientReasonLabel(_ disposition: CodemapSetupDisposition) -> String {
+        guard case let .unavailable(reason) = disposition else { return "setup.ready" }
+        // Setup labels keep their established `demandUnavailable` granularity.
+        if case .demandUnavailable = reason { return "setup.demandUnavailable" }
+        return "setup.\(codemapUnavailableReasonLabel(reason))"
+    }
+
     private func scheduleCodemapGraphIndexBuildRetry(
         launchID: UUID,
-        authority: CodemapRootAuthority
+        authority: CodemapRootAuthority,
+        transientReason: String
     ) {
         guard !codemapGenerationIsSuspended(rootEpoch: authority.rootEpoch),
               let launch = codemapGraphIndexBuildLaunchesByRootEpoch[authority.rootEpoch],
@@ -14060,7 +14303,8 @@ actor WorkspaceFileContextStore {
             recordCodemapGraphIndexBuildStoreEvent(
                 .retryExhausted,
                 rootEpoch: authority.rootEpoch,
-                phase: .retryExhausted
+                phase: .retryExhausted,
+                transientReason: transientReason
             )
             return
         }
@@ -14094,7 +14338,8 @@ actor WorkspaceFileContextStore {
         recordCodemapGraphIndexBuildStoreEvent(
             .retryScheduled,
             rootEpoch: authority.rootEpoch,
-            phase: .transientRetry
+            phase: .transientRetry,
+            transientReason: transientReason
         )
     }
 
@@ -14127,6 +14372,7 @@ actor WorkspaceFileContextStore {
         {
             _ = detachCodemapSession(
                 rootEpoch: authority.rootEpoch,
+                origin: .retryableSetupRetry,
                 invalidationCommands: [.catalogAdvanced]
             )
             await awaitCodemapCleanupFlights(rootIDs: [authority.rootEpoch.rootID])
@@ -14148,6 +14394,28 @@ actor WorkspaceFileContextStore {
     func requestCodemapArtifactWithOwnership(
         forFileID fileID: UUID,
         priority: CodeMapArtifactBuildPriority = .demand
+    ) async -> WorkspaceCodemapArtifactDemandOwnedResult {
+        let owned = await requestCodemapArtifactWithOwnershipUnrecorded(forFileID: fileID, priority: priority)
+        #if DEBUG
+            if let file = filesByID[fileID], let state = rootStatesByID[file.rootID] {
+                let ownership = switch owned.ownership {
+                case .notAcquired: "notAcquired"
+                case .created: "created"
+                case .joined: "joined"
+                }
+                recordCodemapDemandEvent(
+                    "request.\(ownership).\(Self.codemapDemandResultLabel(owned.result))",
+                    rootEpoch: WorkspaceCodemapRootEpoch(rootID: file.rootID, rootLifetimeID: state.lifetimeID),
+                    fileID: fileID
+                )
+            }
+        #endif
+        return owned
+    }
+
+    private func requestCodemapArtifactWithOwnershipUnrecorded(
+        forFileID fileID: UUID,
+        priority: CodeMapArtifactBuildPriority
     ) async -> WorkspaceCodemapArtifactDemandOwnedResult {
         #if DEBUG
             codemapArtifactDemandRequestCountForTesting += 1
@@ -14216,6 +14484,7 @@ actor WorkspaceFileContextStore {
         {
             _ = detachCodemapSession(
                 rootEpoch: rootEpoch,
+                origin: .demandAuthorityMismatch,
                 invalidationCommands: [.repositoryAuthority]
             )
             return .init(result: .unavailable(.busy(retryAfterMilliseconds: nil)), ownership: .notAcquired)
@@ -14286,7 +14555,7 @@ actor WorkspaceFileContextStore {
                     ownership: .notAcquired
                 )
             }
-            _ = detachCodemapSession(rootEpoch: rootEpoch)
+            _ = detachCodemapSession(rootEpoch: rootEpoch, origin: .demandRetryableSetup)
             return .init(result: .unavailable(.busy(retryAfterMilliseconds: nil)), ownership: .notAcquired)
         }
 
@@ -14560,21 +14829,18 @@ actor WorkspaceFileContextStore {
                     continue
                 }
             } else {
-                // Unavailability follows the root's actual terminal setup disposition. An admitted
-                // root that is still awaiting its graph stays pending, whatever its source mode is.
-                let terminalReason = codemapTerminalSetupUnavailableReason(rootEpoch: rootEpoch)
-                let isUnavailable = terminalReason != nil
+                let noGraph = codemapNoGraphStructureAnswer(rootEpoch: rootEpoch)
                 roots.append(WorkspaceCodemapStructureRootResult(
                     rootEpoch: rootEpoch,
                     rootDisplayName: rootName,
-                    status: isUnavailable ? .unavailable : .pending,
+                    status: noGraph.isTerminal ? .unavailable : .pending,
                     coverage: nil,
-                    updatesPending: !isUnavailable,
+                    updatesPending: !noGraph.isTerminal,
                     seeds: rootSeedIDs.map {
                         WorkspaceCodemapStructureSeedResult(
                             fileID: $0,
                             path: seedPathsByFileID[$0] ?? rootName,
-                            state: isUnavailable ? .notIndexed : .pending
+                            state: noGraph.isTerminal ? .notIndexed : .pending
                         )
                     },
                     nodes: [],
@@ -14582,16 +14848,14 @@ actor WorkspaceFileContextStore {
                     unresolved: [],
                     truncation: nil,
                     issues: [WorkspaceCodemapStructureIssueRecord(
-                        code: isUnavailable ? "git_root_unavailable" : "graph_indexing",
+                        code: noGraph.code,
                         phase: "graph_snapshot",
                         path: nil,
-                        retryable: !isUnavailable,
-                        retryAfterMilliseconds: isUnavailable ? nil : 100,
+                        retryable: !noGraph.isTerminal,
+                        retryAfterMilliseconds: noGraph.isTerminal ? nil : 100,
                         attempted: nil,
                         limit: nil,
-                        message: isUnavailable
-                            ? "Code structure is unavailable because this root has no usable source authority."
-                            : "The root-local committed graph is still being initialized."
+                        message: noGraph.message
                     )],
                     receipt: nil
                 ))
@@ -14835,6 +15099,59 @@ actor WorkspaceFileContextStore {
             receipt: nil
         )
     }
+
+    /// The structure query's answer for a root with no usable committed graph. Terminal states — no
+    /// usable source authority, a bare or invalid Git layout, exhausted build retries, or exhausted
+    /// worker recovery — are unavailable and not retryable (none recovers without a root reload or an
+    /// explicit prioritization); only a graph that is still being built or retried is pending and
+    /// retryable, whatever the root's source mode is.
+    private func codemapNoGraphStructureAnswer(
+        rootEpoch: WorkspaceCodemapRootEpoch
+    ) -> (isTerminal: Bool, code: String, message: String) {
+        switch codemapRootUnavailableReason(rootEpoch: rootEpoch) {
+        case .sourceRootUnavailable:
+            return (true, "git_root_unavailable", Self.codemapSourceRootUnavailableStructureMessage)
+        case .retryExhausted:
+            return (
+                true,
+                "graph_retry_exhausted",
+                "Code structure is unavailable because building this root's code-map graph failed after "
+                    + "its automatic retries; it is not retried again until the root is reloaded."
+            )
+        case .workerRecoveryExhausted:
+            return (
+                true,
+                "graph_worker_recovery_exhausted",
+                "Code structure is unavailable because this root's code-map graph worker could not be "
+                    + "recovered; it is not retried again until the root is reloaded."
+            )
+        case .bareRepository:
+            return (
+                true,
+                "git_bare_repository",
+                "Code structure is unavailable because this root is a bare Git repository with no work "
+                    + "tree to index; open a checkout of the repository instead."
+            )
+        case .invalidGitLayout:
+            return (
+                true,
+                "git_layout_invalid",
+                "Code structure is unavailable because Git cannot resolve this root's repository layout; "
+                    + "repair it, then reload the root."
+            )
+        case .setupFailed, .graphUnavailable, nil:
+            break
+        }
+        // Unavailability follows the root's actual terminal setup disposition, which a demand can
+        // install without a launch recording the terminal phase.
+        if codemapTerminalSetupUnavailableReason(rootEpoch: rootEpoch) != nil {
+            return (true, "git_root_unavailable", Self.codemapSourceRootUnavailableStructureMessage)
+        }
+        return (false, "graph_indexing", "The root-local committed graph is still being initialized.")
+    }
+
+    private static let codemapSourceRootUnavailableStructureMessage =
+        "Code structure is unavailable because this root has no usable source authority."
 
     private func codemapStructureIssueRecord(
         _ issue: WorkspaceCodemapGraphStructureIssue,
@@ -15330,11 +15647,17 @@ actor WorkspaceFileContextStore {
         if !record.retainIDs.isEmpty {
             session.demandsByFileID[ticket.fileID] = record
             codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+            recordCodemapDemandEvent("release.retained", rootEpoch: ticket.rootEpoch, fileID: ticket.fileID)
             return true
         }
         if case .unavailable(.cancelled) = record.result {
             return true
         }
+        recordCodemapDemandEvent(
+            "release.cancelled.from.\(Self.codemapDemandResultLabel(record.result))",
+            rootEpoch: ticket.rootEpoch,
+            fileID: ticket.fileID
+        )
         let shouldRevokeReadyArtifact = if case .ready = record.result {
             true
         } else {
@@ -15988,6 +16311,11 @@ actor WorkspaceFileContextStore {
         record.task = nil
         session.demandsByFileID[ticket.fileID] = record
         codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        recordCodemapDemandEvent(
+            "publish.\(Self.codemapDemandResultLabel(result))",
+            rootEpoch: ticket.rootEpoch,
+            fileID: ticket.fileID
+        )
         return true
     }
 
@@ -16776,7 +17104,10 @@ actor WorkspaceFileContextStore {
             standardizedRelativePaths: paths
         )
         advanceCodemapGraphIndexInvalidationGeneration(rootEpoch: rootEpoch)
-        _ = cancelCodemapGraphIndexBuildLaunchForInvalidation(rootEpoch: rootEpoch)
+        _ = cancelCodemapGraphIndexBuildLaunchForInvalidation(
+            rootEpoch: rootEpoch,
+            origin: .pathInvalidation(commandLabels: commands.map(\.caseLabel))
+        )
 
         let token = CodemapPathFenceToken(
             id: UUID(),
@@ -17140,7 +17471,8 @@ actor WorkspaceFileContextStore {
     }
 
     private func cancelCodemapGraphIndexBuildLaunchForInvalidation(
-        rootEpoch: WorkspaceCodemapRootEpoch
+        rootEpoch: WorkspaceCodemapRootEpoch,
+        origin: CodemapLaunchCancellationOrigin
     ) -> Task<Void, Never>? {
         codemapGraphIndexRetryExhaustionByRootEpoch.removeValue(forKey: rootEpoch)
         codemapGraphIndexBuildRetriesByRootEpoch.removeValue(forKey: rootEpoch)?.task.cancel()
@@ -17151,13 +17483,15 @@ actor WorkspaceFileContextStore {
         recordCodemapGraphIndexBuildStoreEvent(
             .superseded,
             rootEpoch: rootEpoch,
-            phase: .superseded
+            phase: .superseded,
+            origin: origin
         )
         return launch.task
     }
 
     private func detachCodemapSession(
         rootEpoch: WorkspaceCodemapRootEpoch,
+        origin: CodemapLaunchCancellationOrigin,
         invalidationCommands: [CodemapInvalidationCommand] = [.catalogAdvanced],
         graphInvalidationReason: WorkspaceCodemapGraphRevocationReason =
             .rootAuthorityChanged
@@ -17169,7 +17503,8 @@ actor WorkspaceFileContextStore {
             recordCodemapGraphIndexBuildStoreEvent(
                 .cancelled,
                 rootEpoch: rootEpoch,
-                phase: .cancelled
+                phase: .cancelled,
+                origin: origin
             )
         }
         let eligibilityFlight = codemapEligibilityFlightsByRootEpoch.removeValue(forKey: rootEpoch)
@@ -17225,6 +17560,12 @@ actor WorkspaceFileContextStore {
         else {
             return codemapCleanupFlightsByRootID[rootEpoch.rootID]
         }
+        recordCodemapGraphIndexBuildStoreEvent(
+            .sessionDetached,
+            rootEpoch: rootEpoch,
+            phase: launch?.phase ?? .notScheduled,
+            origin: origin
+        )
         advanceCodemapGraphIndexInvalidationGeneration(rootEpoch: rootEpoch)
         guard let authority = session?.authority ?? launch?.authority ?? eligibilityFlight?.authority
             ?? completedEligibility?.authority ?? graphIndexRetry?.authority
@@ -17471,7 +17812,8 @@ actor WorkspaceFileContextStore {
 
     private func beginCodemapRootMutationFence(
         rootID: UUID,
-        command: CodemapInvalidationCommand
+        command: CodemapInvalidationCommand,
+        site: String
     ) async -> CodemapRootMutationFenceToken? {
         guard let initialState = rootStatesByID[rootID] else { return nil }
         let rootEpoch = WorkspaceCodemapRootEpoch(
@@ -17505,7 +17847,7 @@ actor WorkspaceFileContextStore {
                 finishCodemapRootMutationFence(token, didCommitMutation: false)
             }
         }
-        await fenceCodemapRootAuthority(rootIDs: [rootID], command: command)
+        await fenceCodemapRootAuthority(rootIDs: [rootID], command: command, site: site)
         guard !Task.isCancelled,
               rootStatesByID[rootID]?.lifetimeID == rootEpoch.rootLifetimeID
         else {
@@ -17648,7 +17990,8 @@ actor WorkspaceFileContextStore {
 
     private func fenceCodemapRootAuthority(
         rootIDs: [UUID],
-        command: CodemapInvalidationCommand
+        command: CodemapInvalidationCommand,
+        site: String
     ) async {
         let loadedRootIDs = Set(rootIDs.filter { rootStatesByID[$0] != nil })
         guard !loadedRootIDs.isEmpty else { return }
@@ -17668,7 +18011,10 @@ actor WorkspaceFileContextStore {
                     // store-owned retry path while graph-bearing roots reconcile through the
                     // engine-owned pull loop above. A watcher gap invalidates the prior terminal
                     // classification, so retire both its launch and stable setup disposition.
-                    _ = cancelCodemapGraphIndexBuildLaunchForInvalidation(rootEpoch: rootEpoch)
+                    _ = cancelCodemapGraphIndexBuildLaunchForInvalidation(
+                        rootEpoch: rootEpoch,
+                        origin: .watcherGapWithoutEngine
+                    )
                     codemapCompletedEligibilityByRootEpoch.removeValue(forKey: rootEpoch)
                     if var session = codemapSessionsByRootEpoch[rootEpoch], session.engine == nil {
                         session.setupTask?.cancel()
@@ -17686,6 +18032,7 @@ actor WorkspaceFileContextStore {
             let previousGeneration = codemapAuthorityGenerationsByRootEpoch[rootEpoch]
             let cleanup = detachCodemapSession(
                 rootEpoch: rootEpoch,
+                origin: .rootAuthorityFence(site: site, commandLabel: command.caseLabel),
                 invalidationCommands: [command]
             )
             if cleanup == nil,
@@ -17702,11 +18049,15 @@ actor WorkspaceFileContextStore {
     }
 
     func fenceCodemapAuthorityForCheckoutMutation(rootIDs: [UUID]) async {
-        await fenceCodemapRootAuthority(rootIDs: rootIDs, command: .checkout)
+        await fenceCodemapRootAuthority(rootIDs: rootIDs, command: .checkout, site: "checkoutMutation")
     }
 
     func fenceCodemapAuthorityForRepositoryAuthorityMutation(rootIDs: [UUID]) async {
-        await fenceCodemapRootAuthority(rootIDs: rootIDs, command: .repositoryAuthority)
+        await fenceCodemapRootAuthority(
+            rootIDs: rootIDs,
+            command: .repositoryAuthority,
+            site: "repositoryAuthorityMutation"
+        )
     }
 
     @discardableResult
@@ -19619,7 +19970,8 @@ actor WorkspaceFileContextStore {
         )
         let codemapFence = await beginCodemapRootMutationFence(
             rootID: candidate.rootID,
-            command: .catalogAdvanced
+            command: .catalogAdvanced,
+            site: "explicitMaterialization"
         )
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.WorkspaceExactResolution.checkpoint,
@@ -19915,7 +20267,8 @@ actor WorkspaceFileContextStore {
         let expectedBatchLifetimeID = initialState.lifetimeID
         guard let codemapFence = await beginCodemapRootMutationFence(
             rootID: request.root.id,
-            command: .catalogAdvanced
+            command: .catalogAdvanced,
+            site: "gitArtifactIngress"
         ) else { return staleRootResult() }
         var didPublishCatalogMutation = false
         defer {
@@ -20498,7 +20851,7 @@ actor WorkspaceFileContextStore {
             // on cleanup flights for it.
             let recoveryOwnsApplication = codemapRecoveryOwnsCatalogApplication(rootID: rootID)
             if repositoryMutationFence == nil, !recoveryOwnsApplication {
-                await fenceCodemapRootAuthority(rootIDs: [rootID], command: rootCommand)
+                await fenceCodemapRootAuthority(rootIDs: [rootID], command: rootCommand, site: "watcherDelta")
             }
             guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
             applyPreparedIndexDeltaMutations(
@@ -20598,7 +20951,8 @@ actor WorkspaceFileContextStore {
         )
         return await beginCodemapRootMutationFence(
             rootID: rootID,
-            command: .repositoryAuthority
+            command: .repositoryAuthority,
+            site: "repositoryLayoutDelta"
         )
     }
 
@@ -21952,7 +22306,8 @@ actor WorkspaceFileContextStore {
 
     private func bumpCatalogGenerations(
         affectedRootKinds: Set<WorkspaceRootKind>,
-        affectedRootIDs: Set<UUID>
+        affectedRootIDs: Set<UUID>,
+        reasons: Set<CatalogInvalidationReason>
     ) {
         guard !affectedRootKinds.isEmpty || !affectedRootIDs.isEmpty else { return }
         for scope in WorkspaceFileContextStore.catalogGenerationScopes {
@@ -21977,9 +22332,11 @@ actor WorkspaceFileContextStore {
             .union(codemapCompletedEligibilityByRootEpoch.keys)
             .union(codemapGraphIndexBuildRetriesByRootEpoch.keys)
             .filter { rootIDsRequiringAuthorityFence.contains($0.rootID) }
+        let origin = CodemapLaunchCancellationOrigin.catalogAdvance(reasonLabels: reasons.map(\.rawValue))
         for rootEpoch in rootEpochsRequiringAuthorityFence {
             _ = detachCodemapSession(
                 rootEpoch: rootEpoch,
+                origin: origin,
                 invalidationCommands: [.catalogAdvanced]
             )
         }
@@ -22363,7 +22720,8 @@ actor WorkspaceFileContextStore {
         #endif
         bumpCatalogGenerations(
             affectedRootKinds: affectedRootKinds,
-            affectedRootIDs: affectedRootIDs
+            affectedRootIDs: affectedRootIDs,
+            reasons: reasons
         )
         // Keep the previous immutable shard until the canonical applied-index batch arrives.
         // The batch either publishes a contiguous patch or replaces it from the authoritative root snapshot.

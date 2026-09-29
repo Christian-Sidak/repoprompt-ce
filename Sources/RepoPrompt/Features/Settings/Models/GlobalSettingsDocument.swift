@@ -46,18 +46,15 @@ struct GlobalSettingsDocument: Codable {
     /// Initial optional app-global model-router configuration.
     static let modelRouterSchemaVersion = 9
     static let scopedModelRouterSchemaVersion = 10
-    static let rejectedExperimentalSchemaVersions = 6 ... 6
-    static let currentSchemaVersion = 10
+    // Schema identity and the load gate live in `DomainGlobalSettingsSchema` so headless
+    // read-only views trust exactly the documents this app loads. Bump `currentVersion` there.
+    static let rejectedExperimentalSchemaVersions = DomainGlobalSettingsSchema.rejectedExperimentalVersions
+    static let currentSchemaVersion = DomainGlobalSettingsSchema.currentVersion
     /// Lineage marker for settings files written by this open-source CE schema family.
-    ///
-    /// CE inherited numeric schema versions from classic/internal builds, so version numbers
-    /// alone are not globally meaningful. Unlineaged v1/v2 files are accepted as legacy CE
-    /// documents; unlineaged higher versions are treated as foreign/future documents even if
-    /// this fork later reaches the same numeric schema version.
-    static let schemaLineage = "repoprompt-ce.global-settings"
+    static let schemaLineage = DomainGlobalSettingsSchema.lineage
     /// FROZEN at 2 forever: this is the last schema version OSS CE wrote without
     /// a lineage marker. It must never track `currentSchemaVersion`.
-    static let legacyUnlineagedSchemaVersionCeiling = 2
+    static let legacyUnlineagedSchemaVersionCeiling = DomainGlobalSettingsSchema.legacyUnlineagedVersionCeiling
 
     var schemaVersion: Int
     var schemaLineage: String?

@@ -7,6 +7,7 @@ import Foundation
 #endif
 import CoreFoundation
 import Cuchardet
+import RepoPromptDomainRuntime
 import UniversalCharsetDetection
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     import Darwin

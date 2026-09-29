@@ -599,6 +599,9 @@ import XCTest
                 let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
                 XCTAssertEqual(reply.isError, true, text, file: file, line: line)
                 let message: String
+                // The host renders the prerequisite through the execution-contract path: the code is a
+                // field (raw) or leads the text exactly once (default), with retry guidance attached.
+                let guidance: [String: Any]
                 if rawJSON {
                     let json = try XCTUnwrap(
                         JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any],
@@ -607,10 +610,35 @@ import XCTest
                         line: line
                     )
                     XCTAssertEqual(json["is_error"] as? Bool, true, text, file: file, line: line)
+                    XCTAssertEqual(json["code"] as? String, "selection_prerequisite_\(outcome)", text, file: file, line: line)
                     message = try XCTUnwrap(json["error"] as? String, text, file: file, line: line)
+                    guidance = json
                 } else {
                     message = text
+                    XCTAssertTrue(text.hasPrefix("selection_prerequisite_\(outcome): "), text, file: file, line: line)
+                    XCTAssertEqual(
+                        text.components(separatedBy: "selection_prerequisite_\(outcome)").count - 1,
+                        1,
+                        "The default-mode text must carry the code exactly once: \(text)",
+                        file: file,
+                        line: line
+                    )
+                    let guidanceLine = try XCTUnwrap(
+                        text.split(separator: "\n", omittingEmptySubsequences: false).dropFirst().first,
+                        "Missing the retry guidance line: \(text)",
+                        file: file,
+                        line: line
+                    )
+                    guidance = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: Data(guidanceLine.utf8)) as? [String: Any],
+                        text,
+                        file: file,
+                        line: line
+                    )
                 }
+                XCTAssertEqual(guidance["retryability"] as? String, "retryable", text, file: file, line: line)
+                XCTAssertEqual(guidance["retryable"] as? Bool, true, text, file: file, line: line)
+                XCTAssertEqual(guidance["mutation_state"] as? String, "not_applied", text, file: file, line: line)
                 XCTAssertFalse(
                     message.contains("MCPToolExecutionCancelledError"),
                     "The caller saw cancellation for the \(outcome) selection prerequisite: \(message)",

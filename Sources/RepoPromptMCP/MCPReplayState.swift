@@ -189,6 +189,12 @@ actor MCPOutstandingRequestReplayState {
         }
     }
 
+    /// Drops cached requests that were answered locally so they are never replayed.
+    func discardRequests(withIDs ids: [JSONRPCBridgeID]) {
+        let discarded = Set(ids)
+        entries = entries.filter { _, entry in !discarded.contains(entry.id) }
+    }
+
     func replayFrames() -> [Data] {
         entries.values
             .sorted { $0.ordinal < $1.ordinal }

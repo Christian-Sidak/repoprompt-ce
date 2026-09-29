@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 protocol GlobalSettingsFileStoring {
     var fileURL: URL { get }
@@ -1086,27 +1087,20 @@ final class GlobalSettingsFileStore: GlobalSettingsFileStoring {
         schemaLineage: String?,
         supportedVersion: Int = GlobalSettingsDocument.currentSchemaVersion
     ) -> GlobalSettingsPersistenceBlockReason? {
-        let normalizedLineage = schemaLineage?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if normalizedLineage == GlobalSettingsDocument.schemaLineage {
-            if GlobalSettingsDocument.rejectedExperimentalSchemaVersions.contains(schemaVersion) {
-                return .incompatibleSchema
-            }
-            return schemaVersion > supportedVersion
-                ? .unsupportedFutureSchema(onDiskVersion: schemaVersion, supportedVersion: supportedVersion)
-                : nil
+        // One gate for the app and headless read-only views; see DomainGlobalSettingsSchema for the
+        // lineage and frozen unlineaged-ceiling compatibility invariants.
+        switch DomainGlobalSettingsSchema.verdict(
+            schemaVersion: schemaVersion,
+            schemaLineage: schemaLineage,
+            supportedVersion: supportedVersion
+        ) {
+        case .accepted:
+            nil
+        case .incompatible:
+            .incompatibleSchema
+        case let .unsupportedFuture(onDiskVersion, supportedVersion):
+            .unsupportedFutureSchema(onDiskVersion: onDiskVersion, supportedVersion: supportedVersion)
         }
-        if normalizedLineage != nil { return .incompatibleSchema }
-
-        // COMPATIBILITY INVARIANT — do not simplify this to `schemaVersion > supportedVersion`.
-        // Numeric schema versions above the inherited v1/v2 CE baseline are ambiguous without a
-        // lineage marker: classic/internal RepoPrompt wrote unlineaged v3/v4 globalSettings.json
-        // into live Application Support folders before CE introduced `schemaLineage`. An
-        // unlineaged version above the frozen ceiling is therefore foreign, permanently — even
-        // after CE's own currentSchemaVersion catches up numerically. Guarded by
-        // testLegacyUnlineagedCeilingIsFrozenAtTwo and
-        // testUnlineagedHigherSchemaStaysBlockedAfterFutureNumericSchemaCatchup.
-        // See docs/architecture/settings-persistence.md.
-        return schemaVersion > GlobalSettingsDocument.legacyUnlineagedSchemaVersionCeiling ? .incompatibleSchema : nil
     }
 
     private static func preservationBlockReason(for header: GlobalSettingsDocumentHeader) -> GlobalSettingsPersistenceBlockReason? {

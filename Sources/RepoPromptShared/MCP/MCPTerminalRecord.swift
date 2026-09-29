@@ -42,6 +42,11 @@ public struct MCPTerminalRecord: Codable, Equatable, Sendable {
     public let bridgeRecentCompletionCount: Int?
     public let bridgePendingTransactionCount: Int?
     public let bridgeHasForwardedProtocolFrame: Bool?
+    /// Host requests answered with a synthesized transport-settlement error before exit.
+    public let hostSettledRequestCount: Int?
+    /// Host requests left unanswered because their response was already in delivery or the
+    /// settlement write could not complete.
+    public let hostUnsettledRequestCount: Int?
 
     public init(
         id: UUID = UUID(),
@@ -63,6 +68,8 @@ public struct MCPTerminalRecord: Codable, Equatable, Sendable {
         bridgeRecentCompletionCount: Int? = nil,
         bridgePendingTransactionCount: Int? = nil,
         bridgeHasForwardedProtocolFrame: Bool? = nil,
+        hostSettledRequestCount: Int? = nil,
+        hostUnsettledRequestCount: Int? = nil,
         toolName: String? = nil,
         invocationID: UUID? = nil,
         elapsedMilliseconds: Double? = nil,
@@ -113,6 +120,8 @@ public struct MCPTerminalRecord: Codable, Equatable, Sendable {
         self.bridgeRecentCompletionCount = bridgeRecentCompletionCount
         self.bridgePendingTransactionCount = bridgePendingTransactionCount
         self.bridgeHasForwardedProtocolFrame = bridgeHasForwardedProtocolFrame
+        self.hostSettledRequestCount = hostSettledRequestCount
+        self.hostUnsettledRequestCount = hostUnsettledRequestCount
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -144,6 +153,8 @@ public struct MCPTerminalRecord: Codable, Equatable, Sendable {
         case handlerPhaseAgeMilliseconds = "handler_phase_age_ms"
         case executionDeadlineMilliseconds = "execution_deadline_ms"
         case cleanupGraceMilliseconds = "cleanup_grace_ms"
+        case hostSettledRequestCount = "host_settled_request_count"
+        case hostUnsettledRequestCount = "host_unsettled_request_count"
     }
 
     private static func nonNegativeFinite(_ value: Double?) -> Double? {

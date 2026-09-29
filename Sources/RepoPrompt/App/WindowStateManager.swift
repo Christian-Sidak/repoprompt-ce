@@ -494,10 +494,32 @@ final class WorkspaceActivityCoordinator {
     }
 }
 
+/// Lock-protected copy of the registered window count for the MCP `tools/call` routing snapshot.
+///
+/// Published inside the same main-actor mutation that changes `WindowStatesManager.allWindows`, so
+/// it is never older than the last completed window change. Unlike a `MainActor.run` hop it does
+/// not wait behind queued main-actor work, which keeps UI load out of every tool call's admission.
+final class WindowRoutingCountMirror: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func publish(count: Int) {
+        lock.withLock { self.count = count }
+    }
+
+    func snapshot() -> (count: Int, isMultiWindowActive: Bool) {
+        let count = lock.withLock { self.count }
+        return (count, count > 1)
+    }
+}
+
 /// Manages all the open WindowState objects, letting you easily
 /// find the "latest" one or broadcast to all windows if needed.
 @MainActor
 class WindowStatesManager: ObservableObject {
+    /// Routing count for the process-wide manager; see `WindowRoutingCountMirror`.
+    nonisolated static let routingCountMirror = WindowRoutingCountMirror()
+
     private final class WeakWindowState {
         weak var value: WindowState?
 
@@ -538,7 +560,15 @@ class WindowStatesManager: ObservableObject {
     // ──────────────────────────────────────────────────────────────
 
     /// All active windows in the order they were created
-    @Published var allWindows: [WindowState] = []
+    @Published var allWindows: [WindowState] = [] {
+        didSet {
+            // Only the process-wide manager owns the routing mirror; test-created managers must not
+            // overwrite it.
+            if self === Self.shared {
+                Self.routingCountMirror.publish(count: allWindows.count)
+            }
+        }
+    }
 
     /// Any incoming URLs that arrived before a window was ready
     @Published var pendingURLs: [URL] = []

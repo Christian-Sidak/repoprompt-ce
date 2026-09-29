@@ -418,7 +418,12 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 )
                 try Task.checkCancellation()
                 try await validate(authority)
-                return try Value(reply)
+                let value = try await MCPCodeStructureReplyProjection.encodeReply(reply)
+                // Encoding suspends this actor while the worker runs, so authority can change before
+                // the value is released; revalidate after the hop.
+                try Task.checkCancellation()
+                try await validate(authority)
+                return value
             }
         }
     }
@@ -651,6 +656,10 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 toolName: MCPWindowToolName.readFile
             )
         }
+        // Encoding suspends this actor while the worker runs, so authority can change before
+        // the value is released; revalidate after the hop.
+        try Task.checkCancellation()
+        try await validate(authority)
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerResultReady)
         return value
     }
@@ -717,7 +726,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
             ?? Int(args["context_lines"]?.stringValue ?? "")
             ?? MCPWindowWorkspaceToolHelpers.parseContextAlias(args)
             ?? 0
-        let maxResults = args["max_results"]?.intValue ?? 50
+        let maxResults = args["max_results"]?.intValue ?? FileSearchResultLimits.defaultMaxResults
         let countOnly = args["count_only"]?.boolValue ?? false
         let filter = args["filter"]?.objectValue
         let includeExts = filter?["extensions"]?.arrayValue?.compactMap(\.stringValue) ?? []

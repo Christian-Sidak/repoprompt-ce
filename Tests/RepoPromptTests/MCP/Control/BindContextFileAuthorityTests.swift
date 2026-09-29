@@ -161,6 +161,48 @@ import XCTest
             }
         }
 
+        /// The validator checks the catalog ticket, then awaits the store's visible roots. A catalog
+        /// advance that lands during that suspension leaves the roots identical, so only a
+        /// post-await ticket check can observe it.
+        @MainActor
+        func testCatalogSupersededWhileValidatorAwaitsVisibleRootsRejectsAuthority() async throws {
+            let fixture = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
+            let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(
+                tabID: fixture.contextID,
+                workspaceID: fixture.workspace.id
+            )
+            let store = fixture.window.promptManager.workspaceFileContextStore
+            let workspaceManager = fixture.window.workspaceManager
+            let gate = DispatchSemaphore(value: 0)
+            addTeardownBlock { gate.signal() }
+            let occupied = expectation(description: "store isolation occupied")
+            let occupant = Task.detached {
+                await store.occupyIsolationForTesting(until: gate) { occupied.fulfill() }
+            }
+            await fulfillment(of: [occupied], timeout: 5)
+
+            // Main-queue work cannot run until the validator suspends. Its first suspension is the
+            // occupied store hop, after the synchronous ticket check has already passed, so the
+            // catalog advances exactly inside that window before the store is released.
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    workspaceManager.republishReadyRootCatalogWithNextGenerationForTesting()
+                }
+                gate.signal()
+            }
+            do {
+                try await authority.validate(workspaceManager: workspaceManager, store: store)
+                XCTFail("A catalog advanced while validation was suspended must not remain usable")
+            } catch let failure as MCPServerViewModel.FileToolAuthorityFailure {
+                XCTAssertEqual(failure, .superseded)
+            }
+
+            let releasedByInjection = await occupant.value
+            XCTAssertTrue(releasedByInjection, "store isolation was not released by the catalog injection")
+            let visibleRoots = await Set(store.rootRefs(scope: .visibleWorkspace))
+            XCTAssertEqual(visibleRoots, authority.canonicalRoots, "roots must be identical so only the ticket fences")
+        }
+
         @MainActor
         func testAffinityFailurePreservesPriorBindingAndAuthority() async throws {
             let prior = try await makeFixture(rootPaths: [makeTemporaryRoot().path])
@@ -876,6 +918,18 @@ import XCTest
 
     private enum AffinityFailure: Error {
         case injected
+    }
+
+    private extension WorkspaceFileContextStore {
+        /// Holds this actor's isolation until `gate` is signalled so a caller's hop onto the store
+        /// stays suspended. Bounded so a missed signal fails the test instead of hanging it.
+        func occupyIsolationForTesting(
+            until gate: DispatchSemaphore,
+            entered: @Sendable () -> Void
+        ) -> Bool {
+            entered()
+            return gate.wait(timeout: .now() + .seconds(10)) == .success
+        }
     }
 
     private actor RootHydrationSuspensionGate {

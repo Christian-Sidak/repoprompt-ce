@@ -14,6 +14,22 @@ enum MCPProviderProjectionWorker {
         let mainActorScheduledAt: UInt64
     }
 
+    #if DEBUG
+        struct ExecutionForTesting: Equatable {
+            let toolName: String
+            let phase: String
+            let ranOnMainThread: Bool
+        }
+
+        /// DEBUG-only observer of where each projection operation runs. Read on the main actor when a
+        /// projection is scheduled and called from the worker, so no mutable state crosses isolation.
+        @MainActor static var executionObserverForTesting: (@Sendable (ExecutionForTesting) -> Void)?
+
+        private nonisolated static func currentThreadIsMain() -> Bool {
+            Thread.isMainThread
+        }
+    #endif
+
     @MainActor
     static func run<Output: Sendable>(
         toolName: String,
@@ -63,9 +79,19 @@ enum MCPProviderProjectionWorker {
             )
         #endif
 
+        #if DEBUG
+            let executionObserver = executionObserverForTesting
+        #endif
         let worker = Task.detached(priority: priority) {
             do {
                 try Task.checkCancellation()
+                #if DEBUG
+                    executionObserver?(ExecutionForTesting(
+                        toolName: toolName,
+                        phase: phase,
+                        ranOnMainThread: currentThreadIsMain()
+                    ))
+                #endif
                 let workerState = EditFlowPerf.begin(
                     EditFlowPerf.Stage.MCPProviderProjection.workerBody,
                     EditFlowPerf.Dimensions(toolName: toolName, outcome: phase)

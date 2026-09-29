@@ -3213,78 +3213,12 @@ final class MCPReadMutationPathContractTests: XCTestCase {
         store: WorkspaceFileContextStore,
         root: URL
     ) throws -> (server: MCPServerViewModel, connectionID: UUID) {
-        let fileManager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
-        let keyManager = KeyManager(
-            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
-        )
-        let aiQueriesService = AIQueriesService(keyManager: keyManager)
-        let apiSettings = APISettingsViewModel(
-            aiQueriesService: aiQueriesService,
-            keyManager: keyManager,
-            loadStoredDataOnInit: false
-        )
-        let settingsManager = WindowSettingsManager(windowID: -859)
-        let prompt = PromptViewModel(
-            fileManager: fileManager,
-            aiQueriesService: aiQueriesService,
-            apiSettingsViewModel: apiSettings,
-            windowID: -859,
-            settingsManager: settingsManager
-        )
-        let workspaceManager = WorkspaceManagerViewModel(
-            fileManager: fileManager,
-            promptViewModel: prompt,
-            performInitialWorkspaceActivation: false
-        )
-        let workspace = WorkspaceModel(name: "Issue 859", repoPaths: [root.path])
-        workspaceManager.workspaces = [workspace]
-        workspaceManager.activeWorkspace = workspace
-        let oracle = OracleViewModel(
-            aiQueriesService: aiQueriesService,
-            promptViewModel: prompt,
-            workspaceManager: workspaceManager,
-            chatData: ChatDataService()
-        )
-        let service = MCPService(
-            hostBootstrapOperation: {},
-            controllerStartOperation: {},
-            controllerFullShutdownOperation: {}
-        )
-        let server = MCPServerViewModel(
-            service: service,
-            promptVM: prompt,
-            oracleVM: oracle,
-            workspaceManager: workspaceManager,
-            windowID: -859,
-            workspaceSearch: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
-                throw MCPError.internalError("search is not used by the file_actions regression")
-            },
-            ensureGitDataRootLoaded: { _, _ in
-                throw MCPError.internalError("Git-data loading is not used by the file_actions regression")
-            }
-        )
-        let connectionID = UUID()
-        try server.bindTabForConnection(
-            connectionID: connectionID,
-            clientName: nil,
-            tabID: XCTUnwrap(workspace.activeComposeTabID),
-            workspaceID: workspace.id,
-            windowID: -859
-        )
-        server.setRequestMetadataOverrideForTesting(
-            MCPServerViewModel.RequestMetadata(
-                connectionID: connectionID,
-                clientName: nil,
-                windowID: -859
-            )
-        )
-        return (server, connectionID)
+        try InProcessMCPWindowServerFixture.make(store: store, root: root, windowID: -859, workspaceName: "Issue 859")
     }
 
     @MainActor
     private func inProcessFileActionsTool(from server: MCPServerViewModel) async throws -> RepoPromptApp.Tool {
-        let tools = await server.windowMCPTools
-        return try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.fileActions })
+        try await InProcessMCPWindowServerFixture.tool(named: MCPWindowToolName.fileActions, from: server)
     }
 
     private func fileActionArguments(

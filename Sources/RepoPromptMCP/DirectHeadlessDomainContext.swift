@@ -324,8 +324,12 @@ actor DirectHeadlessDomainContext {
         let checked = allowMissingLeaf
             ? standardized.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(standardized.lastPathComponent)
             : standardized.resolvingSymlinksInPath()
+        // `resolvingSymlinksInPath()` strips a leading `/private`, so a root spelled
+        // `/private/var/...` must also be matched by its resolved spelling.
         guard roots.contains(where: { root in
-            checked.path == root.path || checked.path.hasPrefix(root.path + "/")
+            [root.path, root.resolvingSymlinksInPath().path].contains { rootPath in
+                checked.path == rootPath || checked.path.hasPrefix(rootPath + "/")
+            }
         }) else {
             throw Error.pathOutsideWorkspace(rawPath)
         }

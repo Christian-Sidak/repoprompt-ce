@@ -3234,6 +3234,15 @@ extension ToolOutputFormatter {
         if issues.contains(where: { $0.code == "git_root_unavailable" }) {
             return "requested root is unavailable"
         }
+        if issues.contains(where: { codeStructureGraphExhaustionCodes.contains($0.code) }) {
+            return "the root's code-map graph could not be built and is not retried automatically"
+        }
+        if issues.contains(where: { $0.code == "git_bare_repository" }) {
+            return "the root is a bare Git repository with no work tree to index"
+        }
+        if issues.contains(where: { $0.code == "git_layout_invalid" }) {
+            return "Git cannot resolve the root's repository layout"
+        }
         return issues.first.map { codeStructureSentenceFragment($0.message) } ?? "code structure is unavailable"
     }
 
@@ -3249,8 +3258,22 @@ extension ToolOutputFormatter {
         if issues.contains(where: { $0.code == "git_root_unavailable" }) {
             return "Resolve the reported root issue, then retry."
         }
+        if issues.contains(where: { codeStructureGraphExhaustionCodes.contains($0.code) }) {
+            return "Reload the workspace root to rebuild its code-map graph; retrying the same request will not help."
+        }
+        if issues.contains(where: { $0.code == "git_bare_repository" }) {
+            return "Open a checkout (work tree) of the repository instead; retrying the same request will not help."
+        }
+        if issues.contains(where: { $0.code == "git_layout_invalid" }) {
+            return "Repair the root's Git layout (for example its .git file), then reload the workspace root."
+        }
         return "Resolve the reported issue, then retry."
     }
+
+    /// Terminal graph-build states: the root's graph is not retried until the root is reloaded.
+    private static let codeStructureGraphExhaustionCodes: Set = [
+        "graph_retry_exhausted", "graph_worker_recovery_exhausted"
+    ]
 
     private static func codeStructureSizeAction(size: WorkspaceCodemapGraphOutputSize) -> String {
         switch size {
@@ -3352,8 +3375,10 @@ extension ToolOutputFormatter {
         _ issue: ToolResultDTOs.CodeStructureReplyDTO.IssueDTO
     ) -> Bool {
         switch issue.code {
-        case "codemaps_disabled", "empty_seeds", "git_root_unavailable", "graph_deadline",
-             "graph_indexing", "graph_revalidation_failed", "graph_revoked", "graph_size_limit",
+        case "codemaps_disabled", "empty_seeds", "git_bare_repository", "git_layout_invalid",
+             "git_root_unavailable", "graph_deadline",
+             "graph_indexing", "graph_retry_exhausted", "graph_revalidation_failed", "graph_revoked",
+             "graph_size_limit", "graph_worker_recovery_exhausted",
              "graph_unavailable", "path_not_found", "seed_excluded", "seed_fenced", "seed_not_indexed",
              "seed_pending", "signature_pending", "signature_publication_stale", "signature_size_limit",
              "signature_unavailable", "updates_pending", "watcher_gap_reconciling":

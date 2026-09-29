@@ -1,5 +1,6 @@
 import CoreServices
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Filters only callback entries proven ignored by the current immutable root rules.
 final class FileSystemWatcherEarlyFilter: @unchecked Sendable {

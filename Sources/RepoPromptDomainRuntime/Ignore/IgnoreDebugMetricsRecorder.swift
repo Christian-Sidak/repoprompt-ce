@@ -2,55 +2,58 @@
     import Darwin
     import Foundation
 
-    struct IgnoreDebugMetrics: Equatable, Codable {
-        var compileCallCount = 0
-        var compileRawLineCount = 0
-        var compilePatternCount = 0
-        var compileNegationPatternCount = 0
-        var compileTraversalExactPrefixCount = 0
-        var compileTraversalPatternHintCount = 0
-        var compileTraversalBroadPatternHintCount = 0
-        var compileBasenameOnlyNegationCount = 0
-        var outcomeEvaluationCount = 0
-        var patternVisitCount = 0
-        var patternMatchAttemptCount = 0
-        var outcomeZeroAttemptCount = 0
-        var outcomeOneAttemptCount = 0
-        var outcomeTwoToFourAttemptCount = 0
-        var outcomeFiveToEightAttemptCount = 0
-        var outcomeNineToSixteenAttemptCount = 0
-        var outcomeSeventeenToThirtyTwoAttemptCount = 0
-        var outcomeThirtyThreeToSixtyFourAttemptCount = 0
-        var outcomeSixtyFivePlusAttemptCount = 0
-        var maxPatternAttemptsPerOutcome = 0
-        var maxPatternVisitsPerOutcome = 0
-        var patternPrefilterCheckCount = 0
-        var patternPrefilterSkipCount = 0
-        var patternPrefilterPassCount = 0
-        var trailingDoubleStarBaseCheckCount = 0
-        var traversalRequiresCheckCount = 0
-        var traversalExactPrefixHitCount = 0
-        var traversalPatternCheckCount = 0
-        var traversalPatternHitCount = 0
-        var prefixCacheHitCount = 0
-        var prefixCacheMissCount = 0
-        var prefixCacheTraversalContinueCount = 0
-        var snapshotIgnoreLocalCacheHitCount = 0
-        var snapshotIgnoreLocalCacheMissCount = 0
-        var snapshotIgnoreReadOnlyBaseHitCount = 0
-        var hierarchicalRulesLookupCount = 0
-        var hierarchicalRulesCacheHitCount = 0
-        var hierarchicalRulesCacheMissCount = 0
-        var hierarchicalComponentEvaluationCount = 0
-        var hierarchicalLockedRulesReuseCount = 0
-        var hierarchicalLockCount = 0
-        var hierarchicalUnlockCount = 0
-        var hierarchicalOutcomeMatchCount = 0
+    package struct IgnoreDebugMetrics: Equatable, Codable {
+        package var compileCallCount = 0
+        package var compileRawLineCount = 0
+        package var compilePatternCount = 0
+        package var compileNegationPatternCount = 0
+        package var compileTraversalExactPrefixCount = 0
+        package var compileTraversalPatternHintCount = 0
+        package var compileTraversalBroadPatternHintCount = 0
+        package var compileBasenameOnlyNegationCount = 0
+        package var outcomeEvaluationCount = 0
+        package var patternVisitCount = 0
+        package var patternMatchAttemptCount = 0
+        package var outcomeZeroAttemptCount = 0
+        package var outcomeOneAttemptCount = 0
+        package var outcomeTwoToFourAttemptCount = 0
+        package var outcomeFiveToEightAttemptCount = 0
+        package var outcomeNineToSixteenAttemptCount = 0
+        package var outcomeSeventeenToThirtyTwoAttemptCount = 0
+        package var outcomeThirtyThreeToSixtyFourAttemptCount = 0
+        package var outcomeSixtyFivePlusAttemptCount = 0
+        package var maxPatternAttemptsPerOutcome = 0
+        package var maxPatternVisitsPerOutcome = 0
+        package var patternPrefilterCheckCount = 0
+        package var patternPrefilterSkipCount = 0
+        package var patternPrefilterPassCount = 0
+        package var trailingDoubleStarBaseCheckCount = 0
+        package var traversalRequiresCheckCount = 0
+        package var traversalExactPrefixHitCount = 0
+        package var traversalPatternCheckCount = 0
+        package var traversalPatternHitCount = 0
+        package var prefixCacheHitCount = 0
+        package var prefixCacheMissCount = 0
+        package var prefixCacheTraversalContinueCount = 0
+        package var snapshotIgnoreLocalCacheHitCount = 0
+        package var snapshotIgnoreLocalCacheMissCount = 0
+        package var snapshotIgnoreReadOnlyBaseHitCount = 0
+        package var hierarchicalRulesLookupCount = 0
+        package var hierarchicalRulesCacheHitCount = 0
+        package var hierarchicalRulesCacheMissCount = 0
+        package var hierarchicalComponentEvaluationCount = 0
+        package var hierarchicalLockedRulesReuseCount = 0
+        package var hierarchicalLockCount = 0
+        package var hierarchicalUnlockCount = 0
+        package var hierarchicalOutcomeMatchCount = 0
+
+        package init() {}
     }
 
-    enum IgnoreDebugMetricsRecorder {
+    package enum IgnoreDebugMetricsRecorder {
         private static let lock = NSLock()
-        private static var storage = IgnoreDebugMetrics()
+        /// Guarded by `lock`.
+        private nonisolated(unsafe) static var storage = IgnoreDebugMetrics()
         private static let enabledEnvironmentKey = "REPOPROMPT_IGNORE_METRICS_ENABLED"
         private static let replayBenchmarkVerboseEnvironmentKey = "REPOPROMPT_REPLAY_BENCHMARK_VERBOSE_TELEMETRY"
         private static let enabledDefaultsKey = "RepoPromptIgnoreMetricsEnabled"
@@ -70,39 +73,40 @@
                 || UserDefaults.standard.bool(forKey: dumpEnabledDefaultsKey)
         }()
 
-        private static var recordingEnabled = defaultRecordingEnabled
+        /// Written under `lock`; the recording fast path reads it unlocked, as before the move.
+        private nonisolated(unsafe) static var recordingEnabled = defaultRecordingEnabled
 
-        static var isRecordingEnabled: Bool {
+        package static var isRecordingEnabled: Bool {
             recordingEnabled
         }
 
-        static func setRecordingEnabledForTesting(_ enabled: Bool) {
+        package static func setRecordingEnabledForTesting(_ enabled: Bool) {
             lock.lock()
             recordingEnabled = enabled
             storage = IgnoreDebugMetrics()
             lock.unlock()
         }
 
-        static func resetRecordingEnabledForTesting() {
+        package static func resetRecordingEnabledForTesting() {
             lock.lock()
             recordingEnabled = defaultRecordingEnabled
             storage = IgnoreDebugMetrics()
             lock.unlock()
         }
 
-        static func reset() {
+        package static func reset() {
             lock.lock()
             storage = IgnoreDebugMetrics()
             lock.unlock()
         }
 
-        static func snapshot() -> IgnoreDebugMetrics {
+        package static func snapshot() -> IgnoreDebugMetrics {
             lock.lock()
             defer { lock.unlock() }
             return storage
         }
 
-        static func recordCompile(
+        package static func recordCompile(
             rawLineCount: Int,
             patternCount: Int,
             negationPatternCount: Int,
@@ -120,7 +124,7 @@
             }
         }
 
-        static func recordOutcomeEvaluation(
+        package static func recordOutcomeEvaluation(
             patternVisits: Int,
             patternAttempts: Int,
             prefilterChecks: Int = 0,
@@ -156,89 +160,89 @@
             }
         }
 
-        static func recordTrailingDoubleStarBaseCheck() {
+        package static func recordTrailingDoubleStarBaseCheck() {
             mutate { $0.trailingDoubleStarBaseCheckCount += 1 }
         }
 
-        static func recordTraversalRequiresCheck() {
+        package static func recordTraversalRequiresCheck() {
             mutate { $0.traversalRequiresCheckCount += 1 }
         }
 
-        static func recordTraversalExactPrefixHit() {
+        package static func recordTraversalExactPrefixHit() {
             mutate { $0.traversalExactPrefixHitCount += 1 }
         }
 
-        static func recordTraversalPatternCheck() {
+        package static func recordTraversalPatternCheck() {
             mutate { $0.traversalPatternCheckCount += 1 }
         }
 
-        static func recordTraversalPatternHit() {
+        package static func recordTraversalPatternHit() {
             mutate { $0.traversalPatternHitCount += 1 }
         }
 
-        static func recordPrefixCacheHit() {
+        package static func recordPrefixCacheHit() {
             mutate { $0.prefixCacheHitCount += 1 }
         }
 
-        static func recordPrefixCacheMiss() {
+        package static func recordPrefixCacheMiss() {
             mutate { $0.prefixCacheMissCount += 1 }
         }
 
-        static func recordPrefixCacheTraversalContinue() {
+        package static func recordPrefixCacheTraversalContinue() {
             mutate { $0.prefixCacheTraversalContinueCount += 1 }
         }
 
-        static func recordSnapshotIgnoreLocalCacheHit() {
+        package static func recordSnapshotIgnoreLocalCacheHit() {
             mutate { $0.snapshotIgnoreLocalCacheHitCount += 1 }
         }
 
-        static func recordSnapshotIgnoreLocalCacheMiss() {
+        package static func recordSnapshotIgnoreLocalCacheMiss() {
             mutate { $0.snapshotIgnoreLocalCacheMissCount += 1 }
         }
 
-        static func recordSnapshotIgnoreReadOnlyBaseHit() {
+        package static func recordSnapshotIgnoreReadOnlyBaseHit() {
             mutate { $0.snapshotIgnoreReadOnlyBaseHitCount += 1 }
         }
 
-        static func recordHierarchicalRulesLookup() {
+        package static func recordHierarchicalRulesLookup() {
             mutate { $0.hierarchicalRulesLookupCount += 1 }
         }
 
-        static func recordHierarchicalRulesCacheHit() {
+        package static func recordHierarchicalRulesCacheHit() {
             mutate { $0.hierarchicalRulesCacheHitCount += 1 }
         }
 
-        static func recordHierarchicalRulesCacheMiss() {
+        package static func recordHierarchicalRulesCacheMiss() {
             mutate { $0.hierarchicalRulesCacheMissCount += 1 }
         }
 
-        static func recordHierarchicalComponentEvaluation() {
+        package static func recordHierarchicalComponentEvaluation() {
             mutate { $0.hierarchicalComponentEvaluationCount += 1 }
         }
 
-        static func recordHierarchicalLockedRulesReuse() {
+        package static func recordHierarchicalLockedRulesReuse() {
             mutate { $0.hierarchicalLockedRulesReuseCount += 1 }
         }
 
-        static func recordHierarchicalLock() {
+        package static func recordHierarchicalLock() {
             mutate { $0.hierarchicalLockCount += 1 }
         }
 
-        static func recordHierarchicalUnlock() {
+        package static func recordHierarchicalUnlock() {
             mutate { $0.hierarchicalUnlockCount += 1 }
         }
 
-        static func recordHierarchicalOutcomeMatch() {
+        package static func recordHierarchicalOutcomeMatch() {
             mutate { $0.hierarchicalOutcomeMatchCount += 1 }
         }
 
-        static func resetAndDumpSnapshotIfEnabled(label: String) {
+        package static func resetAndDumpSnapshotIfEnabled(label: String) {
             guard metricsDumpEnabled else { return }
             reset()
             dumpSnapshotIfEnabled(label: label)
         }
 
-        static func dumpSnapshotIfEnabled(label: String) {
+        package static func dumpSnapshotIfEnabled(label: String) {
             guard metricsDumpEnabled else { return }
             let payload = IgnoreDebugMetricsDump(
                 label: label,
