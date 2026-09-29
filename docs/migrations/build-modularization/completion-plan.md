@@ -351,15 +351,15 @@ The frozen branch touched these areas (`git diff --stat` [M]): MCP CLI 15 files,
 
 ---
 
-## 7. Decisions still needed
+## 7. Decisions (approved 2026-09-29)
 
-| # | Decision | Options | Recommendation |
-| --- | --- | --- | --- |
-| U1 | **Scope vs. calendar.** Agent runtime (F, 18–31 agent-days) is what takes G1 past a majority (47% → 60% of edits) | (a) Keep F: 9–15 weeks. (b) Defer F: about 7–11 weeks, but G1's X1 falls to about 47% and the AgentMode cycle stays | **(a)** AgentMode is the most-edited area |
-| U2 | **Worktrees after T4** | 2, or 3 from week 3 | 2 as the default. 3 cuts the calendar to about **7–11 weeks** (then bound by the critical path: 33.5–56.5 agent-days), at the cost of more review and merge load. Only one worktree may hold a god file |
-| U3 | **X1 threshold and window** | ≥ 55% over 60 days, or a stricter ≥ 60% | ≥ 55%, because future churn may shift toward UI |
-| U4 | **X4 Sentry build** | Keep it on the PR path, make it conditional (paths or labels), or move it to `main` only | Conditional, or `main` only. Otherwise every PR pays a second app build |
-| U5 | **Plan location** | `docs/migrations/build-modularization/completion-plan.md` (allowlisted, next to the ledger), as done here, or promote it to `docs/architecture/` | Keep it next to the ledger |
+| # | Decision | Approved |
+| --- | --- | --- |
+| U1 | Scope vs. calendar | **(a) Keep wave F** (agent runtime). G1 targets 60% edit locality |
+| U2 | Worktrees | **2 to start; 3 once T4 lands and heavy-slot wait measures ≤ 5 min p90** |
+| U3 | X1 threshold and window | **≥ 55% over the trailing 60 days** |
+| U4 | Sentry build in CI | **Conditional (by path or label) or `main` only, not on every PR** (in T5) |
+| U5 | Plan location | **`docs/migrations/build-modularization/completion-plan.md`** |
 
 ---
 
