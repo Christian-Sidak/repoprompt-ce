@@ -1919,7 +1919,8 @@ class OracleViewModel: ObservableObject {
             name: session.name
         ) else { return nil }
 
-        guard contextBuilderScope?.isLive != false else { return nil }
+        // The tab already exists: link it even if the lane expired meanwhile, rather than leave an
+        // unlinked tab behind. Callers re-check the lane before any further work.
         var updatedTab = newTab
         updatedTab.selection = StoredSelection(
             selectedPaths: session.selectedFilePaths,
@@ -3198,7 +3199,9 @@ class OracleViewModel: ObservableObject {
         #if DEBUG
             if let contextBuilderScope { contextBuilderBeforeAvailabilityForTesting?(contextBuilderScope, model) }
         #endif
-        if !promptViewModel.isModelAvailable(model) {
+        // A revoked lane adds no error turn: it falls through to the bind below, which refuses and
+        // rolls back the user turn.
+        if !promptViewModel.isModelAvailable(model), contextBuilderScope?.isLive != false {
             // Show error in chat instead of silently falling back
             let errorMessage = AIChatMessage(
                 content: "Error: The model '\(model.displayName)' is not available. Please check that the \(model.providerType.displayName) API key is configured in Settings.",
@@ -3209,6 +3212,7 @@ class OracleViewModel: ObservableObject {
                 msgs.append(errorMessage)
             }
             registerMessage(errorMessage.id, sessionID: targetSessionID)
+            clearMCPSessionUIState(for: targetSessionID) // This send ends here; drop the label set for it.
             autosaveChatHistory(for: targetSessionID)
             await finalisationHub.fulfil(
                 errorMessage.id,
@@ -3547,13 +3551,24 @@ class OracleViewModel: ObservableObject {
         streamIDsByQueryId.removeValue(forKey: queryID)
         contextBuilderScopes.removeValue(forKey: queryID)
         if runStateBySession[scope.sessionID]?.activeQueryId == queryID {
+            var droppedEmptyPlaceholder = false
             withSessionMessages(scope.sessionID) { messages in
-                if let index = messages.firstIndex(where: { $0.id == queryID }) {
+                guard let index = messages.firstIndex(where: { $0.id == queryID }) else { return }
+                if messages[index].content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    // Like an ordinary cancel: keep the dispatched user turn, not an empty assistant turn.
+                    messages.remove(at: index)
+                    droppedEmptyPlaceholder = true
+                } else {
                     messages[index].setIsFinalized(true)
                 }
             }
             clearSessionStreaming(scope.sessionID)
             clearMCPSessionUIState(for: scope.sessionID)
+            // Save the admitted transcript now; the waiter's unpin can unload this chat unsaved.
+            autosaveChatHistory(for: scope.sessionID)
+            // Purge after saving, as an ordinary cancel does: the save still needs this query's
+            // session mapping to keep the lane's frozen Oracle settings.
+            if droppedEmptyPlaceholder { purgeMessageCaches(for: queryID) }
         }
         if let streamID { await aiQueriesService.cancelStream(id: streamID) }
         // fulfil is first-wins: cleanup must never replace an authoritative outcome already stored.
