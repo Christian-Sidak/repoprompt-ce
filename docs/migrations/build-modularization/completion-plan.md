@@ -283,6 +283,21 @@ The frozen branch touched these areas (`git diff --stat` [M]): MCP CLI 15 files,
 - Nothing is closed with "looks fine".
 - For **M** and **A** PRs the reviewer re-runs the move audit (§4.4) and checks its report instead of reading moved bodies.
 
+- **Reviewer model and depth (user rule, 2026-09-29).** Every slice PR and every wave gets a critical review by a **read-only GPT-6 Astra session**:
+  - `codexExec:gpt-6-astra-high` for Tooling (T0–T5) and waves A, B, and E;
+  - `codexExec:gpt-6-astra-xhigh` for waves C, D, and F (god-file carve-outs, concurrency, ordering and cancellation), and for any **L** PR in any wave that touches settlement, admission, cancellation, or actor isolation.
+- **End-of-wave review.** When a wave's last PR is up, one XHigh cross-PR review covers the whole wave. It checks:
+  - exit criteria and seam contracts met;
+  - no behavior drift across the PRs;
+  - ratchets actually gated.
+  The next wave does not start until its findings are dispositioned.
+- **Reviewers are read-only:** no GitHub writes and no edits. Reports go to `/tmp/rpce-pr-reviews/<PR>.md`, and end-of-wave reports to `/tmp/rpce-pr-reviews/wave-<X>.md`, with evidence alongside.
+- **The author dispositions each finding against the code and tests:**
+  - **CONFIRMED:** fixed, with a regression test.
+  - **REFUTED:** with evidence.
+  - **UNRESOLVED:** with what would settle it.
+  Evidence-backed pushback counts as a resolution. Severity may be re-ranked with a stated reason.
+
 ### 4.3 Validation
 
 | Check | L | A | M | Wave exit |
