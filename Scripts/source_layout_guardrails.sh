@@ -810,6 +810,7 @@ allowed_tracked_docs=(
   "docs/migrations/build-modularization/ledger.md"
   "docs/migrations/build-modularization/ratchets.json"
   "docs/open-source-readiness.md"
+  "docs/plans/modularization-completion-plan.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"
   "docs/testing.md"
