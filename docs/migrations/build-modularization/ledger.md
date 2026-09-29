@@ -16,6 +16,10 @@ Living record for [`../build-modularization-2026-09-28.md`](../build-modularizat
 
 Self-tests: `make conductor-selftest` (includes `test_modularization_metrics.py`, `test_modularization_index_graph.py`, `test_conductor_job_timings.py`, and `test_conductor_job_phases.py`).
 
+## T0 — move-audit tooling (2026-09-29)
+
+Added a fail-closed Git move audit (manifest, normalized SHA-256, similarity, import/access-only and discovery checks), dry-run diagnostics-driven `package` access lift, dry-run test-import retarget helper, and `make new-module` checklist. The helpers make no Swift changes in this slice. T0's Python regressions use temporary Git repositories and run in `make conductor-selftest`. The audit's first-party import allowlist is derived from first-party source/test targets and `Package.swift` at the compared revisions; unchanged external imports remain valid.
+
 ## Ratchet policy
 
 - **Gated** (CI fails on any increase): `app_files_over_5000_lines`, `app_static_shared_declarations`.
