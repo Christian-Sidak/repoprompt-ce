@@ -1,8 +1,8 @@
 // MARK: - DEBUG Worktree Startup Benchmark Diagnostics
 
 import Foundation
-import RepoPromptInstrumentation
 import MCP
+import RepoPromptInstrumentation
 
 #if DEBUG
     extension ServerNetworkManager {

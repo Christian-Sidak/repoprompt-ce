@@ -1,5 +1,5 @@
-import RepoPromptInstrumentation
 import OSLog
+import RepoPromptInstrumentation
 
 /// Privacy-safe spawn-attempt diagnostics for git children.
 ///

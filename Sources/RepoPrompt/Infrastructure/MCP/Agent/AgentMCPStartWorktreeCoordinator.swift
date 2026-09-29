@@ -1,6 +1,6 @@
 import Foundation
-import RepoPromptInstrumentation
 import MCP
+import RepoPromptInstrumentation
 import RepoPromptProcess
 import RepoPromptWorkspaceCore
 
@@ -71,19 +71,22 @@ struct AgentMCPStartWorktreeCoordinator {
     let gitTargetResolver: GitRepoTargetResolver
     private let transitionObserver: TransitionObserver?
     private let preBindingCommitObserver: PreBindingCommitObserver?
+    private let startupPhaseEventSink: any WorktreeStartupPhaseEventSink
 
     init(
         operationName: String,
         vcsService: VCSService,
         gitTargetResolver: GitRepoTargetResolver,
         transitionObserver: TransitionObserver? = nil,
-        preBindingCommitObserver: PreBindingCommitObserver? = nil
+        preBindingCommitObserver: PreBindingCommitObserver? = nil,
+        startupPhaseEventSink: any WorktreeStartupPhaseEventSink
     ) {
         self.operationName = operationName
         self.vcsService = vcsService
         self.gitTargetResolver = gitTargetResolver
         self.transitionObserver = transitionObserver
         self.preBindingCommitObserver = preBindingCommitObserver
+        self.startupPhaseEventSink = startupPhaseEventSink
     }
 
     func containsArguments(_ args: [String: Value]) -> Bool {
@@ -172,7 +175,10 @@ struct AgentMCPStartWorktreeCoordinator {
             guard startupContext.agentSessionID == targetSessionID else {
                 throw MCPError.internalError("\(operationName) startup context does not belong to the target Agent session.")
             }
-            WorktreeStartupInstrumentation.record(.worktreePreparationStarted, context: startupContext)
+            startupPhaseEventSink.record(WorktreeStartupPhaseEvent(
+                phase: .worktreePreparationStarted,
+                context: startupContext
+            ))
         }
         try Task.checkCancellation()
         if request.hasExplicitWorktreeArgs {

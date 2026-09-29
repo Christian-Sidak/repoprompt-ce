@@ -1,7 +1,7 @@
 import Foundation
-import RepoPromptInstrumentation
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptInstrumentation
 import RepoPromptWorkspaceCore
 
 struct WorkspaceRootBindingProjection: Equatable {

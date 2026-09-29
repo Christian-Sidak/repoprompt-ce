@@ -1,9 +1,9 @@
 import CryptoKit
 import Darwin
 import Foundation
-import RepoPromptInstrumentation
 import OSLog
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import RepoPromptProcess
 import RepoPromptWorkspaceCore
 

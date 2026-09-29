@@ -4,6 +4,17 @@ import RepoPromptInstrumentation
     import CryptoKit
 #endif
 
+struct AppWorktreeStartupPhaseEventSink: WorktreeStartupPhaseEventSink {
+    func record(_ event: WorktreeStartupPhaseEvent) {
+        WorktreeStartupInstrumentation.record(
+            event.phase,
+            context: event.context,
+            route: event.route,
+            fallback: event.fallback
+        )
+    }
+}
+
 extension WorktreeStartupFeatureFlags {
     static func current(defaults: UserDefaults = .standard) -> Self {
         #if DEBUG

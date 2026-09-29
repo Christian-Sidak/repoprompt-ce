@@ -1,11 +1,11 @@
 import Foundation
 
-package enum WorktreeStartupServingControl: Equatable {
+package enum WorktreeStartupServingControl: Equatable, Sendable {
     case automatic
     case forceFullCrawl
 }
 
-package struct WorktreeStartupFeatureFlags: Equatable {
+package struct WorktreeStartupFeatureFlags: Equatable, Sendable {
     package static let observeDefaultsKey = "observeDiffSeededWorktreeStartup"
     package static let serveDefaultsKey = "serveDiffSeededWorktreeStartup"
 
@@ -21,11 +21,9 @@ package struct WorktreeStartupFeatureFlags: Equatable {
         self.serveDiffSeededWorktreeStartup = serveDiffSeededWorktreeStartup
             && observeDiffSeededWorktreeStartup
     }
-
-
 }
 
-package struct WorktreeStartupContext: Equatable {
+package struct WorktreeStartupContext: Equatable, Sendable {
     package let agentSessionID: UUID
     package let correlationID: UUID
     package let flags: WorktreeStartupFeatureFlags
@@ -42,16 +40,15 @@ package struct WorktreeStartupContext: Equatable {
         self.flags = flags
         self.servingControl = servingControl
     }
-
 }
 
-package enum WorkspaceRootStartupRoute: String, Equatable {
+package enum WorkspaceRootStartupRoute: String, Equatable, Sendable {
     case fullCrawl
     case diffSeedObservation
     case diffSeedServing
 }
 
-package enum WorkspaceRootSeedFallbackReason: String, Equatable {
+package enum WorkspaceRootSeedFallbackReason: String, Equatable, Sendable {
     case noReceipt
     case expiredReceipt
     case unsupportedDestination
@@ -95,7 +92,7 @@ package enum WorkspaceRootSeedFallbackReason: String, Equatable {
     case cancellation
 }
 
-package enum WorktreeStartupPhase: String, Equatable {
+package enum WorktreeStartupPhase: String, Equatable, Sendable {
     case agentRunStarted
     case worktreePreparationStarted
     case bindingTransitionStarted
@@ -125,7 +122,37 @@ package enum WorktreeStartupPhase: String, Equatable {
     case failed
 }
 
-package enum GitProcessCommandFamily: String, Equatable {
+/// Bounded phase record. The app owns storage, timestamps, and log output.
+package struct WorktreeStartupPhaseEvent: Equatable, Sendable {
+    package let phase: WorktreeStartupPhase
+    package let context: WorktreeStartupContext
+    package let route: WorkspaceRootStartupRoute?
+    package let fallback: WorkspaceRootSeedFallbackReason?
+
+    package init(
+        phase: WorktreeStartupPhase,
+        context: WorktreeStartupContext,
+        route: WorkspaceRootStartupRoute? = nil,
+        fallback: WorkspaceRootSeedFallbackReason? = nil
+    ) {
+        self.phase = phase
+        self.context = context
+        self.route = route
+        self.fallback = fallback
+    }
+}
+
+package protocol WorktreeStartupPhaseEventSink: Sendable {
+    func record(_ event: WorktreeStartupPhaseEvent)
+}
+
+package struct NoopWorktreeStartupPhaseEventSink: WorktreeStartupPhaseEventSink {
+    package init() {}
+
+    package func record(_: WorktreeStartupPhaseEvent) {}
+}
+
+package enum GitProcessCommandFamily: String, Equatable, Sendable {
     case treeResolution
     case treeInventory
     case treeDelta
