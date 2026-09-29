@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import io
+import hashlib
+import json
+import os
+import tarfile
 import subprocess
 import sys
 import tempfile
@@ -15,6 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import ci_app_test_runner as runner  # noqa: E402
+import modularization_ci_artifact as artifact  # noqa: E402
 
 
 class InterpreterCompatibilityTests(unittest.TestCase):
@@ -28,6 +33,82 @@ class InterpreterCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Run deterministic RepoPrompt CE XCTest suites.", result.stdout)
+
+
+class HostedShardTests(unittest.TestCase):
+    def test_list_uses_skip_build_for_transferred_artifact(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, stdout='RepoPromptTests.ExampleTests/testOne\n')
+        with mock.patch.object(runner.subprocess, 'run', return_value=completed) as run:
+            found = runner.list_suite_methods('swift', Path('/checkout'), skip_build=True)
+        self.assertEqual(found, {'RepoPromptTests.ExampleTests': ('RepoPromptTests.ExampleTests/testOne',)})
+        self.assertEqual(run.call_args.args[0], ['swift', 'test', 'list', '--skip-build'])
+
+
+class TransferredBuildTests(unittest.TestCase):
+    def test_archive_contains_only_runnable_products_and_gate_attestations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'source'
+            copy = Path(temporary) / 'copy'
+            app = source / 'Sources/RepoPrompt/App'
+            app.mkdir(parents=True)
+            (app / 'Main.swift').write_text('struct Main {}\n')
+            test_source = source / 'Tests/RepoPromptTests/ExampleTests.swift'
+            test_source.parent.mkdir(parents=True)
+            test_source.write_text('import XCTest\n')
+            metadata = source / '.build/modularization'
+            metadata.mkdir(parents=True)
+            digest = hashlib.sha256((app / 'Main.swift').read_bytes()).hexdigest()
+            for name in ('app-source-sha256.json', 'index-check.json'):
+                (metadata / name).write_text(json.dumps({'source_sha256': {'App/Main.swift': digest}}))
+            (metadata / 'ci-test-list.txt').write_text('RepoPromptTests.ExampleTests/testOne\n')
+            (metadata / 'test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(test_source.read_bytes()).hexdigest()}}))
+            products = source / '.build/out/Products/Debug'
+            bundle = products / 'RepoPromptTests.xctest'
+            bundle.mkdir(parents=True)
+            (bundle / 'test-binary').write_bytes(b'test')
+            (bundle / 'alias').symlink_to('test-binary')
+            resource = products / 'Example.bundle'
+            resource.mkdir()
+            (resource / 'resource').write_bytes(b'data')
+            (products / 'unused.o').write_bytes(b'object')
+            checkout = source / '.build/checkouts/example'
+            checkout.mkdir(parents=True)
+            (checkout / 'source.swift').write_text('not transferred')
+            archive = Path(temporary) / 'build.tar.gz'
+            artifact.pack(source, archive)
+            (copy / 'Sources/RepoPrompt/App').mkdir(parents=True)
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Main {}\n')
+            copied_test = copy / 'Tests/RepoPromptTests/ExampleTests.swift'
+            copied_test.parent.mkdir(parents=True)
+            copied_test.write_text('import XCTest\n')
+            with tarfile.open(archive, 'r:gz') as stream:
+                stream.extractall(copy, filter='data')
+            self.assertTrue((copy / '.build/out/Products/Debug/RepoPromptTests.xctest/alias').is_symlink())
+            self.assertFalse((copy / '.build/out/Products/Debug/unused.o').exists())
+            self.assertFalse((copy / '.build/checkouts').exists())
+            self.assertIsNone(runner.verify_transferred_build(copy))
+            copied_test.write_text('import Testing\n')
+            self.assertIn('test sources do not match', runner.verify_transferred_build(copy))
+            (copy / '.build/modularization/test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(copied_test.read_bytes()).hexdigest()}}))
+            self.assertIn('cannot run Swift Testing', runner.verify_transferred_build(copy))
+            copied_test.write_text('import XCTest\n')
+            (copy / '.build/modularization/test-source-sha256.json').write_text(
+                json.dumps({'source_sha256': {'RepoPromptTests/ExampleTests.swift':
+                                             hashlib.sha256(copied_test.read_bytes()).hexdigest()}}))
+            discovered = runner.discover_test_bundles('swift', copy, prebuilt_bin_path=artifact.validate(copy))
+            self.assertIn('RepoPromptTests', discovered)
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Other {}\n')
+            self.assertIn('do not match', runner.verify_transferred_build(copy))
+            (copy / 'Sources/RepoPrompt/App/Main.swift').write_text('struct Main {}\n')
+            (copy / '.build/modularization/index-check.json').unlink()
+            self.assertIn('metadata missing', runner.verify_transferred_build(copy))
+            (metadata / 'index-check.json').unlink()
+            with self.assertRaises(ValueError):
+                artifact.pack(source, archive)
 
 
 class LocalExecutionTests(unittest.TestCase):
