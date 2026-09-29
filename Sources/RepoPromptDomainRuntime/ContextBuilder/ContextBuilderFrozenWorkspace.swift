@@ -6,7 +6,9 @@ import MCP
 package struct ContextBuilderDiscoveryAuthorizedPath: Equatable, Sendable {
     /// Absolute path spelled under the frozen physical root that owns it.
     package let absolutePath: String
-    /// Root-relative path, prefixed with the root's folder name when there are several roots.
+    /// The spelling shown to the provider, the client, and the pack. With one root it is
+    /// root-relative. With several it is `<root label>/<relative path>` when that spelling resolves
+    /// back to exactly this file, and the absolute path otherwise. `authorize` accepts it.
     package let displayPath: String
     package let byteCount: Int
 }
@@ -16,6 +18,12 @@ package struct ContextBuilderDiscoveryAuthorizedPath: Equatable, Sendable {
 /// policy as `read_file`, `file_search`, `get_file_tree`, and `get_code_structure`), and the
 /// adapter's mutation hook always refuses. Selected paths are admitted through
 /// `HeadlessReadAuthority`, the headless explicit-read authority.
+///
+/// Path spellings round-trip. Every path discovery shows (search results, tree headings, the staged
+/// selection, selected paths, pack provenance) is accepted back by `authorize` and by the read
+/// tools, and names the same file. With several roots, a relative spelling may lead with a root's
+/// label (its folder name, or its full path when another root shares the folder name). A spelling
+/// that could name two different entries is refused as `ambiguous_across_roots`, never guessed.
 package struct ContextBuilderFrozenWorkspace: Sendable {
     package static let readToolNames: Set<String> = [
         "get_file_tree",
@@ -57,18 +65,25 @@ package struct ContextBuilderFrozenWorkspace: Sendable {
         guard Self.readToolNames.contains(tool) else {
             throw MCPError.invalidParams("\(tool) is not a discovery read tool")
         }
+        let arguments = try resolvingPathArguments(of: tool, in: arguments)
         let frozen = DomainCanonicalWorkspaceSnapshot(
             identity: snapshot.identity,
             roots: snapshot.roots,
             prompt: snapshot.prompt,
             selection: stagedSelection
         )
+        var presentPath: DomainCanonicalWorkspaceAdapter.PresentPath?
+        if snapshot.roots.count > 1 {
+            let workspace = self
+            presentPath = { url, _ in workspace.presentedPath(of: url) }
+        }
         let service = MCPDomainCanonicalWorkspaceService(adapter: DomainCanonicalWorkspaceAdapter(
             toolSnapshot: { _ in frozen },
             readSnapshot: { _ in frozen },
             mutate: { _, _ in throw ContextBuilderDiscoveryError.readOnlyWorkspace },
             resolvePath: resolvePath,
-            ignoreConfiguration: ignoreConfiguration
+            ignoreConfiguration: ignoreConfiguration,
+            presentPath: presentPath
         ))
         let request = try DomainPhysicalReadRequest(
             request: DomainPhysicalToolRequest(
@@ -97,9 +112,9 @@ package struct ContextBuilderFrozenWorkspace: Sendable {
         return try String(decoding: encoder.encode(value), as: UTF8.self)
     }
 
-    /// Admits `rawPath` as a selectable file: inside one frozen root (a relative path must exist
-    /// under exactly one), not a symbolic link and without a symlinked component (per the
-    /// `skip_symlinks` policy), canonically contained, a regular file, and within the read limit.
+    /// Admits `rawPath` as a selectable file: inside one frozen root (see the type's spelling rules),
+    /// not a symbolic link and without a symlinked component (per the `skip_symlinks` policy),
+    /// canonically contained, a regular file, and within the read limit.
     package func authorize(
         _ rawPath: String,
         skipSymlinks: Bool
@@ -109,20 +124,10 @@ package struct ContextBuilderFrozenWorkspace: Sendable {
             throw ContextBuilderDiscoveryError.invalidSelectedPath(path: rawPath, reason: "empty_path")
         }
         let logical: String
-        if trimmed.hasPrefix("/") {
-            logical = URL(fileURLWithPath: trimmed).standardizedFileURL.path
-        } else {
-            let candidates = snapshot.roots.map {
-                URL(fileURLWithPath: $0.path + "/" + trimmed).standardizedFileURL.path
-            }.filter { candidate in
-                var status = stat()
-                return lstat(candidate, &status) == 0
-            }
-            guard candidates.count <= 1 else {
-                throw ContextBuilderDiscoveryError.invalidSelectedPath(path: rawPath, reason: "ambiguous_across_roots")
-            }
-            logical = candidates.first ?? URL(fileURLWithPath: (snapshot.roots.first?.path ?? "") + "/" + trimmed)
-                .standardizedFileURL.path
+        do {
+            logical = try resolveSpelling(trimmed)
+        } catch is AmbiguousSpelling {
+            throw ContextBuilderDiscoveryError.invalidSelectedPath(path: rawPath, reason: "ambiguous_across_roots")
         }
         guard let owner = owningRoot(of: logical) else {
             throw ContextBuilderDiscoveryError.invalidSelectedPath(path: rawPath, reason: "outside_root")
@@ -212,9 +217,107 @@ package struct ContextBuilderFrozenWorkspace: Sendable {
         return snapshot.roots.indices.map { rootLabel($0) }
     }
 
+    /// The discovery spelling of an enumerated file or directory, or nil outside every root.
+    /// Used for `file_search` results and tree headings when there are several roots.
+    func presentedPath(of url: URL) -> String? {
+        let logical = url.standardizedFileURL.path
+        for (index, root) in snapshot.roots.enumerated()
+            where HeadlessPathSpelling.equivalentPaths(root).contains(logical)
+        {
+            return rootLabel(index)
+        }
+        guard let owner = owningRoot(of: logical) else { return nil }
+        return displayPath(rootIndex: owner.rootIndex, relativePath: owner.relativePath)
+    }
+
     private func displayPath(rootIndex: Int, relativePath: String) -> String {
         guard snapshot.roots.count > 1 else { return relativePath }
-        return rootLabel(rootIndex) + "/" + relativePath
+        let absolute = URL(fileURLWithPath: snapshot.roots[rootIndex].path + "/" + relativePath).standardizedFileURL.path
+        let qualified = rootLabel(rootIndex) + "/" + relativePath
+        // The short spelling is shown only when it resolves back to exactly this entry; otherwise
+        // (another root holds `<label>/<relative path>` itself) the absolute path is shown.
+        return (try? resolveSpelling(qualified)) == absolute ? qualified : absolute
+    }
+
+    private struct AmbiguousSpelling: Error {
+        let candidates: [String]
+    }
+
+    /// The logical absolute path a spelling names. An absolute spelling is standardized. A relative
+    /// one is read under every root, and, with several roots, also as `<root label>/<rest>`; the
+    /// readings that exist must all be one entry (`AmbiguousSpelling` otherwise). When none exists,
+    /// the root-qualified reading (else the first root's) is returned for the caller to refuse.
+    private func resolveSpelling(_ trimmed: String) throws -> String {
+        if trimmed.hasPrefix("/") {
+            return URL(fileURLWithPath: trimmed).standardizedFileURL.path
+        }
+        var readings: [String] = []
+        if snapshot.roots.count > 1 {
+            for (index, root) in snapshot.roots.enumerated() {
+                let label = rootLabel(index)
+                // A full-path label is an absolute spelling, handled above.
+                guard !label.hasPrefix("/") else { continue }
+                if trimmed == label {
+                    readings.append(root.path)
+                } else if trimmed.hasPrefix(label + "/") {
+                    readings.append(root.path + "/" + trimmed.dropFirst(label.count + 1))
+                }
+            }
+        }
+        readings += snapshot.roots.map { $0.path + "/" + trimmed }
+        var seen: Set<String> = []
+        readings = readings.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+            .filter { seen.insert($0).inserted }
+        var existing: [(path: String, device: dev_t, inode: ino_t)] = []
+        for reading in readings {
+            var status = stat()
+            guard lstat(reading, &status) == 0,
+                  !existing.contains(where: { $0.device == status.st_dev && $0.inode == status.st_ino })
+            else { continue }
+            existing.append((reading, status.st_dev, status.st_ino))
+        }
+        guard existing.count <= 1 else { throw AmbiguousSpelling(candidates: existing.map(\.path)) }
+        return existing.first?.path ?? readings.first ?? trimmed
+    }
+
+    /// Resolves the path arguments of a read tool to absolute paths when there are several roots,
+    /// so a root-qualified spelling reads the file it names. Ambiguous spellings are refused with
+    /// their unambiguous alternatives; spellings that name nothing are left to the read tool's own
+    /// errors.
+    private func resolvingPathArguments(of tool: String, in arguments: [String: Value]) throws -> [String: Value] {
+        guard snapshot.roots.count > 1 else { return arguments }
+        func resolved(_ raw: String) throws -> String {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("/") else { return raw }
+            let logical: String
+            do {
+                logical = try resolveSpelling(trimmed)
+            } catch let error as AmbiguousSpelling {
+                throw MCPError.invalidParams(
+                    "ambiguous_across_roots: '\(trimmed)' names more than one entry; use one of: "
+                        + error.candidates.joined(separator: ", ")
+                )
+            }
+            var status = stat()
+            return lstat(logical, &status) == 0 ? logical : raw
+        }
+        var arguments = arguments
+        switch tool {
+        case "read_file", "get_file_tree":
+            if let raw = arguments["path"]?.stringValue {
+                arguments["path"] = try .string(resolved(raw))
+            }
+        case "get_code_structure":
+            if case let .array(items)? = arguments["paths"] {
+                arguments["paths"] = try .array(items.map { item in
+                    guard case let .string(raw) = item else { return item }
+                    return try .string(resolved(raw))
+                })
+            }
+        default:
+            break
+        }
+        return arguments
     }
 
     /// The root's folder name, or its full path when another root shares the folder name.

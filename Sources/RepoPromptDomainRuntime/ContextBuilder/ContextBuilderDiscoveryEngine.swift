@@ -16,6 +16,11 @@ import MCP
 ///
 /// No step before the commit writes to the context. A failure after the pack is stored and before
 /// or during the commit leaves at most one unreferenced content-addressed pack artifact.
+///
+/// The commit is the settlement boundary. Cancellation observed before it throws
+/// `CancellationError` with nothing written. Once the committer returns, the run returns its
+/// outcome even if the task was cancelled meanwhile: the selection is written, so a caller must be
+/// told so, and it owns reporting whatever it does next (see `ContextBuilderDiscoveryOutcome`).
 package struct ContextBuilderDiscoveryEngine: Sendable {
     package typealias Sleep = @Sendable (Duration) async throws -> Void
 
@@ -372,6 +377,7 @@ package struct ContextBuilderDiscoveryEngine: Sendable {
         let reference = try await OracleFrozenPackReference(artifactID: packStore.storeArtifact(data))
         try Task.checkCancellation()
         let receipt = try await committer.commitSelection(files.map(\.absolutePath), over: workspace.snapshot)
+        // Committed: nothing below may throw or observe cancellation.
         return ContextBuilderDiscoveryOutcome(
             context: workspace.snapshot.identity,
             selection: files.map(\.absolutePath),
@@ -480,6 +486,11 @@ package enum ContextBuilderDiscoveryPrompt {
         let roots = zip(workspace.rootDisplayNames, workspace.snapshot.roots).map { name, root in
             name == root.path ? "- \(root.path)" : "- \(name): \(root.path)"
         }.joined(separator: "\n")
+        let pathRule = if workspace.snapshot.roots.count > 1 {
+            "Paths are written as tool results show them: `<root label>/<path in that root>` (labels are listed in <workspace_roots>), or absolute under a root. A path without its root label is accepted only when it exists under exactly one root, and a path that could name two different files is rejected as ambiguous."
+        } else {
+            "Paths are relative to a workspace root or absolute under one."
+        }
         return """
         <discovery_protocol version="\(protocolVersion)">
         You are the discovery agent for RepoPrompt's headless Context Builder. Find the workspace files a follow-up model needs for the user's task, then finish with a clarified task prompt and the selected files. Do not solve the task yourself.
@@ -501,7 +512,7 @@ package enum ContextBuilderDiscoveryPrompt {
         - manage_selection {"op": "get"|"add"|"remove"|"set"|"clear", "paths"?: [string]}: edit the staged selection. Nothing is written to the workspace until you finish.
 
         Rules:
-        - Paths are relative to a workspace root or absolute under one. Only regular files inside the roots can be selected; symbolic links, directories, and paths outside the roots are rejected, and a final selection that contains one fails the whole run.
+        - \(pathRule) Only regular files inside the roots can be selected; symbolic links, directories, and paths outside the roots are rejected, and a final selection that contains one fails the whole run.
         - Select at most \(limits.maximumSelectedFiles) files. Prefer the smallest set that fully covers the task.
         - You have at most \(limits.maximumTurns) replies. Any other tool name is refused.
         </discovery_protocol>

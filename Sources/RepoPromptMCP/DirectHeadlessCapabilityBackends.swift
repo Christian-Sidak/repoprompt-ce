@@ -842,8 +842,14 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     }
 
     /// Opt-in raw-instruction Context Builder (M17): discover and commit the selection over the
-    /// bound context, then feed the frozen pack to the planned Oracle route. A discovery failure
-    /// writes no selection and runs no Oracle.
+    /// bound context, then feed the frozen pack to the planned Oracle route.
+    ///
+    /// Settlement is split at the commit. Before it (discovery failure or cancellation) nothing is
+    /// written and the error propagates unchanged. After it, every failure of the Oracle step,
+    /// cancellation included, is reported as `oracle_*_after_discovery` with what was committed
+    /// (see `settlementAfterDiscovery`); it is never a bare cancellation. The Oracle step's
+    /// child-launch carriers are prepared only here, after the commit, through the invocation's
+    /// single-use handoff.
     private func buildDiscoveredContext(
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         arguments: [String: Value],
@@ -852,60 +858,129 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         guard let contextDiscovery else {
             throw MCPError.internalError("Context Builder discovery is planned but not configured for this runtime.")
         }
+        let handoff = DomainChildLaunchContext.handoff
+        // Checked before discovery, so a missing preparation port can never strand a commit.
+        if route.oracle != .none, handoff == nil {
+            throw DirectHeadlessOracleAdapter.AdapterError.missingPreparedInvocation
+        }
         let outcome = try await contextDiscovery.run(
             instructions: route.instructions,
             mode: route.mode,
             model: route.discoveryModel,
             request: request
         )
+        // Committed from here on.
         var fields = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
-        switch route.oracle {
-        case .none:
-            return try .object(fields)
-        case let .direct(modelID):
-            let conversation: (id: UUID, response: String)
-            do {
-                conversation = try await providerCoordinator.createConversation(
-                    providerID: route.discoveryModel.providerID,
-                    message: outcome.pack.content,
-                    model: modelID,
-                    request: request
-                )
-            } catch {
-                throw Self.oracleFailedAfterDiscovery(error, outcome: outcome)
+        guard route.oracle != .none, let handoff else { return try .object(fields) }
+        do {
+            let bundle = try await handoff.prepare()
+            let oracleFields = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
+                try await DomainChildLaunchContext.$current.withValue(bundle.singleCarrier) {
+                    try await self.runDiscoveredOracle(
+                        route: route,
+                        outcome: outcome,
+                        arguments: arguments,
+                        request: request
+                    )
+                }
             }
-            fields["chat_id"] = .string(conversation.id.uuidString)
-            fields["response"] = .string(conversation.response)
-            return try .object(fields)
-        case .group:
-            let grouped: Value
-            do {
-                grouped = try await oracleAdapter.buildContext(
-                    arguments: arguments,
-                    request: request,
-                    discoveredInput: outcome.oracleInput()
-                )
-            } catch {
-                throw Self.oracleFailedAfterDiscovery(error, outcome: outcome)
-            }
-            guard case let .object(groupFields) = grouped else { return try .mcp(grouped) }
             // The group's own `status` (a failed lane set reports `failed`) wins over discovery's.
-            fields.merge(groupFields) { _, group in group }
+            fields.merge(oracleFields) { _, oracle in oracle }
             return try .object(fields)
+        } catch {
+            throw Self.settlementAfterDiscovery(
+                error,
+                cancelled: Task.isCancelled,
+                outcome: outcome,
+                route: route,
+                request: request
+            )
         }
     }
 
-    /// The selection is already committed and the pack persisted when the Oracle step fails; say so,
-    /// and hand back the pack reference so a grouped retry can use `context_pack_ref`.
-    private static func oracleFailedAfterDiscovery(
+    private func runDiscoveredOracle(
+        route: DirectHeadlessOracleAdapter.DiscoveryRoute,
+        outcome: ContextBuilderDiscoveryOutcome,
+        arguments: [String: Value],
+        request: DomainPhysicalToolRequest
+    ) async throws -> [String: Value] {
+        switch route.oracle {
+        case .none:
+            return [:]
+        case let .direct(modelID):
+            let (id, response) = try await providerCoordinator.createConversation(
+                providerID: route.discoveryModel.providerID,
+                message: outcome.pack.content,
+                model: modelID,
+                request: request
+            )
+            return [
+                "chat_id": .string(id.uuidString),
+                "response": .string(response)
+            ]
+        case .group:
+            let grouped = try await oracleAdapter.buildContext(
+                arguments: arguments,
+                request: request,
+                discoveredInput: outcome.oracleInput()
+            )
+            guard case let .object(groupFields) = grouped else {
+                throw MCPError.internalError("The grouped Oracle step returned a non-object result.")
+            }
+            return groupFields
+        }
+    }
+
+    /// Reports an Oracle step that did not complete after discovery committed. The failure says
+    /// what is already true: the selection (`mutation_state`, the commit's `operation_id`), the
+    /// persisted pack, and how to resume without rediscovering. A grouped roster resumes with
+    /// `context_pack_ref`; a roster of one has no pack-reference route, so replaying the raw
+    /// instructions rediscovers over the committed selection (an identical selection is a no-op
+    /// commit). A committed selection is never reported as retryable, so a host does not replay it
+    /// blindly.
+    static func settlementAfterDiscovery(
         _ error: Error,
-        outcome: ContextBuilderDiscoveryOutcome
-    ) -> Error {
-        if error is CancellationError { return error }
-        let underlying = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-        return MCPError.internalError(
-            "oracle_failed_after_discovery: \(underlying) Discovery committed \(outcome.selection.count) selected file(s) "
-                + "and persisted \(outcome.packReference.rawValue)."
+        cancelled taskCancelled: Bool,
+        outcome: ContextBuilderDiscoveryOutcome,
+        route: DirectHeadlessOracleAdapter.DiscoveryRoute,
+        request: DomainPhysicalToolRequest
+    ) -> MCPDomainToolFailure {
+        let cancelled = taskCancelled || MCPToolExecutionCancelledError.matches(error)
+        let underlying = cancelled
+            ? "The Oracle step was cancelled."
+            : "The Oracle step failed: " + ((error as? LocalizedError)?.errorDescription ?? String(describing: error))
+        let committed = outcome.receipt.applied
+        var details = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
+        details["status"] = .string(cancelled ? "oracle_cancelled" : "oracle_failed")
+        let resume: String
+        if case .group = route.oracle {
+            var resumeArguments: [String: Value] = ["context_pack_ref": .string(outcome.packReference.rawValue)]
+            if let responseType = route.responseType {
+                resumeArguments["response_type"] = .string(responseType)
+            }
+            details["resume"] = .object([
+                "tool": .string("context_builder"),
+                "arguments": .object(resumeArguments)
+            ])
+            resume = "Resume the Oracle step with context_builder context_pack_ref=\(outcome.packReference.rawValue); "
+                + "it reuses this pack without rediscovering."
+        } else {
+            resume = "Replaying the raw instructions reruns discovery over the committed selection."
+        }
+        let selectionText = committed
+            ? "Discovery committed \(outcome.selection.count) selected file(s)"
+            : "The context already held the \(outcome.selection.count) discovered file(s)"
+        return MCPDomainToolFailure(
+            toolName: "context_builder",
+            code: cancelled ? "oracle_cancelled_after_discovery" : "oracle_failed_after_discovery",
+            message: "\(underlying) \(selectionText) and persisted \(outcome.packReference.rawValue). \(resume)",
+            retryability: committed ? .indeterminate : (cancelled ? .retryable : .permanent),
+            mutationState: committed
+                ? DomainProtectedMutationState.applied.rawValue
+                : DomainProtectedMutationState.notApplied.rawValue,
+            operationID: committed ? request.securityContext?.invocationID.uuidString : nil,
+            settlement: "discovery_committed",
+            details: details
         )
     }
 }

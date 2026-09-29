@@ -1244,13 +1244,116 @@ Remaining gaps:
   pack carries no codemaps or file tree.
 - Grouped lane carriers are prepared at admission and keep the 60-second launch-token lifetime.
   After a longer discovery, lane children cannot redeem the private tool endpoint. The pack itself
-  is self-contained.
+  is self-contained. (Fixed in M18: carriers are minted at the post-commit handoff.)
 - A run rejected at or after the content-addressed store can leave one unreferenced pack artifact.
   There is no artifact collection.
 - The discovery `codex` process can still read files through its own sandboxed shell. The
   authority bounds what is selected, packed, and committed, not what the model reads.
 - `export_response` is still ignored by direct headless.
 - A per-call opt-in needs a shared-schema change that the app must also accept or reject.
+
+### M18 — discovery settlement, handoff carriers, and multi-root spellings
+
+M18 repairs three M17 defects found in independent review. No feature scope was added.
+
+- **Post-commit settlement.** The discovery commit is the settlement boundary.
+  `ContextBuilderDiscoveryEngine` observes cancellation before the commit (`CancellationError`,
+  nothing written, at most one unreferenced pack) and never after it: once the committer returns,
+  the outcome is returned even if the task was cancelled meanwhile. M17's backend rethrew a bare
+  `CancellationError` when the Oracle step was cancelled, so a client was told nothing about the
+  selection already written. `DirectHeadlessConversationBackend.buildDiscoveredContext` now reports
+  every failure after the commit, cancellation included, through `settlementAfterDiscovery` as an
+  `MCPDomainToolFailure`:
+  - `oracle_cancelled_after_discovery` or `oracle_failed_after_discovery`;
+  - `mutation_state` `applied` with the commit's `operation_id` (the invocation ID) when the
+    selection changed, else `not_applied` (the context already held that selection);
+  - retryability `indeterminate` for a changed selection, so a host never replays it blindly;
+    otherwise `retryable` for cancellation and `permanent` for a failure, as the classifier would;
+  - `settlement` `discovery_committed`;
+  - `details` (a new optional field on `MCPDomainToolFailure`, rendered under `details`) with the
+    discovery fields (`context_id`, `selection`, `selected_paths`, `context_pack_ref`,
+    `selection_committed`, counts), `status` `oracle_cancelled`/`oracle_failed`, and, for a grouped
+    roster, `resume`: a `context_builder` request with `context_pack_ref` (and `response_type`)
+    that reruns only the Oracle step from the persisted pack. A roster of one has no
+    pack-reference route, so the message says a replay rediscovers over the committed selection;
+    an identical selection then commits as a no-op.
+
+  The backend refuses an Oracle-consuming discovery route with no handoff before discovery
+  starts, so a missing preparation port can never strand a commit.
+- **Handoff carriers.** `DomainChildLaunchPlan.preparation` is `.atAdmission` (every ordinary
+  route, unchanged) or `.atHandoff`. For a `.atHandoff` plan, `MCPDomainLongRunningToolProvider`
+  mints nothing at admission and installs `DomainChildLaunchContext.handoff`, a single-use
+  `DomainChildLaunchHandoff`, instead of `bundle`/`current`. Its `prepare()` checks cancellation,
+  revalidates the admission authorizations (a revalidation interrupted by cancellation reads as
+  cancellation), and calls the plan's `prepareChildLaunches` once. A second call fails with
+  `child_launch_handoff_consumed`, a call after the invocation ended with
+  `child_launch_handoff_closed`, and the provider revokes whatever was minted when the invocation
+  ends. The direct-headless discovery plan (direct and grouped) is `.atHandoff`, and the backend
+  prepares it only after the commit, then runs the Oracle step with that bundle (or its single
+  carrier). The carriers are therefore bound to the committed context revision with a full
+  lifetime, however long discovery took, and discovery itself never holds a carrier. `clarify`
+  mints none. `DirectHeadlessChildLaunchCoordinator` takes an injectable `carrierLifetime`
+  (default 60 seconds).
+- **Multi-root spellings.** M17 showed `<root>/<path>` display paths, but `authorize` read that
+  whole string under every root, so a displayed path could not be selected, and `file_search`
+  showed bare root-relative paths that could not be told apart across roots.
+  `ContextBuilderFrozenWorkspace` now has one spelling authority. A relative spelling is read under
+  every root and, with several roots, also as `<root label>/<rest>`, where the label is the folder
+  name, or the full path when another root shares that name. All readings that exist must be one
+  entry (compared by device and inode), otherwise the spelling is `ambiguous_across_roots`, never
+  guessed. An emitted display path uses the short spelling only when that spelling resolves back
+  to exactly its file; otherwise it is absolute. Discovery's `read_file`, `get_file_tree`, and
+  `get_code_structure` resolve their path arguments through the same authority, refusing an
+  ambiguous spelling with its absolute alternatives. A new optional
+  `DomainCanonicalWorkspaceAdapter.presentPath` hook, nil for the ordinary headless tools, lets
+  discovery show the same spellings in `file_search` results and tree headings. The protocol text
+  describes the multi-root rule. `file_search` filter paths still match root-relative paths.
+- **Guardrail.** `headless_runtime_guardrails.sh` requires `.atHandoff` discovery plans and the
+  backend's post-commit handoff and settlement.
+
+Evidence (focused conductor runs):
+
+- `ContextBuilderDiscoveryTests` gains 3: cancellation after the commit returns the committed
+  outcome; cancellation at the pack store fails before the commit; and a three-root workspace (two
+  roots named `app`, a `lib` root whose short spelling collides with `app/lib/...`, and the same
+  relative path under all three). There, every `file_search` spelling round-trips through
+  `manage_selection`, the final selection, the commit, the pack provenance, and the pack file tags,
+  and ambiguous spellings are refused.
+- `OracleLaneLaunchAuthorizationTests` gains 2: a `.atHandoff` plan installs no carrier, prepares
+  once, and revokes at the end; and cancellation at the handoff mints nothing, and the closed
+  handoff refuses later use.
+- `DirectHeadlessContextDiscoveryTests` gains 3:
+  - cancellation exactly at the post-commit handoff yields `oracle_cancelled_after_discovery` with
+    the committed selection and no Oracle run, and its `resume` request completes the grouped step
+    from the same pack without rediscovery;
+  - a direct Oracle failure after the commit is typed with no resume;
+  - through the real long-running provider, child-launch coordinator, and routing tokens with a
+    2-second carrier lifetime, a discovery held past that lifetime mints nothing while it runs.
+    The gated lane's handoff token then redeems (`accepted`), and the unredeemed lane's token is
+    dead after the invocation.
+
+  The M17 tests now drive discovery plans through a handoff.
+
+Conductor evidence. The first focused run (`89408c51`) failed one new expectation. Under a cancelled
+task, the handoff's policy revalidation surfaced `policyReadOnly("policy_changed")` instead of
+cancellation, so the handoff now checks cancellation before revalidating and maps a revalidation
+failure under cancellation to `CancellationError`. The broader focused run (`47638965`) then passed
+293/293: `RepoPromptTests` 103 and `RepoPromptDomainRuntimeTests` 190. It covered the three suites
+above plus the direct-headless Oracle group, protected-mutation security, code-structure
+resilience, ignore enumeration and parity, read-authority and symlink parity and policy, the
+backend parity harness, canonical search semantics and workspace bounds, the invocation pipeline,
+standalone composition, Oracle group, route settlement, and frozen pack suites. The first lint run
+flagged formatting in one test file only. After that fix, `conductor lint` (`561e7d0a`) passed, and
+a rerun of the three M18 suites (`ff6db9e3`) passed 42/42. `conductor guardrails` (`ff7ce1f7`) and
+`swift-build --product all` (`f87fb5e8`) passed. Builds used the locally restored, untracked
+official Sparkle 2.9.2 dSYMs for Xcode 27, which were removed before commit. Not run: the full root
+suite, a live MCP smoke, and a release build.
+
+Not claimed or changed: app Context Builder parity; a single-member `context_pack_ref` route; a
+live MCP smoke with a real `codex` provider; `file_search` filter spellings across roots; and
+artifact collection for unreferenced packs. The policy store's behaviour when revalidation runs
+under a cancelled task (it can degrade to `policy_changed`) predates M18. M18 only avoids
+triggering it at the handoff.
 
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 

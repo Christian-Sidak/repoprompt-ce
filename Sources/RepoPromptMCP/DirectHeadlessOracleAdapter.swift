@@ -453,6 +453,10 @@ actor DirectHeadlessOracleAdapter {
     /// Plans an opt-in discovery invocation. `plan`, `question`, and `review` keep the configured
     /// roster for the Oracle step (one member: direct conversation; several: a group); `clarify` or
     /// no response type plans only the roster primary, which runs discovery and nothing after it.
+    ///
+    /// The child plan is `.atHandoff`: no carrier exists while discovery runs, and the Oracle
+    /// step's carriers are minted after the commit, bound to the committed context revision and
+    /// with a full lifetime, however long discovery took. `clarify` never mints any.
     private func discoveryPlan(
         instructions: String,
         responseType: String?,
@@ -481,7 +485,7 @@ actor DirectHeadlessOracleAdapter {
                 claimID: nil,
                 input: nil,
                 route: .direct(modelID: oracleRoster.primary.modelID, implicitConversationID: nil),
-                childLaunchPlan: Self.childPlan(runID: runID, roster: oracleRoster),
+                childLaunchPlan: Self.childPlan(runID: runID, roster: oracleRoster, preparation: .atHandoff),
                 discovery: discovery
             )
         }
@@ -500,7 +504,13 @@ actor DirectHeadlessOracleAdapter {
             claimID: claimID,
             input: nil,
             route: .startGroup(group: group, roster: oracleRoster, members: members),
-            childLaunchPlan: Self.childPlan(runID: runID, group: group, claimID: claimID, roster: oracleRoster),
+            childLaunchPlan: Self.childPlan(
+                runID: runID,
+                group: group,
+                claimID: claimID,
+                roster: oracleRoster,
+                preparation: .atHandoff
+            ),
             discovery: discovery
         )
     }
@@ -678,7 +688,8 @@ actor DirectHeadlessOracleAdapter {
         runID: UUID,
         group: OracleGroupDescriptor? = nil,
         claimID: UUID? = nil,
-        roster: OracleRoster
+        roster: OracleRoster,
+        preparation: DomainChildLaunchPreparation = .atAdmission
     ) throws -> DomainChildLaunchPlan {
         let lanes = try roster.orderedModels.enumerated().map { index, model in
             try DomainChildLaunchLanePlan(
@@ -691,7 +702,8 @@ actor DirectHeadlessOracleAdapter {
             oracleGroupID: group?.id,
             oracleGroupClaimID: claimID,
             lanes: lanes,
-            approvalMetadata: ["oracle_count": "\(roster.count)"]
+            approvalMetadata: ["oracle_count": "\(roster.count)"],
+            preparation: preparation
         )
     }
 

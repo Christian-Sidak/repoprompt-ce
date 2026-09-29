@@ -5,6 +5,85 @@ package enum DomainChildLaunchContext {
     /// Exact N=1 compatibility carrier. Group execution uses `bundle` and leaves this nil.
     @TaskLocal package static var current: DomainChildLaunchCarrier?
     @TaskLocal package static var bundle: DomainChildLaunchCarrierBundle?
+    /// Installed instead of `bundle`/`current` for a `.atHandoff` plan: the tool prepares its
+    /// carriers here, once, when it is ready to launch children.
+    @TaskLocal package static var handoff: DomainChildLaunchHandoff?
+}
+
+/// Single-use, invocation-scoped preparation of a `.atHandoff` plan's carriers.
+///
+/// Before `prepare()` the invocation holds no carrier, so nothing it runs can redeem the private
+/// endpoint. `prepare()` revalidates the admission authorizations, then mints the plan's carriers
+/// against the context as it is at that moment, with a full launch-token lifetime. The provider
+/// revokes whatever was minted when the invocation ends (`close()`).
+package actor DomainChildLaunchHandoff {
+    package enum HandoffError: Error, Equatable, LocalizedError {
+        case alreadyPrepared
+        case closed
+
+        package var errorDescription: String? {
+            switch self {
+            case .alreadyPrepared:
+                "child_launch_handoff_consumed: the invocation's child-launch carriers were already prepared once."
+            case .closed:
+                "child_launch_handoff_closed: the invocation ended before its child-launch carriers were prepared."
+            }
+        }
+    }
+
+    package typealias Prepare = @Sendable () async throws -> DomainChildLaunchCarrierBundle
+    package typealias Revoke = @Sendable (DomainChildLaunchCarrierBundle) async -> Void
+
+    private enum State {
+        case ready
+        case preparing
+        case prepared(DomainChildLaunchCarrierBundle)
+        /// A preparation was attempted and failed; the handoff is not reusable.
+        case spent
+        case closed
+    }
+
+    private let prepareBundle: Prepare
+    private let revokeLate: Revoke
+    private var state = State.ready
+
+    /// `revokeLate` revokes a bundle whose preparation finished after `close()`.
+    package init(prepare: @escaping Prepare, revokeLate: @escaping Revoke) {
+        prepareBundle = prepare
+        self.revokeLate = revokeLate
+    }
+
+    package func prepare() async throws -> DomainChildLaunchCarrierBundle {
+        switch state {
+        case .ready:
+            break
+        case .closed:
+            throw HandoffError.closed
+        case .preparing, .prepared, .spent:
+            throw HandoffError.alreadyPrepared
+        }
+        state = .preparing
+        let bundle: DomainChildLaunchCarrierBundle
+        do {
+            bundle = try await prepareBundle()
+        } catch {
+            if case .preparing = state { state = .spent }
+            throw error
+        }
+        guard case .preparing = state else {
+            await revokeLate(bundle)
+            throw HandoffError.closed
+        }
+        state = .prepared(bundle)
+        return bundle
+    }
+
+    /// Ends the handoff and returns the prepared bundle, if any, for the caller to revoke.
+    package func close() -> DomainChildLaunchCarrierBundle? {
+        defer { state = .closed }
+        if case let .prepared(bundle) = state { return bundle }
+        return nil
+    }
 }
 
 package enum DomainInteractionPresentationContext {
@@ -193,13 +272,43 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                 }
                 let carrier: DomainChildLaunchCarrier?
                 var bundle: DomainChildLaunchCarrierBundle?
+                var handoff: DomainChildLaunchHandoff?
                 if requiresLaunch {
                     guard let securityContext else {
                         throw MCPError.invalidParams(
                             "approval_required_noninteractive: missing verified invocation identity"
                         )
                     }
-                    if let launchPlan, let prepareChildLaunches {
+                    if let launchPlan, let prepareChildLaunches, launchPlan.preparation == .atHandoff {
+                        // Nothing is minted now; the tool prepares its carriers at its handoff,
+                        // after revalidating the same authorizations.
+                        let policyStore = policyStore
+                        let revokeChildLaunches = revokeChildLaunches
+                        handoff = DomainChildLaunchHandoff(
+                            prepare: {
+                                // Cancellation is checked first: a revalidation interrupted by it
+                                // must read as cancellation, not as a changed policy.
+                                try Task.checkCancellation()
+                                do {
+                                    for authorization in authorizations {
+                                        try await policyStore.revalidate(authorization)
+                                    }
+                                } catch {
+                                    if Task.isCancelled { throw CancellationError() }
+                                    throw error
+                                }
+                                try Task.checkCancellation()
+                                return try await prepareChildLaunches(
+                                    launchPlan,
+                                    toolName,
+                                    arguments,
+                                    securityContext
+                                )
+                            },
+                            revokeLate: { bundle in await revokeChildLaunches?(launchPlan, bundle) }
+                        )
+                        carrier = nil
+                    } else if let launchPlan, let prepareChildLaunches {
                         do {
                             bundle = try await prepareChildLaunches(
                                 launchPlan,
@@ -223,15 +332,19 @@ package struct MCPDomainLongRunningToolProvider: Sendable {
                         try await policyStore.revalidate(authorization)
                     }
                     try Task.checkCancellation()
-                    value = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
-                        try await DomainChildLaunchContext.$current.withValue(carrier) {
-                            try await binding(arguments)
+                    value = try await DomainChildLaunchContext.$handoff.withValue(handoff) {
+                        try await DomainChildLaunchContext.$bundle.withValue(bundle) {
+                            try await DomainChildLaunchContext.$current.withValue(carrier) {
+                                try await binding(arguments)
+                            }
                         }
                     }
                 } catch {
+                    if let handoff { bundle = await handoff.close() }
                     if let launchPlan { await revokeChildLaunches?(launchPlan, bundle) }
                     throw error
                 }
+                if let handoff { bundle = await handoff.close() }
                 if let launchPlan { await revokeChildLaunches?(launchPlan, bundle) }
             }
             _ = await activityCenter.finish(

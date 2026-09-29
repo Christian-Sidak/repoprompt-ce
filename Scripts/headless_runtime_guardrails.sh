@@ -149,6 +149,14 @@ if ! grep -q 'ContextBuilderDiscoveryEngine' Sources/RepoPromptMCP/DirectHeadles
   echo "error: direct-headless discovery must run through the shared core with the read-only discovery purpose" >&2
   exit 1
 fi
+# M18: discovery plans mint no child-launch carrier until the post-commit Oracle handoff, and the
+# Oracle step after a commit is always settled with what was committed.
+if [[ "$(grep -c 'preparation: .atHandoff' Sources/RepoPromptMCP/DirectHeadlessOracleAdapter.swift)" -lt 2 ]] \
+  || ! grep -q 'handoff.prepare()' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
+  || ! grep -q 'settlementAfterDiscovery' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift; then
+  echo "error: discovery must prepare Oracle carriers at the post-commit handoff and settle post-commit failures" >&2
+  exit 1
+fi
 
 if grep -R -n --include='MCP*ToolProvider.swift' \
   -E 'dependencies:[[:space:]]+MCPAppPhysicalCapabilityAdapters([[:space:],?)]|$)' \

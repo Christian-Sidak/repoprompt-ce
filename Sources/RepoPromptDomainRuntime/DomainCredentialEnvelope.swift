@@ -471,19 +471,32 @@ package enum DomainChildLaunchPlanError: Error, Equatable, Sendable {
     case carrierMismatch
 }
 
+/// When a planned invocation's child-launch carriers are minted.
+package enum DomainChildLaunchPreparation: Sendable, Equatable {
+    /// Minted at admission and installed for the whole invocation (every ordinary route).
+    case atAdmission
+    /// Nothing is minted at admission. The tool prepares the plan's carriers once, at the point
+    /// it launches children, through `DomainChildLaunchContext.handoff`. Used when a long
+    /// carrier-free phase (Context Builder discovery) precedes the launches, so the carriers are
+    /// bound to the context revision and lifetime of the launch rather than of admission.
+    case atHandoff
+}
+
 package struct DomainChildLaunchPlan: Sendable {
     package let runID: UUID
     package let oracleGroupID: OracleGroupID?
     package let oracleGroupClaimID: UUID?
     package let lanes: [DomainChildLaunchLanePlan]
     package let approvalMetadata: [String: String]
+    package let preparation: DomainChildLaunchPreparation
 
     package init(
         runID: UUID,
         oracleGroupID: OracleGroupID? = nil,
         oracleGroupClaimID: UUID? = nil,
         lanes: [DomainChildLaunchLanePlan],
-        approvalMetadata: [String: String] = [:]
+        approvalMetadata: [String: String] = [:],
+        preparation: DomainChildLaunchPreparation = .atAdmission
     ) throws {
         guard (1 ... OracleRosterContract.maximumCount).contains(lanes.count) else {
             throw DomainChildLaunchPlanError.invalidLaneCount
@@ -505,6 +518,7 @@ package struct DomainChildLaunchPlan: Sendable {
         self.oracleGroupID = oracleGroupID
         self.oracleGroupClaimID = oracleGroupClaimID
         self.lanes = lanes
+        self.preparation = preparation
         var metadata = approvalMetadata
         metadata["lane_count"] = "\(lanes.count)"
         metadata["providers"] = lanes.map(\.providerIdentifier).joined(separator: ",")

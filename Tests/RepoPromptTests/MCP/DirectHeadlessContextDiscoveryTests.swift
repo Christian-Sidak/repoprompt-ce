@@ -341,6 +341,235 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         }
     }
 
+    // MARK: - M18 post-commit settlement and handoff carriers
+
+    func testCancellationAtThePostCommitHandoffReportsTheCommitAndResumesFromThePack() async throws {
+        let fixture = try Fixture(name: "handoff-cancel", discovery: true)
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
+        let backend = Self.backend(prepared)
+        let before = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let feature = try XCTUnwrap(before.roots.first).path + "/Sources/Feature.swift"
+        let security = try await securityContext(prepared)
+
+        // Cancellation lands exactly between the commit and the Oracle step's carriers.
+        let task = Task {
+            try await self.invoke(
+                prepared: prepared,
+                backend: backend,
+                arguments: ["instructions": .string("Where is the feature marker?"), "response_type": .string("plan")],
+                security: security,
+                atHandoff: {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    try Task.checkCancellation()
+                }
+            )
+        }
+        let failure: MCPDomainToolFailure
+        do {
+            _ = try await task.value
+            return XCTFail("Expected the post-commit cancellation to be reported")
+        } catch let error as MCPDomainToolFailure {
+            failure = error
+        }
+
+        XCTAssertEqual(failure.code, "oracle_cancelled_after_discovery")
+        XCTAssertEqual(failure.retryability, .indeterminate, "a committed selection is never blindly retryable")
+        XCTAssertEqual(failure.mutationState, "applied")
+        XCTAssertEqual(failure.operationID, security.invocationID.uuidString)
+        XCTAssertEqual(failure.settlement, "discovery_committed")
+        XCTAssertEqual(failure.details["status"], .string("oracle_cancelled"))
+        XCTAssertEqual(failure.details["selection_committed"], .bool(true))
+        XCTAssertEqual(failure.details["selection"], .array([.string(feature)]))
+        XCTAssertEqual(failure.details["selected_paths"], .array([.string("Sources/Feature.swift")]))
+        guard case let .string(reference)? = failure.details["context_pack_ref"],
+              case let .object(resume)? = failure.details["resume"],
+              case let .object(resumeArguments)? = resume["arguments"]
+        else {
+            return XCTFail("Expected the pack reference and a resume request: \(failure.details)")
+        }
+        XCTAssertEqual(resume["tool"], .string("context_builder"))
+        XCTAssertEqual(resumeArguments, ["context_pack_ref": .string(reference), "response_type": .string("plan")])
+        XCTAssertTrue(failure.message.contains(reference))
+        XCTAssertTrue(failure.renderedText.hasPrefix("oracle_cancelled_after_discovery: "))
+        XCTAssertTrue(failure.renderedText.contains(#""mutation_state":"applied""#))
+
+        // What the failure says is what happened: the selection is committed, no Oracle ran.
+        let after = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(after.selection, [feature])
+        XCTAssertGreaterThan(after.context.revisions.workingRevision, before.context.revisions.workingRevision)
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"])
+        let owner = try OracleConversationOwner(kind: "direct-headless", identifier: fixture.profileName)
+        let stored = try await prepared.oracleStore.loadMostRecentConversation(owner: owner)
+        XCTAssertNil(stored)
+
+        // The resume request reuses the persisted pack without rediscovering.
+        let resumed = try await invoke(prepared: prepared, backend: backend, arguments: resumeArguments)
+        XCTAssertEqual(resumed["oracle_count"] as? Int, 2)
+        let lanes = try XCTUnwrap(resumed["oracle_results"] as? [[String: Any]])
+        XCTAssertEqual(lanes.compactMap { $0["response"] as? String }, ["oracle-0-lane-0-pack", "oracle-1-lane-1-pack"])
+        XCTAssertEqual(try fixture.calls().count(where: { $0.kind == "discovery" }), 2)
+        guard case let .group(group)? = try await prepared.oracleStore.loadMostRecentConversation(owner: owner) else {
+            return XCTFail("Expected the resumed Oracle group")
+        }
+        let artifactID = try OracleFrozenPackReference(rawValue: reference).artifactID
+        XCTAssertEqual(group.turns.last?.input.context?.content, .durableArtifact(id: artifactID))
+    }
+
+    func testOracleFailureAfterCommitIsTypedWithTheCommittedSelection() async throws {
+        let fixture = try Fixture(name: "oracle-failure", discovery: true)
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "oracle-fail", additional: [])
+        let backend = Self.backend(prepared)
+        let before = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let feature = try XCTUnwrap(before.roots.first).path + "/Sources/Feature.swift"
+
+        do {
+            _ = try await invoke(
+                prepared: prepared,
+                backend: backend,
+                arguments: ["instructions": .string("What does Feature hold?"), "response_type": .string("question")]
+            )
+            XCTFail("Expected the Oracle failure")
+        } catch let failure as MCPDomainToolFailure {
+            XCTAssertEqual(failure.code, "oracle_failed_after_discovery")
+            XCTAssertEqual(failure.retryability, .indeterminate)
+            XCTAssertEqual(failure.mutationState, "applied")
+            XCTAssertEqual(failure.details["status"], .string("oracle_failed"))
+            XCTAssertEqual(failure.details["selection_committed"], .bool(true))
+            XCTAssertNil(failure.details["resume"], "a roster of one has no pack-reference route")
+            XCTAssertTrue(failure.message.contains("Replaying the raw instructions"), failure.message)
+        }
+        let after = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(after.selection, [feature])
+        let calls = try fixture.calls()
+        XCTAssertEqual(calls.map(\.kind), ["discovery", "discovery", "oracle"])
+        XCTAssertNotNil(calls[2].launchID, "the direct Oracle ran with the carrier prepared at the handoff")
+    }
+
+    func testSlowDiscoveryPreparesRedeemableGroupedCarriersAtTheHandoff() async throws {
+        let fixture = try Fixture(name: "handoff-carriers", discovery: true)
+        defer { fixture.cleanup() }
+        defer {
+            fixture.openGate()
+            fixture.openOracleGate()
+        }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "gated", additional: ["lane-1"])
+        let backend = Self.backend(prepared)
+
+        // The real admission path: long-running provider, child-launch coordinator, and routing
+        // tokens, with a carrier lifetime shorter than discovery.
+        let lifetime = Duration.seconds(3)
+        let coordinator = DirectHeadlessChildLaunchCoordinator(carrierLifetime: lifetime)
+        await coordinator.configure(
+            runtime: prepared.runtime,
+            endpointDescriptor: prepared.childEndpoint.socketURL.path,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        let preparations = BundleRecorder()
+        let provider = MCPDomainLongRunningToolProvider(
+            identity: prepared.runtime.identity,
+            policyStore: prepared.runtime.mutationPolicyStore,
+            interactionBroker: prepared.runtime.interactionBroker,
+            activityCenter: prepared.runtime.activityCenter,
+            resolveChildLaunchPlan: { toolName, arguments, security in
+                try await coordinator.resolvePlan(toolName: toolName, arguments: arguments, securityContext: security)
+            },
+            prepareChildLaunches: { plan, toolName, arguments, security in
+                let bundle = try await coordinator.prepare(
+                    plan: plan,
+                    toolName: toolName,
+                    arguments: arguments,
+                    securityContext: security
+                )
+                await preparations.record(bundle)
+                return bundle
+            },
+            revokeChildLaunches: { plan, bundle in await coordinator.revoke(plan: plan, bundle: bundle) }
+        )
+        let binding = MCPDomainToolBinding(
+            definition: .init(
+                name: "context_builder",
+                description: "discovery through the long-running provider",
+                inputSchema: .object(["type": .string("object")])
+            )
+        ) { arguments in
+            let request = try DomainPhysicalToolRequest(
+                argumentsJSON: JSONEncoder().encode(arguments),
+                securityContext: MCPDomainInvocationSecurityContext.current
+            )
+            let result = try await backend.buildContext(request)
+            return try JSONDecoder().decode(Value.self, from: result.json)
+        }
+        let wrapped = provider.wrapping(binding)
+        let security = try await verifiedSecurityContext(prepared)
+        let task = Task {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("Where is the feature marker?"), "response_type": .string("plan")])
+            }
+        }
+
+        try await fixture.waitForGate()
+        let duringDiscovery = await preparations.bundles
+        XCTAssertTrue(duringDiscovery.isEmpty, "no carrier exists while discovery runs")
+        // Hold discovery past the carrier lifetime: a carrier minted at admission would be expired.
+        try await Task.sleep(for: lifetime + .milliseconds(500))
+        fixture.openGate()
+        try await fixture.waitForOracleGate()
+
+        let blocked = try XCTUnwrap(fixture.calls().first { $0.kind == "oracle" && $0.model == "gated" })
+        let redemption = try await prepared.runtime.routingCoordinator.redeemLaunchToken(
+            material: XCTUnwrap(blocked.launchToken),
+            runtimeID: prepared.runtime.identity.runtimeID,
+            runtimeGeneration: prepared.runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: XCTUnwrap(blocked.clientPrincipal),
+            providerIdentifier: XCTUnwrap(blocked.providerIdentifier)
+        )
+        guard case .accepted = redemption else {
+            return XCTFail("The lane's carrier must be redeemable after a slow discovery, got \(redemption)")
+        }
+        fixture.openOracleGate()
+
+        let value = try await task.value
+        guard case let .object(result) = value else { return XCTFail("Expected an object result") }
+        XCTAssertEqual(result["selection_committed"], .bool(true))
+        XCTAssertEqual(result["oracle_count"], .int(2))
+        let bundles = await preparations.bundles
+        XCTAssertEqual(bundles.count, 1, "one single-use preparation, at the handoff")
+        let calls = try fixture.calls()
+        XCTAssertTrue(calls.filter { $0.kind == "discovery" }.allSatisfy { $0.launchToken == nil })
+        let oracleCalls = calls.filter { $0.kind == "oracle" }
+        try XCTAssertEqual(
+            Set(oracleCalls.compactMap(\.launchID)),
+            Set(XCTUnwrap(bundles.first).carriers.map(\.launchID.uuidString))
+        )
+        // The invocation revoked its carriers when it ended: the unredeemed lane's token is dead.
+        let unredeemed = try XCTUnwrap(oracleCalls.first { $0.model == "lane-1" })
+        let late = try await prepared.runtime.routingCoordinator.redeemLaunchToken(
+            material: XCTUnwrap(unredeemed.launchToken),
+            runtimeID: prepared.runtime.identity.runtimeID,
+            runtimeGeneration: prepared.runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: XCTUnwrap(unredeemed.clientPrincipal),
+            providerIdentifier: XCTUnwrap(unredeemed.providerIdentifier)
+        )
+        if case .accepted = late {
+            XCTFail("A carrier must not outlive its invocation")
+        }
+    }
+
     func testDiscoveryPurposeAndOptInParsing() {
         XCTAssertEqual(
             DirectHeadlessProviderCoordinator.codexExecArguments(model: "m", purpose: .contextDiscovery),
@@ -377,17 +606,62 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         )
     }
 
+    /// Mirrors the long-running provider's carrier contract with synthetic carriers: an ordinary
+    /// plan gets its bundle at admission, a `.atHandoff` plan gets only a handoff. `atHandoff`
+    /// runs inside the handoff's preparation, before the carriers exist.
     private func invoke(
         prepared: DirectHeadlessMCPService.PreparedRuntime,
         backend: DirectHeadlessConversationBackend,
-        arguments: [String: Value]
+        arguments: [String: Value],
+        security suppliedSecurity: DomainToolInvocationSecurityContext? = nil,
+        atHandoff: (@Sendable () async throws -> Void)? = nil
     ) async throws -> [String: Any] {
-        let security = try await securityContext(prepared)
+        let security: DomainToolInvocationSecurityContext = if let suppliedSecurity {
+            suppliedSecurity
+        } else {
+            try await securityContext(prepared)
+        }
         let plan = try await prepared.oracleAdapter.resolveChildLaunchPlan(
             toolName: "context_builder",
             arguments: arguments,
             securityContext: security
         )
+        let request = try DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(arguments),
+            securityContext: security
+        )
+        if plan.preparation == .atHandoff {
+            let handoff = DomainChildLaunchHandoff(
+                prepare: {
+                    try await atHandoff?()
+                    return try Self.syntheticBundle(for: plan)
+                },
+                revokeLate: { _ in }
+            )
+            let result: DomainPhysicalToolResult
+            do {
+                result = try await DomainChildLaunchContext.$handoff.withValue(handoff) {
+                    try await backend.buildContext(request)
+                }
+            } catch {
+                // As the provider's revocation does when an invocation ends early.
+                _ = await handoff.close()
+                await prepared.oracleAdapter.discardPreparedInvocation(plan: plan)
+                throw error
+            }
+            _ = await handoff.close()
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: result.json) as? [String: Any])
+        }
+        let bundle = try Self.syntheticBundle(for: plan)
+        let result = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
+            try await DomainChildLaunchContext.$current.withValue(bundle.singleCarrier) {
+                try await backend.buildContext(request)
+            }
+        }
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: result.json) as? [String: Any])
+    }
+
+    private static func syntheticBundle(for plan: DomainChildLaunchPlan) throws -> DomainChildLaunchCarrierBundle {
         let carriers = plan.lanes.map { lane in
             var environment: [String: String] = [
                 DomainChildLaunchCarrier.runIDEnvironmentKey: plan.runID.uuidString,
@@ -415,17 +689,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
                 environment: environment
             )
         }
-        let bundle = try DomainChildLaunchCarrierBundle(plan: plan, carriers: carriers)
-        let request = try DomainPhysicalToolRequest(
-            argumentsJSON: JSONEncoder().encode(arguments),
-            securityContext: security
-        )
-        let result = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
-            try await DomainChildLaunchContext.$current.withValue(bundle.singleCarrier) {
-                try await backend.buildContext(request)
-            }
-        }
-        return try XCTUnwrap(JSONSerialization.jsonObject(with: result.json) as? [String: Any])
+        return try DomainChildLaunchCarrierBundle(plan: plan, carriers: carriers)
     }
 
     private func toolRequest(
@@ -434,6 +698,39 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         try await DomainPhysicalToolRequest(
             argumentsJSON: JSONEncoder().encode([String: Value]()),
             securityContext: securityContext(prepared)
+        )
+    }
+
+    /// A verified run-scoped caller granted `context_builder`, so the long-running provider's
+    /// approval admits it.
+    private func verifiedSecurityContext(
+        _ prepared: DirectHeadlessMCPService.PreparedRuntime
+    ) async throws -> DomainToolInvocationSecurityContext {
+        let base = try await securityContext(prepared)
+        return DomainToolInvocationSecurityContext(
+            principal: DomainClientPrincipal(
+                principalID: UUID(),
+                stableKey: "m18-verified-client",
+                displayName: "M18 verified client",
+                kind: .runScoped,
+                assurance: .verifiedProcess,
+                processID: getpid(),
+                runID: prepared.principal.runID,
+                provider: "direct-stdio",
+                verifiedIdentityFingerprint: "m18-fixture",
+                claimedProcessID: nil
+            ),
+            connectionID: base.connectionID,
+            connectionGeneration: base.connectionGeneration,
+            invocationID: UUID(),
+            runtimeID: base.runtimeID,
+            runtimeGeneration: base.runtimeGeneration,
+            workspaceID: base.workspaceID,
+            workspaceRevision: base.workspaceRevision,
+            authorizedCanonicalRoots: base.authorizedCanonicalRoots,
+            hasAuthoritativeRoutingContext: true,
+            ephemeralGrantedToolNames: ["context_builder"],
+            ephemeralGrantedOperations: []
         )
     }
 
@@ -458,6 +755,14 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
     }
 }
 
+private actor BundleRecorder {
+    private(set) var bundles: [DomainChildLaunchCarrierBundle] = []
+
+    func record(_ bundle: DomainChildLaunchCarrierBundle) {
+        bundles.append(bundle)
+    }
+}
+
 private struct Fixture {
     struct Call {
         let kind: String
@@ -466,6 +771,9 @@ private struct Fixture {
         let sandbox: String
         let launchID: String?
         let processID: String
+        let launchToken: String?
+        let clientPrincipal: String?
+        let providerIdentifier: String?
     }
 
     let root: URL
@@ -510,8 +818,9 @@ private struct Fixture {
           *"\#(ContextBuilderDiscoveryPrompt.protocolVersion)"*) kind=discovery ;;
         esac
         /usr/bin/printf '%s' "$input" > '\#(inputs.path)/'"$kind-$lane-$$.txt"
-        /usr/bin/printf '%s|%s|%s|%s|%s|%s\n' "$kind" "$lane" "$model" "$sandbox" \
-          "${REPOPROMPT_MCP_LAUNCH_ID:-}" "$$" >> '\#(callLog.path)'
+        /usr/bin/printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$lane" "$model" "$sandbox" \
+          "${REPOPROMPT_MCP_LAUNCH_ID:-}" "$$" "${REPOPROMPT_MCP_LAUNCH_TOKEN:-}" \
+          "${REPOPROMPT_MCP_CLIENT_PRINCIPAL:-}" "${REPOPROMPT_MCP_PROVIDER_IDENTIFIER:-}" >> '\#(callLog.path)'
         if [ "$kind" = discovery ]; then
           if [ "$model" = gated ]; then
             case "$input" in
@@ -538,6 +847,18 @@ private struct Fixture {
               ;;
           esac
           exit 0
+        fi
+        if [ "$model" = gated ]; then
+          : > '\#(profile.path)/oracle-waiting'
+          i=0
+          while [ ! -f '\#(profile.path)/oracle-go' ] && [ "$i" -lt 400 ]; do
+            /bin/sleep 0.05
+            i=$((i + 1))
+          done
+        fi
+        if [ "$model" = oracle-fail ]; then
+          /usr/bin/printf '%s\n' 'fake oracle failure' >&2
+          exit 9
         fi
         case "$input" in
           *FEATURE_MARKER*) saw=pack ;;
@@ -569,13 +890,19 @@ private struct Fixture {
             .split(separator: "\n")
             .map { line in
                 let fields = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+                func optional(_ index: Int) -> String? {
+                    fields.indices.contains(index) && !fields[index].isEmpty ? fields[index] : nil
+                }
                 return Call(
                     kind: fields[0],
                     lane: fields[1],
                     model: fields[2],
                     sandbox: fields[3],
-                    launchID: fields[4].isEmpty ? nil : fields[4],
-                    processID: fields[5]
+                    launchID: optional(4),
+                    processID: fields[5],
+                    launchToken: optional(6),
+                    clientPrincipal: optional(7),
+                    providerIdentifier: optional(8)
                 )
             }
     }
@@ -594,6 +921,22 @@ private struct Fixture {
 
     func openGate() {
         FileManager.default.createFile(atPath: profile.appendingPathComponent("go").path, contents: Data())
+    }
+
+    /// Waits until a `gated` Oracle lane is blocked.
+    func waitForOracleGate() async throws {
+        let marker = profile.appendingPathComponent("oracle-waiting")
+        let deadline = ContinuousClock.now + .seconds(15)
+        while !FileManager.default.fileExists(atPath: marker.path) {
+            guard ContinuousClock.now < deadline else {
+                throw CancellationError()
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    func openOracleGate() {
+        FileManager.default.createFile(atPath: profile.appendingPathComponent("oracle-go").path, contents: Data())
     }
 
     func input(of call: Call) throws -> String {

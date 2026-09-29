@@ -59,6 +59,11 @@ package struct DomainCanonicalWorkspaceAdapter {
 
     package typealias IgnoreConfigurationProvider = @Sendable () async -> DomainIgnoreConfiguration?
 
+    /// Presents an enumerated file or directory to the caller. `rootRelativePath` is the path the
+    /// service matches against ("" for a root itself). Returning nil keeps the default rendering:
+    /// the root-relative path in `file_search` results, the base's folder name as a tree heading.
+    package typealias PresentPath = @Sendable (_ url: URL, _ rootRelativePath: String) -> String?
+
     package let toolSnapshot: ToolSnapshot
     package let readSnapshot: ReadSnapshot
     package let mutate: Mutate
@@ -66,19 +71,24 @@ package struct DomainCanonicalWorkspaceAdapter {
     /// When present, enumeration applies the app's ignore layers; when nil, enumeration keeps the
     /// legacy hidden-file-only filtering.
     package let ignoreConfiguration: IgnoreConfigurationProvider?
+    /// Nil for the ordinary headless tools. Context Builder discovery sets it so every path it
+    /// shows is a spelling its selection authority resolves back to the same file.
+    package let presentPath: PresentPath?
 
     package init(
         toolSnapshot: @escaping ToolSnapshot,
         readSnapshot: @escaping ReadSnapshot,
         mutate: @escaping Mutate,
         resolvePath: @escaping ResolvePath,
-        ignoreConfiguration: IgnoreConfigurationProvider? = nil
+        ignoreConfiguration: IgnoreConfigurationProvider? = nil,
+        presentPath: PresentPath? = nil
     ) {
         self.toolSnapshot = toolSnapshot
         self.readSnapshot = readSnapshot
         self.mutate = mutate
         self.resolvePath = resolvePath
         self.ignoreConfiguration = ignoreConfiguration
+        self.presentPath = presentPath
     }
 }
 
@@ -322,13 +332,21 @@ package struct MCPDomainCanonicalWorkspaceService {
             snapshot.roots
         }
         let ignoreContext = try await makeIgnoreContext(roots: snapshot.roots)
+        let relativeRoots = Self.relativeRoots(snapshot.roots)
+        let headings = roots.map { base in
+            let relative = snapshot.roots.contains(where: { $0.standardizedFileURL.path == base.standardizedFileURL.path })
+                ? ""
+                : Self.relativePath(base, roots: relativeRoots)
+            return (adapter.presentPath?(base, relative) ?? base.lastPathComponent) + "/"
+        }
         let lines = try await Self.runCancellableBlocking { cancellation in
             var lines: [String] = []
-            for root in roots {
+            for (root, heading) in zip(roots, headings) {
                 let remaining = MCPDomainCanonicalReadBounds.maximumTreeLines - lines.count
                 guard remaining > 0 else { break }
                 try lines.append(contentsOf: Self.treeLines(
                     root: root,
+                    heading: heading,
                     maxDepth: maxDepth,
                     maximumLines: remaining,
                     ignore: ignoreContext,
@@ -409,6 +427,7 @@ package struct MCPDomainCanonicalWorkspaceService {
         let filter = Self.searchFilter(args)
         let relativeRoots = Self.relativeRoots(snapshot.roots)
         let roots = snapshot.roots
+        let presentPath = adapter.presentPath
         let ignoreContext = try await makeIgnoreContext(roots: roots)
         let (results, count, enumerationTruncated, skippedLargeFiles) = try await Self.runCancellableBlocking { cancellation in
             // Like the app, each stage scans every admitted file in full-path order (the path stage by
@@ -437,7 +456,10 @@ package struct MCPDomainCanonicalWorkspaceService {
                     try cancellation.check()
                     guard matcher.matches(candidate.relativePath) else { continue }
                     pathCount += 1
-                    if !countOnly { results.append(.object(["path": .string(candidate.relativePath)])) }
+                    if !countOnly {
+                        let shown = presentPath?(candidate.file, candidate.relativePath) ?? candidate.relativePath
+                        results.append(.object(["path": .string(shown)]))
+                    }
                 }
             }
             var contentCount = 0
@@ -473,7 +495,7 @@ package struct MCPDomainCanonicalWorkspaceService {
                         contentCount += 1
                         if countOnly { continue }
                         results.append(.object([
-                            "path": .string(candidate.relativePath),
+                            "path": .string(presentPath?(candidate.file, candidate.relativePath) ?? candidate.relativePath),
                             "line": .int(index + 1),
                             "text": .string(String(line))
                         ]))
@@ -986,12 +1008,13 @@ package struct MCPDomainCanonicalWorkspaceService {
 
     private static func configuredTreeLines(
         root: URL,
+        heading: String,
         located: HeadlessIgnoreContext.Located,
         maxDepth: Int,
         maximumLines: Int,
         cancellation: BlockingCancellation
     ) throws -> [String] {
-        var lines = [root.lastPathComponent + "/"]
+        var lines = [heading]
         guard !located.baseIsUnreachableUnderSymlinkPolicy() else { return lines }
         try located.makeWalk(cancellation: cancellation).walk(
             base: root,
@@ -1011,6 +1034,7 @@ package struct MCPDomainCanonicalWorkspaceService {
 
     private static func treeLines(
         root: URL,
+        heading: String,
         maxDepth: Int,
         maximumLines: Int,
         ignore: HeadlessIgnoreContext? = nil,
@@ -1019,6 +1043,7 @@ package struct MCPDomainCanonicalWorkspaceService {
         if let located = ignore?.locate(root) {
             return try configuredTreeLines(
                 root: root,
+                heading: heading,
                 located: located,
                 maxDepth: maxDepth,
                 maximumLines: maximumLines,
@@ -1026,7 +1051,7 @@ package struct MCPDomainCanonicalWorkspaceService {
             )
         }
         // Legacy enumeration (no ignore configuration, or a base outside every root).
-        var lines = [root.lastPathComponent + "/"]
+        var lines = [heading]
         guard let enumerator = FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: [.isDirectoryKey],

@@ -509,6 +509,151 @@ final class ContextBuilderDiscoveryTests: XCTestCase {
         XCTAssertEqual(artifacts.count, 1)
     }
 
+    // MARK: - Commit boundary (M18)
+
+    func testCancellationObservedAfterTheCommitStillReturnsTheCommittedOutcome() async throws {
+        let fixture = try WorkspaceFixture()
+        defer { fixture.cleanup() }
+        // The committer writes, then cancellation lands before the engine resumes.
+        let committer = RecordingCommitter(afterCommit: { withUnsafeCurrentTask { $0?.cancel() } })
+        let store = RecordingPackStore()
+        let workspace = fixture.workspace()
+        let task = Task {
+            try await ContextBuilderDiscoveryEngine().run(
+                ContextBuilderDiscoveryRequest(instructions: "Select", mode: .plan),
+                workspace: workspace,
+                provider: ScriptedProvider(replies: [#"{"final":{"selected_paths":["README.md"]}}"#]),
+                committer: committer,
+                packStore: store
+            )
+        }
+
+        let outcome = try await task.value
+        XCTAssertTrue(task.isCancelled)
+        XCTAssertEqual(outcome.selection, [fixture.root.path + "/README.md"])
+        XCTAssertTrue(outcome.receipt.applied)
+        let commits = await committer.commits
+        let artifacts = await store.artifacts
+        XCTAssertEqual(commits.count, 1)
+        XCTAssertEqual(Array(artifacts.keys), [outcome.packReference.artifactID])
+    }
+
+    func testCancellationAtThePackStoreBoundaryFailsBeforeTheCommit() async throws {
+        let fixture = try WorkspaceFixture()
+        defer { fixture.cleanup() }
+        let committer = RecordingCommitter()
+        // Cancellation lands while the pack is being stored, the last step before the commit.
+        let store = RecordingPackStore(onStore: { withUnsafeCurrentTask { $0?.cancel() } })
+        let workspace = fixture.workspace()
+        let task = Task {
+            try await ContextBuilderDiscoveryEngine().run(
+                ContextBuilderDiscoveryRequest(instructions: "Select", mode: .plan),
+                workspace: workspace,
+                provider: ScriptedProvider(replies: [#"{"final":{"selected_paths":["README.md"]}}"#]),
+                committer: committer,
+                packStore: store
+            )
+        }
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation before the commit")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        let commits = await committer.commits
+        let artifacts = await store.artifacts
+        XCTAssertTrue(commits.isEmpty, "pre-commit cancellation writes no selection")
+        XCTAssertEqual(artifacts.count, 1, "at most the one unreferenced content-addressed pack remains")
+    }
+
+    // MARK: - Multi-root spellings (M18)
+
+    func testMultiRootEmittedSpellingsRoundTripThroughTheFinalSelectionAndPack() async throws {
+        let fixture = try MultiRootFixture()
+        defer { fixture.cleanup() }
+        let provider = ScriptedProvider(steps: [
+            { _, _ in
+                #"""
+                {"tool_calls":[
+                  {"tool":"file_search","arguments":{"pattern":"_MARKER","mode":"content"}},
+                  {"tool":"get_file_tree","arguments":{"max_depth":1}},
+                  {"tool":"read_file","arguments":{"path":"lib/Only.swift"}},
+                  {"tool":"manage_selection","arguments":{"op":"add","paths":["Sources/Feature.swift"]}},
+                  {"tool":"manage_selection","arguments":{"op":"add","paths":["lib/Sources/Feature.swift"]}}
+                ]}
+                """#
+            },
+            { prompt, _ in
+                // Select exactly the spellings the search emitted.
+                let paths = try MultiRootFixture.searchResultPaths(in: prompt)
+                let final: [String: Any] = ["final": ["selected_paths": paths]]
+                return try String(decoding: JSONSerialization.data(withJSONObject: final), as: UTF8.self)
+            }
+        ])
+        let committer = RecordingCommitter()
+
+        let outcome = try await ContextBuilderDiscoveryEngine().run(
+            ContextBuilderDiscoveryRequest(instructions: "Collect every marker", mode: .review),
+            workspace: fixture.workspace(),
+            provider: provider,
+            committer: committer,
+            packStore: RecordingPackStore()
+        )
+
+        // Duplicate basenames are labelled by full path; the unique root by its folder name. A short
+        // spelling that another root also holds (`lib/Sources/Feature.swift` exists under the first
+        // root) is emitted absolute instead, so every emitted spelling names one file.
+        let expectedDisplay = [
+            "lib/Only.swift",
+            fixture.lib.path + "/Sources/Feature.swift",
+            fixture.appOne.path + "/Sources/Feature.swift",
+            fixture.appOne.path + "/lib/Sources/Feature.swift",
+            fixture.appTwo.path + "/Sources/Feature.swift"
+        ]
+        let expectedSelection = [
+            fixture.lib.path + "/Only.swift",
+            fixture.lib.path + "/Sources/Feature.swift",
+            fixture.appOne.path + "/Sources/Feature.swift",
+            fixture.appOne.path + "/lib/Sources/Feature.swift",
+            fixture.appTwo.path + "/Sources/Feature.swift"
+        ]
+        let prompts = await provider.prompts
+        XCTAssertEqual(try MultiRootFixture.searchResultPaths(in: prompts[1]), expectedDisplay)
+        XCTAssertEqual(outcome.displayPaths, expectedDisplay)
+        XCTAssertEqual(outcome.selection, expectedSelection)
+        let commits = await committer.commits
+        XCTAssertEqual(commits.map(\.paths), [expectedSelection])
+        XCTAssertEqual(outcome.pack.provenance, expectedDisplay.map { OracleEvidenceReference(path: $0) })
+        for (display, marker) in zip(expectedDisplay, ["ONLY", "LIB", "APP_ONE", "SHADOW", "APP_TWO"]) {
+            XCTAssertTrue(outcome.pack.content.contains("<file path=\"\(display)\">\nlet value = \"\(marker)_MARKER\""), display)
+        }
+
+        // Read tools accept the same spellings, and tree headings are the root labels.
+        XCTAssertTrue(prompts[1].contains("tool=\"read_file\" status=\"ok\">\nlet value = \"ONLY_MARKER\""))
+        XCTAssertTrue(prompts[1].contains("\n" + fixture.appOne.path + "/\n"))
+        XCTAssertTrue(prompts[1].contains("\n" + fixture.appTwo.path + "/\n"))
+        XCTAssertTrue(prompts[1].contains("\nlib/\n"))
+        // A bare path under two roots, and a short spelling another root also holds, are refused.
+        XCTAssertEqual(prompts[1].components(separatedBy: "ambiguous_across_roots").count - 1, 2)
+        XCTAssertTrue(prompts[1].contains("No files are staged."))
+        XCTAssertTrue(prompts[0].contains("`<root label>/<path in that root>`"))
+
+        // Every emitted spelling is admitted back to its own file; ambiguous ones are not guessed.
+        let workspace = fixture.workspace()
+        for (display, absolute) in zip(expectedDisplay, expectedSelection) {
+            XCTAssertEqual(try workspace.authorize(display, skipSymlinks: true).absolutePath, absolute)
+        }
+        for ambiguous in ["Sources/Feature.swift", "lib/Sources/Feature.swift"] {
+            XCTAssertThrowsError(try workspace.authorize(ambiguous, skipSymlinks: true)) { error in
+                XCTAssertEqual(
+                    error as? ContextBuilderDiscoveryError,
+                    .invalidSelectedPath(path: ambiguous, reason: "ambiguous_across_roots")
+                )
+            }
+        }
+    }
+
     func testPromptBudgetElidesOldestToolResultsFirst() async throws {
         let fixture = try WorkspaceFixture()
         defer { fixture.cleanup() }
@@ -679,6 +824,88 @@ private struct WorkspaceFixture {
     }
 }
 
+/// Three roots: two share the folder name `app`, and the first holds `lib/Sources/Feature.swift`,
+/// which is also the short spelling of the `lib` root's `Sources/Feature.swift`. Every
+/// `Sources/Feature.swift` exists under all three roots.
+private struct MultiRootFixture {
+    let base: URL
+    let appOne: URL
+    let appTwo: URL
+    let lib: URL
+
+    init() throws {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-discovery-multi-\(UUID().uuidString)", isDirectory: true)
+        self.base = base
+        let files = [
+            ("one/app/Sources/Feature.swift", "APP_ONE"),
+            ("one/app/lib/Sources/Feature.swift", "SHADOW"),
+            ("two/app/Sources/Feature.swift", "APP_TWO"),
+            ("lib/Sources/Feature.swift", "LIB"),
+            ("lib/Only.swift", "ONLY")
+        ]
+        for (path, marker) in files {
+            let url = base.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("let value = \"\(marker)_MARKER\"\n".utf8).write(to: url)
+        }
+        func root(_ path: String) -> URL {
+            base.appendingPathComponent(path, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+        }
+        appOne = root("one/app")
+        appTwo = root("two/app")
+        lib = root("lib")
+    }
+
+    func workspace() -> ContextBuilderFrozenWorkspace {
+        ContextBuilderFrozenWorkspace(
+            snapshot: ContextBuilderDiscoverySnapshot(
+                identity: DomainContextIdentity(workspaceID: UUID(), contextID: UUID()),
+                workspaceRevision: 1,
+                contextRevision: 1,
+                roots: [appOne, appTwo, lib],
+                prompt: "",
+                selection: []
+            ),
+            resolvePath: { rawPath, roots, _ in
+                let candidates = rawPath.hasPrefix("/")
+                    ? [URL(fileURLWithPath: rawPath)]
+                    : roots.map { $0.appendingPathComponent(rawPath) }
+                        .filter { FileManager.default.fileExists(atPath: $0.path) }
+                guard candidates.count == 1, let candidate = candidates.first else {
+                    throw MCPError.invalidParams("Relative path is ambiguous across workspace roots")
+                }
+                let resolved = candidate.standardizedFileURL.resolvingSymlinksInPath().path
+                guard roots.contains(where: { root in
+                    let rootPath = root.resolvingSymlinksInPath().path
+                    return resolved == rootPath || resolved.hasPrefix(rootPath + "/")
+                }) else {
+                    throw MCPError.invalidParams("Path is outside the bound workspace roots: \(rawPath)")
+                }
+                return URL(fileURLWithPath: resolved)
+            }
+        )
+    }
+
+    /// The `path` of every `file_search` match shown in a discovery prompt, in order.
+    static func searchResultPaths(in prompt: String) throws -> [String] {
+        let opening = #"tool="file_search" status="ok">"# + "\n"
+        guard let start = prompt.range(of: opening),
+              let end = prompt.range(of: "\n</tool_result>", range: start.upperBound ..< prompt.endIndex)
+        else {
+            throw CocoaError(.coderValueNotFound)
+        }
+        let body = Data(prompt[start.upperBound ..< end.lowerBound].utf8)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let matches = try XCTUnwrap(object["matches"] as? [[String: Any]])
+        return matches.compactMap { $0["path"] as? String }
+    }
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: base)
+    }
+}
+
 private actor ScriptedProvider: ContextBuilderDiscoveryProvider {
     typealias Step = @Sendable (_ prompt: String, _ turn: Int) async throws -> String
 
@@ -706,10 +933,12 @@ private actor RecordingCommitter: ContextBuilderDiscoveryCommitter {
     }
 
     private let failure: ContextBuilderDiscoveryError?
+    private let afterCommit: (@Sendable () -> Void)?
     private(set) var commits: [Commit] = []
 
-    init(failure: ContextBuilderDiscoveryError? = nil) {
+    init(failure: ContextBuilderDiscoveryError? = nil, afterCommit: (@Sendable () -> Void)? = nil) {
         self.failure = failure
+        self.afterCommit = afterCommit
     }
 
     func commitSelection(
@@ -718,6 +947,7 @@ private actor RecordingCommitter: ContextBuilderDiscoveryCommitter {
     ) async throws -> ContextBuilderDiscoveryCommitReceipt {
         commits.append(Commit(paths: absolutePaths, snapshot: snapshot))
         if let failure { throw failure }
+        afterCommit?()
         return ContextBuilderDiscoveryCommitReceipt(
             applied: true,
             workspaceRevision: snapshot.workspaceRevision + 1,
@@ -727,11 +957,17 @@ private actor RecordingCommitter: ContextBuilderDiscoveryCommitter {
 }
 
 private actor RecordingPackStore: OracleArtifactStore {
+    private let onStore: (@Sendable () -> Void)?
     private(set) var artifacts: [String: Data] = [:]
+
+    init(onStore: (@Sendable () -> Void)? = nil) {
+        self.onStore = onStore
+    }
 
     func storeArtifact(_ data: Data) async throws -> String {
         let id = DomainContentDigest.sha256(data)
         artifacts[id] = data
+        onStore?()
         return id
     }
 

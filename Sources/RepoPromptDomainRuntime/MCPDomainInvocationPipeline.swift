@@ -41,6 +41,10 @@ package struct MCPDomainToolFailure: Error, Equatable, Sendable {
     package let mutationState: String?
     package let operationID: String?
     package let settlement: String?
+    /// Tool-specific structured facts about what did happen (for example, the committed selection
+    /// and pack reference of a Context Builder run whose Oracle step failed). Rendered under
+    /// `details`; empty for every classifier-derived failure.
+    package let details: [String: Value]
 
     package init(
         toolName: String,
@@ -50,7 +54,8 @@ package struct MCPDomainToolFailure: Error, Equatable, Sendable {
         retryAfterMilliseconds: Int? = nil,
         mutationState: String? = nil,
         operationID: String? = nil,
-        settlement: String? = nil
+        settlement: String? = nil,
+        details: [String: Value] = [:]
     ) {
         self.toolName = toolName
         self.code = code
@@ -60,6 +65,7 @@ package struct MCPDomainToolFailure: Error, Equatable, Sendable {
         self.mutationState = mutationState
         self.operationID = operationID
         self.settlement = settlement
+        self.details = details
     }
 
     package var metadata: [String: Value] {
@@ -74,6 +80,7 @@ package struct MCPDomainToolFailure: Error, Equatable, Sendable {
         if let mutationState { metadata["mutation_state"] = .string(mutationState) }
         if let operationID { metadata["operation_id"] = .string(operationID) }
         if let settlement { metadata["settlement"] = .string(settlement) }
+        if !details.isEmpty { metadata["details"] = .object(details) }
         return metadata
     }
 

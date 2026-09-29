@@ -189,6 +189,124 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         XCTAssertEqual(recorded, ["revoked-plan"])
     }
 
+    func testHandoffPlanMintsNoCarrierBeforeItsSingleUseHandoffAndRevokesAtTheEnd() async throws {
+        let runtime = makeRuntime(mode: .app, profile: "handoff")
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let recorder = LaunchRecorder()
+        let plan = try DomainChildLaunchPlan(
+            runID: UUID(),
+            oracleGroupID: OracleGroupID(),
+            oracleGroupClaimID: UUID(),
+            lanes: (0 ..< 2).map {
+                try DomainChildLaunchLanePlan(providerIdentifier: "fixture", oracleLaneID: OracleLaneID(index: $0))
+            },
+            preparation: .atHandoff
+        )
+        let provider = MCPDomainLongRunningToolProvider(
+            identity: runtime.identity,
+            policyStore: runtime.mutationPolicyStore,
+            interactionBroker: runtime.interactionBroker,
+            activityCenter: runtime.activityCenter,
+            resolveChildLaunchPlan: { _, _, _ in plan },
+            prepareChildLaunches: { preparedPlan, _, _, _ in
+                await recorder.record("prepared")
+                return try Self.bundle(for: preparedPlan)
+            },
+            revokeChildLaunches: { _, bundle in await recorder.record("revoked:\(bundle?.carriers.count ?? 0)") }
+        )
+        let binding = MCPDomainToolBinding(
+            definition: .init(
+                name: "context_builder",
+                description: "handoff fixture",
+                inputSchema: .object(["type": .string("object")])
+            )
+        ) { _ in
+            // The carrier-free phase: nothing is installed or minted.
+            XCTAssertNil(DomainChildLaunchContext.bundle)
+            XCTAssertNil(DomainChildLaunchContext.current)
+            let handoff = try XCTUnwrap(DomainChildLaunchContext.handoff)
+            await recorder.record("discovery")
+            let bundle = try await handoff.prepare()
+            XCTAssertEqual(bundle.carriers.map(\.launchID), plan.lanes.map(\.launchID))
+            do {
+                _ = try await handoff.prepare()
+                XCTFail("A handoff prepares once")
+            } catch {
+                XCTAssertEqual(error as? DomainChildLaunchHandoff.HandoffError, .alreadyPrepared)
+            }
+            return .string("ok")
+        }
+        let security = makeSecurityContext(identity: runtime.identity, toolName: "context_builder")
+        let value = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+            try await provider.wrapping(binding)(["instructions": .string("find it")])
+        }
+
+        XCTAssertEqual(value, .string("ok"))
+        let recorded = await recorder.values()
+        XCTAssertEqual(recorded, ["discovery", "prepared", "revoked:2"])
+    }
+
+    func testHandoffObservesCancellationBeforeMintingAndIsClosedAfterTheInvocation() async throws {
+        let runtime = makeRuntime(mode: .app, profile: "handoff-cancel")
+        try await runtime.start()
+        defer { Task { await runtime.shutdown() } }
+        let recorder = LaunchRecorder()
+        let plan = try DomainChildLaunchPlan(
+            runID: UUID(),
+            lanes: [DomainChildLaunchLanePlan(providerIdentifier: "fixture")],
+            preparation: .atHandoff
+        )
+        let provider = MCPDomainLongRunningToolProvider(
+            identity: runtime.identity,
+            policyStore: runtime.mutationPolicyStore,
+            interactionBroker: runtime.interactionBroker,
+            activityCenter: runtime.activityCenter,
+            resolveChildLaunchPlan: { _, _, _ in plan },
+            prepareChildLaunches: { preparedPlan, _, _, _ in
+                await recorder.record("unexpected-prepare")
+                return try Self.bundle(for: preparedPlan)
+            },
+            revokeChildLaunches: { _, bundle in await recorder.record("revoked:\(bundle?.carriers.count ?? 0)") }
+        )
+        let escaped = HandoffBox()
+        let binding = MCPDomainToolBinding(
+            definition: .init(
+                name: "context_builder",
+                description: "handoff cancellation fixture",
+                inputSchema: .object(["type": .string("object")])
+            )
+        ) { _ in
+            let handoff = try XCTUnwrap(DomainChildLaunchContext.handoff)
+            await escaped.store(handoff)
+            // Cancellation lands exactly at the handoff: nothing may be minted.
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try await handoff.prepare()
+            return .string("unexpected")
+        }
+        let security = makeSecurityContext(identity: runtime.identity, toolName: "context_builder")
+        let task = Task {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await provider.wrapping(binding)([:])
+            }
+        }
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        let recorded = await recorder.values()
+        XCTAssertEqual(recorded, ["revoked:0"])
+        let stored = await escaped.value
+        let handoff = try XCTUnwrap(stored)
+        await XCTAssertOracleLaunchThrowsErrorAsync {
+            try await handoff.prepare()
+        } verify: {
+            XCTAssertEqual($0 as? DomainChildLaunchHandoff.HandoffError, .closed, "an ended invocation cannot mint carriers")
+        }
+    }
+
     func testRoutingKeepsSharedRunPendingUntilAllFiveLaunchesSettle() async throws {
         let fixture = try await makeRuntimeWithContext(profile: "routing-count")
         defer { Task { await fixture.runtime.shutdown() } }
@@ -503,6 +621,22 @@ final class OracleLaneLaunchAuthorizationTests: XCTestCase {
         )
     }
 
+    private static func bundle(for plan: DomainChildLaunchPlan) throws -> DomainChildLaunchCarrierBundle {
+        try DomainChildLaunchCarrierBundle(plan: plan, carriers: plan.lanes.map { lane in
+            DomainChildLaunchCarrier(
+                runID: plan.runID,
+                launchID: lane.launchID,
+                providerIdentifier: lane.providerIdentifier,
+                oracleGroupID: plan.oracleGroupID,
+                oracleLaneID: lane.oracleLaneID,
+                oracleGroupClaimID: plan.oracleGroupClaimID,
+                launchTokenID: UUID(),
+                credentialEnvelope: nil,
+                environment: [:]
+            )
+        })
+    }
+
     private func makeSecurityContext(
         identity: DomainRuntimeIdentity,
         toolName: String
@@ -540,6 +674,12 @@ private func XCTAssertOracleLaunchThrowsErrorAsync<T>(
     } catch {
         verify(error)
     }
+}
+
+private actor HandoffBox {
+    private(set) var value: DomainChildLaunchHandoff?
+
+    func store(_ handoff: DomainChildLaunchHandoff) { value = handoff }
 }
 
 private actor LaunchRecorder {

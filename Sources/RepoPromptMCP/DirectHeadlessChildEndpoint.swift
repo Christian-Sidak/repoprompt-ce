@@ -250,9 +250,16 @@ actor DirectHeadlessChildLaunchCoordinator {
         case missingRoutingContext
     }
 
+    /// Launch-token lifetime of every carrier this coordinator prepares. A `.atHandoff` plan is
+    /// prepared at its handoff, so the lifetime starts there rather than at admission.
+    private let carrierLifetime: Duration
     private var runtime: MCPDomainRuntime?
     private var harness: DomainPrivateChildLaunchHarness?
     private var oracleAdapter: DirectHeadlessOracleAdapter?
+
+    init(carrierLifetime: Duration = .seconds(60)) {
+        self.carrierLifetime = carrierLifetime
+    }
 
     func configure(
         runtime: MCPDomainRuntime,
@@ -329,7 +336,7 @@ actor DirectHeadlessChildLaunchCoordinator {
                     runPurpose: toolName,
                     additionalTools: Set(arguments["additional_tools"]?.arrayValue?.compactMap(\.stringValue) ?? []),
                     expectedProcessID: nil,
-                    lifetime: .seconds(60)
+                    lifetime: carrierLifetime
                 )
                 try await carriers.append(harness.prepare(request: request))
             }
