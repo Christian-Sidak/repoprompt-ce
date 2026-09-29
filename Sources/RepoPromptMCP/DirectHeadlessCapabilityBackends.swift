@@ -1382,10 +1382,9 @@ enum DirectProcess {
     }
 
     /// `didStart` runs exactly once for a process that was spawned (never when it fails to spawn
-    /// or is cancelled before spawning), and always before the run settles: a process that exits
-    /// before the spawning thread gets to report it is reported by its termination first.
-    /// `afterSpawn` is a test seam that runs on the spawning thread right after the spawn, before
-    /// that thread reports it.
+    /// or is cancelled before spawning), and it has *completed* before the run can settle: the
+    /// once-only claim and the callback happen under one start lock, which the termination handler
+    /// also takes before it settles, whichever of the two reports the spawn.
     static func run(
         _ executable: String,
         arguments: [String],
@@ -1393,7 +1392,7 @@ enum DirectProcess {
         environment: [String: String] = [:],
         currentDirectory: URL? = nil,
         didStart: (@Sendable () -> Void)? = nil,
-        afterSpawn: (@Sendable () -> Void)? = nil
+        testHooks: DirectProcessTestHooks = .init()
     ) async throws -> String {
         try await DirectProcessInvocation(
             executable: executable,
@@ -1402,8 +1401,32 @@ enum DirectProcess {
             environment: environment,
             currentDirectory: currentDirectory,
             didStart: didStart,
-            afterSpawn: afterSpawn
+            testHooks: testHooks
         ).run()
+    }
+}
+
+/// Test seams for `DirectProcess.run`'s spawn reporting. All default to no-ops.
+struct DirectProcessTestHooks: @unchecked Sendable {
+    /// On the spawning thread, right after the spawn, before that thread reports it.
+    var afterSpawn: (@Sendable () -> Void)?
+    /// On whichever thread claimed the once-only spawn report, before it calls `didStart`.
+    var afterStartClaimed: (@Sendable () -> Void)?
+    /// In the termination handler, after its spawn report, right before it settles the run.
+    var beforeTerminationSettles: (@Sendable () -> Void)?
+    /// Replaces the start lock (for observing contention).
+    var startLock: NSLocking?
+
+    init(
+        afterSpawn: (@Sendable () -> Void)? = nil,
+        afterStartClaimed: (@Sendable () -> Void)? = nil,
+        beforeTerminationSettles: (@Sendable () -> Void)? = nil,
+        startLock: NSLocking? = nil
+    ) {
+        self.afterSpawn = afterSpawn
+        self.afterStartClaimed = afterStartClaimed
+        self.beforeTerminationSettles = beforeTerminationSettles
+        self.startLock = startLock
     }
 }
 
@@ -1465,7 +1488,10 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     private let inputPipe: Pipe?
     private let input: Data?
     private let didStart: (@Sendable () -> Void)?
-    private let afterSpawn: (@Sendable () -> Void)?
+    private let testHooks: DirectProcessTestHooks
+    /// Held across the once-only spawn claim and the `didStart` callback (never across anything
+    /// else), separate from `lock` so cancellation never waits on the callback.
+    private let startLock: NSLocking
     private var cancellationRequested = false
     private var startReported = false
 
@@ -1476,11 +1502,12 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         environment overrides: [String: String],
         currentDirectory: URL?,
         didStart: (@Sendable () -> Void)? = nil,
-        afterSpawn: (@Sendable () -> Void)? = nil
+        testHooks: DirectProcessTestHooks = .init()
     ) {
         self.input = input
         self.didStart = didStart
-        self.afterSpawn = afterSpawn
+        self.testHooks = testHooks
+        startLock = testHooks.startLock ?? NSLock()
         inputPipe = input == nil ? nil : Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -1506,8 +1533,10 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                         return
                     }
                     // Only a spawned process terminates: report the spawn before settling, in case
-                    // the spawning thread has not reported it yet.
+                    // the spawning thread has not; if it is reporting right now, this waits until
+                    // its `didStart` completed.
                     reportStartOnce()
+                    testHooks.beforeTerminationSettles?()
                     pipe.fileHandleForReading.readabilityHandler = nil
                     let snapshot = outputCapture.finish {
                         self.pipe.fileHandleForReading.readDataToEndOfFile()
@@ -1528,7 +1557,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                 }
                 do {
                     try process.run()
-                    afterSpawn?()
+                    testHooks.afterSpawn?()
                     reportStartOnce()
                     if let inputPipe, let input {
                         inputPipe.fileHandleForWriting.write(input)
@@ -1546,13 +1575,15 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     }
 
     /// Calls `didStart` the first time only, whichever of the spawning thread and the termination
-    /// handler gets here first.
+    /// handler gets here first. The claim and the callback are one critical section: a later
+    /// caller returns only once the first caller's `didStart` has completed.
     private func reportStartOnce() {
-        lock.lock()
-        let first = !startReported
+        startLock.lock()
+        defer { startLock.unlock() }
+        guard !startReported else { return }
         startReported = true
-        lock.unlock()
-        if first { didStart?() }
+        testHooks.afterStartClaimed?()
+        didStart?()
     }
 
     private func isCancellationRequested() -> Bool {

@@ -1637,6 +1637,24 @@ regression that fails with its fix reverted.
   settlement. It still runs only for a process that was spawned. Note: `run()` could not actually
   return before the old report ran, because the continuation body executes synchronously on the
   awaiting task. The change makes the ordering structural, so it no longer depends on that detail.
+- **Spawn report completion (re-review of `a349168e`, P2).** `reportStartOnce` marked the report
+  claimed and released its lock *before* calling `didStart`. A reporter paused between the claim and
+  the callback let the termination handler see the flag, skip the callback, and settle the run while
+  `didStart` had not run, so settlement could read `oracle_started: false`. The claim and the callback
+  are now one critical section under a dedicated start lock, separate from the cancellation lock so
+  cancellation never waits on the callback. The termination handler takes that lock before it
+  settles, so neither a termination nor a return can settle before `didStart` has completed. Seams
+  live in `DirectProcessTestHooks`: after spawn, after the start claim, before the termination
+  settles, and an injectable start lock. The regression
+  `testTerminationCannotSettleWhileTheClaimedSpawnReportHasNotCompleted` does the following:
+  - the spawning thread claims the report long before `/bin/sleep 0.3` exits;
+  - it pauses exactly between the claim and the callback, until the termination either contends for
+    the start lock or settles;
+  - it requires the order `started` then `settling`.
+
+  With the pre-fix structure (the claim, the unlock, then the callback) the same test observed
+  `settling` then `started` and failed (`a18812c5`). With the fix it passes in about 0.3 s, released by
+  the contention rather than by a timeout.
 - **Guardrail.** `headless_runtime_guardrails.sh` also requires the host entry/return bracket and
   the two `reportStartOnce()` sites.
 

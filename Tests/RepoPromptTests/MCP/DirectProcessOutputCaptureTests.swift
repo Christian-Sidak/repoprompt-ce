@@ -141,14 +141,40 @@ final class DirectProcessSpawnReportTests: XCTestCase {
                 starts.record()
                 reported.signal()
             },
-            afterSpawn: {
+            testHooks: DirectProcessTestHooks(afterSpawn: {
                 if reported.wait(timeout: .now() + 10) == .success {
                     reportedBeforeSpawningThread.record()
                 }
-            }
+            })
         )
         XCTAssertEqual(reportedBeforeSpawningThread.count, 1, "the termination reported the spawn before the run settled")
         XCTAssertEqual(starts.count, 1, "the spawn is reported exactly once")
+    }
+
+    func testTerminationCannotSettleWhileTheClaimedSpawnReportHasNotCompleted() async throws {
+        let events = OrderedEvents()
+        let progressed = DispatchSemaphore(value: 0)
+        // Contention on the start lock means the termination handler is waiting for the report.
+        let startLock = ContentionSignallingLock { progressed.signal() }
+        // The spawning thread claims the report long before the process exits (0.3 s), then pauses
+        // precisely between the claim and the callback until the termination either waits for it
+        // (contends for the start lock) or settles past it.
+        _ = try await DirectProcess.run(
+            "/bin/sleep",
+            arguments: ["0.3"],
+            didStart: { events.append("started") },
+            testHooks: DirectProcessTestHooks(
+                afterStartClaimed: {
+                    _ = progressed.wait(timeout: .now() + 10)
+                },
+                beforeTerminationSettles: {
+                    events.append("settling")
+                    progressed.signal()
+                },
+                startLock: startLock
+            )
+        )
+        XCTAssertEqual(events.values, ["started", "settling"], "the run settled before its spawn report completed")
     }
 
     func testAProcessReportsItsSpawnOnceWhenTheSpawningThreadReportsFirst() async throws {
@@ -166,6 +192,44 @@ final class DirectProcessSpawnReportTests: XCTestCase {
             XCTFail("A missing executable must fail to spawn")
         } catch {}
         XCTAssertEqual(starts.count, 0)
+    }
+}
+
+private final class OrderedEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+
+    func append(_ event: String) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+}
+
+/// A lock that reports every acquisition attempt that has to wait for another holder.
+private final class ContentionSignallingLock: NSLocking, @unchecked Sendable {
+    private let mutex = NSLock()
+    private let onContention: @Sendable () -> Void
+
+    init(onContention: @escaping @Sendable () -> Void) {
+        self.onContention = onContention
+    }
+
+    func lock() {
+        if !mutex.try() {
+            onContention()
+            mutex.lock()
+        }
+    }
+
+    func unlock() {
+        mutex.unlock()
     }
 }
 
