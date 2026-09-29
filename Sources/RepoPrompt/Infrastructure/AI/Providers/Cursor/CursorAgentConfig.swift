@@ -1,3 +1,4 @@
+import RepoPromptProcess
 import Foundation
 
 enum CursorAgentCommandSelection: Equatable {

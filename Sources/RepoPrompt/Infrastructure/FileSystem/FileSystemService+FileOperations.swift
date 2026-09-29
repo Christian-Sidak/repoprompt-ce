@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 import RepoPromptDomainRuntime
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     import Darwin

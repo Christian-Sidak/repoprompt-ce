@@ -1,3 +1,5 @@
+import RepoPromptProcess
+import RepoPromptSecureStorage
 import AppKit
 import Darwin
 import Foundation

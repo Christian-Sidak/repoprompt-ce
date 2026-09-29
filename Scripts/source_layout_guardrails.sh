@@ -32,7 +32,7 @@ required_dirs=(
   "Sources/RepoPromptExecutable"
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
-  "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
+  "Sources/RepoPromptFoundation/SyntaxParsing"
   "Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptWorkspaceCore"
   "Sources/RepoPromptDomainRuntime"
@@ -667,10 +667,10 @@ fi
 # 4. Parser fixtures and sample parser inputs must not live in app source.
 print_matches \
   "parser fixture/test directory found under app syntax parsing source" \
-  find Sources/RepoPrompt/Infrastructure/SyntaxParsing -type d \( -iname '*fixture*' -o -iname '*test*' \) -print
+  find Sources/RepoPromptFoundation/SyntaxParsing -type d \( -iname '*fixture*' -o -iname '*test*' \) -print
 print_matches \
   "parser fixture-like sample input found under app syntax parsing source" \
-  find Sources/RepoPrompt/Infrastructure/SyntaxParsing -type f \( \
+  find Sources/RepoPromptFoundation/SyntaxParsing -type f \( \
     -iname '*fixture*' -o -iname '*test*' -o \
     -name '*.dart' -o -name '*.go' -o -name '*.java' -o -name '*.js' -o -name '*.jsx' -o \
     -name '*.py' -o -name '*.rb' -o -name '*.rs' -o -name '*.ts' -o -name '*.tsx' -o \

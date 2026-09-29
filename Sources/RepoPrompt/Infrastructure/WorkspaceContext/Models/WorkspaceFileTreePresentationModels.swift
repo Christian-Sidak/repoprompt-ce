@@ -1,3 +1,4 @@
+import RepoPromptWorkspaceCore
 import Foundation
 
 struct WorkspaceFileTreePresentationSnapshot {

@@ -1,4 +1,6 @@
+import RepoPromptProcess
 import Foundation
+import RepoPromptWorkspaceCore
 import MCP
 
 @MainActor

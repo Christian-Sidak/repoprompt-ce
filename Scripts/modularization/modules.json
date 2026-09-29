@@ -19,7 +19,11 @@
         "RepoPromptC",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
+        "RepoPromptFoundation",
+        "RepoPromptInstrumentation",
+        "RepoPromptProcess",
         "RepoPromptRegexCore",
+        "RepoPromptSecureStorage",
         "RepoPromptShared",
         "RepoPromptWorkspaceCore",
         "Sparkle"
@@ -62,6 +66,36 @@
         "RepoPromptDomainRuntime"
       ]
     },
+    "RepoPromptFoundation": {
+      "source_root": "Sources/RepoPromptFoundation",
+      "allowed_dependencies": [
+        "RepoPromptCodeMapCore",
+        "RepoPromptWorkspaceCore"
+      ],
+      "test_target": "RepoPromptFoundationTests",
+      "app_free_tests": true
+    },
+    "RepoPromptFoundationTests": {
+      "source_root": "Tests/RepoPromptFoundationTests",
+      "allowed_dependencies": [
+        "RepoPromptFoundation"
+      ]
+    },
+    "RepoPromptInstrumentation": {
+      "source_root": "Sources/RepoPromptInstrumentation",
+      "allowed_dependencies": [
+        "RepoPromptProcess"
+      ],
+      "test_target": "RepoPromptInstrumentationTests",
+      "app_free_tests": true
+    },
+    "RepoPromptInstrumentationTests": {
+      "source_root": "Tests/RepoPromptInstrumentationTests",
+      "allowed_dependencies": [
+        "RepoPromptInstrumentation",
+        "RepoPromptTestSupport"
+      ]
+    },
     "RepoPromptMCP": {
       "source_root": "Sources/RepoPromptMCP",
       "allowed_dependencies": [
@@ -90,6 +124,21 @@
         "RepoPromptTestSupport"
       ]
     },
+    "RepoPromptProcess": {
+      "source_root": "Sources/RepoPromptProcess",
+      "allowed_dependencies": [
+        "RepoPromptFoundation",
+        "RepoPromptShared"
+      ],
+      "test_target": "RepoPromptProcessTests",
+      "app_free_tests": true
+    },
+    "RepoPromptProcessTests": {
+      "source_root": "Tests/RepoPromptProcessTests",
+      "allowed_dependencies": [
+        "RepoPromptProcess"
+      ]
+    },
     "RepoPromptRegexCore": {
       "source_root": "Sources/RepoPromptRegexCore",
       "allowed_dependencies": [
@@ -102,6 +151,19 @@
       "source_root": "Tests/RepoPromptRegexCoreTests",
       "allowed_dependencies": [
         "RepoPromptRegexCore"
+      ]
+    },
+    "RepoPromptSecureStorage": {
+      "source_root": "Sources/RepoPromptSecureStorage",
+      "allowed_dependencies": [],
+      "test_target": "RepoPromptSecureStorageTests",
+      "app_free_tests": true
+    },
+    "RepoPromptSecureStorageTests": {
+      "source_root": "Tests/RepoPromptSecureStorageTests",
+      "allowed_dependencies": [
+        "RepoPromptSecureStorage",
+        "RepoPromptTestSupport"
       ]
     },
     "RepoPromptShared": {
@@ -118,7 +180,11 @@
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
+        "RepoPromptFoundation",
+        "RepoPromptInstrumentation",
         "RepoPromptMCPCore",
+        "RepoPromptProcess",
+        "RepoPromptSecureStorage",
         "RepoPromptShared",
         "RepoPromptTestSupport"
       ]
@@ -144,5 +210,61 @@
       "allowed_dependencies": []
     }
   },
-  "moved_families": {}
+  "moved_families": {
+    "FoundationConcurrency": {
+      "owner": "RepoPromptFoundation",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/Concurrency"
+      ]
+    },
+    "FoundationNetworking": {
+      "owner": "RepoPromptFoundation",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/Networking"
+      ]
+    },
+    "FoundationSliceRanges": {
+      "owner": "RepoPromptFoundation",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Slices/LineRange.swift",
+        "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Slices/SliceRangeMath.swift"
+      ]
+    },
+    "FoundationSyntaxParsing": {
+      "owner": "RepoPromptFoundation",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
+      ]
+    },
+    "FoundationUtilities": {
+      "owner": "RepoPromptFoundation",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/Utilities"
+      ]
+    },
+    "InstrumentationTelemetryModel": {
+      "owner": "RepoPromptInstrumentation",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/Telemetry/SentryTelemetryModel.swift"
+      ]
+    },
+    "Process": {
+      "owner": "RepoPromptProcess",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/Process"
+      ]
+    },
+    "RegexAdapters": {
+      "owner": "RepoPromptRegexCore",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/Regex"
+      ]
+    },
+    "SecureStorage": {
+      "owner": "RepoPromptSecureStorage",
+      "former_app_roots": [
+        "Sources/RepoPrompt/Infrastructure/Security"
+      ]
+    }
+  }
 }

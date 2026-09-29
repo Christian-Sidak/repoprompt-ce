@@ -1,3 +1,5 @@
+import RepoPromptFoundation
+import RepoPromptProcess
 import Foundation
 
 struct HeadlessAgentContext {

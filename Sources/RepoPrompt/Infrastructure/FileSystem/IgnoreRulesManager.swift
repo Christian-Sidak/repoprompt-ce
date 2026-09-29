@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import CryptoKit
 import Foundation
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)

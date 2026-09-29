@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 
 /// Why an Agent-run review source cannot be used by its delegated consumer.

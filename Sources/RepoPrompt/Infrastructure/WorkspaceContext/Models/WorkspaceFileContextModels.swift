@@ -1,4 +1,6 @@
+import RepoPromptFoundation
 import Foundation
+import RepoPromptWorkspaceCore
 
 /// Root scopes shared by UI and headless workspace file lookup paths.
 enum WorkspaceLookupRootScope: Hashable {

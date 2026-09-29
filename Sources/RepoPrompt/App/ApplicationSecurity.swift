@@ -5,6 +5,7 @@
 //  Created by Eric Provencher on 2025-02-27.
 //
 
+import RepoPromptProcess
 import Cocoa
 import Foundation
 import MachO

@@ -1,3 +1,4 @@
+import RepoPromptProcess
 import Foundation
 
 enum ACPProviderID: String, Codable, Hashable {

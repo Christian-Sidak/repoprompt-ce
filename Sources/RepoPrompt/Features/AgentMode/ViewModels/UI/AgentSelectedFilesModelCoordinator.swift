@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 
 struct AgentSelectedFilesModelIdentity: Equatable, Hashable {

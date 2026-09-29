@@ -1,3 +1,4 @@
+import RepoPromptProcess
 import Foundation
 
 /// Singleton actor that manages the cache of broken Codex MCP servers.

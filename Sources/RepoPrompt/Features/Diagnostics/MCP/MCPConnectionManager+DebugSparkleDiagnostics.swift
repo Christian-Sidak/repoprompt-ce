@@ -1,5 +1,6 @@
 // MARK: - DEBUG Sparkle Diagnostics
 
+import RepoPromptFoundation
 import Foundation
 import MCP
 

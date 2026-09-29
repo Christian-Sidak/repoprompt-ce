@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 
 extension WorkspaceRootReadinessFailure.Availability: @unchecked Sendable {}

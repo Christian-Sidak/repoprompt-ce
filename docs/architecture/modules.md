@@ -10,6 +10,9 @@ The app target (`RepoPromptApp`) is the composition and product-flow owner, not 
 | `RepoPromptApp` | Product flow, UI, composition | May depend on lower app-free targets |
 | `RepoPromptMCPCore`, `RepoPromptDomainRuntime` | Headless CLI and domain runtime | Never depend on app |
 | `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, `RepoPromptShared` | Narrow reusable cores | Never depend on app |
+| `RepoPromptFoundation`, `RepoPromptInstrumentation` | Reusable substrate and diagnostic sink contracts | Never depend on app |
+| `RepoPromptProcess` | Headless process and CLI mechanics (no `Bundle.main` or `UserDefaults.standard`) | Foundation and Shared only |
+| `RepoPromptSecureStorage` | App-only secure storage | Never linked into MCP CLI |
 | `RepoPromptC`, `CSwiftPCRE2`, `TreeSitterScannerSupport`, `Sparkle` | C/binary support | Leaf support targets |
 | `<Module>Tests` | Tests of their corresponding module | Production target plus explicitly cataloged test support |
 

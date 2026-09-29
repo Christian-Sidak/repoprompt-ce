@@ -1,4 +1,6 @@
+import RepoPromptRegexCore
 import Foundation
+import RepoPromptWorkspaceCore
 import JSONSchema
 import MCP
 import Ontology

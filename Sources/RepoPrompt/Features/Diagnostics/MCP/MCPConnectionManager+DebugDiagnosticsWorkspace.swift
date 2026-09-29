@@ -1,6 +1,8 @@
 // MARK: - DEBUG Workspace Diagnostics
 
+import RepoPromptFoundation
 import Foundation
+import RepoPromptWorkspaceCore
 import MCP
 
 #if DEBUG

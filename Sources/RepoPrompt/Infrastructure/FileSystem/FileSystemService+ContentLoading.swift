@@ -1,5 +1,6 @@
 import Cuchardet
 import Foundation
+import RepoPromptWorkspaceCore
 import RepoPromptDomainRuntime
 import UniversalCharsetDetection
 

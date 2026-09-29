@@ -1,3 +1,5 @@
+import RepoPromptProcess
+import RepoPromptFoundation
 import Foundation
 
 enum CursorACPLaunchCandidate: CaseIterable, Equatable {

@@ -1,6 +1,8 @@
+import RepoPromptFoundation
 import AppKit
 import Combine
 import Foundation
+import RepoPromptWorkspaceCore
 import SwiftUI
 #if DEBUG || EDIT_FLOW_PERF
     import os

@@ -1,5 +1,6 @@
 // MARK: - Connection Management Components
 
+import RepoPromptFoundation
 import CryptoKit
 import Darwin
 import Dispatch
