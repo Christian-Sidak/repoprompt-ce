@@ -226,7 +226,9 @@ layer yet: explicit parity contract and the read-only authority view are the nex
   for the default profile; an isolated file for an explicit headless profile) and reports
   `settings`, `value_absent`, `file_missing`, or `blocked_<reason>` (`unreadable`,
   `incompatible_schema`, `unsupported_future_schema`, `invalid_value`). It never writes. A
-  blocked document's value is never used; like the app's blocked load, the canonical list applies.
+  blocked document's value is never used and the canonical list applies. Since M14 the app's
+  blocked load instead keeps its legacy `UserDefaults` value, which this file-only view cannot
+  read, so the two can differ while the settings file is blocked (documented divergence).
 - Headless `app_settings` serves `file_system.global_ignore_defaults` from that view (re-read on
   every access), marks it `writable: false` with `authority: app` and `authority_status`, and
   rejects `set` with `appAuthorityReadOnly`. A value previously stored for this key in headless
@@ -896,6 +898,33 @@ M13 claims no compile result, no test result, and no parity runtime result: the 
 established from source, and the new parity scenarios, owner tests, codemap test synchronization, and
 hand-patched schema review snapshot are unverified until a build succeeds. Not run: the full suite,
 live MCP smoke, and packaged-release checks; backend defaults are unchanged.
+
+### M14 — global-ignore authority safety and `max_results` range parity
+
+- **Migration marker after a durable write.** `GlobalSettingsStore` recorded the one-time legacy
+  global-ignore migration marker before the startup save ran, so a failed write followed by a
+  relaunch lost a customized legacy value (the JSON on disk was still canonical and the migration
+  never retried). The marker is now recorded only after a save carrying the migrated value succeeds
+  (the startup save, a retry, or any later save); a failed write keeps the live value and retries on
+  the next launch.
+- **Blocked load keeps user exclusions.** A blocked or incompatible settings file installs provisional
+  defaults, which published the canonical list to the crawl and suppressed the legacy effective
+  exclusions that `IgnoreRulesManager`'s pre-load fallback would have applied. The provisional
+  document now keeps the legacy effective value until a compatible document is loaded or recovered,
+  and explicit recovery persists it. A loaded document whose save later failed is unchanged. Headless
+  `DomainGlobalIgnoreDefaultsView` reads only the JSON file and still reports the canonical list in
+  that blocked state (documented divergence).
+- **`max_results` range.** Headless clamped `max_results` to `1...1000`; the app provider passed 0,
+  negatives, and values above 1000 through unchanged. `FileSearchResultLimits.effectiveMaxResults`
+  now owns the range (absent → 50; zero and negatives → 1; above 1000 → 1000; never refused), both
+  backends call it, and the canonical schema text states the range.
+
+Evidence: focused coordinated test ticket `e5d95110` passed (98 tests: `GlobalIgnoreDefaultsAuthorityTests`,
+every `GlobalSettings*` suite, `MCPDomainCanonicalSearchSemanticsTests`, `MCPBackendParityHarnessTests`
+with three new negative/zero/above-maximum parity scenarios, `DirectHeadlessCompositionTests`,
+`DomainGlobalIgnoreDefaultsViewTests`, `HeadlessIgnoreParityTests`); `conductor lint` ticket `53e6ee9c`
+and `conductor guardrails` ticket `65d98249` passed. The build used the locally restored, untracked
+official Sparkle 2.9.2 dSYMs; no Vendor file is part of this change.
 
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 

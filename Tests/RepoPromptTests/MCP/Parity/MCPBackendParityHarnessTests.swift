@@ -759,6 +759,23 @@ import XCTest
                     ["pattern": "order/a", "mode": "path", "max_results": 2],
                     Expectation(include: ["order/a-z.txt", "order/a.txt"], exclude: ["order/a/b.txt"])
                 ),
+                // M14: both backends clamp `max_results` into 1...FileSearchResultLimits.maximumMaxResults
+                // instead of refusing, so zero and negatives keep exactly the first full-path-order hit.
+                search(
+                    "negative max_results clamps to one hit per stage",
+                    ["pattern": "orderMarker", "mode": "content", "max_results": -5],
+                    Expectation(include: ["order/a-z.txt"], exclude: ["order/a.txt", "order/a/b.txt"])
+                ),
+                search(
+                    "zero max_results clamps to one hit per stage",
+                    ["pattern": "order/a", "mode": "path", "max_results": 0],
+                    Expectation(include: ["order/a-z.txt"], exclude: ["order/a.txt", "order/a/b.txt"])
+                ),
+                search(
+                    "max_results above the maximum clamps and still answers",
+                    ["pattern": "orderMarker", "mode": "content", "max_results": 1_000_000],
+                    Expectation(include: ["order/a-z.txt", "order/a.txt", "order/a/b.txt"])
+                ),
                 // Only docs/blank_line.txt has an empty line; every other non-empty fixture file ends with a
                 // newline, which must not start a phantom empty last line, and the empty file has no lines.
                 search(

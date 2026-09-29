@@ -14,6 +14,8 @@ RepoPrompt CE stores app settings in the versioned JSON document at:
 
 `fileSystem.globalIgnoreDefaults` in this file is the authority for app-wide ignore patterns: `app_settings` writes it and the workspace crawl reads it. `GlobalSettingsStore.shared` publishes the effective value to `GlobalIgnoreDefaultsAuthority.processWide`, which `IgnoreRulesManager` reads without a MainActor hop. The legacy `UserDefaults` keys `globalIgnoreDefaults` / `globalIgnoreDefaultsVersion` are no longer the crawl's source; they are read only by a one-time startup migration (marker `globalIgnoreDefaultsSettingsAuthorityMigration`) that copies a customized legacy value into an uncustomized JSON value, and as a fallback for a crawl that starts before the store loads. An explicitly customized JSON value always wins, and the legacy keys are left in place for downgrade safety.
 
+The migration marker is recorded only after a save carrying the migrated value succeeds; a failed write leaves it unset, so the next launch retries the migration instead of losing the customization. When no compatible document can be loaded (blocked schema, corrupt file, failed initial write), the store's document is provisional: it keeps and publishes the legacy effective value rather than the canonical list, and an explicit recovery persists that value. Headless `DomainGlobalIgnoreDefaultsView` reads only the JSON file, so in that blocked state it reports the canonical list (a documented divergence).
+
 The file is identified by two fields, not one:
 
 - `schemaLineage` answers **who wrote this settings family**.

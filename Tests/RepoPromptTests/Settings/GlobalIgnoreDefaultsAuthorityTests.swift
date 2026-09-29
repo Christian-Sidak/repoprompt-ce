@@ -80,7 +80,136 @@ final class GlobalIgnoreDefaultsAuthorityTests: XCTestCase {
         XCTAssertNotEqual(before.globalIgnoreDefaultsDigest, after.globalIgnoreDefaultsDigest)
     }
 
+    // MARK: - M14: authority safety
+
+    /// The migration marker is recorded only after the migrated value is durably saved: a failed
+    /// write keeps the live customization, leaves the marker unset, and the next launch retries.
+    func testFailedMigrationWriteRetriesOnRelaunchInsteadOfLosingTheCustomization() throws {
+        let fileURL = try makeSettingsURL()
+        // An earlier launch seeded an uncustomized settings file.
+        _ = makeStore(fileURL: fileURL, defaults: makeDefaults(), authority: nil)
+        XCTAssertEqual(try storedGlobalIgnoreDefaults(at: fileURL), IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults)
+
+        let defaults = makeDefaults()
+        let legacy = "**/legacy-custom/\n"
+        defaults.set(legacy, forKey: legacyKey)
+        defaults.set(IgnoreSettingsDefaults.currentGlobalIgnoreDefaultsVersion, forKey: legacyVersionKey)
+        let authority = GlobalIgnoreDefaultsAuthority()
+        let failed = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(
+                fileURL: fileURL,
+                startupMigrationAtomicWriter: { _, _ in throw CocoaError(.fileWriteOutOfSpace) }
+            ),
+            ignoreDefaultsAuthority: authority
+        )
+
+        XCTAssertEqual(failed.persistenceBlockReason, .saveFailed)
+        XCTAssertEqual(failed.globalIgnoreDefaults(), legacy, "the live session keeps the customization")
+        XCTAssertEqual(authority.current(), legacy)
+        XCTAssertFalse(IgnoreSettingsDefaults.isSettingsAuthorityMigrated(defaults: defaults))
+        XCTAssertEqual(try storedGlobalIgnoreDefaults(at: fileURL), IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults)
+
+        // Relaunch with a working disk: the migration runs again and is then recorded.
+        let relaunchAuthority = GlobalIgnoreDefaultsAuthority()
+        let relaunched = makeStore(fileURL: fileURL, defaults: defaults, authority: relaunchAuthority)
+        XCTAssertNil(relaunched.persistenceBlockReason)
+        XCTAssertEqual(relaunched.globalIgnoreDefaults(), legacy)
+        XCTAssertEqual(relaunchAuthority.current(), legacy)
+        XCTAssertEqual(try storedGlobalIgnoreDefaults(at: fileURL), legacy)
+        XCTAssertTrue(IgnoreSettingsDefaults.isSettingsAuthorityMigrated(defaults: defaults))
+    }
+
+    /// A same-session retry that durably saves the migrated value records the marker.
+    func testSuccessfulRetryAfterFailedMigrationWriteRecordsTheMarker() throws {
+        let fileURL = try makeSettingsURL()
+        _ = makeStore(fileURL: fileURL, defaults: makeDefaults(), authority: nil)
+        let defaults = makeDefaults()
+        let legacy = "**/legacy-custom/\n"
+        defaults.set(legacy, forKey: legacyKey)
+        defaults.set(IgnoreSettingsDefaults.currentGlobalIgnoreDefaultsVersion, forKey: legacyVersionKey)
+        let gate = WriteGate()
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(
+                fileURL: fileURL,
+                startupMigrationAtomicWriter: { data, url in
+                    if gate.failWrites { throw CocoaError(.fileWriteOutOfSpace) }
+                    try data.write(to: url, options: .atomic)
+                }
+            ),
+            ignoreDefaultsAuthority: GlobalIgnoreDefaultsAuthority()
+        )
+        XCTAssertEqual(store.persistenceBlockReason, .saveFailed)
+        XCTAssertFalse(IgnoreSettingsDefaults.isSettingsAuthorityMigrated(defaults: defaults))
+
+        gate.failWrites = false
+        XCTAssertTrue(store.retryBlockedPersistenceSave())
+        XCTAssertEqual(try storedGlobalIgnoreDefaults(at: fileURL), legacy)
+        XCTAssertTrue(IgnoreSettingsDefaults.isSettingsAuthorityMigrated(defaults: defaults))
+    }
+
+    /// A blocked settings file installs provisional defaults, which must not replace the user's
+    /// legacy exclusions in the crawl. Explicit recovery then persists those exclusions.
+    func testBlockedSettingsLoadKeepsLegacyExclusionsInTheCrawlUntilRecovered() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ignore-authority-blocked-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("legacy-out", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        addTeardownBlock { await IgnoreRulesManager.shared.setGlobalDefaultsAuthorityOverride(nil) }
+        let legacy = "**/legacy-out/\n"
+        let blockedDocuments: [(String, [String: Any])] = [
+            ("unsupported future schema", [
+                "schemaVersion": GlobalSettingsDocument.currentSchemaVersion + 90,
+                "schemaLineage": GlobalSettingsDocument.schemaLineage
+            ]),
+            ("incompatible lineage", ["schemaVersion": 1, "schemaLineage": "another-app.global-settings"])
+        ]
+
+        for (label, header) in blockedDocuments {
+            let fileURL = try makeSettingsURL()
+            var document = header
+            document["scalarPreferences"] = ["fileSystem": ["globalIgnoreDefaults": "**/unreadable-choice/\n"]]
+            let blockedBytes = try JSONSerialization.data(withJSONObject: document)
+            try blockedBytes.write(to: fileURL)
+            let defaults = makeDefaults()
+            defaults.set(legacy, forKey: legacyKey)
+            defaults.set(IgnoreSettingsDefaults.currentGlobalIgnoreDefaultsVersion, forKey: legacyVersionKey)
+            let authority = GlobalIgnoreDefaultsAuthority()
+            await IgnoreRulesManager.shared.setGlobalDefaultsAuthorityOverride(authority)
+
+            let store = makeStore(fileURL: fileURL, defaults: defaults, authority: authority)
+            XCTAssertNotNil(store.persistenceBlockReason, label)
+            XCTAssertEqual(store.globalIgnoreDefaults(), legacy, label)
+            XCTAssertEqual(authority.current(), legacy, "\(label): the crawl keeps the legacy exclusions")
+            XCTAssertFalse(IgnoreSettingsDefaults.isSettingsAuthorityMigrated(defaults: defaults), label)
+            XCTAssertEqual(try Data(contentsOf: fileURL), blockedBytes, "\(label): the blocked file is untouched")
+            let blocked = try await IgnoreRulesManager.shared.resolvedIgnoreRules(for: root.path, policy: .nonGitRoot)
+            XCTAssertTrue(blocked.rules.isIgnored(relativePath: "legacy-out", isDirectory: true), label)
+
+            XCTAssertTrue(store.recoverBlockedPersistenceAfterBackup(), label)
+            XCTAssertNil(store.persistenceBlockReason, label)
+            XCTAssertEqual(store.globalIgnoreDefaults(), legacy, label)
+            XCTAssertEqual(try storedGlobalIgnoreDefaults(at: fileURL), legacy, "\(label): recovery persists the exclusions")
+            XCTAssertTrue(IgnoreSettingsDefaults.isSettingsAuthorityMigrated(defaults: defaults), label)
+            let recovered = try await IgnoreRulesManager.shared.resolvedIgnoreRules(for: root.path, policy: .nonGitRoot)
+            XCTAssertTrue(recovered.rules.isIgnored(relativePath: "legacy-out", isDirectory: true), label)
+        }
+    }
+
     // MARK: - Helpers
+
+    private final class WriteGate: @unchecked Sendable {
+        var failWrites = true
+    }
+
+    private func storedGlobalIgnoreDefaults(at fileURL: URL) throws -> String? {
+        let document = try GlobalSettingsFileStore(fileURL: fileURL).load()
+        return document.scalarPreferences?.fileSystem?.globalIgnoreDefaults
+    }
 
     private func makeDefaults() -> UserDefaults {
         let suiteName = "RepoPromptCE.ignore-authority.\(UUID().uuidString)"

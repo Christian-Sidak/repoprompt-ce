@@ -386,7 +386,7 @@ package struct MCPDomainCanonicalWorkspaceService {
         guard !pattern.isEmpty else {
             throw MCPError.invalidParams("pattern cannot be empty")
         }
-        let maxResults = max(1, min(args["max_results"]?.intValue ?? FileSearchResultLimits.defaultMaxResults, 1000))
+        let maxResults = FileSearchResultLimits.effectiveMaxResults(args["max_results"]?.intValue)
         let countOnly = args["count_only"]?.boolValue == true
         // Regex auto-detection and `auto` mode share the app's heuristics.
         let regexEnabled = args["regex"]?.boolValue ?? FileSearchPatternHeuristics.containsRegexSyntax(pattern)

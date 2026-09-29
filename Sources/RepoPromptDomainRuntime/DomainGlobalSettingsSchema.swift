@@ -84,8 +84,9 @@ package enum DomainGlobalIgnoreDefaultsView {
     package struct Resolution: Equatable {
         package let source: Source
 
-        /// The patterns the app itself applies in this state. A blocked document is never read;
-        /// like the app's blocked load, the canonical list applies.
+        /// The patterns the app itself applies in this state. A blocked document is never read and
+        /// the canonical list applies here; the app instead keeps its legacy `UserDefaults` value
+        /// while blocked, which this read-only file view cannot see (documented divergence).
         package var effectivePatterns: String {
             if case let .settings(value) = source { return value }
             return DomainGlobalIgnoreDefaults.canonical

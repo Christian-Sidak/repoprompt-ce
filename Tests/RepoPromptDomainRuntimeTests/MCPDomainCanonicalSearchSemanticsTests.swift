@@ -208,6 +208,29 @@ final class MCPDomainCanonicalSearchSemanticsTests: XCTestCase {
         XCTAssertEqual(both["count"], .int(limit + 1), "the path stage has its own cap: one path hit plus a full content page")
     }
 
+    /// M14: out-of-range requests are clamped into `1...maximumMaxResults`, never refused. The app
+    /// provider applies the same function; `MCPBackendParityHarnessTests` pins both backends together.
+    func testOutOfRangeMaxResultsClampsToTheSharedRange() async throws {
+        let maximum = FileSearchResultLimits.maximumMaxResults
+        let table: [(Int?, Int)] = [
+            (nil, FileSearchResultLimits.defaultMaxResults),
+            (Int.min, 1), (-3, 1), (0, 1), (1, 1),
+            (maximum, maximum), (maximum + 1, maximum), (Int.max, maximum)
+        ]
+        for (requested, expected) in table {
+            XCTAssertEqual(FileSearchResultLimits.effectiveMaxResults(requested), expected, "\(String(describing: requested))")
+        }
+
+        let service = try makeService(files: ["hit.txt": String(repeating: "hit\n", count: maximum + 5)])
+        for (requested, expected) in [(-3, 1), (0, 1), (maximum + 1, maximum)] {
+            let content = try await search(
+                service,
+                ["pattern": .string("hit"), "mode": .string("content"), "max_results": .int(requested)]
+            )
+            XCTAssertEqual(content["count"], .int(expected), "max_results \(requested)")
+        }
+    }
+
     /// The shared schema states the per-stage contract from `FileSearchResultLimits`, not the vendored
     /// "Maximum total results" wording, and canonicalization is idempotent.
     func testFileSearchSchemaDescribesThePerStageLimit() throws {

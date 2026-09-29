@@ -384,6 +384,8 @@ actor IgnoreRulesManager {
 
         // `globalSettings.json` (via GlobalSettingsStore) is the authority `app_settings` writes.
         // The legacy defaults read remains only for a crawl that starts before the store loads.
+        // After a blocked load the store publishes this same legacy effective value, not the
+        // canonical list, until a compatible document is loaded or recovered.
         return GlobalIgnoreDefaultsAuthority.processWide.current()
             ?? IgnoreSettingsDefaults.resolvedGlobalIgnoreDefaults(defaults: .standard)
     }

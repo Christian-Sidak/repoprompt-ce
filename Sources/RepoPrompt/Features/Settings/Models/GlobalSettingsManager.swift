@@ -352,6 +352,8 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     /// Receives the effective global ignore defaults so the crawl reads this store's value.
     /// Only the process-wide store publishes; other instances (tests, previews) never do.
     private let ignoreDefaultsAuthority: GlobalIgnoreDefaultsAuthority?
+    /// A legacy global-ignore value was migrated into the live document but not yet durably saved.
+    private var legacyIgnoreDefaultsMigrationAwaitingSave = false
     private let invalidAgentModelsProfileAssertion: (String) -> Void
 
     @Published private(set) var copySettings: [UUID: CopyGlobalSettings] = [:]
@@ -1348,20 +1350,53 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         ignoreDefaultsAuthority?.publish(globalIgnoreDefaults())
     }
 
+    /// Resolves and publishes the global ignore defaults for a freshly installed document.
+    /// Returns true when a legacy value was migrated into it and must be saved.
+    private func installGlobalIgnoreDefaultsAuthority(documentIsProvisional: Bool) -> Bool {
+        let migrated: Bool
+        if documentIsProvisional {
+            preserveLegacyGlobalIgnoreDefaultsForProvisionalDocument()
+            migrated = false
+        } else {
+            migrated = migrateLegacyGlobalIgnoreDefaultsIfNeeded()
+        }
+        publishGlobalIgnoreDefaultsAuthority()
+        return migrated
+    }
+
+    /// A blocked load installs provisional defaults, not the user's settings. Until a compatible
+    /// document is loaded or recovered, keep the legacy effective value (what the crawl used before
+    /// this store became its authority, and still uses before the store loads) rather than
+    /// replacing the user's exclusions with the canonical list. Saves stay blocked, so this is
+    /// persisted only by an explicit recovery, which then carries the exclusions forward.
+    private func preserveLegacyGlobalIgnoreDefaultsForProvisionalDocument() {
+        legacyIgnoreDefaultsMigrationAwaitingSave = false
+        var settings = scalarPreferences.fileSystem ?? GlobalScalarPreferences.FileSystemSettings()
+        settings.globalIgnoreDefaults = IgnoreSettingsDefaults.resolvedGlobalIgnoreDefaults(defaults: defaults)
+        scalarPreferences.fileSystem = settings
+    }
+
     /// Carries a customized legacy `UserDefaults` value (what the crawl used before this store
-    /// became its authority) into an uncustomized JSON value, once, when it can be persisted.
+    /// became its authority) into an uncustomized JSON value. The one-time marker is recorded only
+    /// once that value is durably saved (see `persist`), so a failed write retries the migration on
+    /// the next launch instead of losing the customization.
     private func migrateLegacyGlobalIgnoreDefaultsIfNeeded() -> Bool {
+        legacyIgnoreDefaultsMigrationAwaitingSave = false
         guard fileStore.blockReason == nil,
               !IgnoreSettingsDefaults.isSettingsAuthorityMigrated(defaults: defaults)
         else { return false }
-        defer { IgnoreSettingsDefaults.markSettingsAuthorityMigrated(defaults: defaults) }
         guard let legacy = IgnoreSettingsDefaults.legacyValueToMigrate(
             jsonValue: scalarPreferences.fileSystem?.globalIgnoreDefaults,
             defaults: defaults
-        ) else { return false }
+        ) else {
+            // Nothing to carry: the JSON value is already the authority.
+            IgnoreSettingsDefaults.markSettingsAuthorityMigrated(defaults: defaults)
+            return false
+        }
         var settings = scalarPreferences.fileSystem ?? GlobalScalarPreferences.FileSystemSettings()
         settings.globalIgnoreDefaults = legacy
         scalarPreferences.fileSystem = settings
+        legacyIgnoreDefaultsMigrationAwaitingSave = true
         return true
     }
 
@@ -2715,8 +2750,9 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
         globalDefaults = migratedContextBuilderState.globalDefaults
         scalarPreferences = migratedContextBuilderState.scalarPreferences
         let seededFileSystemDefaults = Self.seedFileSystemGlobalIgnoreDefaults(in: &scalarPreferences)
-        let migratedLegacyIgnoreDefaults = migrateLegacyGlobalIgnoreDefaultsIfNeeded()
-        publishGlobalIgnoreDefaultsAuthority()
+        let migratedLegacyIgnoreDefaults = installGlobalIgnoreDefaultsAuthority(
+            documentIsProvisional: loadedExistingDocument == nil && fileStore.blockReason != nil
+        )
         let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
         if shouldSyncTelemetryMirror {
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
@@ -2821,8 +2857,7 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
             globalDefaults = migratedContextBuilderState.globalDefaults
             scalarPreferences = migratedContextBuilderState.scalarPreferences
             let seededFileSystemDefaults = Self.seedFileSystemGlobalIgnoreDefaults(in: &scalarPreferences)
-            let migratedLegacyIgnoreDefaults = migrateLegacyGlobalIgnoreDefaultsIfNeeded()
-            publishGlobalIgnoreDefaultsAuthority()
+            let migratedLegacyIgnoreDefaults = installGlobalIgnoreDefaultsAuthority(documentIsProvisional: false)
             let disabledInvalidSync = disableInvalidLoadedAgentModelsSyncState()
             syncTelemetryMirrorFromLoadedSettings(scalarPreferences)
             codeMapsGloballyDisabled = globalDefaults.codeMapsGloballyDisabled ?? false
@@ -3167,6 +3202,11 @@ class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsProviding 
     private func persist(_ operation: () throws -> Void) -> Bool {
         do {
             try operation()
+            if legacyIgnoreDefaultsMigrationAwaitingSave {
+                // Any successful save writes the current document, which carries the migrated value.
+                legacyIgnoreDefaultsMigrationAwaitingSave = false
+                IgnoreSettingsDefaults.markSettingsAuthorityMigrated(defaults: defaults)
+            }
             if persistenceBlockReason != fileStore.blockReason {
                 persistenceBlockReason = fileStore.blockReason
             }
