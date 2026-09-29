@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -128,6 +129,56 @@ class CatalogTests(unittest.TestCase):
             (root / 'Attributed.swift').write_text(source)
             violations = swift_imports.forbidden_ui_imports([root])
             self.assertEqual(len(violations), 3, violations)
+
+    def test_comment_separated_attributed_ui_imports_fail_cli_gate(self) -> None:
+        source = ('@preconcurrency /* imported for legacy declarations */ import AppKit\n'
+                  '@_spi(Private) /* outer /* nested */ comment */ public import SwiftUI\n'
+                  'package import class AppKit.NSView\n'
+                  'import Foundation; @preconcurrency /* sibling */ import AppKit\n')
+        self.assertEqual(swift_imports.imported_modules(source),
+                         ['AppKit', 'SwiftUI', 'AppKit', 'Foundation', 'AppKit'])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'ImportComment.swift').write_text(source)
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT_DIR / 'swift_imports.py'), '--forbid-ui', str(root)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('ImportComment.swift:1:', result.stdout)
+            self.assertIn('ImportComment.swift:2:', result.stdout)
+            self.assertIn('ImportComment.swift:3:', result.stdout)
+            self.assertIn('ImportComment.swift:4:', result.stdout)
+
+    def test_multiline_comment_between_attribute_and_import(self) -> None:
+        source = '@preconcurrency /* legacy\n declarations */ import AppKit\n'
+        self.assertEqual(swift_imports.imported_modules(source), ['AppKit'])
+
+    def test_comment_and_string_lookalikes_are_not_imports(self) -> None:
+        source = ('// @preconcurrency /* comment */ import AppKit\n'
+                  '/* @preconcurrency import SwiftUI */\n'
+                  'let example = """\n'
+                  '@preconcurrency /* text */ import AppKit\n'
+                  '"""\n'
+                  'let raw = #"import SwiftUI"#\n'
+                  'import Foundation\n')
+        self.assertEqual(swift_imports.imported_modules(source), ['Foundation'])
+
+    def test_unterminated_comment_or_string_fails_closed(self) -> None:
+        for source in ('@preconcurrency /* unfinished import AppKit',
+                       'let value = "unfinished\nimport AppKit'):
+            with self.subTest(source=source):
+                with self.assertRaises(swift_imports.SwiftImportScanError):
+                    swift_imports.imported_modules(source)
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    (root / 'Broken.swift').write_text(source)
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPT_DIR / 'swift_imports.py'), '--forbid-ui', str(root)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertIn('failed closed', result.stderr)
 
     def test_filter_resolves_only_exact_app_free_suite(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

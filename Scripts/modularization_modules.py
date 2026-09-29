@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from swift_imports import imported_modules
+from swift_imports import SwiftImportScanError, imported_modules
 
 ROOT = Path(__file__).resolve().parent.parent
 CATALOG = Path('Scripts/modularization/modules.json')
@@ -90,7 +90,12 @@ def check(root: Path, package: dict, catalog: dict) -> list[str]:
         if not source_root.is_dir():
             continue
         for path in source_root.rglob('*.swift'):
-            for imported in imported_modules(path.read_text(encoding='utf-8', errors='replace')):
+            try:
+                imports = imported_modules(path.read_text(encoding='utf-8', errors='replace'))
+            except SwiftImportScanError as error:
+                errors.append(f"{path.relative_to(root)}: import scan failed closed: {error}")
+                continue
+            for imported in imports:
                 if imported in targets and imported != name and imported not in declared:
                     errors.append(f"{path.relative_to(root)}: undeclared first-party import {imported}")
     added = added_swift_paths(root)
