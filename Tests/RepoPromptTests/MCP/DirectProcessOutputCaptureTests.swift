@@ -124,3 +124,64 @@ private final class ReadState: @unchecked Sendable {
         lock.withLock { storedSnapshot = snapshot }
     }
 }
+
+/// M21 follow-up: a spawned process is reported started exactly once, before its run settles,
+/// whichever of the spawning thread and the termination handler reports it first.
+final class DirectProcessSpawnReportTests: XCTestCase {
+    func testAProcessThatExitsBeforeItsSpawnIsReportedIsReportedByItsTermination() async throws {
+        let starts = SpawnReports()
+        let reported = DispatchSemaphore(value: 0)
+        let reportedBeforeSpawningThread = SpawnReports()
+        // The spawning thread is held after the spawn until the start was reported elsewhere: only
+        // the termination of the (immediately exiting) process can report it.
+        _ = try await DirectProcess.run(
+            "/usr/bin/true",
+            arguments: [],
+            didStart: {
+                starts.record()
+                reported.signal()
+            },
+            afterSpawn: {
+                if reported.wait(timeout: .now() + 10) == .success {
+                    reportedBeforeSpawningThread.record()
+                }
+            }
+        )
+        XCTAssertEqual(reportedBeforeSpawningThread.count, 1, "the termination reported the spawn before the run settled")
+        XCTAssertEqual(starts.count, 1, "the spawn is reported exactly once")
+    }
+
+    func testAProcessReportsItsSpawnOnceWhenTheSpawningThreadReportsFirst() async throws {
+        let starts = SpawnReports()
+        _ = try await DirectProcess.run("/bin/sleep", arguments: ["0.2"], didStart: { starts.record() })
+        XCTAssertEqual(starts.count, 1)
+    }
+
+    func testAProcessThatFailsToSpawnIsNeverReportedStarted() async {
+        let starts = SpawnReports()
+        let missing = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-direct-process-missing-\(UUID().uuidString)").path
+        do {
+            _ = try await DirectProcess.run(missing, arguments: [], didStart: { starts.record() })
+            XCTFail("A missing executable must fail to spawn")
+        } catch {}
+        XCTAssertEqual(starts.count, 0)
+    }
+}
+
+private final class SpawnReports: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func record() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+}

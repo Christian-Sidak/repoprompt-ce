@@ -969,7 +969,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let after = try await prepared.context.snapshot(connectionID: prepared.connectionID)
         XCTAssertEqual(after.roots.map(\.path), committed.roots.map(\.path) + [extraRoot.resolvingSymlinksInPath().path])
         await prepared.context.detachLaunchConnection(child)
-        let counts = await prepared.context.launchRootAuthorityCounts()
+        let counts = prepared.context.launchRootAuthorityCounts()
         XCTAssertEqual(counts.leasedConnections, 0)
     }
 
@@ -1145,7 +1145,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
             guard (try? fixture.calls().contains { $0.kind == "oracle" && $0.model == "lane-1" }) == true else {
                 return false
             }
-            return await prepared.context.launchRootAuthorityCounts().leases == 1
+            return prepared.context.launchRootAuthorityCounts().leases == 1
         }
         let calls = try fixture.calls()
         let laneZero = try XCTUnwrap(calls.first { $0.kind == "oracle" && $0.model == "gated" })
@@ -1267,7 +1267,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         try await Task.sleep(for: lifetime + .milliseconds(300))
         let admitted = try await admitChild(of: oracle, service: service, prepared: prepared)
         XCTAssertNil(admitted, "an expired token admits no child")
-        let counts = await prepared.context.launchRootAuthorityCounts()
+        let counts = prepared.context.launchRootAuthorityCounts()
         XCTAssertEqual(counts.activeLeases, 1, "the process still runs under its authority")
         XCTAssertEqual(counts.leasedConnections, 0)
 
@@ -1338,6 +1338,142 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         XCTAssertEqual(failure.details["oracle_started"], .bool(false))
         XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"], "no Oracle process ran")
         await assertLaunchRootAuthorityIdle(prepared)
+    }
+
+    // MARK: - M21 follow-up: in-flight child invocations keep the lane's root exclusion
+
+    func testACapturedChildWriteKeepsTheRootsExcludedAfterItsLaneExitsUntilItSettles() async throws {
+        let fixture = try Fixture(name: "lease-inflight-write", discovery: true)
+        defer { fixture.cleanup() }
+        defer { fixture.openOracleGate() }
+        let extraRoot = try Self.temporaryDirectory("inflight-write-root")
+        defer { try? FileManager.default.removeItem(at: extraRoot) }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let feature = try XCTUnwrap(committed.roots.first).appendingPathComponent("Sources/Feature.swift")
+        let (oracleTask, oracle) = try await startGatedDirectLaunch(fixture: fixture, prepared: prepared)
+        let admitted = try await admitChildConnection(of: oracle, service: service, prepared: prepared)
+        let connection = try XCTUnwrap(admitted)
+
+        // A child apply_edits enters through the real host hooks, captures the lease's roots in
+        // its edit host, and parks at its commit.
+        let arguments: [String: Value] = [
+            "path": .string("Sources/Feature.swift"),
+            "search": .string("FEATURE_MARKER"),
+            "replace": .string("LEASED_WRITE")
+        ]
+        let invocation = try await childInvocation("apply_edits", arguments, connection: connection, prepared: prepared)
+        try invocation.onProviderEntry()
+        let parked = AsyncGate()
+        let resume = AsyncGate()
+        let controller = Self.parkingCommitController(parked: parked, resume: resume)
+        let request = try DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(arguments),
+            securityContext: invocation.securityContext
+        )
+        let backend = DirectHeadlessFilesystemBackend(context: prepared.context)
+        let write = Task {
+            try await MCPDomainMutationCommitContext.$controller.withValue(controller) {
+                try await backend.applyFileEdits(request)
+            }
+        }
+        await parked.wait()
+
+        // The lane's process exits: its lease is released but stays releasing while the write
+        // is in flight, so a roots change is still refused and no new child call enters.
+        fixture.openOracleGate()
+        _ = try await oracleTask.value
+        var counts = prepared.context.launchRootAuthorityCounts()
+        XCTAssertEqual(counts.activeLeases, 0)
+        XCTAssertEqual(counts.releasingLeases, 1)
+        XCTAssertEqual(counts.inFlightInvocations, 1)
+        let addFolder: [String: Value] = ["action": .string("add_folder"), "folder_path": .string(extraRoot.path)]
+        do {
+            _ = try await manageWorkspaces(addFolder, prepared: prepared)
+            XCTFail("A roots change must not land while a captured child write is in flight")
+        } catch let failure as MCPDomainToolFailure {
+            XCTAssertEqual(failure.code, "root_authority_leased")
+            XCTAssertEqual(failure.retryability, .retryable)
+        }
+        let late = try await childInvocation("read_file", ["path": .string("Sources/Feature.swift")], connection: connection, prepared: prepared)
+        XCTAssertThrowsError(try late.onProviderEntry(), "a released lease admits no new child call")
+
+        // The write lands in the leased root, then settles; only then can the roots change.
+        await resume.open()
+        _ = try await write.value
+        let written = try String(contentsOf: feature, encoding: .utf8)
+        XCTAssertTrue(written.contains("LEASED_WRITE"), written)
+        invocation.onProviderReturn()
+        counts = prepared.context.launchRootAuthorityCounts()
+        XCTAssertEqual(counts.leases, 0)
+        XCTAssertEqual(counts.inFlightInvocations, 0)
+        let added = try await manageWorkspaces(addFolder, prepared: prepared)
+        XCTAssertEqual(added["action"], .string("add_folder"))
+    }
+
+    func testAChildCallInFlightThroughTheHostHoldsTheExclusionAcrossExitAndCloseThenFailsClosed() async throws {
+        let fixture = try Fixture(name: "lease-inflight-host", discovery: true)
+        defer { fixture.cleanup() }
+        defer { fixture.openOracleGate() }
+        let extraRoot = try Self.temporaryDirectory("inflight-host-root")
+        defer { try? FileManager.default.removeItem(at: extraRoot) }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let (oracleTask, oracle) = try await startGatedDirectLaunch(fixture: fixture, prepared: prepared)
+        let admitted = try await admitChildConnection(of: oracle, service: service, prepared: prepared)
+        let connection = try XCTUnwrap(admitted)
+        let invocation = try await childInvocation(
+            "get_file_tree",
+            [:],
+            connection: connection,
+            prepared: prepared
+        )
+        // The child's read, inside the real host invocation (after provider entry), parks in its
+        // read-context resolution.
+        let parked = AsyncGate()
+        let resume = AsyncGate()
+        let routing = prepared.runtime.routingCoordinator
+        await routing.testSetAfterReadTargetCaptured {
+            await routing.testSetAfterReadTargetCaptured(nil)
+            await parked.open()
+            await resume.wait()
+        }
+        let host = prepared.runtime.domainHost
+        let read = Task { try await host.invoke(invocation) }
+        await parked.wait()
+        XCTAssertEqual(prepared.context.launchRootAuthorityCounts().inFlightInvocations, 1)
+
+        // The lane exits and the connection closes while the call is in flight: the exclusion and
+        // the leased connection both outlive them.
+        fixture.openOracleGate()
+        _ = try await oracleTask.value
+        await prepared.context.detachLaunchConnection(connection.connectionID)
+        var counts = prepared.context.launchRootAuthorityCounts()
+        XCTAssertEqual(counts.releasingLeases, 1)
+        XCTAssertEqual(counts.leasedConnections, 1, "a closed connection is kept until its calls settle")
+        let addFolder: [String: Value] = ["action": .string("add_folder"), "folder_path": .string(extraRoot.path)]
+        do {
+            _ = try await manageWorkspaces(addFolder, prepared: prepared)
+            XCTFail("A roots change must not land while a child call is in flight")
+        } catch let failure as MCPDomainToolFailure {
+            XCTAssertEqual(failure.code, "root_authority_leased")
+        }
+
+        // The parked read resumes after the release: it fails closed, never resolving live roots.
+        await resume.open()
+        do {
+            _ = try await read.value
+            XCTFail("A read resumed after its lease was released must fail closed")
+        } catch DirectHeadlessDomainContext.Error.launchRootAuthorityReleased {}
+        counts = prepared.context.launchRootAuthorityCounts()
+        XCTAssertEqual(counts.leases, 0)
+        XCTAssertEqual(counts.leasedConnections, 0)
+        XCTAssertEqual(counts.inFlightInvocations, 0)
+        let added = try await manageWorkspaces(addFolder, prepared: prepared)
+        XCTAssertEqual(added["action"], .string("add_folder"))
     }
 
     func testPinnedLaunchErrorClassification() {
@@ -1434,6 +1570,64 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         return admitted == nil ? nil : connectionID
     }
 
+    private func admitChildConnection(
+        of call: Fixture.Call,
+        service: DirectHeadlessMCPService,
+        prepared: DirectHeadlessMCPService.PreparedRuntime
+    ) async throws -> DirectHeadlessMCPService.ConnectionContext? {
+        let handshake = try DirectHeadlessChildBridge.handshake(environment: call.carrierEnvironment)
+        return await service.admitPrivateChild(
+            connectionID: UUID(),
+            peerPID: nil,
+            handshake: handshake,
+            prepared: prepared
+        )?.connection
+    }
+
+    /// The exact host invocation the endpoint would run for `toolName` on a child connection.
+    private func childInvocation(
+        _ toolName: String,
+        _ arguments: [String: Value],
+        connection: DirectHeadlessMCPService.ConnectionContext,
+        prepared: DirectHeadlessMCPService.PreparedRuntime
+    ) async throws -> MCPDomainHostInvocation {
+        let resolution = try await prepared.runtime.domainHost.resolve(
+            toolName: toolName,
+            scope: .standalone(id: prepared.scopeID)
+        )
+        return await DirectHeadlessMCPService.hostInvocation(
+            prepared: prepared,
+            connection: connection,
+            resolution: resolution,
+            arguments: arguments
+        )
+    }
+
+    /// A commit controller that fences and opens the physical targets like the protected path,
+    /// then parks the commit until `resume` opens.
+    private static func parkingCommitController(
+        parked: AsyncGate,
+        resume: AsyncGate
+    ) -> DomainMutationCommitController {
+        let fence = FenceBox()
+        return DomainMutationCommitController(
+            admitPhysicalTargets: { paths, mappings in
+                try await fence.set(DomainMutationPathFence.admit(
+                    requestedPaths: paths,
+                    authorizedRoots: Set(mappings.map(\.physicalRoot))
+                ))
+            },
+            physicalMutationCapability: {
+                guard let snapshot = await fence.snapshot else { return nil }
+                return try DomainMutationPhysicalCapability.open(snapshot: snapshot)
+            },
+            willCommit: {
+                await parked.open()
+                await resume.wait()
+            }
+        )
+    }
+
     private func redeem(
         _ call: Fixture.Call,
         prepared: DirectHeadlessMCPService.PreparedRuntime
@@ -1478,7 +1672,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) async {
-        let counts = await prepared.context.launchRootAuthorityCounts()
+        let counts = prepared.context.launchRootAuthorityCounts()
         XCTAssertEqual(counts.leases, 0, "a launch root authority is still held", file: file, line: line)
         XCTAssertEqual(counts.claims, claimsExpected, "root-mutation claims", file: file, line: line)
         let routing = await prepared.runtime.routingCoordinator.snapshot()
@@ -1824,6 +2018,14 @@ private actor BarrierFlag {
 
     func set() {
         value = true
+    }
+}
+
+private actor FenceBox {
+    private(set) var snapshot: DomainMutationPathFenceSnapshot?
+
+    func set(_ snapshot: DomainMutationPathFenceSnapshot) {
+        self.snapshot = snapshot
     }
 }
 

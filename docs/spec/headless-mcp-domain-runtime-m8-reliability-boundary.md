@@ -1608,6 +1608,55 @@ Conductor evidence:
   through `admitPrivateChild`, not a socket-connected bridge) and a release build. The Oracle
   review could not run: the review session was bound to another tab's selection.
 
+#### M21 follow-up — in-flight child invocations and spawn reporting
+
+Independent review of `758c6d71` found two ordering gaps. Both are closed here, and each has a
+regression that fails with its fix reverted.
+
+- **A captured child write could outlive its lease (P2).** The provider task released the lease
+  as soon as the lane's process exited, but the child connection's host invocations are cancelled
+  and drained later, when the connection ends. A child `apply_edits` could capture the lease's roots
+  in its edit host, suspend at its commit, and write after a roots change had been admitted in
+  between. The lease/claim/connection state now lives in one lock-protected
+  `DirectHeadlessLaunchRootRegistry`. That lets the host's synchronous provider callbacks
+  participate: `DirectHeadlessMCPService.hostInvocation` brackets exactly the binding call with
+  `beginInvocation` and `endInvocation`.
+  - A child invocation runs only while its lease is active, and holds the lease's root exclusion
+    until the invocation settles.
+  - Release at process exit now moves a lease with calls in flight to `releasing`. A releasing lease
+    admits no new child call and resolves no new snapshot, so attached connections fail closed. It
+    still refuses root mutations (`root_authority_leased`) until its last in-flight invocation
+    settles; then it is removed. The token is still revoked at exit.
+  - A closing connection is unregistered from routing before it is detached, and the registry
+    forgets it only once its calls settled. A settling call therefore never resolves live roots.
+  - An invocation that ignores cancellation holds the exclusion until it settles. That is the
+    fail-safe direction.
+- **Spawn reporting ordering (P2).** `didStart` was reported only by the spawning thread after
+  `Process.run()` returned, while the termination handler could settle first. The report is now a
+  once-only step under the invocation's lock, and the termination handler makes it before any
+  settlement. It still runs only for a process that was spawned. Note: `run()` could not actually
+  return before the old report ran, because the continuation body executes synchronously on the
+  awaiting task. The change makes the ordering structural, so it no longer depends on that detail.
+- **Guardrail.** `headless_runtime_guardrails.sh` also requires the host entry/return bracket and
+  the two `reportStartOnce()` sites.
+
+Tests:
+- `testACapturedChildWriteKeepsTheRootsExcludedAfterItsLaneExitsUntilItSettles`. A real
+  `applyFileEdits` enters through the service's host hooks and captures the leased edit host, then
+  parks at `willCommit`. The lane exits. While it is parked: `releasing`, one in-flight call,
+  `add_folder` refused, and a new child call refused at entry. Resumed, it writes into the leased
+  root; after it settles, `add_folder` applies.
+- `testAChildCallInFlightThroughTheHostHoldsTheExclusionAcrossExitAndCloseThenFailsClosed`. A real
+  `MCPDomainHost.invoke` of a child `get_file_tree` parks in its read-context resolution, after
+  provider entry. The lane exits and the connection closes: the exclusion and the connection
+  entry persist and `add_folder` is refused. The read resumes into `launchRootAuthorityReleased`
+  instead of live roots, then everything drains.
+- `DirectProcessSpawnReportTests`:
+  - a process that exits while its spawning thread is held after `Process.run()` is reported by its
+    termination, before the run settles, exactly once;
+  - a normal run reports once;
+  - a spawn failure never reports.
+
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 
 The M8A–M13 branch was merged onto `origin/main` `a5586936`, which had independently landed #1081

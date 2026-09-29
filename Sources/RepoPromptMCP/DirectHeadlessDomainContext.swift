@@ -41,27 +41,6 @@ actor DirectHeadlessDomainContext {
         }
     }
 
-    /// A pinned lane launch's root authority while it is validated (`lease == nil`) and while its
-    /// process runs.
-    private struct LaunchRootLeaseRecord {
-        let leaseID: UUID
-        let runID: UUID
-        let launchID: UUID
-        let context: DomainContextIdentity
-        let overlaySessionID: UUID?
-        var lease: DirectHeadlessLaunchRootLease?
-    }
-
-    /// A workspace-roots change (`contextID == nil`) or a context removal in flight.
-    private struct RootMutationClaim {
-        let workspaceID: UUID
-        let contextID: UUID?
-
-        func covers(_ context: DomainContextIdentity) -> Bool {
-            workspaceID == context.workspaceID && (contextID == nil || contextID == context.contextID)
-        }
-    }
-
     enum ContextMutation {
         case setPrompt(String)
         case setSelection([String])
@@ -92,12 +71,10 @@ actor DirectHeadlessDomainContext {
     let scopeID: DomainStandaloneScopeID
     private let processRootOverlay: DirectHeadlessRootOverlay
     private var sessionRootOverlays: [UUID: DirectHeadlessRootOverlay] = [:]
-    /// Pinned lane launches holding (or validating) a launch-scoped root authority, by launch ID.
-    private var launchRootLeases: [UUID: LaunchRootLeaseRecord] = [:]
-    private var rootMutationClaims: [UUID: RootMutationClaim] = [:]
-    /// Child connections that redeemed a launch-scoped-roots token, to the launch ID they read
-    /// through. An entry outlives its lease so the connection keeps failing closed after release.
-    private var leasedConnections: [UUID: UUID] = [:]
+    /// Launch-scoped root authorities, root-mutation claims, leased child connections, and their
+    /// in-flight invocations (M21). Synchronous, so the host's provider entry/return callbacks can
+    /// hold a lease's root exclusion for exactly the life of a child invocation.
+    nonisolated let launchRoots = DirectHeadlessLaunchRootRegistry()
 
     init(
         runtime: MCPDomainRuntime,
@@ -149,26 +126,29 @@ actor DirectHeadlessDomainContext {
         sessionID: UUID?,
         connectionID: UUID?
     ) async throws -> Snapshot {
-        if let connectionID, let launchID = leasedConnections[connectionID] {
-            return try await leasedSnapshot(launchID: launchID, context: identity)
+        guard let connectionID else { return try await snapshot(identity: identity, sessionID: sessionID) }
+        switch launchRoots.lookup(connectionID: connectionID) {
+        case .unleased:
+            return try await snapshot(identity: identity, sessionID: sessionID)
+        case .released:
+            throw Error.launchRootAuthorityReleased
+        case let .active(lease):
+            return try await leasedSnapshot(lease, context: identity)
         }
-        return try await snapshot(identity: identity, sessionID: sessionID)
     }
 
     /// A leased connection's view: the lease's context, canonical roots, and physical overlay. It
     /// never falls back to live resolution: a released lease or drifted roots fail closed.
-    private func leasedSnapshot(launchID: UUID, context: DomainContextIdentity) async throws -> Snapshot {
-        guard let lease = launchRootLeases[launchID]?.lease else {
-            throw Error.launchRootAuthorityReleased
-        }
+    private func leasedSnapshot(
+        _ lease: DirectHeadlessLaunchRootLease,
+        context: DomainContextIdentity
+    ) async throws -> Snapshot {
         guard context == lease.context else {
             throw Error.launchRootAuthorityChanged("the connection no longer resolves to the launch's context")
         }
         let snapshot = try await snapshot(identity: lease.context, sessionID: nil, lease: lease)
         // Released while it was read: nothing read under it may be served.
-        guard launchRootLeases[launchID]?.lease?.leaseID == lease.leaseID else {
-            throw Error.launchRootAuthorityReleased
-        }
+        guard launchRoots.isActive(lease) else { throw Error.launchRootAuthorityReleased }
         return snapshot
     }
 
@@ -191,21 +171,20 @@ actor DirectHeadlessDomainContext {
     ) async throws -> DirectHeadlessLaunchRootLease {
         let pin = lane.launch.pin
         let carrier = lane.carrier
-        guard launchRootLeases[carrier.launchID] == nil else {
+        let leaseID = UUID()
+        switch launchRoots.registerPending(
+            launchID: carrier.launchID,
+            leaseID: leaseID,
+            holder: .init(context: pin.context, runID: carrier.runID, launchID: carrier.launchID),
+            overlaySessionID: sessionID
+        ) {
+        case .registered:
+            break
+        case .duplicateLaunch:
             throw Error.stateConflict("launch \(carrier.launchID.uuidString) already holds a root authority")
-        }
-        guard !rootMutationClaims.values.contains(where: { $0.covers(pin.context) }) else {
+        case .rootsChanging:
             throw DomainChildLaunchContextPin.Mismatch.rootsChanging
         }
-        let leaseID = UUID()
-        launchRootLeases[carrier.launchID] = LaunchRootLeaseRecord(
-            leaseID: leaseID,
-            runID: carrier.runID,
-            launchID: carrier.launchID,
-            context: pin.context,
-            overlaySessionID: sessionID,
-            lease: nil
-        )
         do {
             try await pin.validate(resolvedHandle(connectionID: connectionID))
             let snapshot = try await snapshot(identity: pin.context, sessionID: sessionID, connectionID: connectionID)
@@ -226,7 +205,6 @@ actor DirectHeadlessDomainContext {
             }
             // Revalidated after the reads: the connection still resolves to exactly the pin.
             try await pin.validate(resolvedHandle(connectionID: connectionID))
-            guard launchRootLeases[carrier.launchID]?.leaseID == leaseID else { throw CancellationError() }
             let lease = try DirectHeadlessLaunchRootLease(
                 leaseID: leaseID,
                 launchID: carrier.launchID,
@@ -237,22 +215,22 @@ actor DirectHeadlessDomainContext {
                 rootOverlay: snapshot.rootOverlay,
                 overlaySessionID: sessionID
             )
-            launchRootLeases[carrier.launchID]?.lease = lease
+            guard launchRoots.activate(lease) else { throw CancellationError() }
             return lease
         } catch {
-            if launchRootLeases[carrier.launchID]?.leaseID == leaseID {
-                launchRootLeases.removeValue(forKey: carrier.launchID)
-            }
+            launchRoots.abandonPending(launchID: carrier.launchID, leaseID: leaseID)
             throw Self.launchRefusal(error)
         }
     }
 
-    /// Releases `lease` (idempotent) and revokes its lane's launch token, so a token never
-    /// redeemed by the exited process cannot admit a connection later. Connections attached to the
-    /// lease keep failing closed with `launchRootAuthorityReleased`.
+    /// Ends `lease` when its process exited (idempotent) and revokes its lane's launch token, so a
+    /// token never redeemed by the exited process cannot admit a connection later. From here the
+    /// lease admits no new child invocation and resolves no new snapshot (attached connections fail
+    /// closed with `launchRootAuthorityReleased`), but its root exclusion lasts until every child
+    /// invocation that entered under it has settled, so no write captured under it can land after
+    /// a roots change.
     func releaseLaunchRootLease(_ lease: DirectHeadlessLaunchRootLease) async {
-        guard launchRootLeases[lease.launchID]?.leaseID == lease.leaseID else { return }
-        launchRootLeases.removeValue(forKey: lease.launchID)
+        guard launchRoots.release(lease) else { return }
         await runtime.routingCoordinator.revokeLaunchToken(lease.launchTokenID)
     }
 
@@ -260,17 +238,20 @@ actor DirectHeadlessDomainContext {
     /// lease; throws (the connection must be refused) when there is none for that run and context.
     func attachLaunchConnection(_ connectionID: UUID, redemption: DomainRunLaunchRedemption) throws {
         guard case let .runScoped(runID, context) = redemption.binding.binding,
-              let lease = launchRootLeases[redemption.launchID]?.lease,
-              lease.runID == runID,
-              lease.context == context
+              launchRoots.attach(
+                  connectionID: connectionID,
+                  launchID: redemption.launchID,
+                  runID: runID,
+                  context: context
+              )
         else {
             throw Error.launchRootAuthorityReleased
         }
-        leasedConnections[connectionID] = redemption.launchID
     }
 
+    /// The connection closed; it is forgotten once its in-flight invocations settled.
     func detachLaunchConnection(_ connectionID: UUID) {
-        leasedConnections.removeValue(forKey: connectionID)
+        launchRoots.detach(connectionID: connectionID)
     }
 
     /// Runs `body` (a workspace-roots change, or with `contextID` the removal of one context) under
@@ -283,27 +264,27 @@ actor DirectHeadlessDomainContext {
         contextID: UUID? = nil,
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
-        let claim = RootMutationClaim(workspaceID: workspaceID, contextID: contextID)
-        if let holder = launchRootLeases.values.first(where: { claim.covers($0.context) }) {
-            throw Self.rootAuthorityLeased(toolName: toolName, holder: holder)
+        let claimID: UUID
+        switch launchRoots.claim(workspaceID: workspaceID, contextID: contextID) {
+        case let .success(id):
+            claimID = id
+        case let .failure(conflict):
+            throw Self.rootAuthorityLeased(toolName: toolName, holder: conflict.holder)
         }
-        let claimID = UUID()
-        rootMutationClaims[claimID] = claim
-        defer { rootMutationClaims.removeValue(forKey: claimID) }
+        defer { launchRoots.endClaim(claimID) }
         return try await body()
     }
 
-    /// Live launch-root leases and root-mutation claims (validation and diagnostics).
-    func launchRootAuthorityCounts() -> (leases: Int, activeLeases: Int, claims: Int, leasedConnections: Int) {
-        (
-            launchRootLeases.count,
-            launchRootLeases.values.count(where: { $0.lease != nil }),
-            rootMutationClaims.count,
-            leasedConnections.count
-        )
+    /// Live launch-root leases, claims, leased connections, and in-flight child invocations
+    /// (validation and diagnostics).
+    nonisolated func launchRootAuthorityCounts() -> DirectHeadlessLaunchRootRegistry.Counts {
+        launchRoots.counts()
     }
 
-    private static func rootAuthorityLeased(toolName: String, holder: LaunchRootLeaseRecord) -> MCPDomainToolFailure {
+    private static func rootAuthorityLeased(
+        toolName: String,
+        holder: DirectHeadlessLaunchRootRegistry.Holder
+    ) -> MCPDomainToolFailure {
         MCPDomainToolFailure(
             toolName: toolName,
             code: "root_authority_leased",
@@ -438,7 +419,7 @@ actor DirectHeadlessDomainContext {
         )
         // A pinned launch resolved (or is resolving) its roots from this session's overlay: the
         // overlay cannot move under it.
-        if let holder = launchRootLeases.values.first(where: { $0.overlaySessionID == sessionID }) {
+        if let holder = launchRoots.overlayHolder(sessionID: sessionID) {
             throw Self.rootAuthorityLeased(toolName: "agent_run", holder: holder)
         }
         let previousOverlay = sessionRootOverlays.updateValue(resolved, forKey: sessionID)

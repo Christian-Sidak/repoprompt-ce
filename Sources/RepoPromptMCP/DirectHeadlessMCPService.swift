@@ -401,18 +401,11 @@ actor DirectHeadlessMCPService {
                 policy: policy,
                 resource: isGlobal ? .appWide : .standaloneScope(prepared.scopeID.rawValue),
                 makeHostInvocation: { resolution in
-                    let invocationID = UUID()
-                    let security = await Self.securityContext(
+                    await Self.hostInvocation(
                         prepared: prepared,
                         connection: connection,
-                        invocationID: invocationID
-                    )
-                    return MCPDomainHostInvocation(
-                        invocationID: invocationID,
-                        connectionID: connection.connectionID,
                         resolution: resolution,
-                        arguments: arguments,
-                        securityContext: security
+                        arguments: arguments
                     )
                 }
             ))
@@ -482,10 +475,47 @@ actor DirectHeadlessMCPService {
             connectionID: connectionID,
             connectionGeneration: accepted.binding.registration.generation
         )
-        await prepared.context.detachLaunchConnection(connectionID)
+        // Unregistered first: a cancelled invocation still settling can resolve nothing live on
+        // this connection, and the lease registry forgets it only after those invocations settle.
         _ = await prepared.runtime.routingCoordinator.unregisterConnection(
             accepted.binding.registration,
             operationID: UUID()
+        )
+        await prepared.context.detachLaunchConnection(connectionID)
+    }
+
+    /// The exact host invocation for one call on `connection`. On a connection attached to a
+    /// launch-scoped root authority, the provider body runs only while that authority is active
+    /// and holds its root exclusion until the body settles (`onProviderEntry`/`onProviderReturn`
+    /// bracket exactly the binding call), so a write that captured the lane's roots finishes
+    /// before any roots change can land, even after the lane's process exited or the connection
+    /// closed. Other connections are unaffected.
+    static func hostInvocation(
+        prepared: PreparedRuntime,
+        connection: ConnectionContext,
+        resolution: MCPDomainHostResolution,
+        arguments: [String: Value],
+        invocationID: UUID = UUID()
+    ) async -> MCPDomainHostInvocation {
+        let security = await securityContext(
+            prepared: prepared,
+            connection: connection,
+            invocationID: invocationID
+        )
+        let launchRoots = prepared.context.launchRoots
+        let connectionID = connection.connectionID
+        return MCPDomainHostInvocation(
+            invocationID: invocationID,
+            connectionID: connectionID,
+            resolution: resolution,
+            arguments: arguments,
+            securityContext: security,
+            onProviderEntry: {
+                try launchRoots.beginInvocation(invocationID, connectionID: connectionID)
+            },
+            onProviderReturn: {
+                launchRoots.endInvocation(invocationID)
+            }
         )
     }
 

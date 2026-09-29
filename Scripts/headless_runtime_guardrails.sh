@@ -176,6 +176,9 @@ if ! grep -q 'let launch = DirectHeadlessPinnedLaunch(pin: pin, committedRoots: 
   || ! grep -q 'attachLaunchConnection(connectionID, redemption: accepted)' Sources/RepoPromptMCP/DirectHeadlessMCPService.swift \
   || [[ "$(grep -c 'withRootMutationClaim(' Sources/RepoPromptMCP/DirectHeadlessWorkspaceBackends.swift)" -lt 3 ]] \
   || ! grep -q 'guard try readTarget(registration) == target else { continue }' Sources/RepoPromptDomainRuntime/DomainRoutingCoordinator.swift \
+  || ! grep -q 'try launchRoots.beginInvocation(invocationID, connectionID: connectionID)' Sources/RepoPromptMCP/DirectHeadlessMCPService.swift \
+  || ! grep -q 'launchRoots.endInvocation(invocationID)' Sources/RepoPromptMCP/DirectHeadlessMCPService.swift \
+  || [[ "$(grep -c 'reportStartOnce()' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift)" -lt 2 ]] \
   || ! grep -q 'Mismatch(pinnedLaunchError: error)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift; then
   echo "error: discovered Oracle lanes must launch under one launch-scoped root authority and settle pre-launch changes" >&2
   exit 1

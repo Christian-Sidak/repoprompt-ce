@@ -1381,15 +1381,19 @@ enum DirectProcess {
         return environment
     }
 
-    /// `didStart` runs once the process is running (never when it fails to spawn or is cancelled
-    /// before spawning).
+    /// `didStart` runs exactly once for a process that was spawned (never when it fails to spawn
+    /// or is cancelled before spawning), and always before the run settles: a process that exits
+    /// before the spawning thread gets to report it is reported by its termination first.
+    /// `afterSpawn` is a test seam that runs on the spawning thread right after the spawn, before
+    /// that thread reports it.
     static func run(
         _ executable: String,
         arguments: [String],
         input: Data? = nil,
         environment: [String: String] = [:],
         currentDirectory: URL? = nil,
-        didStart: (@Sendable () -> Void)? = nil
+        didStart: (@Sendable () -> Void)? = nil,
+        afterSpawn: (@Sendable () -> Void)? = nil
     ) async throws -> String {
         try await DirectProcessInvocation(
             executable: executable,
@@ -1397,7 +1401,8 @@ enum DirectProcess {
             input: input,
             environment: environment,
             currentDirectory: currentDirectory,
-            didStart: didStart
+            didStart: didStart,
+            afterSpawn: afterSpawn
         ).run()
     }
 }
@@ -1460,7 +1465,9 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     private let inputPipe: Pipe?
     private let input: Data?
     private let didStart: (@Sendable () -> Void)?
+    private let afterSpawn: (@Sendable () -> Void)?
     private var cancellationRequested = false
+    private var startReported = false
 
     init(
         executable: String,
@@ -1468,10 +1475,12 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         input: Data?,
         environment overrides: [String: String],
         currentDirectory: URL?,
-        didStart: (@Sendable () -> Void)? = nil
+        didStart: (@Sendable () -> Void)? = nil,
+        afterSpawn: (@Sendable () -> Void)? = nil
     ) {
         self.input = input
         self.didStart = didStart
+        self.afterSpawn = afterSpawn
         inputPipe = input == nil ? nil : Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -1496,6 +1505,9 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                         continuation.resume(throwing: CancellationError())
                         return
                     }
+                    // Only a spawned process terminates: report the spawn before settling, in case
+                    // the spawning thread has not reported it yet.
+                    reportStartOnce()
                     pipe.fileHandleForReading.readabilityHandler = nil
                     let snapshot = outputCapture.finish {
                         self.pipe.fileHandleForReading.readDataToEndOfFile()
@@ -1516,7 +1528,8 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                 }
                 do {
                     try process.run()
-                    didStart?()
+                    afterSpawn?()
+                    reportStartOnce()
                     if let inputPipe, let input {
                         inputPipe.fileHandleForWriting.write(input)
                         try? inputPipe.fileHandleForWriting.close()
@@ -1530,6 +1543,16 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         } onCancel: {
             requestCancellation()
         }
+    }
+
+    /// Calls `didStart` the first time only, whichever of the spawning thread and the termination
+    /// handler gets here first.
+    private func reportStartOnce() {
+        lock.lock()
+        let first = !startReported
+        startReported = true
+        lock.unlock()
+        if first { didStart?() }
     }
 
     private func isCancellationRequested() -> Bool {
