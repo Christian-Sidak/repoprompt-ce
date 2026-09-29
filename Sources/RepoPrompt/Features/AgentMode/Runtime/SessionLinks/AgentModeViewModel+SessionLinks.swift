@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 // The window-local host surface for oversight: candidates, exact projections, and observation.
 //
@@ -109,7 +110,7 @@ extension AgentModeViewModel {
             #if DEBUG
                 // A stale workspace owner completing a level it no longer owns is the exact race the
                 // fence exists for, so it is worth one line even though nothing changed.
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "oversight.discovery",
                     fields: [
                         "state": "stale_owner_ignored",
@@ -123,7 +124,7 @@ extension AgentModeViewModel {
         }
         agentSessionLinkDiscoveryCompletedGeneration = epoch.generation
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "oversight.discovery",
                 fields: [
                     "state": "current_owner_complete",

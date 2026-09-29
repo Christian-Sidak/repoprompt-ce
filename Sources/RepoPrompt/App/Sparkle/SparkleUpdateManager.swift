@@ -5,11 +5,11 @@
 //  Created by Eric Provencher on 2025-02-28.
 //
 
-import RepoPromptSecureStorage
 import AppKit
 import Combine
-import Sparkle
 import RepoPromptFoundation
+import RepoPromptSecureStorage
+import Sparkle
 import SwiftUI
 
 enum SparkleAppcastCheckState: Equatable {

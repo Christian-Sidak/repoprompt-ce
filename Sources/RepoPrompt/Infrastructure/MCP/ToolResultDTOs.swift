@@ -1,5 +1,5 @@
-import RepoPromptFoundation
 import Foundation
+import RepoPromptFoundation
 
 /// Namespace for MCP Tool result DTOs.
 /// Using a namespace avoids name collisions with existing private structs

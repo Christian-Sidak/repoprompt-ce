@@ -1,9 +1,9 @@
-import RepoPromptWorkspaceCore
 import AppKit
 import Combine
 import Foundation
 import os
 import RepoPromptDomainRuntime
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 enum WindowKind: String, Codable {

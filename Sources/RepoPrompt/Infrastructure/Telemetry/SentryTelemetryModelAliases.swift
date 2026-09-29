@@ -31,33 +31,33 @@ extension SentryTelemetryBootstrap {
 }
 
 extension SentryTelemetryModel.ProviderKind {
-        init(agentKind: AgentProviderKind) {
-            switch agentKind {
-            case .claudeCode:
-                self = .claudeCode
-            case .codexExec:
-                self = .codexExec
-            case .openCode:
-                self = .openCode
-            case .cursor:
-                self = .cursor
-            case .grokBuild:
-                self = .grokBuild
-            case .antigravity:
-                self = .antigravity
-            case .devin:
-                self = .devin
-            case .claudeCodeGLM:
-                self = .claudeCodeGLM
-            case .kimiCode:
-                self = .kimiCode
-            case .customClaudeCompatible:
-                self = .customClaudeCompatible
-            }
-        }
-
-        init?(agentKindRaw: String) {
-            guard let agentKind = AgentProviderKind(rawValue: agentKindRaw) else { return nil }
-            self.init(agentKind: agentKind)
+    init(agentKind: AgentProviderKind) {
+        switch agentKind {
+        case .claudeCode:
+            self = .claudeCode
+        case .codexExec:
+            self = .codexExec
+        case .openCode:
+            self = .openCode
+        case .cursor:
+            self = .cursor
+        case .grokBuild:
+            self = .grokBuild
+        case .antigravity:
+            self = .antigravity
+        case .devin:
+            self = .devin
+        case .claudeCodeGLM:
+            self = .claudeCodeGLM
+        case .kimiCode:
+            self = .kimiCode
+        case .customClaudeCompatible:
+            self = .customClaudeCompatible
         }
     }
+
+    init?(agentKindRaw: String) {
+        guard let agentKind = AgentProviderKind(rawValue: agentKindRaw) else { return nil }
+        self.init(agentKind: agentKind)
+    }
+}

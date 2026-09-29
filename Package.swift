@@ -85,6 +85,7 @@ var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptMCPCore",
     "RepoPromptShared",
     "RepoPromptTestSupport",
+    "RepoPromptWorkspaceCore",
     .product(name: "Markdown", package: "swift-markdown")
 ]
 
@@ -165,7 +166,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptInstrumentation",
-            dependencies: ["RepoPromptProcess"],
+            dependencies: ["RepoPromptFoundation", "RepoPromptShared"],
             path: "Sources/RepoPromptInstrumentation",
             swiftSettings: [
                 .define("DEBUG", .when(configuration: .debug))

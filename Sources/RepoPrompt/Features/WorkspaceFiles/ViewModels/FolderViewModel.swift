@@ -1,6 +1,6 @@
-import RepoPromptFoundation
 import Combine
 import Foundation
+import RepoPromptFoundation
 import RepoPromptWorkspaceCore
 
 /// A folder in the file tree, with subfolders and files.

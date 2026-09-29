@@ -1,7 +1,7 @@
-import RepoPromptFoundation
 import Combine
 import Foundation
 import OSLog
+import RepoPromptFoundation
 
 enum AgentContextFileBrowseUnavailableReason: Equatable {
     case sessionRootsUnavailable

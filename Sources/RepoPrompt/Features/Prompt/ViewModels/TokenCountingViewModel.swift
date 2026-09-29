@@ -1,7 +1,7 @@
-import RepoPromptFoundation
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFoundation
 import SwiftUI
 
 @MainActor

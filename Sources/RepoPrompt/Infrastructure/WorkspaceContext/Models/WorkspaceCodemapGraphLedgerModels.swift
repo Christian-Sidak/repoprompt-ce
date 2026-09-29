@@ -1,6 +1,6 @@
-import RepoPromptWorkspaceCore
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptWorkspaceCore
 
 enum WorkspaceCodemapGraphTerminalArtifactReason: Hashable {
     case oversize

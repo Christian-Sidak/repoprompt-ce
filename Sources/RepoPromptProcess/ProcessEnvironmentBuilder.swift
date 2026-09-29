@@ -1,11 +1,6 @@
 import Foundation
 
-package enum ShellEnvironmentSource: Equatable {
-    case inheritedRichEnvironment
-    case capturedLoginShell
-    case previousCapturedFallback
-    case enrichedFallback
-}
+import RepoPromptFoundation
 
 package enum ShellEnvironmentCaptureMode: Hashable, CaseIterable {
     case interactiveLoginShell

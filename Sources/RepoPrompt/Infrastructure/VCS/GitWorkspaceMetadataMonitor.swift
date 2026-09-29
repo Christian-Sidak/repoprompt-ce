@@ -1,8 +1,8 @@
-import RepoPromptFoundation
 import CoreFoundation
 import CoreServices
 import Dispatch
 import Foundation
+import RepoPromptFoundation
 
 enum GitWorkspaceMetadataMonitorError: LocalizedError, Equatable {
     case repositoryLimitExceeded

@@ -1,8 +1,8 @@
-import RepoPromptFoundation
 import Foundation
-import RepoPromptWorkspaceCore
 import OSLog
 import RepoPromptCodeMapCore
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 /// Inert orchestration for Git-only, artifact-backed workspace codemap bindings.
 ///

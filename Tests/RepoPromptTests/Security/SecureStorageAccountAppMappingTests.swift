@@ -1,10 +1,9 @@
 import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptSecureStorage
-import RepoPromptSecureStorage
 import XCTest
 
-final class SecureStorageAccountCatalogTests: XCTestCase {
+final class SecureStorageAccountAppMappingTests: XCTestCase {
     func testProviderMappingsUseCatalogAccounts() {
         let mappings: [(AIProviderType, SecureStorageAccount)] = [
             (.anthropic, .anthropicAPI),
@@ -42,5 +41,4 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
             SecureStorageAccountCatalog.agentPermissionAccounts
         )
     }
-
 }

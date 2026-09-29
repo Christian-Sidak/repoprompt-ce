@@ -1,6 +1,6 @@
+import Combine
 import RepoPromptProcess
 import RepoPromptSecureStorage
-import Combine
 import SwiftUI
 
 #if DEBUG

@@ -1,8 +1,8 @@
-import RepoPromptProcess
 import Cocoa
 import Combine
 import Darwin
 import Logging
+import RepoPromptProcess
 import Sparkle
 import SwiftUI
 

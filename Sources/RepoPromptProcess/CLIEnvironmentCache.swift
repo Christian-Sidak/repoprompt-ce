@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptFoundation
 
 package actor CLIEnvironmentCache {
     package static let shared = CLIEnvironmentCache()

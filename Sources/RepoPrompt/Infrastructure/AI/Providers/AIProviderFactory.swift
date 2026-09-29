@@ -165,7 +165,7 @@ class BlankProvider: AIProvider {
     func dispose() async {}
 }
 
-enum AIProviderType: Codable, Equatable, Sendable {
+enum AIProviderType: Codable, Equatable {
     case anthropic
     case openAI
     case ollama

@@ -1,6 +1,6 @@
-import RepoPromptWorkspaceCore
 import Foundation
 import OSLog
+import RepoPromptWorkspaceCore
 
 struct AgentContextFileBrowseRoot: Equatable, Hashable {
     let id: UUID

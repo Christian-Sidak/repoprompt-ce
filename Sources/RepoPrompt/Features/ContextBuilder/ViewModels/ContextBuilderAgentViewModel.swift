@@ -1,9 +1,10 @@
-import RepoPromptWorkspaceCore
-import RepoPromptFoundation
 import AppKit
 import Combine
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 // AgentLogEntry and AgentLogEntryType are defined in Models/Agent/AgentLogModels.swift
@@ -140,6 +141,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         private static let maxLogEntries = 5
 
         let tabID: UUID
+        let perfRecorder: any AgentModePerfRecording
         @Published var agentLog: [AgentLogEntry]
         /// Total tool calls for the current run (tracked separately since agentLog is limited)
         @Published var toolCallCount: Int = 0
@@ -329,8 +331,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         func beginRunAttempt(source: String) -> AgentRunOwnership {
             let ownership = runLifecycleTracker.begin(tabID: tabID, persistentSessionID: nil)
             #if DEBUG
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.started")
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.started.source.\(source)")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.started")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.started.source.\(source)")
             #endif
             return ownership
         }
@@ -352,7 +354,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
             #if DEBUG
                 if case let .rejected(reason) = result {
-                    AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
+                    perfRecorder.increment("contextBuilder.run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
                 }
             #endif
             return result
@@ -375,13 +377,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         private func recordRunAttemptEnded(source: String) {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.ended")
-                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.ended.source.\(source)")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.ended")
+                perfRecorder.increment("contextBuilder.run.lifecycle.attempt.ended.source.\(source)")
             #endif
         }
 
-        init(tabID: UUID) {
+        init(tabID: UUID, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
             self.tabID = tabID
+            self.perfRecorder = perfRecorder
             agentLog = []
             agentRunState = .idle
             isAgentBusy = false
@@ -601,7 +604,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         func replaceSessionForTesting(tabID: UUID) {
-            sessions[tabID] = TabSession(tabID: tabID)
+            sessions[tabID] = TabSession(tabID: tabID, perfRecorder: perfRecorder)
         }
 
         func hasFollowUpOracleGroupTaskForTesting(tabID: UUID) -> Bool {
@@ -1062,6 +1065,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var grokBuildModelsSubscriptionTask: Task<Void, Never>?
     private let codexModelPollingService: CodexModelPollingService
+    private let perfRecorder: any AgentModePerfRecording
     private var hasPreparedForWindowClose = false
 
     // MARK: - Init / Deinit
@@ -1073,7 +1077,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         oracleViewModel: OracleViewModel,
         settingsManager: GlobalSettingsStore = .shared,
         providerFactory: ProviderFactory? = nil,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.promptManager = promptManager
         self.workspaceManager = workspaceManager
@@ -1081,6 +1086,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.oracleViewModel = oracleViewModel
         self.settingsManager = settingsManager
         self.codexModelPollingService = codexModelPollingService
+        self.perfRecorder = perfRecorder
         self.providerFactory = providerFactory ?? { agent, modelString, workspacePath, modelParameterSelections in
             AgentRuntimeProviderService.shared.makeProvider(
                 for: agent,
@@ -1522,7 +1528,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         if let existing = sessions[tabID] {
             return existing
         }
-        let newSession = TabSession(tabID: tabID)
+        let newSession = TabSession(tabID: tabID, perfRecorder: perfRecorder)
         sessions[tabID] = newSession
         return newSession
     }
@@ -2354,7 +2360,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
         #if DEBUG
             if !accepted {
-                AgentModePerfDiagnostics.increment(
+                perfRecorder.increment(
                     "contextBuilder.run.lifecycle.event.rejected",
                     tabID: record.tabID
                 )
@@ -2563,7 +2569,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         #if DEBUG
-            AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.started", tabID: record.tabID)
+            perfRecorder.increment("contextBuilder.run.teardown.started", tabID: record.tabID)
         #endif
 
         let disposalTask = Task { @MainActor [record] in
@@ -2581,7 +2587,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard let self else { return }
             if runRegistry.removeAfterTeardown(record) {
                 #if DEBUG
-                    AgentModePerfDiagnostics.increment("contextBuilder.run.teardown.completed", tabID: record.tabID)
+                    perfRecorder.increment("contextBuilder.run.teardown.completed", tabID: record.tabID)
                     observeStartupBoundary(.teardown, record: record)
                     runTestHooks?.teardownCompleted?(record.runID)
                 #endif

@@ -1,11 +1,12 @@
-import RepoPromptRegexCore
 import Foundation
-import RepoPromptWorkspaceCore
 import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptRegexCore
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 @MainActor
 final class MCPFileToolProvider: MCPAppToolProviding {

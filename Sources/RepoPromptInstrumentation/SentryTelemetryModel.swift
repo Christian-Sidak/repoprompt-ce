@@ -1,5 +1,5 @@
 import Foundation
-import RepoPromptProcess
+import RepoPromptFoundation
 
 package enum SentryTelemetryModel {
     package enum Category: String, CaseIterable {

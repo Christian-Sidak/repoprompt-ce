@@ -1,6 +1,6 @@
-import RepoPromptWorkspaceCore
 import CryptoKit
 import Foundation
+import RepoPromptWorkspaceCore
 
 struct WorkspaceRootByteExactPathKey: Hashable, Comparable {
     let value: String

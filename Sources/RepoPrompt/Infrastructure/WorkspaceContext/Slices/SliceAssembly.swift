@@ -1,5 +1,5 @@
-import RepoPromptFoundation
 import Foundation
+import RepoPromptFoundation
 
 struct WorkspaceSliceSegment: Equatable {
     let range: LineRange

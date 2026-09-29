@@ -1,8 +1,8 @@
 // MARK: - DEBUG Sparkle Diagnostics
 
-import RepoPromptFoundation
 import Foundation
 import MCP
+import RepoPromptFoundation
 
 #if DEBUG
     extension ServerNetworkManager {

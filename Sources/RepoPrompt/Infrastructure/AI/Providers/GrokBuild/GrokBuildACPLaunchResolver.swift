@@ -1,6 +1,6 @@
-import RepoPromptProcess
-import RepoPromptFoundation
 import Foundation
+import RepoPromptFoundation
+import RepoPromptProcess
 
 enum GrokBuildACPLaunchCandidate: Equatable {
     case grokAgentStdio

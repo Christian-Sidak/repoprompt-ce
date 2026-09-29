@@ -1,5 +1,5 @@
-import RepoPromptFoundation
 import Foundation
+import RepoPromptFoundation
 import RepoPromptWorkspaceCore
 
 /// Background actor that handles all VCS (git/jj) operations off the main thread.

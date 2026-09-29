@@ -84,7 +84,8 @@
     "RepoPromptInstrumentation": {
       "source_root": "Sources/RepoPromptInstrumentation",
       "allowed_dependencies": [
-        "RepoPromptProcess"
+        "RepoPromptFoundation",
+        "RepoPromptShared"
       ],
       "test_target": "RepoPromptInstrumentationTests",
       "app_free_tests": true
@@ -186,7 +187,8 @@
         "RepoPromptProcess",
         "RepoPromptSecureStorage",
         "RepoPromptShared",
-        "RepoPromptTestSupport"
+        "RepoPromptTestSupport",
+        "RepoPromptWorkspaceCore"
       ]
     },
     "RepoPromptWorkspaceCore": {

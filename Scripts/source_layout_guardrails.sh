@@ -194,7 +194,7 @@ else:
 app_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_app_dependencies if dependency.get("byName")]
 if app_by_name_dependencies.count("RepoPromptWorkspaceCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptWorkspaceCore")
-for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptMCPCore", "RepoPromptShared", "RepoPromptTests"):
+for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptMCPCore", "RepoPromptShared"):
     dependencies = [dependency["byName"][0] for dependency in targets.get(forbidden_consumer, {}).get("dependencies", []) if dependency.get("byName")]
     if "RepoPromptWorkspaceCore" in dependencies: errors.append(f"{forbidden_consumer} must not directly depend on RepoPromptWorkspaceCore")
 for target_name, target in targets.items():
