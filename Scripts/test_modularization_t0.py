@@ -115,8 +115,42 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(audit.normalize_access("let text = \"public struct Foo\"\n"),
                          "let text = \"public struct Foo\"\n")
 
+    def test_nested_attribute_and_literal_are_not_normalized_as_code(self) -> None:
+        attribute = '@available(*, renamed: "foo(bar:)")'
+        before = f'{attribute} internal  struct Foo {{}}\n'
+        after = f'{attribute} package  struct Foo {{}}\n'
+        self.assertEqual(audit.normalize_access(before), audit.normalize_access(after))
+        self.assertEqual(audit.normalized(before.encode()), audit.normalized(after.encode()))
+        self.assertEqual(audit.normalize_access('@available(*, message: "public )") struct Foo {}\n'),
+                         '@available(*, message: "public )") struct Foo {}\n')
+        self.assertNotEqual(audit.normalized(b'internal  struct Foo {}\n'),
+                            audit.normalized(b'internal struct Foo {}\n'))
+
 
 class HelperTests(unittest.TestCase):
+    def test_lift_balances_nested_attributes_and_quoted_parentheses(self) -> None:
+        cases = (
+            '@available(*, renamed: "foo(bar:)") struct Foo {}\n',
+            '@available(*, message: "close ) now") struct Foo {}\n',
+            '@available(*, message: "public ) struct Foo") struct Foo {}\n',
+            '@Some(arg: nested(foo())) struct Foo {}\n',
+            '@available(*, message: "close \\" ) later") struct Foo {}\n',
+        )
+        for before in cases:
+            with self.subTest(before=before):
+                expected = before.removesuffix('struct Foo {}\n') + 'package struct Foo {}\n'
+                self.assertEqual(access.lift_line(before, 'Foo'), expected)
+                self.assertEqual(audit.normalized(before.encode()), audit.normalized(expected.encode()))
+        self.assertIsNone(access.lift_line('@available(*, message: "unfinished) struct Foo {}\n', 'Foo'))
+
+    def test_lift_preserves_modifier_separator_whitespace(self) -> None:
+        for separator in (' ', '  ', '\t', '\t\t', ' \t '):
+            before = f'internal{separator}struct Foo {{}}\n'
+            after = f'package{separator}struct Foo {{}}\n'
+            with self.subTest(separator=repr(separator)):
+                self.assertEqual(access.lift_line(before, 'Foo'), after)
+                self.assertEqual(audit.normalized(before.encode()), audit.normalized(after.encode()))
+
     def test_access_lift_unique_cross_module_and_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -160,6 +194,30 @@ class HelperTests(unittest.TestCase):
             applied = subprocess.run(command + ["--apply"], cwd=root, capture_output=True, text=True)
             self.assertEqual(applied.returncode, 0, applied.stderr)
             self.assertEqual((root / "Sources/One/Thing.swift").read_text(), "package struct Thing {}\n")
+
+    def test_lift_then_move_audit_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git(root, 'init', '-q')
+            git(root, 'config', 'user.email', 'test@example.invalid')
+            git(root, 'config', 'user.name', 'Test')
+            old_path = root / 'Sources/One/Foo.swift'
+            before = '@available(*, renamed: "foo(bar:)") internal\t\tstruct Foo {}\n'
+            write(root, 'Sources/One/Foo.swift', before)
+            write(root, 'Sources/Two/Client.swift', 'let value = Foo()\n')
+            git(root, 'add', '.')
+            git(root, 'commit', '-qm', 'base')
+            log = "Sources/Two/Client.swift:1:13: error: 'Foo' is inaccessible due to 'internal' protection level\n"
+            changes, notes = access.proposals(log, root)
+            self.assertEqual(notes, [])
+            old_path.unlink()
+            new_path = root / 'Sources/Two/Foo.swift'
+            new_path.write_text(changes[old_path])
+            git(root, 'add', '-A')
+            git(root, 'commit', '-qm', 'moved')
+            report = audit.audit('HEAD^', 'HEAD', root)
+            self.assertEqual(report['violations'], [])
+            self.assertEqual(report['moves'][0]['base_sha256'], report['moves'][0]['head_sha256'])
 
     def test_retarget_cli_dry_run_then_apply_in_git_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

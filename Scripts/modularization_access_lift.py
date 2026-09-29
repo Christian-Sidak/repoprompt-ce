@@ -8,6 +8,8 @@ import difflib
 import re
 from pathlib import Path
 
+from modularization_move_audit import attribute_prefix_end
+
 DIAGNOSTIC = re.compile(r"^(.*?\.swift):\d+:\d+: error: (?:'([^']+)' is inaccessible due to 'internal' protection level|cannot find (?:type )?'?([^' ]+)'? in scope)", re.MULTILINE)
 DECL = re.compile(r"\b(?:struct|class|enum|actor|protocol|func|var|let|typealias|init|subscript|associatedtype)\s+([A-Za-z_]\w*)\b")
 EXPLICIT_ACCESS = re.compile(r"\b(?:open|public|package|private|fileprivate)\b")
@@ -22,17 +24,20 @@ def owner(path: Path, root: Path) -> str | None:
 
 
 def lift_line(line: str, symbol: str) -> str | None:
-    declaration = DECL.search(line)
+    lead = attribute_prefix_end(line)
+    if lead is None:
+        return None
+    declaration = DECL.search(line, lead)
     if not declaration or declaration.group(1) != symbol:
         return None
-    prefix = line[:declaration.start()]
+    prefix = line[lead:declaration.start()]
     if EXPLICIT_ACCESS.search(prefix):
         return None
-    internal = re.search(r"\binternal\s+", prefix)
+    internal = re.search(r"\binternal(?=[ \t])", prefix)
     if internal:
-        return line[:internal.start()] + "package " + line[internal.end():]
+        start = lead + internal.start()
+        return line[:start] + "package" + line[start + len("internal"):]
     # Keep attributes ahead of the access level; modifiers remain after it.
-    lead = re.match(r"^(\s*(?:@\w+(?:\([^)]*\))?\s+)*)", line).end()
     return line[:lead] + "package " + line[lead:]
 
 

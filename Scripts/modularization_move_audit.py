@@ -24,6 +24,7 @@ ALLOWED_NON_SWIFT = {
 }
 IMPORT = re.compile(r"^\s*(?:(?:@testable|@preconcurrency|public|internal|package)\s+)*import\s+([A-Za-z_]\w*)(?:\.[A-Za-z_]\w*)?\s*$")
 DECLARATION = re.compile(r"\b(?:struct|class|enum|protocol|actor|extension|func|var|let|typealias|init|subscript|associatedtype|operator|precedencegroup)\b")
+# Consume one required separator only; the audit must not hide formatting edits.
 ACCESS = re.compile(r"(?<![\w.])(?:open|public|package|internal)(?:[ \t])(?!\()")
 PREFIX_TOKEN = re.compile(r"(?:@\w+(?:\([^)]*\))?|final|static|class|override|nonisolated|required|convenience|mutating|nonmutating|lazy|weak|unowned|open|public|package|internal|private|fileprivate)\s*")
 
@@ -46,21 +47,62 @@ def module_allowlist(base: str, head: str, cwd: Path) -> set[str]:
     return modules
 
 
+def attribute_prefix_end(line: str) -> int | None:
+    """Return the end of leading Swift attributes, or fail closed on an incomplete head."""
+    index = len(line) - len(line.lstrip(" \t"))
+    while index < len(line) and line[index] == "@":
+        name = re.match(r"@[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", line[index:])
+        if not name:
+            return None
+        index += name.end()
+        if index < len(line) and line[index] == "(":
+            depth = 0
+            quoted = False
+            escaped = False
+            while index < len(line):
+                char = line[index]
+                if quoted:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        quoted = False
+                elif char == '"':
+                    quoted = True
+                elif char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        index += 1
+                        break
+                index += 1
+            if depth != 0 or quoted:
+                return None
+        if index >= len(line) or line[index] not in " \t":
+            return None
+        while index < len(line) and line[index] in " \t":
+            index += 1
+    return index
+
+
 def normalize_access(line: str) -> str:
     """Remove only an access token in the head of a declaration, never body text."""
-    declaration = DECLARATION.search(line)
+    lead = attribute_prefix_end(line)
+    if lead is None:
+        return line
+    declaration = DECLARATION.search(line, lead)
     if not declaration:
         return line
-    prefix = line[:declaration.start()]
-    indentation = len(prefix) - len(prefix.lstrip(" \t"))
-    rest = prefix[indentation:]
+    prefix = line[lead:declaration.start()]
     offset = 0
-    while offset < len(rest):
-        match = PREFIX_TOKEN.match(rest, offset)
+    while offset < len(prefix):
+        match = PREFIX_TOKEN.match(prefix, offset)
         if not match or match.end() == offset:
             return line
         offset = match.end()
-    return ACCESS.sub("", prefix) + line[declaration.start():]
+    return line[:lead] + ACCESS.sub("", prefix) + line[declaration.start():]
 
 
 def normalized(data: bytes) -> str:
