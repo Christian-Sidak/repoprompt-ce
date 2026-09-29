@@ -75,7 +75,7 @@ def save_app_index_fingerprint(repo_root: Path, before: Dict[str, str]) -> bool:
     return True
 
 
-PROTOCOL_VERSION = 17
+PROTOCOL_VERSION = 18
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 JOB_PHASES = {
     "queued",

@@ -64,7 +64,7 @@ package enum SentryTelemetryModel {
         case mcpToolCall
         case workspaceAction
 
-        var name: String {
+        package var name: String {
             switch self {
             case .agentRun: "agent.run"
             case .appLaunch: "app.launch"
@@ -76,7 +76,7 @@ package enum SentryTelemetryModel {
             }
         }
 
-        var operation: String {
+        package var operation: String {
             switch self {
             case .agentRun: "agent.run"
             case .appLaunch, .mcpServerStart: "app.startup"

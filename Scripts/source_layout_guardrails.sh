@@ -872,12 +872,11 @@ if [[ -n "$bundle_main_hits" ]]; then
 fi
 # Extracted logic targets are app-free. Process additionally cannot read ambient
 # process-wide defaults; an app adapter must supply such configuration.
-for logic_root in Sources/RepoPromptFoundation Sources/RepoPromptInstrumentation Sources/RepoPromptProcess Sources/RepoPromptRegexCore; do
-  if [[ -d "$logic_root" ]]; then
-    print_matches "UI framework import in app-free target $logic_root" \
-      grep -R -n -E '^[[:space:]]*import[[:space:]]+(SwiftUI|AppKit)([[:space:]]|$)' "$logic_root" --include='*.swift'
-  fi
-done
+if ! python3 Scripts/swift_imports.py --forbid-ui \
+  Sources/RepoPromptFoundation Sources/RepoPromptInstrumentation \
+  Sources/RepoPromptProcess Sources/RepoPromptRegexCore; then
+  fail "UI framework import in app-free target"
+fi
 if [[ -d Sources/RepoPromptProcess ]]; then
   print_matches "ambient Bundle.main or UserDefaults.standard in RepoPromptProcess" \
     grep -R -n -E 'Bundle[.]main|UserDefaults[.]standard' Sources/RepoPromptProcess --include='*.swift'

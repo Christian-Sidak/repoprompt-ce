@@ -5,14 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 
+from swift_imports import imported_modules
+
 ROOT = Path(__file__).resolve().parent.parent
 CATALOG = Path('Scripts/modularization/modules.json')
-IMPORT = re.compile(r'^\s*(?:@testable\s+)?import\s+([A-Za-z_][A-Za-z_0-9]*)\b', re.M)
 
 
 def added_swift_paths(root: Path) -> set[str]:
@@ -38,10 +38,27 @@ def added_swift_paths(root: Path) -> set[str]:
     return {path for path in result if path.endswith('.swift')}
 
 
+def target_dependency_names(target: dict, errors: list[str]) -> set[str]:
+    names = set()
+    for dependency in target.get('dependencies', []):
+        if not isinstance(dependency, dict) or len(dependency) != 1:
+            errors.append(f"{target['name']}: unrecognized dependency {dependency!r}")
+            continue
+        kind, value = next(iter(dependency.items()))
+        valid_shape = isinstance(value, list) and bool(value) and isinstance(value[0], str)
+        if kind not in {'byName', 'target', 'product'} or not valid_shape:
+            errors.append(f"{target['name']}: unrecognized dependency {dependency!r}")
+            continue
+        if kind != 'product':
+            names.add(value[0])
+    return names
+
+
 def check(root: Path, package: dict, catalog: dict) -> list[str]:
     errors: list[str] = []
     modules = catalog['modules']
     targets = {target['name']: target for target in package['targets']}
+    actual_edges = {name: target_dependency_names(target, errors) for name, target in targets.items()}
     if set(modules) != set(targets):
         errors.append(f"catalog target drift: missing {sorted(set(targets)-set(modules))}; removed {sorted(set(modules)-set(targets))}")
     for name, entry in modules.items():
@@ -50,7 +67,7 @@ def check(root: Path, package: dict, catalog: dict) -> list[str]:
             continue
         if entry['source_root'] != target.get('path'):
             errors.append(f"{name}: source root changed from {entry['source_root']} to {target.get('path')}")
-        declared = {dependency['byName'][0] for dependency in target.get('dependencies', []) if 'byName' in dependency}
+        declared = actual_edges[name]
         allowed = set(entry['allowed_dependencies'])
         if declared != allowed:
             errors.append(f"{name}: direct edges {sorted(declared)} do not match allowed {sorted(allowed)}")
@@ -66,14 +83,14 @@ def check(root: Path, package: dict, catalog: dict) -> list[str]:
                     if current in seen:
                         continue
                     seen.add(current)
-                    pending.extend(modules.get(current, {}).get('allowed_dependencies', []))
+                    pending.extend(actual_edges.get(current, set()))
                 if 'RepoPromptApp' in seen:
                     errors.append(f"{name}: owning tests transitively build RepoPromptApp")
         source_root = root / entry['source_root']
         if not source_root.is_dir():
             continue
         for path in source_root.rglob('*.swift'):
-            for imported in IMPORT.findall(path.read_text(encoding='utf-8', errors='replace')):
+            for imported in imported_modules(path.read_text(encoding='utf-8', errors='replace')):
                 if imported in targets and imported != name and imported not in declared:
                     errors.append(f"{path.relative_to(root)}: undeclared first-party import {imported}")
     added = added_swift_paths(root)
