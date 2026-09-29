@@ -44,6 +44,24 @@ class ParseTests(unittest.TestCase):
 
 
 class CollectTests(unittest.TestCase):
+    def test_verbose_log_footer_beyond_old_limit_is_classified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = Path(tmp) / "repo-hash" / "jobs"
+            jobs.mkdir(parents=True)
+            (jobs / "a.log").write_text(
+                "$ python3 Scripts/ci_app_test_runner.py --local\n" + "diagnostic\n" * 50000 +
+                "Compiling RepoPromptApp Foo.swift\nExecuted 4 tests, with 0 failures\n"
+            )
+            (jobs / "a.timing.json").write_text(json.dumps({
+                "schemaVersion": 1, "state": "completed", "exitCode": 0,
+                "phaseTimings": {"segments": {"totalSeconds": 100.0}},
+            }))
+            samples = timings.collect(Path(tmp), 10)
+        summary = timings.summarize(samples)
+        self.assertEqual(summary["net test focused: app recompiled"]["n"], 1)
+        self.assertEqual(summary["coverage"]["unclassified"], 0)
+        self.assertEqual(summary["coverage"]["truncated"], 0)
+
     def test_collect_and_summarize(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jobs = Path(tmp) / "repo-hash" / "jobs"

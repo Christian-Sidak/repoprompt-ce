@@ -282,7 +282,10 @@ def execute_command(
         return 127
 
 
-SWIFT_TESTING_IMPORT = re.compile(r"^\s*(?:@testable\s+)?import\s+Testing\b", re.MULTILINE)
+SWIFT_TESTING_IMPORT = re.compile(
+    r"^\s*(?:(?:@\w+|public|internal|package|private|fileprivate)\s+)*"
+    r"import\s+(?:\w+\s+)?Testing\b", re.MULTILINE,
+)
 XCTEST_HELPER_RELATIVE_PATH = Path("libexec/swift/pm/swiftpm-xctest-helper")
 SWIFT_TESTING_HELPER_RELATIVE_PATH = Path("libexec/swift/pm/swiftpm-testing-helper")
 # Swift Testing's EXIT_NO_TESTS_FOUND (EX_UNAVAILABLE); `swift test` treats it as success.

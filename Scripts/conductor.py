@@ -39,7 +39,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 16
+PROTOCOL_VERSION = 17
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 JOB_PHASES = {
     "queued",

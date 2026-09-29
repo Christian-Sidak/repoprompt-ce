@@ -10,12 +10,30 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import conductor  # noqa: E402
+
+
+class ProtocolCompatibilityTests(unittest.TestCase):
+    def test_new_client_rejects_active_protocol_16_daemon(self) -> None:
+        self.assertGreater(conductor.PROTOCOL_VERSION, 16)
+        old_status = {"protocolVersion": 16, "runningJobs": [{"ticket": "old"}], "queuedJobs": []}
+        with mock.patch.object(conductor, "request_daemon", return_value=old_status) as request:
+            with self.assertRaisesRegex(conductor.ConductorError, "protocol mismatch.*jobs are active"):
+                conductor.compatible_daemon_status_or_stop_idle_mismatch(mock.Mock())
+        request.assert_called_once()
+
+    def test_idle_protocol_16_daemon_is_restarted_before_new_request(self) -> None:
+        old_status = {"protocolVersion": 16, "runningJobs": [], "queuedJobs": []}
+        with mock.patch.object(conductor, "request_daemon", side_effect=[old_status, {}]) as request, \
+                mock.patch.object(conductor, "wait_until_stopped", return_value=True):
+            self.assertEqual(conductor.compatible_daemon_status_or_stop_idle_mismatch(mock.Mock()), (None, None))
+        self.assertEqual(request.call_args_list[1].args[1], {"type": "stop", "force": False})
 
 
 def make_job(log_path: Path = Path("/tmp/ticket-1.log"), **overrides: object) -> conductor.Job:

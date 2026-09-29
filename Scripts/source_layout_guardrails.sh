@@ -14,7 +14,13 @@ print_matches() {
   local label="$1"
   shift
   local output
-  output="$($@ 2>/dev/null || true)"
+  local status=0
+  output="$("$@" 2>&1)" || status=$?
+  if (( status > 1 )); then
+    fail "$label: check failed (exit $status)"
+    printf '%s\n' "$output" >&2
+    return
+  fi
   if [[ -n "$output" ]]; then
     fail "$label"
     printf '%s\n' "$output" >&2
@@ -579,9 +585,11 @@ else
 fi
 
 service_registry_source="Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift"
-print_matches \
-  "ServiceRegistry reintroduced stored service/schema/catalog authority" \
-  grep -n -E 'static[[:space:]]+(var|let)[[:space:]]+(services|schemas|catalog)|\[any[[:space:]]+Service\]|\[Tool\]' "$service_registry_source"
+if [[ -f "$service_registry_source" ]]; then
+  print_matches \
+    "ServiceRegistry reintroduced stored service/schema/catalog authority" \
+    grep -n -E 'static[[:space:]]+(var|let)[[:space:]]+(services|schemas|catalog)|\[any[[:space:]]+Service\]|\[Tool\]' "$service_registry_source"
+fi
 for forwarding_source in \
   Sources/RepoPrompt/Infrastructure/MCP/MCPGlobalToolNames.swift \
   Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolNames.swift \
@@ -823,11 +831,11 @@ fi
 
 # 9. Runtime identity (build-modularization P0.6; inventory in
 # docs/migrations/build-modularization/ledger.md, "P0.6 compatibility inventory").
-# Production resources come only from the packaged app bundle. A SwiftPM
-# `resources:` declaration or `Bundle.module` would resolve a per-target bundle
-# that Scripts/package_app.sh does not ship.
+# First-party production targets do not yet use SwiftPM resource bundles.
+# package_app.sh copies build-directory bundles, but arbitrary target bundles
+# have not been validated for runtime lookup after packaging.
 print_matches \
-  "production target declares SwiftPM resources (only test targets may; package_app.sh ships AppResources only)" \
+  "production target declares SwiftPM resources (only test targets may; runtime bundle lookup is not validated)" \
   awk '/\.(target|executableTarget|testTarget|binaryTarget)\(/ { kind = $0 } /resources:/ && kind !~ /testTarget/ { print FILENAME ":" FNR ": " $0 }' Package.swift
 print_matches \
   "per-target bundle lookup in first-party Sources (use the app bundle via an allowlisted target)" \

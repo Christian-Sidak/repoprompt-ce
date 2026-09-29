@@ -86,6 +86,14 @@ class CollectTests(unittest.TestCase):
 
 
 class RatchetCommandTests(unittest.TestCase):
+    def test_lexical_collision_and_fake_clock_are_informational(self) -> None:
+        self.assertIn("app_largest_cycle_components", mm.TRACKED_METRICS)
+        self.assertIn("tests_sleep_calls", mm.TRACKED_METRICS)
+        self.assertEqual(len(mm._SLEEP.findall("func sleep(until deadline: Instant) {}")), 1)
+        baseline = {name: 0 for name in mm.RATCHETED_METRICS}
+        current = {**baseline, "app_largest_cycle_components": 68, "tests_sleep_calls": 50}
+        self.assertEqual(mm.regressions(current, baseline), [])
+
     def run_main(self, *args: str) -> int:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return mm.main(list(args))

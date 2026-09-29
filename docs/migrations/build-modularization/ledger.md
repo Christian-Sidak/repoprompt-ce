@@ -18,8 +18,8 @@ Self-tests: `make conductor-selftest` (includes `test_modularization_metrics.py`
 
 ## Ratchet policy
 
-- **Gated** (CI fails on any increase): `app_files_over_5000_lines`, `app_static_shared_declarations`, `app_largest_cycle_components`, `tests_sleep_calls`. Ordinary feature work never needs to worsen these.
-- **Tracked** (reported, not gated): `app_target_swift_lines`, `app_files_over_2000_lines`, `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, `app_wrong_way_file_edges`, `tests_testable_import_app_files`. Each is promoted to gated when its wave provides an alternative home (a module or an injection seam). Wrong-way edges stay tracked for now: the regex count is too noisy to gate, and the index-store count needs a build that guardrails do not have (P0.2 decision below).
+- **Gated** (CI fails on any increase): `app_files_over_5000_lines`, `app_static_shared_declarations`.
+- **Tracked** (reported, not gated): `app_target_swift_lines`, `app_files_over_2000_lines`, `app_shared_accessor_uses`, `app_userdefaults_standard_uses`, `app_wrong_way_file_edges`, `app_largest_cycle_components`, `tests_sleep_calls`, `tests_testable_import_app_files`. The lexical graph can add false edges from identifier collisions; the sleep regex also counts fake-clock declarations. Do not gate these counts until their semantics are corrected.
 - Lower a baseline with `update` in the slice that improves it. Raising one requires `update --allow-regression` plus a justification entry here.
 
 ## Baseline — 2026-09-28 (`589cecc5`)
@@ -37,6 +37,8 @@ Conductor timings (last 3,000 jobs, net of queue):
 | Package, app recompiled | 19 | 13.2 min | 60.1 min |
 
 **Correction:** the first draft of the plan reported a heavy-slot wait of p50 12.3 min, because an ad-hoc parser read `739ms` as minutes. The tested parser shows that 75% of jobs are admitted immediately, 295 waited at least a minute, and 22 waited over an hour. The plan text has been corrected.
+
+**Historical sample qualification:** these percentiles are from the earlier prefix-limited log classifier, which could omit verbose test jobs whose XCTest footer followed 400,000 characters. They describe a potentially censored subset, not a complete test-job population. The current summarizer streams full logs and reports unclassified, missing-duration, and known-failed counts; the original historical corpus has not been independently reconstructed here.
 
 ## Ratchet re-baseline — 2026-09-29 (rebase onto `5d5a99de`)
 
@@ -477,6 +479,8 @@ Not in the catalog:
 
 **Readiness samples**:
 
+Readiness is only affirmative for a complete, current source/index snapshot. Saved graphs now revalidate source bytes on load; older graph documents without source fingerprints report freshness unknown and cannot claim `ready`.
+
 | Candidate | Files | Blockers (outbound target files) | Outbound symbols | Inbound files / symbols needing access |
 | --- | --- | --- | --- | --- |
 | `Infrastructure/Concurrency` | 6 | none (**ready**) | 0 | 18 / 19 |
@@ -486,7 +490,7 @@ Not in the catalog:
 
 **Ratchet decision: keep the regex source.** Neither `app_wrong_way_file_edges` nor `app_largest_cycle_components` switches to the index.
 - **The index needs a build.** It is exact only after a current debug build of the app, which took 768 s here. `make guardrails`, the commit preflight, and the CI guardrail step run without one. A stale or absent store would make the gate depend on which worktree ran it.
-- **`app_largest_cycle_components` stays gated on the regex.** The graphs differ by one component (67 vs 66, the Diffing false edge), and the regex value moves with real cycle changes. Gating on it is sound, and conservative by one.
+- **`app_largest_cycle_components` is now informational.** A dependency-free helper with a colliding parameter name can raise the lexical SCC size, so the prior claim that gating was sound was incorrect. Promote it only after scope-correct or compiler-derived edges are available in the gate.
 - **`app_wrong_way_file_edges` stays tracked, not gated.** With 11% false edges and 28% missed, the regex count can move by name collisions alone, for example a new file-private global named like a common property.
 - **Index baseline.** For slice reporting it is **1,360 wrong-way file edges and 66 of 75 components** (HEAD `9e912a86`). Slices that change boundaries record both counts after their conductor build.
 - **When to gate on the index:** promote to an index-backed gate once CI has a build-producing job that can run `report` after building (P1.4 build-once). It is not added to `ratchets.json`, because `update` would drop keys that `collect` does not produce.
@@ -737,7 +741,7 @@ grep -rn --include='*.swift' -E 'Bundle\.(main|module)|Bundle\(for:|NSImage\(nam
 | --- | --- | --- | --- |
 | `Bundle.main`: 34 references in 21 files, all under `Sources/RepoPrompt` (`RepoPromptApp`) | Info.plist keys: `WindowState`, `SparkleUpdateManager` (versions, `SUPublicEDKey`), `MCPConnectionManager+DebugSparkleDiagnostics` (`SUFeedURL`, versions), `RuntimeCodeSigningPolicy` (signing-mode and debug-storage keys), `CodexAppServerClient` and `ACPAgentSessionController` (client version), `SentryTelemetryBootstrap` (`RepoPromptSentryDSN`), `BootstrapSocketConnectionManager` (name, version). Bundle identifier: Logger subsystems in `AppCommandLifetime`, `AgentSessionLifecycleAuthority`, `WorkspaceManagerViewModel`, `WorkspaceAgentAdmissionCoordinator`, `AgentSessionLinkCatalogDiagnostics`; `NotificationSettingsView`; `BundleIdentityDefaultsMigration`. Bundle and resources URL: `AppLaunchConfiguration` (XCTest detection), `UserNotificationCenterClient`, `CodexRuntimeAuthority` (bundled Codex). Auxiliary executable `repoprompt-mcp`: `ServerController`, `CLISymlinkManager`, `CLIPathInstaller` | None while the code stays in a target statically linked into the app. Moving it into a target that the CLI links (`RepoPromptShared`, `RepoPromptDomainRuntime`, `RepoPromptMCPCore`, `RepoPromptMCP`, `RepoPromptCodeMapCore`, `RepoPromptWorkspaceCore`, `RepoPromptRegexCore`) changes which process answers | **New guardrail:** `Bundle.main` and `NSImage(named:)` only under allowlisted app-only roots (today `Sources/RepoPrompt/`) |
 | `NSImage(named: "RepoPromptLogoNoBg_Monochrome")` (`MCPBackgroundModeCoordinator`) | Implicit main-bundle image | No such asset is packaged, so the lookup returns `nil` and the code falls back. Pre-existing; unchanged | Same guardrail |
-| `Bundle.module`, `Bundle(for:)` in production | — | 0 sites. The only SwiftPM `resources:` belong to the `RepoPromptCodeMapCoreTests` test target (Fixtures, Goldens). A production `resources:` or `Bundle.module` would resolve a per-target bundle that `package_app.sh` does not ship | **New guardrail** rejects both |
+| `Bundle.module`, `Bundle(for:)` in production | — | 0 sites. The only SwiftPM `resources:` belong to the `RepoPromptCodeMapCoreTests` test target (Fixtures, Goldens). `package_app.sh` copies build-directory bundles, but arbitrary first-party target bundle lookup after packaging is not validated | **New guardrail** rejects both pending validation |
 | `AppResources/` copied to `Contents/Resources` by `package_app.sh` | `AppIcon.icns` (through Info.plist); `Audio/notificationDing.mp3` (no code reference found) | Unaffected by Swift moves | `package_app.sh` |
 | KeyboardShortcuts `Bundle.module` | Third-party resources | Unaffected; patched by `patch_keyboard_shortcuts_resource_lookup.sh` | Packaging |
 

@@ -350,6 +350,16 @@ class ModuleExecutionTests(unittest.TestCase):
                                             "/b/MixedTests.xctest/Contents/MacOS/MixedTests",
                                             "--testing-library", "swift-testing"))
 
+    def test_qualified_swift_testing_only_target_runs_failing_test(self) -> None:
+        (self.root / "Tests" / "MixedTests" / "B.swift").write_text(
+            "internal import Testing\n@Test func fails() { #expect(false) }\n"
+        )
+        for prefix in ("internal", "public", "@_exported"):
+            self.assertTrue(runner.SWIFT_TESTING_IMPORT.search(f"{prefix} import Testing\n"))
+        result, calls = self.run_mixed(statuses=[0, 1], listed=(), test_filter=None)
+        self.assertEqual(result, 1)
+        self.assertEqual([call[0][0] for call in calls], ["swift", "/tc/swiftpm-testing-helper"])
+
     def test_module_run_fails_closed_when_swift_testing_cannot_run_equivalently(self) -> None:
         result, calls = self.run_mixed(statuses=[], testing_helper=lambda swift: None)
         self.assertEqual((result, calls), (2, []))

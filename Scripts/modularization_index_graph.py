@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import collections
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -342,6 +343,9 @@ def extract_graph(store, root: Path, module: str = DEFAULT_MODULE, source_dir: P
             "unindexed_files": sorted(set(sources) - set(chosen)),
             "stale_files": stale,
             "index_units_for_deleted_files": len(missing_sources),
+            "source_sha256": {
+                rel: hashlib.sha256(path.read_bytes()).hexdigest() for rel, path in sorted(sources.items())
+            },
         },
     }
 
@@ -496,10 +500,19 @@ def readiness(document: Mapping[str, object], paths: Sequence[str], limit: int =
         {m for rel in selected for m in document["files"][rel]["imports"]}  # type: ignore[index]
     )
     blockers = sorted(outbound.items(), key=lambda item: (-len(item[1]["from"]), item[0]))  # type: ignore[arg-type]
+    freshness = document.get("freshness", {})
+    coverage_complete = (isinstance(freshness, dict) and
+                         isinstance(freshness.get("source_sha256"), dict) and
+                         freshness.get("source_files") == len(document["files"]) and
+                         not freshness.get("unindexed_files") and
+                         not freshness.get("stale_files") and
+                         freshness.get("current", True) is not False)
     return {
         "files": len(selected),
         "unmatched_paths": unmatched,
-        "ready": not outbound and not unmatched and bool(selected),
+        "ready": not outbound and not unmatched and bool(selected) and coverage_complete,
+        "coverage_complete": coverage_complete,
+        "freshness": freshness,
         "outbound_target_files": len(outbound),
         "outbound_file_edges": sum(len(entry["from"]) for entry in outbound.values()),  # type: ignore[arg-type]
         "outbound_symbols": len({usr for entry in outbound.values() for usr in entry["symbols"]}),  # type: ignore[union-attr]
@@ -698,6 +711,7 @@ def load_document(args: argparse.Namespace, root: Path) -> Dict[str, object]:
         document = json.loads(Path(args.graph).read_text(encoding="utf-8"))
         if document.get("version") != GRAPH_VERSION:
             raise SystemExit(f"{args.graph}: unsupported graph version {document.get('version')}")
+        refresh_cached_freshness(document, root)
         return document
     store_path = Path(args.store) if args.store else default_store_path(root)
     if store_path is None or not store_path.is_dir():
@@ -714,11 +728,35 @@ def load_document(args: argparse.Namespace, root: Path) -> Dict[str, object]:
         store.close()
 
 
+def refresh_cached_freshness(document: Dict[str, object], root: Path) -> None:
+    """Revalidate a saved graph against current source bytes, or mark it unknown."""
+    freshness = document.get("freshness")
+    if not isinstance(freshness, dict):
+        freshness = {}
+        document["freshness"] = freshness
+    expected = freshness.get("source_sha256")
+    if not isinstance(expected, dict):
+        freshness["current"] = False
+        freshness["freshness_unknown"] = True
+        return
+    source_dir = Path(str(document.get("source_dir", mm.APP_SOURCE_DIR)))
+    actual = {
+        path.relative_to(root / source_dir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in mm.swift_files(root / source_dir)
+    }
+    freshness["unindexed_files"] = sorted(set(actual) - set(document.get("files", {})))
+    freshness["stale_files"] = sorted(
+        set(freshness.get("stale_files", [])) |
+        {rel for rel, digest in actual.items() if expected.get(rel) != digest}
+    )
+    freshness["current"] = not freshness["unindexed_files"] and not freshness["stale_files"] and not (set(expected) - set(actual))
+
+
 def warn_if_stale(document: Mapping[str, object]) -> None:
     freshness = document.get("freshness", {})
     stale = len(freshness.get("stale_files", []))  # type: ignore[union-attr]
     unindexed = len(freshness.get("unindexed_files", []))  # type: ignore[union-attr]
-    if stale or unindexed:
+    if stale or unindexed or freshness.get("current") is False:
         print(
             f"warning: index is not current ({stale} stale, {unindexed} unindexed source files); rebuild for exact results",
             file=sys.stderr,

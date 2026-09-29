@@ -40,8 +40,6 @@ FIRST_PARTY_SOURCE_DIRS = (Path("Sources"), Path("Packages"))
 RATCHETED_METRICS: Tuple[str, ...] = (
     "app_files_over_5000_lines",
     "app_static_shared_declarations",
-    "app_largest_cycle_components",
-    "tests_sleep_calls",
 )
 # Tracked: reported against the baseline but not gated until the owning wave provides an
 # alternative home (a module, an injection seam). Wrong-way edges stay tracked: the regex count is
@@ -52,6 +50,8 @@ TRACKED_METRICS: Tuple[str, ...] = (
     "app_shared_accessor_uses",
     "app_userdefaults_standard_uses",
     "app_wrong_way_file_edges",
+    "app_largest_cycle_components",
+    "tests_sleep_calls",
     "tests_testable_import_app_files",
 )
 

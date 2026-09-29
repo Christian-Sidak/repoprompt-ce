@@ -169,6 +169,22 @@ class ExtractionTests(unittest.TestCase):
         document = ig.extract_graph(FakeStore(self.root, fixture_units(self.root)), self.root)
         self.assertEqual(document["freshness"]["unindexed_files"], ["App/New.swift"])
         self.assertEqual(document["freshness"]["stale_files"], [SHELL])
+        readiness = ig.readiness(document, ["App", "Infrastructure"])
+        self.assertFalse(readiness["ready"])
+        self.assertFalse(readiness["coverage_complete"])
+
+    def test_saved_graph_revalidates_source_edit(self) -> None:
+        self.assertTrue(ig.readiness(self.document, ["App", "Infrastructure"])["ready"])
+        (self.root / APP / UTIL).write_text(SOURCES[UTIL] + "\n// edited after dump\n")
+        ig.refresh_cached_freshness(self.document, self.root)
+        result = ig.readiness(self.document, ["App", "Infrastructure"])
+        self.assertFalse(result["ready"])
+        self.assertIn(UTIL, result["freshness"]["stale_files"])
+
+    def test_legacy_graph_without_fingerprint_cannot_claim_ready(self) -> None:
+        self.document["freshness"].pop("source_sha256")
+        ig.refresh_cached_freshness(self.document, self.root)
+        self.assertFalse(ig.readiness(self.document, ["App", "Infrastructure"])["ready"])
 
 
 class AnalysisTests(unittest.TestCase):
