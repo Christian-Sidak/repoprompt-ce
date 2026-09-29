@@ -666,7 +666,7 @@ actor DirectHeadlessWorkspaceBackend: DomainWorkspaceCapabilityBackend {
 
     /// Global patterns come from the app authority view (M8M); switches from headless settings,
     /// whose defaults match the app crawl's.
-    private static func ignoreConfiguration(from store: DomainDirectSettingsStore) async -> DomainIgnoreConfiguration {
+    static func ignoreConfiguration(from store: DomainDirectSettingsStore) async -> DomainIgnoreConfiguration {
         await store.bootstrap()
         func bool(_ key: String, default fallback: Bool) async -> Bool {
             if case let .bool(value)? = try? await store.effectiveValue(for: key) { return value }

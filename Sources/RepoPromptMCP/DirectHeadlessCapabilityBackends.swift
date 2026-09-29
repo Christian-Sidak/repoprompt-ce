@@ -688,13 +688,16 @@ actor DirectHeadlessVersionControlBackend: DomainVersionControlCapabilityBackend
 actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     private let providerCoordinator: DirectHeadlessProviderCoordinator
     private let oracleAdapter: DirectHeadlessOracleAdapter
+    private let contextDiscovery: DirectHeadlessContextDiscovery?
 
     init(
         providerCoordinator: DirectHeadlessProviderCoordinator,
-        oracleAdapter: DirectHeadlessOracleAdapter
+        oracleAdapter: DirectHeadlessOracleAdapter,
+        contextDiscovery: DirectHeadlessContextDiscovery? = nil
     ) {
         self.providerCoordinator = providerCoordinator
         self.oracleAdapter = oracleAdapter
+        self.contextDiscovery = contextDiscovery
     }
 
     func accessOracleUtilities(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -715,6 +718,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
             throw MCPError.invalidParams("ask_oracle requires message")
         }
         switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case .discovery:
+            // Discovery is planned only for `context_builder`.
+            throw DirectHeadlessOracleAdapter.AdapterError.missingPreparedInvocation
         case .group:
             return try await .mcp(oracleAdapter.start(arguments: args, request: request))
         case let .direct(modelID, _):
@@ -738,6 +744,8 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
             throw MCPError.invalidParams("oracle_send requires message")
         }
         switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case .discovery:
+            throw DirectHeadlessOracleAdapter.AdapterError.missingPreparedInvocation
         case .group:
             return try await .mcp(oracleAdapter.continue(arguments: args, request: request))
         case let .direct(modelID, implicitConversationID):
@@ -807,6 +815,8 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     func buildContext(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
         switch try await oracleAdapter.consumePreparedRoute(request: request) {
+        case let .discovery(route):
+            return try await buildDiscoveredContext(route: route, arguments: args, request: request)
         case .group:
             return try await .mcp(oracleAdapter.buildContext(arguments: args, request: request))
         case let .direct(modelID, _):
@@ -829,6 +839,74 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
 
     func requestUserInput(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         throw MCPError.invalidRequest("interaction_unavailable: no elicitation-capable client is registered")
+    }
+
+    /// Opt-in raw-instruction Context Builder (M17): discover and commit the selection over the
+    /// bound context, then feed the frozen pack to the planned Oracle route. A discovery failure
+    /// writes no selection and runs no Oracle.
+    private func buildDiscoveredContext(
+        route: DirectHeadlessOracleAdapter.DiscoveryRoute,
+        arguments: [String: Value],
+        request: DomainPhysicalToolRequest
+    ) async throws -> DomainPhysicalToolResult {
+        guard let contextDiscovery else {
+            throw MCPError.internalError("Context Builder discovery is planned but not configured for this runtime.")
+        }
+        let outcome = try await contextDiscovery.run(
+            instructions: route.instructions,
+            mode: route.mode,
+            model: route.discoveryModel,
+            request: request
+        )
+        var fields = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
+        switch route.oracle {
+        case .none:
+            return try .object(fields)
+        case let .direct(modelID):
+            let conversation: (id: UUID, response: String)
+            do {
+                conversation = try await providerCoordinator.createConversation(
+                    providerID: route.discoveryModel.providerID,
+                    message: outcome.pack.content,
+                    model: modelID,
+                    request: request
+                )
+            } catch {
+                throw Self.oracleFailedAfterDiscovery(error, outcome: outcome)
+            }
+            fields["chat_id"] = .string(conversation.id.uuidString)
+            fields["response"] = .string(conversation.response)
+            return try .object(fields)
+        case .group:
+            let grouped: Value
+            do {
+                grouped = try await oracleAdapter.buildContext(
+                    arguments: arguments,
+                    request: request,
+                    discoveredInput: outcome.oracleInput()
+                )
+            } catch {
+                throw Self.oracleFailedAfterDiscovery(error, outcome: outcome)
+            }
+            guard case let .object(groupFields) = grouped else { return try .mcp(grouped) }
+            // The group's own `status` (a failed lane set reports `failed`) wins over discovery's.
+            fields.merge(groupFields) { _, group in group }
+            return try .object(fields)
+        }
+    }
+
+    /// The selection is already committed and the pack persisted when the Oracle step fails; say so,
+    /// and hand back the pack reference so a grouped retry can use `context_pack_ref`.
+    private static func oracleFailedAfterDiscovery(
+        _ error: Error,
+        outcome: ContextBuilderDiscoveryOutcome
+    ) -> Error {
+        if error is CancellationError { return error }
+        let underlying = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        return MCPError.internalError(
+            "oracle_failed_after_discovery: \(underlying) Discovery committed \(outcome.selection.count) selected file(s) "
+                + "and persisted \(outcome.packReference.rawValue)."
+        )
     }
 }
 

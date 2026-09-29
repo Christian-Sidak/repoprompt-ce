@@ -132,6 +132,24 @@ if ! grep -q 'ContextBuilderRouteSettlementRace.run' \
   exit 1
 fi
 
+discovery_core="$runtime_sources/ContextBuilder/ContextBuilderDiscoveryEngine.swift"
+if [[ ! -f "$discovery_core" ]] \
+  || ! grep -q 'struct ContextBuilderDiscoveryEngine' "$discovery_core"; then
+  echo "error: missing shared headless Context Builder discovery core" >&2
+  exit 1
+fi
+if grep -n -E 'applyFileEdits|manageFiles|DomainMutationPhysicalCapability|admitPhysicalTargets|workspaceStore' \
+  "$runtime_sources"/ContextBuilder/ContextBuilderDiscovery*.swift \
+  "$runtime_sources/ContextBuilder/ContextBuilderFrozenWorkspace.swift"; then
+  echo "error: the discovery core must stay read-only; only the host committer port may write the selection" >&2
+  exit 1
+fi
+if ! grep -q 'ContextBuilderDiscoveryEngine' Sources/RepoPromptMCP/DirectHeadlessContextDiscovery.swift \
+  || ! grep -q 'purpose: .contextDiscovery' Sources/RepoPromptMCP/DirectHeadlessContextDiscovery.swift; then
+  echo "error: direct-headless discovery must run through the shared core with the read-only discovery purpose" >&2
+  exit 1
+fi
+
 if grep -R -n --include='MCP*ToolProvider.swift' \
   -E 'dependencies:[[:space:]]+MCPAppPhysicalCapabilityAdapters([[:space:],?)]|$)' \
   Sources/RepoPrompt/Infrastructure/MCP/WindowTools; then

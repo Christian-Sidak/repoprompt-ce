@@ -1092,6 +1092,166 @@ A repeat of the two new suites passed 24/24 (`75d654d8`). `conductor lint` (`d59
 official Sparkle 2.9.2 dSYMs for Xcode 27; no Vendor file is part of this change. Not run: the full
 root test suite, live MCP smoke, and a release-configuration build.
 
+### M17 — opt-in direct-headless Context Builder discovery
+
+Before M17, direct headless could not turn raw instructions into a selection. `context_builder` with
+`instructions` sent them unchanged to one Oracle conversation (roster of one) or failed with
+`context_pack_required` (grouped roster), so a third-party host could not get a discovered selection
+or a frozen pack without the app.
+
+- **Opt-in, unchanged default.** `REPOPROMPT_MCP_HEADLESS_CONTEXT_DISCOVERY=1` (also `true`, `yes`,
+  `on`) enables discovery for a raw-instruction `context_builder` call on a direct-headless process.
+  Without it, both established contracts are byte-for-byte unchanged, including the error text. The
+  opt-in is process-level on purpose. The canonical tool schema is shared with the app, so a per-call
+  argument would have changed the app-bound catalog, its fingerprints, and the generated review
+  snapshot. `context_pack_ref` calls ignore the opt-in.
+- **Core (`RepoPromptDomainRuntime/ContextBuilder`, `package`, no MainActor or UI).**
+  `ContextBuilderDiscoverySnapshot` freezes the bound context once: identity, workspace and context
+  revisions, physical roots, prompt, and selection. `ContextBuilderFrozenWorkspace` serves
+  `get_file_tree`, `file_search`, `read_file`, and `get_code_structure` from that snapshot. It uses
+  `MCPDomainCanonicalWorkspaceService` with the same bounds, ignore layers, and symlink policy as the
+  headless tools, and an adapter whose mutation hook always refuses. Selected paths are admitted
+  through `HeadlessReadAuthority`. Relative paths resolve under exactly one root, and anything
+  outside the roots is refused. A final symbolic link, or a symlinked directory component under
+  `skip_symlinks`, is refused, as is a canonical escape, a directory, a FIFO, and a file above the
+  read limit. `ContextBuilderDiscoveryEngine` runs the loop:
+  1. Exploration, under a wall-clock deadline: at most 12 provider replies, each one JSON object with
+     up to 8 tool calls or a `final` answer. Replies inside prose or code fences are accepted, and two
+     malformed replies are answered with a protocol error before the run fails. `manage_selection`
+     edits a staged in-memory selection only. Any other tool name, including `apply_edits` and
+     `file_actions`, is refused without being executed. Tool results are capped at 16,000
+     characters, and the oldest results are elided to keep each prompt within 240,000 characters.
+  2. Validation: the frozen roots are rechecked (a root that moved or disappeared is
+     `discovery_context_changed`), and every selected path is admitted again. At most 48 files.
+  3. Pack: files are read through the contained `O_NOFOLLOW` walk into one canonical
+     `OracleFrozenContextPack`. It holds a task section with the mode directive, the original
+     instructions when they differ from the clarified prompt, a file map, and the file contents,
+     with root-relative display paths as provenance. The pack is capped at 1,500,000 bytes and
+     stored content-addressed.
+  4. Commit through the host's `ContextBuilderDiscoveryCommitter` port.
+
+  The deadline covers exploration only, so it can never interrupt a commit. Every failure is typed
+  (`discovery_*`, description led by the code, with a retryability flag) and writes no selection.
+- **Compare-and-set commit.** `DirectHeadlessDomainContext.commitDiscoveredSelection` writes only if
+  the connection still resolves to the frozen context with the same physical roots and the same
+  workspace and context revisions. The store command carries both expected revisions and
+  `conflictRecoveryPolicy: .failClosed`, so a concurrent durable writer is never overwritten by
+  replay. An identical selection is a no-op receipt (`selection_committed: false`), because a
+  context-scoped replacement that changes no context is a store conflict. Nothing after the store
+  command can throw.
+- **Provider.** Each turn is one `codex exec` with the new `.contextDiscovery` purpose (read-only
+  sandbox) and an explicitly empty child-launch carrier. The discovery process therefore cannot
+  redeem the private tool endpoint, and its only RepoPrompt tools are the frozen protocol tools.
+  Discovery runs on the roster primary, or on the `model` override.
+- **Oracle consumption.** `DirectHeadlessOracleAdapter` plans discovery as a new `.discovery`
+  prepared route. With `plan`, `question`, or `review`, a multi-member roster keeps its grouped plan
+  (claim and lane carriers) and consumes the discovered pack through
+  `buildContext(arguments:request:discoveredInput:)`. The `OracleInput` is identical to what a
+  `context_pack_ref` naming that pack resolves to. A roster of one sends the pack content to a direct
+  conversation. `clarify` or no response type plans the primary only and stops after discovery. The
+  reply carries `selection`, `selected_paths`, `prompt`, `file_count`, `context_pack_ref`,
+  `selection_committed`, and `discovery` counts, plus the Oracle fields. A failure after the commit is
+  `oracle_failed_after_discovery` and names the committed file count and the pack reference.
+- **Side fix: non-blocking leaf open.** `HeadlessReadAuthority` now opens every leaf with
+  `O_NONBLOCK`, refuses anything that is not a regular file, then restores blocking mode before
+  reading. Before this, headless `read_file` or `get_code_structure` on a FIFO waited for a writer
+  forever. That contradicted M8C's typed refusal of non-regular files, and it would have pinned the
+  discovery deadline, because blocking work is awaited rather than abandoned. Regular-file reads are
+  unchanged.
+- **Guardrail.** `headless_runtime_guardrails.sh` requires the discovery core. It rejects write
+  entry points in the core (`applyFileEdits`, `manageFiles`, physical mutation capabilities,
+  `workspaceStore`) and requires the headless adapter to use the core with the read-only discovery
+  purpose.
+
+Evidence: `ContextBuilderDiscoveryTests` (domain runtime, 17) drives the engine with scripted
+providers over a real temporary workspace and records the commit and pack ports. It covers:
+
+- the happy path, with the exact canonical pack, its storage, the commit over the frozen snapshot,
+  and the prompt and transcript contents;
+- a final selection that replaces and de-duplicates the staged one;
+- refused `apply_edits` and `file_actions`, with the file unchanged;
+- staged symlink, outside, directory, and symlinked-component paths rejected without changing the
+  staged selection;
+- final inadmissible paths failing closed with no commit and no pack (symlink, symlinked
+  component, outside, directory, FIFO, and missing);
+- a file swapped for a symlink after staging;
+- a moved root;
+- the turn limit and the last-turn warning;
+- malformed-reply repair and the protocol violation past the limit;
+- provider failure, cancellation during a turn, and the exploration deadline;
+- the selection, pack, and empty-selection budgets;
+- a committer conflict;
+- prompt elision under a small budget;
+- a FIFO `read_file` returning a typed error;
+- the reply parser.
+
+`DirectHeadlessContextDiscoveryTests` (9) runs raw instructions through the real backend,
+workspace, pack store, CAS, and Oracle routes, with a fake `codex` that plays the discovery model and
+the Oracle lanes. It covers:
+
+- discovery, commit, and one frozen pack consumed by a two-lane group. Discovery turns are
+  read-only with no carrier. The group turn's input references the pack, each lane's stdin equals
+  the pack, and `apply_edits` was refused;
+- `clarify` with no Oracle, then its reference consumed by a later grouped `context_pack_ref`;
+- a single-member `question` answered through a direct conversation;
+- unchanged opt-out contracts;
+- a discovery provider failure, with no selection written and no group created;
+- a context edited while discovery was blocked in a turn, failing closed through the backend;
+- cancellation mid-turn draining the provider process and writing nothing;
+- the CAS commit in isolation (stale, applied, identical no-op, superseded);
+- the purpose and opt-in parsing.
+
+Conductor evidence. The first focused run (`a46c394a`) failed two expectations:
+
+- The engine did not unwrap an `NSError` description; `describe` now reads
+  `NSLocalizedDescriptionKey`.
+- The CAS test reused one invocation ID for a prompt edit and the commit. The store correctly
+  refused that as `operation_id_reused_with_different_command`, and the test now uses one invocation
+  per call.
+
+The rerun (`760c9e6f`) passed 25/25. On the settled tree, the final focused run (`1a2fdb81`) passed
+331/331. That is `RepoPromptTests` 148 and `RepoPromptDomainRuntimeTests` 183, covering the new
+suites plus these existing ones:
+
+- the direct-headless Oracle group, composition, and read-authority suites;
+- ignore, symlink, and code-structure resilience;
+- the canonical workspace bounds and search semantics;
+- protected-mutation security;
+- the Oracle group contracts, runtime, and claims;
+- standalone composition and the read tool provider;
+- route settlement and the frozen pack;
+- the `get_code_structure` provider and orchestrator;
+- the backend parity harness.
+
+A repeat of the two new suites (`8293e108`) passed 26/26. `conductor lint` (`2deacd6a`),
+`conductor guardrails` (`da47f16b`), and `swift-build --product all` (`f590158a`) passed. Builds used
+the locally restored, untracked official Sparkle 2.9.2 dSYMs for Xcode 27; no Vendor file is part of
+this change. Not run: the full root suite, a live MCP smoke with a real `codex` provider, and a
+release-configuration build.
+
+- **Not claimed.** This is not app Context Builder parity. There is no tab, agent session, run
+  record, transcript, preview, or token accounting. The app's nested discovery agent and its M16
+  route settlement are not used, and `context_builder.agent`/`context_builder.model` are not
+  consulted.
+
+Remaining gaps:
+
+- The protocol is a JSON text loop over one-shot `codex exec` turns, not native tool calling through
+  the private endpoint. Every turn resends the bounded transcript, and `codexExec` is the only
+  headless provider.
+- The clarified prompt is returned and packed but not written to the context. The selection is
+  whole files only (no slices or codemap-only entries), budgeted in bytes rather than tokens, and the
+  pack carries no codemaps or file tree.
+- Grouped lane carriers are prepared at admission and keep the 60-second launch-token lifetime.
+  After a longer discovery, lane children cannot redeem the private tool endpoint. The pack itself
+  is self-contained.
+- A run rejected at or after the content-addressed store can leave one unreferenced pack artifact.
+  There is no artifact collection.
+- The discovery `codex` process can still read files through its own sandboxed shell. The
+  authority bounds what is selected, packed, and committed, not what the model reads.
+- `export_response` is still ignored by direct headless.
+- A per-call opt-in needs a shared-schema change that the app must also accept or reject.
+
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 
 The M8A–M13 branch was merged onto `origin/main` `a5586936`, which had independently landed #1081

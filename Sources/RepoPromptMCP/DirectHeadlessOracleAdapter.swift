@@ -47,15 +47,46 @@ actor DirectHeadlessOracleAdapter {
     enum PreparedRoute {
         case direct(modelID: String, implicitConversationID: UUID?)
         case group
+        /// Opt-in raw-instruction Context Builder discovery (M17). The Oracle route consumes the
+        /// discovered frozen pack afterwards, or nothing runs after discovery for `clarify`.
+        case discovery(DiscoveryRoute)
+    }
+
+    struct DiscoveryRoute: Equatable {
+        enum Oracle: Equatable {
+            /// `clarify` or no response type: discovery only.
+            case none
+            case direct(modelID: String)
+            /// The retained grouped plan consumes the pack through
+            /// `buildContext(arguments:request:discoveredInput:)`.
+            case group
+        }
+
+        let instructions: String
+        let mode: OracleMode
+        let responseType: String?
+        /// Discovery turns run on the roster primary (or the `model` override).
+        let discoveryModel: OracleModelReference
+        let oracle: Oracle
+    }
+
+    private struct DiscoveryIntent {
+        let instructions: String
+        let mode: OracleMode
+        let responseType: String?
+        let discoveryModel: OracleModelReference
+        let consumesOracle: Bool
     }
 
     private struct InvocationPlan {
         let invocationID: UUID
         let runID: UUID
         let claimID: UUID?
-        let input: OracleInput
+        /// Nil only for a discovery plan until its pack exists.
+        var input: OracleInput?
         let route: Route
         let childLaunchPlan: DomainChildLaunchPlan
+        var discovery: DiscoveryIntent?
     }
 
     private let owner: OracleConversationOwner
@@ -63,6 +94,8 @@ actor DirectHeadlessOracleAdapter {
     private let store: any DirectHeadlessOracleStore
     private let provider: DirectHeadlessProviderCoordinator
     private let groupRuntime: OracleGroupRuntime
+    /// Process-level opt-in for raw-instruction discovery (`DirectHeadlessContextDiscovery`).
+    private let contextDiscoveryEnabled: Bool
     private var plansByInvocationID: [UUID: InvocationPlan] = [:]
     private var isShuttingDown = false
 
@@ -71,12 +104,14 @@ actor DirectHeadlessOracleAdapter {
         rosterResolver: DirectHeadlessOracleRosterResolver,
         store: any DirectHeadlessOracleStore,
         claimManager: OracleGroupClaimManager,
-        provider: DirectHeadlessProviderCoordinator
+        provider: DirectHeadlessProviderCoordinator,
+        contextDiscoveryEnabled: Bool = false
     ) throws {
         owner = try OracleConversationOwner(kind: "direct-headless", identifier: profileIdentifier)
         self.rosterResolver = rosterResolver
         self.store = store
         self.provider = provider
+        self.contextDiscoveryEnabled = contextDiscoveryEnabled
         groupRuntime = OracleGroupRuntime(store: store, claimManager: claimManager)
     }
 
@@ -102,6 +137,26 @@ actor DirectHeadlessOracleAdapter {
               let plan = plansByInvocationID[invocationID]
         else {
             throw AdapterError.missingPreparedInvocation
+        }
+        if let discovery = plan.discovery {
+            let oracle: DiscoveryRoute.Oracle
+            switch plan.route {
+            case let .direct(modelID, _):
+                plansByInvocationID.removeValue(forKey: invocationID)
+                oracle = discovery.consumesOracle ? .direct(modelID: modelID) : .none
+            case .startGroup:
+                oracle = .group
+            case .continueGroup:
+                plansByInvocationID.removeValue(forKey: invocationID)
+                throw AdapterError.missingPreparedInvocation
+            }
+            return .discovery(DiscoveryRoute(
+                instructions: discovery.instructions,
+                mode: discovery.mode,
+                responseType: discovery.responseType,
+                discoveryModel: discovery.discoveryModel,
+                oracle: oracle
+            ))
         }
         guard plan.claimID != nil else {
             plansByInvocationID.removeValue(forKey: invocationID)
@@ -133,6 +188,24 @@ actor DirectHeadlessOracleAdapter {
 
     func buildContext(arguments: [String: Value], request: DomainPhysicalToolRequest) async throws -> Value {
         let plan = try await consumePlan(toolName: "context_builder", arguments: arguments, request: request)
+        guard plan.discovery == nil else { throw AdapterError.missingPreparedInvocation }
+        return try await execute(plan, request: request)
+    }
+
+    /// Runs the retained grouped discovery plan with the discovered pack as its input, exactly as a
+    /// `context_pack_ref` naming that pack would.
+    func buildContext(
+        arguments: [String: Value],
+        request: DomainPhysicalToolRequest,
+        discoveredInput: OracleInput
+    ) async throws -> Value {
+        var plan = try await consumePlan(toolName: "context_builder", arguments: arguments, request: request)
+        guard let discovery = plan.discovery, discovery.consumesOracle, discovery.mode == discoveredInput.mode,
+              case .startGroup = plan.route
+        else {
+            throw AdapterError.missingPreparedInvocation
+        }
+        plan.input = discoveredInput
         return try await execute(plan, request: request)
     }
 
@@ -212,6 +285,20 @@ actor DirectHeadlessOracleAdapter {
                 primaryModelOverride: arguments["model"]?.stringValue,
                 newChat: true
             ))
+            if contextDiscoveryEnabled, arguments["context_pack_ref"] == nil,
+               let instructions = arguments["instructions"]?.stringValue?
+               .trimmingCharacters(in: .whitespacesAndNewlines),
+               !instructions.isEmpty
+            {
+                return try await discoveryPlan(
+                    instructions: instructions,
+                    responseType: arguments["response_type"]?.stringValue,
+                    mode: mode,
+                    roster: roster,
+                    invocationID: invocationID,
+                    runID: runID
+                )
+            }
             if roster.count == 1, arguments["context_pack_ref"]?.stringValue != nil {
                 throw AdapterError.contextPackRequired
             }
@@ -363,6 +450,61 @@ actor DirectHeadlessOracleAdapter {
         }
     }
 
+    /// Plans an opt-in discovery invocation. `plan`, `question`, and `review` keep the configured
+    /// roster for the Oracle step (one member: direct conversation; several: a group); `clarify` or
+    /// no response type plans only the roster primary, which runs discovery and nothing after it.
+    private func discoveryPlan(
+        instructions: String,
+        responseType: String?,
+        mode: OracleMode,
+        roster: OracleRoster,
+        invocationID: UUID,
+        runID: UUID
+    ) async throws -> InvocationPlan {
+        if let responseType, !["plan", "question", "review", "clarify"].contains(responseType) {
+            throw MCPError.invalidParams("response_type must be plan, question, review, or clarify.")
+        }
+        let consumesOracle = responseType.map { ["plan", "question", "review"].contains($0) } ?? false
+        let oracleRoster = try consumesOracle ? roster : OracleRoster(primary: roster.primary)
+        try await provider.validateOracleRoster(oracleRoster)
+        let discovery = DiscoveryIntent(
+            instructions: instructions,
+            mode: mode,
+            responseType: responseType,
+            discoveryModel: roster.primary,
+            consumesOracle: consumesOracle
+        )
+        if oracleRoster.count == 1 {
+            return try InvocationPlan(
+                invocationID: invocationID,
+                runID: runID,
+                claimID: nil,
+                input: nil,
+                route: .direct(modelID: oracleRoster.primary.modelID, implicitConversationID: nil),
+                childLaunchPlan: Self.childPlan(runID: runID, roster: oracleRoster),
+                discovery: discovery
+            )
+        }
+        let group = try OracleGroupDescriptor(size: oracleRoster.count)
+        let members = try oracleRoster.orderedModels.enumerated().map { laneIndex, model in
+            try OracleGroupMember(
+                laneID: OracleLaneID(index: laneIndex),
+                publicChatID: UUID().uuidString,
+                model: model
+            )
+        }
+        let claimID = UUID()
+        return try InvocationPlan(
+            invocationID: invocationID,
+            runID: runID,
+            claimID: claimID,
+            input: nil,
+            route: .startGroup(group: group, roster: oracleRoster, members: members),
+            childLaunchPlan: Self.childPlan(runID: runID, group: group, claimID: claimID, roster: oracleRoster),
+            discovery: discovery
+        )
+    }
+
     private static func prefersGroup(
         _ group: OracleGroupDocument,
         overDirectUpdatedAt latestDirectAt: Date?
@@ -401,6 +543,7 @@ actor DirectHeadlessOracleAdapter {
     }
 
     private func execute(_ plan: InvocationPlan, request: DomainPhysicalToolRequest) async throws -> Value {
+        guard let input = plan.input else { throw AdapterError.missingPreparedInvocation }
         switch plan.route {
         case .direct:
             throw AdapterError.missingPreparedInvocation
@@ -413,12 +556,12 @@ actor DirectHeadlessOracleAdapter {
                     invocationID: plan.invocationID,
                     runID: plan.runID,
                     claimID: claimID,
-                    input: plan.input,
+                    input: input,
                     intent: .start(
                         .init(
                             group: group,
                             owner: owner,
-                            name: String(plan.input.userMessage.prefix(80)),
+                            name: String((plan.discovery?.instructions ?? input.userMessage).prefix(80)),
                             roster: roster,
                             members: members
                         )
@@ -438,7 +581,7 @@ actor DirectHeadlessOracleAdapter {
                     invocationID: plan.invocationID,
                     runID: plan.runID,
                     claimID: claimID,
-                    input: plan.input,
+                    input: input,
                     intent: .continuation(
                         .init(
                             group: group,

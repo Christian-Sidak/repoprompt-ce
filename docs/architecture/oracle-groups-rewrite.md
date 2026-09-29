@@ -82,6 +82,8 @@ A direct grouped Context Builder request must use a persisted `context_pack_ref`
 
 `MCPCommandRunner` accepts exactly one of `instructions` or `context_pack_ref`. The direct adapter verifies the pack schema, mode, content digest, and stored artifact before launching lanes. Invalid or missing packs fail with `context_pack_required` or the relevant pack validation error.
 
+With the process-level opt-in `REPOPROMPT_MCP_HEADLESS_CONTEXT_DISCOVERY=1`, raw `instructions` first run bounded discovery (`ContextBuilderDiscoveryEngine`) over the connection-bound context. Discovery commits the selection by compare-and-set and persists one canonical pack. That pack then becomes the input a `context_pack_ref` naming it would resolve to: the grouped start for a multi-member roster with `plan`, `question`, or `review`, or the direct conversation for one member. `clarify` or no response type stops after discovery and returns the reference. Without the opt-in, the contracts above are unchanged.
+
 ## Durability and claims
 
 `DomainOracleConversationStore` stores one document per group. `OracleGroupDocument.currentSchemaVersion` is `2`. The document contains immutable group topology, the ordered roster, member chat IDs, a revision, and ordered turns. Schema 1 documents are normalized on read by deriving the terminal group status from their lane outcomes; their next mutation writes schema 2. Unknown future schemas remain fail-closed.

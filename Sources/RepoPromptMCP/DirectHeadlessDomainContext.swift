@@ -299,6 +299,103 @@ actor DirectHeadlessDomainContext {
         )
     }
 
+    /// Freezes the context bound to `request` for one Context Builder discovery run.
+    func discoverySnapshot(for request: DomainPhysicalToolRequest) async throws -> ContextBuilderDiscoverySnapshot {
+        let current = try await snapshot(for: request)
+        return ContextBuilderDiscoverySnapshot(
+            identity: current.identity,
+            workspaceRevision: current.workspace.revisions.workingRevision,
+            contextRevision: current.context.revisions.workingRevision,
+            roots: current.roots,
+            prompt: current.prompt,
+            selection: current.selection
+        )
+    }
+
+    /// Compare-and-set commit of a discovered selection. It writes only when the connection is still
+    /// bound to the frozen context, the physical roots are unchanged, and neither the workspace nor
+    /// the context revision moved since the freeze; the store enforces the same revisions again.
+    /// Every refusal is `ContextBuilderDiscoveryError.contextChanged` and writes nothing.
+    func commitDiscoveredSelection(
+        _ absolutePaths: [String],
+        over frozen: ContextBuilderDiscoverySnapshot,
+        request: DomainPhysicalToolRequest
+    ) async throws -> ContextBuilderDiscoveryCommitReceipt {
+        let current: Snapshot
+        do {
+            current = try await snapshot(for: request)
+        } catch {
+            throw ContextBuilderDiscoveryError.contextChanged(
+                "the bound context is no longer available: \(error.localizedDescription)"
+            )
+        }
+        guard current.identity == frozen.identity else {
+            throw ContextBuilderDiscoveryError.contextChanged("the connection is now bound to a different context")
+        }
+        guard current.roots.map(\.path) == frozen.roots.map(\.path) else {
+            throw ContextBuilderDiscoveryError.contextChanged("the workspace roots changed")
+        }
+        guard current.workspace.revisions.workingRevision == frozen.workspaceRevision,
+              current.context.revisions.workingRevision == frozen.contextRevision
+        else {
+            throw ContextBuilderDiscoveryError.contextChanged("the bound context was modified")
+        }
+        guard var document = try JSONSerialization.jsonObject(
+            with: current.workspace.document.documentBytes
+        ) as? [String: Any],
+            var contexts = document["composeTabs"] as? [[String: Any]],
+            let index = contexts.firstIndex(where: { ($0["id"] as? String) == current.identity.contextID.uuidString })
+        else {
+            throw Error.invalidWorkspaceDocument
+        }
+        let canonicalPaths = try Self.translateSelectionToCanonical(
+            absolutePaths,
+            mappings: current.rootOverlay.mappings
+        )
+        let storedPaths = contexts[index]["selectedPaths"] as? [String] ?? contexts[index]["selection"] as? [String]
+        if storedPaths == canonicalPaths {
+            // Already exactly this selection: a context-scoped replacement would change no context.
+            return ContextBuilderDiscoveryCommitReceipt(
+                applied: false,
+                workspaceRevision: frozen.workspaceRevision,
+                contextRevision: frozen.contextRevision
+            )
+        }
+        contexts[index]["selectedPaths"] = canonicalPaths
+        document["composeTabs"] = contexts
+        let bytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+        let replacement = try DomainWorkspaceDocument.decode(
+            documentBytes: bytes,
+            fileURL: current.workspace.document.fileURL
+        )
+        try await MCPDomainMutationCommitContext.willCommit()
+        // `failClosed`: a concurrent durable writer (another process) wins; the captured document is
+        // never replayed over it without the expected revisions.
+        let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
+            operationID: request.securityContext?.invocationID ?? UUID(),
+            expectedCatalogRevision: nil,
+            expectedWorkspaceRevision: frozen.workspaceRevision,
+            expectedContextRevision: frozen.contextRevision,
+            conflictRecoveryPolicy: .failClosed,
+            origin: .standalone,
+            command: .replaceWorkingDocument(replacement)
+        ))
+        guard outcome.disposition == .applied || outcome.disposition == .deduplicated else {
+            throw ContextBuilderDiscoveryError.contextChanged(
+                outcome.diagnostic ?? outcome.errorCode?.rawValue ?? outcome.disposition.rawValue
+            )
+        }
+        // Nothing after the store command may throw: the selection is committed.
+        let committedContext = outcome.workspace?.contexts.first { $0.metadata.identity == frozen.identity }
+        return ContextBuilderDiscoveryCommitReceipt(
+            applied: true,
+            workspaceRevision: outcome.workspace?.revisions.workingRevision
+                ?? outcome.after?.workingRevision
+                ?? frozen.workspaceRevision,
+            contextRevision: committedContext?.revisions.workingRevision ?? frozen.contextRevision
+        )
+    }
+
     nonisolated static func resolvePath(_ rawPath: String, roots: [URL], allowMissingLeaf: Bool = false) throws -> URL {
         guard !rawPath.contains("\0") else {
             throw Error.pathOutsideWorkspace(rawPath)

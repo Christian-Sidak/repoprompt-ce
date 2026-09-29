@@ -20,6 +20,8 @@ actor DirectHeadlessMCPService {
         let oracleAdapter: DirectHeadlessOracleAdapter
         let oracleStore: DomainOracleConversationStore
         let settingsStore: DomainDirectSettingsStore
+        /// Present only with the `REPOPROMPT_MCP_HEADLESS_CONTEXT_DISCOVERY` opt-in.
+        let contextDiscovery: DirectHeadlessContextDiscovery?
     }
 
     struct ConnectionContext {
@@ -225,6 +227,14 @@ actor DirectHeadlessMCPService {
                 persistence: runtime.persistenceCoordinator,
                 identity: runtime.identity
             )
+            let contextDiscovery = DirectHeadlessContextDiscovery.isEnabled(environment: environment)
+                ? DirectHeadlessContextDiscovery(
+                    context: context,
+                    providerCoordinator: providerCoordinator,
+                    packStore: oracleStore,
+                    settingsStore: settingsStore
+                )
+                : nil
             let oracleAdapter = try DirectHeadlessOracleAdapter(
                 profileIdentifier: runtime.configuration.profileIdentifier,
                 rosterResolver: DirectHeadlessOracleRosterResolver(settingsStore: settingsStore),
@@ -233,7 +243,8 @@ actor DirectHeadlessMCPService {
                     persistence: runtime.persistenceCoordinator,
                     identity: runtime.identity
                 ),
-                provider: providerCoordinator
+                provider: providerCoordinator,
+                contextDiscoveryEnabled: contextDiscovery != nil
             )
             let backends = MCPDomainStandaloneCapabilityBackends(
                 global: global,
@@ -241,7 +252,8 @@ actor DirectHeadlessMCPService {
                 filesystem: DirectHeadlessFilesystemBackend(context: context),
                 conversation: DirectHeadlessConversationBackend(
                     providerCoordinator: providerCoordinator,
-                    oracleAdapter: oracleAdapter
+                    oracleAdapter: oracleAdapter,
+                    contextDiscovery: contextDiscovery
                 ),
                 versionControl: DirectHeadlessVersionControlBackend(runtime: runtime, context: context),
                 agent: DirectHeadlessAgentBackend(coordinator: providerCoordinator),
@@ -292,7 +304,8 @@ actor DirectHeadlessMCPService {
                 providerCoordinator: providerCoordinator,
                 oracleAdapter: oracleAdapter,
                 oracleStore: oracleStore,
-                settingsStore: settingsStore
+                settingsStore: settingsStore,
+                contextDiscovery: contextDiscovery
             )
         } catch {
             _ = await runtime.shutdown()

@@ -12,11 +12,14 @@ actor DirectHeadlessProviderCoordinator {
     enum ExecutionPurpose {
         case directOracle
         case oracleGroup
+        /// One Context Builder discovery turn. Discovery reads the workspace only through the
+        /// frozen protocol tools, so the provider process gets a read-only sandbox and no carrier.
+        case contextDiscovery
         case agent
 
         var sandbox: String {
             switch self {
-            case .oracleGroup: "read-only"
+            case .oracleGroup, .contextDiscovery: "read-only"
             case .directOracle, .agent: "workspace-write"
             }
         }

@@ -65,33 +65,18 @@ enum HeadlessReadAuthority {
     /// Reads `target` by walking its canonical components from the canonical root with
     /// `O_NOFOLLOW`, so no symlink is traversed at read time; a swapped component fails closed.
     /// `admitSize` sees the regular file's size before any byte is read (after the `limit` check);
-    /// returning false refuses the read with `readBudgetExhausted`.
+    /// returning false refuses the read with `readBudgetExhausted`. A leaf that is not a regular
+    /// file (including a FIFO swapped in after authorization) fails as `notARegularFile` without
+    /// blocking; see `openContainedRegularFile`.
     static func readContained(
         _ target: Target,
         limit: Int,
         admitSize: (Int) -> Bool = { _ in true }
     ) throws -> Data {
-        var descriptor = open(target.canonicalRoot, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        for (index, component) in target.canonicalComponents.enumerated() {
-            let isLast = index == target.canonicalComponents.count - 1
-            let next = openat(descriptor, component, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | (isLast ? 0 : O_DIRECTORY))
-            let openError = errno
-            close(descriptor)
-            guard next >= 0 else {
-                // ELOOP: a symlink now sits where authorization saw none. ENOTDIR: a directory
-                // component became something else. Either way the path changed; fail closed.
-                if openError == ELOOP || openError == ENOTDIR {
-                    throw MCPDomainCanonicalReadError.pathChangedDuringRead
-                }
-                throw POSIXError(POSIXErrorCode(rawValue: openError) ?? .EIO)
-            }
-            descriptor = next
-        }
+        let descriptor = try openContainedRegularFile(target)
         defer { close(descriptor) }
         var status = stat()
         guard fstat(descriptor, &status) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        guard status.st_mode & S_IFMT == S_IFREG else { throw MCPDomainCanonicalReadError.notARegularFile }
         guard status.st_size <= off_t(limit) else {
             throw MCPDomainCanonicalReadError.fileTooLarge(byteCount: Int(status.st_size), limit: limit)
         }
@@ -111,6 +96,67 @@ enum HeadlessReadAuthority {
             data.append(contentsOf: buffer[0 ..< count])
         }
         return data
+    }
+
+    /// The size of the regular file at `target`, opened like `readContained` without reading it.
+    static func containedRegularFileSize(_ target: Target) throws -> Int {
+        let descriptor = try openContainedRegularFile(target)
+        defer { close(descriptor) }
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        return Int(status.st_size)
+    }
+
+    /// Opens the regular file at `target` through the `O_NOFOLLOW` walk. The leaf is opened with
+    /// `O_NONBLOCK`, so opening a FIFO never waits for a writer; anything that is not a regular file
+    /// is refused, and blocking mode is restored before the caller reads. The caller owns the
+    /// returned descriptor.
+    private static func openContainedRegularFile(_ target: Target) throws -> Int32 {
+        let descriptor = try openContained(target)
+        var status = stat()
+        guard fstat(descriptor, &status) == 0 else {
+            let code = errno
+            close(descriptor)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        guard status.st_mode & S_IFMT == S_IFREG else {
+            close(descriptor)
+            throw MCPDomainCanonicalReadError.notARegularFile
+        }
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags & ~O_NONBLOCK) == 0 else {
+            let code = errno
+            close(descriptor)
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+        return descriptor
+    }
+
+    /// Opens `target` by walking its canonical components from the canonical root with
+    /// `O_NOFOLLOW` (and a non-blocking leaf); the caller owns the returned descriptor.
+    private static func openContained(_ target: Target) throws -> Int32 {
+        var descriptor = open(target.canonicalRoot, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard descriptor >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+        for (index, component) in target.canonicalComponents.enumerated() {
+            let isLast = index == target.canonicalComponents.count - 1
+            let next = openat(
+                descriptor,
+                component,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | (isLast ? O_NONBLOCK : O_DIRECTORY)
+            )
+            let openError = errno
+            close(descriptor)
+            guard next >= 0 else {
+                // ELOOP: a symlink now sits where authorization saw none. ENOTDIR: a directory
+                // component became something else. Either way the path changed; fail closed.
+                if openError == ELOOP || openError == ENOTDIR {
+                    throw MCPDomainCanonicalReadError.pathChangedDuringRead
+                }
+                throw POSIXError(POSIXErrorCode(rawValue: openError) ?? .EIO)
+            }
+            descriptor = next
+        }
+        return descriptor
     }
 
     /// UTF-8 text, or UTF-16 when a byte-order mark says so.
