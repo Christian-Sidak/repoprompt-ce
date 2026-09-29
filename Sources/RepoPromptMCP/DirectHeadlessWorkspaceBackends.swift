@@ -288,14 +288,21 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
         }
 
         if action == "delete" {
-            try await MCPDomainMutationCommitContext.willCommit()
-            let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
+            let envelope = DomainWorkspaceCommandEnvelope(
                 operationID: operationID,
                 expectedCatalogRevision: catalog.catalogRevision,
                 expectedWorkspaceRevision: workspace.revisions.workingRevision,
                 origin: .standalone,
                 command: .deleteWorkspace(workspaceID: workspace.document.workspaceID)
-            ))
+            )
+            // Deleting the workspace removes every root a running pinned Oracle launch may hold.
+            let outcome = try await context.withRootMutationClaim(
+                toolName: "manage_workspaces",
+                workspaceID: workspace.document.workspaceID
+            ) { [runtime] in
+                try await MCPDomainMutationCommitContext.willCommit()
+                return await runtime.workspaceStore.execute(envelope)
+            }
             try requireApplied(outcome)
             if let scope = try? await runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID),
                bindingContext(scope.binding)?.workspaceID == workspace.document.workspaceID
@@ -394,14 +401,36 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
         if action == "add_folder" || action == "remove_folder" || selectedContextID != nil {
             try await context.validateWorkspaceRoots(replacement.metadata.repoPaths)
         }
-        try await MCPDomainMutationCommitContext.willCommit()
-        let outcome = await runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
+        let envelope = DomainWorkspaceCommandEnvelope(
             operationID: operationID,
             expectedCatalogRevision: catalog.catalogRevision,
             expectedWorkspaceRevision: workspace.revisions.workingRevision,
             origin: .standalone,
             command: .replaceWorkingDocument(replacement)
-        ))
+        )
+        let commit: @Sendable () async throws -> DomainCommandOutcome = { [runtime] in
+            try await MCPDomainMutationCommitContext.willCommit()
+            return await runtime.workspaceStore.execute(envelope)
+        }
+        // A roots change, or closing a context, cannot land under a running pinned Oracle launch
+        // that holds those roots; it is refused (typed, retryable) until the launch ends.
+        let outcome: DomainCommandOutcome = switch action {
+        case "add_folder", "remove_folder":
+            try await context.withRootMutationClaim(
+                toolName: "manage_workspaces",
+                workspaceID: workspace.document.workspaceID,
+                commit
+            )
+        case "close_tab":
+            try await context.withRootMutationClaim(
+                toolName: "manage_workspaces",
+                workspaceID: workspace.document.workspaceID,
+                contextID: closedContextID,
+                commit
+            )
+        default:
+            try await commit()
+        }
         try requireApplied(outcome)
         var result: [String: Value] = [
             "workspace_id": .string(workspace.document.workspaceID.uuidString),

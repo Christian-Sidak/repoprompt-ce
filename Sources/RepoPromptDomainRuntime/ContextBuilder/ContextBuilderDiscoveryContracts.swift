@@ -215,6 +215,9 @@ package struct ContextBuilderDiscoveryRequest: Equatable, Sendable {
 package struct ContextBuilderDiscoveryOutcome: Sendable {
     /// The frozen context the selection was committed to.
     package let context: DomainContextIdentity
+    /// The frozen physical roots the pack was built from and the commit was made over (the commit
+    /// refuses when the context's roots are no longer these).
+    package let roots: [URL]
     /// Committed selection: absolute paths under the frozen physical roots, in selection order.
     package let selection: [String]
     /// Root-relative display paths (root-labeled when there are several roots), in the same order.

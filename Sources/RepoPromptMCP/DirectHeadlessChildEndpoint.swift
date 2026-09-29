@@ -317,7 +317,8 @@ actor DirectHeadlessChildLaunchCoordinator {
 
     /// Mints the plan's carriers. Without a pin (admission) they are bound to the connection's
     /// current context. With a pin (a `.atHandoff` handoff) the current context must be exactly the
-    /// pinned one, else nothing is minted; the tokens are issued for the pinned context and revision.
+    /// pinned one, else nothing is minted; the tokens are issued for the pinned context and revision
+    /// with `launchScopedRoots`, so each redeems only onto its lane's launch-scoped root authority.
     func prepare(
         plan: DomainChildLaunchPlan,
         toolName: String,
@@ -353,7 +354,8 @@ actor DirectHeadlessChildLaunchCoordinator {
                     runPurpose: toolName,
                     additionalTools: Set(arguments["additional_tools"]?.arrayValue?.compactMap(\.stringValue) ?? []),
                     expectedProcessID: nil,
-                    lifetime: carrierLifetime
+                    lifetime: carrierLifetime,
+                    launchScopedRoots: pin != nil
                 )
                 try await carriers.append(harness.prepare(request: request))
             }

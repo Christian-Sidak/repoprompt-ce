@@ -70,6 +70,100 @@ final class DomainRoutingBindingCASTests: XCTestCase {
         XCTAssertFalse(runBinding.ordinaryContextMatches(closed))
         XCTAssertTrue(DomainBinding.context(closed, explicit: true).ordinaryContextMatches(closed))
     }
+
+    // MARK: - M21 read-context resolution across its suspension
+
+    func testReadContextResolutionReResolvesABindThatLandsDuringItsRead() async throws {
+        let fixture = try RoutingFixture.make()
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            fixture.remove()
+        }
+        try await fixture.install(in: runtime)
+        let scopeID = DomainStandaloneScopeID()
+        let scope = try await runtime.standaloneScopeCoordinator.register(
+            scopeID: scopeID,
+            connectionID: UUID(),
+            workingDirectories: [fixture.primaryRoot]
+        )
+        let closed = DomainContextIdentity(workspaceID: fixture.primaryWorkspaceID, contextID: fixture.closedContextID)
+        let other = DomainContextIdentity(workspaceID: fixture.secondaryWorkspaceID, contextID: fixture.otherContextID)
+        _ = try await runtime.standaloneScopeCoordinator.bind(scopeID: scopeID, context: closed)
+        let coordinator = runtime.routingCoordinator
+        let hookRuns = HookCounter()
+        // The bind lands after the binding (`closed`) was read and while the context read is in
+        // flight: the handle must be `other`'s, never `closed` paired with a later routing state.
+        await coordinator.testSetAfterReadTargetCaptured {
+            guard await hookRuns.increment() == 1 else { return }
+            _ = try? await runtime.standaloneScopeCoordinator.bind(scopeID: scopeID, context: other)
+        }
+
+        let handle = try await coordinator.resolveReadContext(connection: scope.registration)
+
+        let runs = await hookRuns.value
+        XCTAssertEqual(runs, 2, "the moved binding was re-resolved once")
+        XCTAssertEqual(handle.context, other)
+        XCTAssertEqual(handle.bindingKind, .explicit)
+        let otherWorkspace = await runtime.contextStore.workspaceSnapshot(fixture.secondaryWorkspaceID)
+        XCTAssertEqual(handle.workspaceRevision, otherWorkspace?.revisions.workingRevision)
+        let routing = await coordinator.snapshot()
+        XCTAssertEqual(handle.routingRevision, routing.revision)
+    }
+
+    func testReadContextResolutionGivesUpTypedWhenTheBindingNeverSettles() async throws {
+        let fixture = try RoutingFixture.make()
+        let runtime = fixture.runtime()
+        try await runtime.start()
+        addTeardownBlock {
+            _ = await runtime.shutdown()
+            fixture.remove()
+        }
+        try await fixture.install(in: runtime)
+        let scopeID = DomainStandaloneScopeID()
+        let scope = try await runtime.standaloneScopeCoordinator.register(
+            scopeID: scopeID,
+            connectionID: UUID(),
+            workingDirectories: [fixture.primaryRoot]
+        )
+        let closed = DomainContextIdentity(workspaceID: fixture.primaryWorkspaceID, contextID: fixture.closedContextID)
+        let other = DomainContextIdentity(workspaceID: fixture.secondaryWorkspaceID, contextID: fixture.otherContextID)
+        _ = try await runtime.standaloneScopeCoordinator.bind(scopeID: scopeID, context: closed)
+        let hookRuns = HookCounter()
+        // Every read is overtaken by another bind.
+        await runtime.routingCoordinator.testSetAfterReadTargetCaptured {
+            let run = await hookRuns.increment()
+            _ = try? await runtime.standaloneScopeCoordinator.bind(
+                scopeID: scopeID,
+                context: run.isMultiple(of: 2) ? closed : other
+            )
+        }
+
+        do {
+            _ = try await runtime.routingCoordinator.resolveReadContext(connection: scope.registration)
+            XCTFail("A binding that never settles must not produce a handle")
+        } catch let error as DomainReadContextResolutionError {
+            XCTAssertEqual(error, .bindingChanged)
+        }
+        let runs = await hookRuns.value
+        XCTAssertEqual(runs, DomainRoutingCoordinator.maximumReadContextResolutionAttempts)
+
+        // Once the binding settles, resolution succeeds again.
+        await runtime.routingCoordinator.testSetAfterReadTargetCaptured(nil)
+        let settled = try await runtime.routingCoordinator.resolveReadContext(connection: scope.registration)
+        let binding = try await runtime.standaloneScopeCoordinator.snapshot(scopeID: scopeID).binding
+        XCTAssertEqual(DomainBinding.context(settled.context, explicit: true), binding)
+    }
+}
+
+private actor HookCounter {
+    private(set) var value = 0
+
+    func increment() -> Int {
+        value += 1
+        return value
+    }
 }
 
 private struct RoutingFixture {

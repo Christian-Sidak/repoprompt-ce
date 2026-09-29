@@ -433,51 +433,16 @@ actor DirectHeadlessMCPService {
         prepared: PreparedRuntime
     ) async {
         let connectionID = UUID()
-        let redemption = await prepared.runtime.routingCoordinator.redeemLaunchToken(
-            material: handshake.launchToken,
-            runtimeID: prepared.runtime.identity.runtimeID,
-            runtimeGeneration: prepared.runtime.identity.lifecycleGeneration,
+        guard let admitted = await admitPrivateChild(
             connectionID: connectionID,
-            processID: peerPID,
-            clientPrincipal: handshake.clientPrincipal,
-            providerIdentifier: handshake.providerIdentifier
-        )
-        guard case let .accepted(accepted) = redemption,
-              case let .runScoped(runID, _) = accepted.binding.binding,
-              runID == handshake.runID,
-              handshake.launchID == accepted.launchID,
-              handshake.oracleGroupID == accepted.oracleGroupID,
-              handshake.oracleLaneID == accepted.oracleLaneID,
-              handshake.oracleGroupClaimID == accepted.oracleGroupClaimID
-        else {
-            logger.warning("Rejected private child launch token", metadata: ["result": "\(redemption)"])
+            peerPID: peerPID,
+            handshake: handshake,
+            prepared: prepared
+        ) else {
             Darwin.shutdown(fd, SHUT_RDWR)
             return
         }
-
-        let principal = DomainClientPrincipal(
-            principalID: UUID(),
-            stableKey: handshake.clientPrincipal,
-            displayName: handshake.providerIdentifier,
-            kind: .runScoped,
-            assurance: .hostLaunchToken,
-            processID: peerPID,
-            runID: handshake.runID,
-            provider: handshake.providerIdentifier,
-            claimedProcessID: nil
-        )
-        let connection = ConnectionContext(
-            connectionID: connectionID,
-            connectionGeneration: accepted.binding.registration.generation,
-            principal: principal,
-            policyProfile: Self.childPolicyProfile(providerIdentifier: handshake.providerIdentifier),
-            restrictedToolNames: Self.childRestrictedToolNames(
-                base: accepted.restrictedTools,
-                oracleGroupID: accepted.oracleGroupID
-            ),
-            additionalToolNames: accepted.additionalTools,
-            ephemeralGrantedOperations: []
-        )
+        let (accepted, connection) = admitted
         let server = Server(
             name: "RepoPrompt CE",
             version: CLI_VERSION,
@@ -517,10 +482,88 @@ actor DirectHeadlessMCPService {
             connectionID: connectionID,
             connectionGeneration: accepted.binding.registration.generation
         )
+        await prepared.context.detachLaunchConnection(connectionID)
         _ = await prepared.runtime.routingCoordinator.unregisterConnection(
             accepted.binding.registration,
             operationID: UUID()
         )
+    }
+
+    /// Redeems a private child's launch token as connection `connectionID`. A launch-scoped-roots
+    /// token (a pinned discovery Oracle lane) must also attach to its lane's live root authority, so
+    /// every tool call on the connection resolves the lane's roots; once that authority is released
+    /// (the lane's process exited) the connection is refused. Returns nil for a refused child, with
+    /// nothing of it left registered.
+    func admitPrivateChild(
+        connectionID: UUID,
+        peerPID: Int32?,
+        handshake: DirectHeadlessChildEndpoint.Handshake,
+        prepared: PreparedRuntime
+    ) async -> (redemption: DomainRunLaunchRedemption, connection: ConnectionContext)? {
+        let redemption = await prepared.runtime.routingCoordinator.redeemLaunchToken(
+            material: handshake.launchToken,
+            runtimeID: prepared.runtime.identity.runtimeID,
+            runtimeGeneration: prepared.runtime.identity.lifecycleGeneration,
+            connectionID: connectionID,
+            processID: peerPID,
+            clientPrincipal: handshake.clientPrincipal,
+            providerIdentifier: handshake.providerIdentifier
+        )
+        guard case let .accepted(accepted) = redemption else {
+            logger.warning("Rejected private child launch token", metadata: ["result": "\(redemption)"])
+            return nil
+        }
+        guard case let .runScoped(runID, _) = accepted.binding.binding,
+              runID == handshake.runID,
+              handshake.launchID == accepted.launchID,
+              handshake.oracleGroupID == accepted.oracleGroupID,
+              handshake.oracleLaneID == accepted.oracleLaneID,
+              handshake.oracleGroupClaimID == accepted.oracleGroupClaimID
+        else {
+            logger.warning("Rejected private child launch token", metadata: ["result": "\(redemption)"])
+            _ = await prepared.runtime.routingCoordinator.unregisterConnection(
+                accepted.binding.registration,
+                operationID: UUID()
+            )
+            return nil
+        }
+        if accepted.launchScopedRoots {
+            do {
+                try await prepared.context.attachLaunchConnection(connectionID, redemption: accepted)
+            } catch {
+                logger.warning("Rejected private child: its launch root authority is gone", metadata: ["error": "\(error)"])
+                _ = await prepared.runtime.routingCoordinator.unregisterConnection(
+                    accepted.binding.registration,
+                    operationID: UUID()
+                )
+                return nil
+            }
+        }
+
+        let principal = DomainClientPrincipal(
+            principalID: UUID(),
+            stableKey: handshake.clientPrincipal,
+            displayName: handshake.providerIdentifier,
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            processID: peerPID,
+            runID: handshake.runID,
+            provider: handshake.providerIdentifier,
+            claimedProcessID: nil
+        )
+        let connection = ConnectionContext(
+            connectionID: connectionID,
+            connectionGeneration: accepted.binding.registration.generation,
+            principal: principal,
+            policyProfile: Self.childPolicyProfile(providerIdentifier: handshake.providerIdentifier),
+            restrictedToolNames: Self.childRestrictedToolNames(
+                base: accepted.restrictedTools,
+                oracleGroupID: accepted.oracleGroupID
+            ),
+            additionalToolNames: accepted.additionalTools,
+            ephemeralGrantedOperations: []
+        )
+        return (accepted, connection)
     }
 
     static func securityContext(

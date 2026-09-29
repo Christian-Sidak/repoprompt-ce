@@ -672,7 +672,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         // The barrier lands after the handoff validated the pin and minted the Oracle's carrier for
         // the committed context, and before the Oracle process launches: a concurrent
         // bind_context moves the connection to `other`.
-        await prepared.providerCoordinator.installPinnedLaunchProbe {
+        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
             _ = try await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
             await rebound.set()
         }
@@ -743,7 +743,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
         // Same binding, but the workspace's roots are replaced between the handoff and the launch:
         // resolving the working directory now would name `movedRoot`, not the committed root.
-        await prepared.providerCoordinator.installPinnedLaunchProbe {
+        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
             try await Self.replaceRoots(of: prepared, with: [movedRoot])
         }
         let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend)
@@ -795,7 +795,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let rebind = OnceBarrier {
             _ = try await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
         }
-        await prepared.providerCoordinator.installPinnedLaunchProbe { try await rebind.pass() }
+        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in try await rebind.pass() }
         let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend)
         let security = try await verifiedSecurityContext(prepared)
 
@@ -888,6 +888,458 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         XCTAssertEqual(after.prompt, "edited before issuance")
     }
 
+    // MARK: - M21 launch-scoped root authority
+
+    func testARootsChangeAfterTheOracleStartsIsRefusedUntilItsLaunchAuthorityIsReleased() async throws {
+        let fixture = try Fixture(name: "lease-after-start", discovery: true)
+        defer { fixture.cleanup() }
+        defer { fixture.openOracleGate() }
+        let extraRoot = try Self.temporaryDirectory("extra-root")
+        defer { try? FileManager.default.removeItem(at: extraRoot) }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let other = try await Self.addContext(to: prepared)
+        let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let runID = try XCTUnwrap(prepared.principal.runID)
+        let (task, oracle) = try await startGatedDirectLaunch(fixture: fixture, prepared: prepared)
+        XCTAssertEqual(oracle.workingDirectory, fixture.physicalRootPath)
+
+        // The Oracle's child connection redeems onto the launch's root authority.
+        let admitted = try await admitChild(of: oracle, service: service, prepared: prepared)
+        let child = try XCTUnwrap(admitted, "a running launch admits its child")
+        let childView = try await prepared.context.snapshot(connectionID: child, sessionID: runID)
+        XCTAssertEqual(childView.identity, committed.identity)
+        XCTAssertEqual(childView.roots.map(\.path), committed.roots.map(\.path))
+
+        // Changes that would move the running launch's roots lose to it: typed, retryable, and
+        // nothing is written.
+        let addFolder: [String: Value] = ["action": .string("add_folder"), "folder_path": .string(extraRoot.path)]
+        let closeCommitted: [String: Value] = [
+            "action": .string("close_tab"),
+            "tab": .string(committed.identity.contextID.uuidString),
+            "allow_active": .bool(true)
+        ]
+        for arguments in [addFolder, closeCommitted] {
+            do {
+                _ = try await manageWorkspaces(arguments, prepared: prepared)
+                XCTFail("\(arguments) must not land under a running launch")
+            } catch let failure as MCPDomainToolFailure {
+                XCTAssertEqual(failure.code, "root_authority_leased")
+                XCTAssertEqual(failure.retryability, .retryable)
+                XCTAssertEqual(failure.mutationState, DomainProtectedMutationState.notApplied.rawValue)
+                XCTAssertEqual(failure.details["context_id"], .string(committed.identity.contextID.uuidString))
+                XCTAssertEqual(failure.details["launch_id"], oracle.launchID.map(Value.string))
+            }
+        }
+        do {
+            _ = try await prepared.context.prepareSessionRootOverlay(
+                sessionID: runID,
+                sourceSessionID: nil,
+                arguments: [:],
+                connectionID: prepared.connectionID
+            )
+            XCTFail("The launch session's overlay must not move under it")
+        } catch let failure as MCPDomainToolFailure {
+            XCTAssertEqual(failure.code, "root_authority_leased")
+        }
+        // A claim is scoped: closing another context is not a change of the launch's roots.
+        _ = try await manageWorkspaces(
+            ["action": .string("close_tab"), "tab": .string(other.contextID.uuidString)],
+            prepared: prepared
+        )
+        let during = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(during.roots.map(\.path), committed.roots.map(\.path))
+        let childDuring = try await prepared.context.snapshot(connectionID: child, sessionID: runID)
+        XCTAssertEqual(childDuring.roots.map(\.path), committed.roots.map(\.path))
+
+        fixture.openOracleGate()
+        guard case let .object(result) = try await task.value else { return XCTFail("Expected an object result") }
+        XCTAssertEqual(result["response"], .string("oracle-none-gated-pack"))
+
+        // Released when the process exited: the child fails closed, nothing holds the roots, and
+        // the same change now succeeds.
+        do {
+            _ = try await prepared.context.snapshot(connectionID: child, sessionID: runID)
+            XCTFail("A released launch authority must not resolve")
+        } catch DirectHeadlessDomainContext.Error.launchRootAuthorityReleased {}
+        await assertLaunchRootAuthorityIdle(prepared)
+        let added = try await manageWorkspaces(addFolder, prepared: prepared)
+        XCTAssertEqual(added["action"], .string("add_folder"))
+        let after = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(after.roots.map(\.path), committed.roots.map(\.path) + [extraRoot.resolvingSymlinksInPath().path])
+        await prepared.context.detachLaunchConnection(child)
+        let counts = await prepared.context.launchRootAuthorityCounts()
+        XCTAssertEqual(counts.leasedConnections, 0)
+    }
+
+    func testAnExternalRootsReplacementUnderARunningLaunchFailsItsChildClosed() async throws {
+        let fixture = try Fixture(name: "lease-external", discovery: true)
+        defer { fixture.cleanup() }
+        defer { fixture.openOracleGate() }
+        let movedRoot = try Self.temporaryDirectory("external-root")
+        defer { try? FileManager.default.removeItem(at: movedRoot) }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let runID = try XCTUnwrap(prepared.principal.runID)
+        let (task, oracle) = try await startGatedDirectLaunch(fixture: fixture, prepared: prepared)
+        let admitted = try await admitChild(of: oracle, service: service, prepared: prepared)
+        let child = try XCTUnwrap(admitted)
+
+        // A writer this runtime does not serialize (the store is written directly, as a reload of
+        // another process's write would be) replaces the roots: the child is never retargeted.
+        try await Self.replaceRoots(of: prepared, with: [movedRoot])
+        do {
+            _ = try await prepared.context.snapshot(connectionID: child, sessionID: runID)
+            XCTFail("A leased child must not read another root set")
+        } catch let DirectHeadlessDomainContext.Error.launchRootAuthorityChanged(reason) {
+            XCTAssertTrue(reason.contains("roots changed"), reason)
+        }
+        let parent = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(parent.roots.map(\.path), [movedRoot.resolvingSymlinksInPath().path])
+
+        fixture.openOracleGate()
+        _ = try await task.value
+        await assertLaunchRootAuthorityIdle(prepared)
+    }
+
+    func testARootsChangeInFlightAtTheLaunchWinsAndTheLaunchIsRefused() async throws {
+        let fixture = try Fixture(name: "lease-roots-changing", discovery: true)
+        defer { fixture.cleanup() }
+        let extraRoot = try Self.temporaryDirectory("in-flight-root")
+        defer { try? FileManager.default.removeItem(at: extraRoot) }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let atLaunch = AsyncGate()
+        let proceed = AsyncGate()
+        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+            await atLaunch.open()
+            await proceed.wait()
+        }
+        let (wrapped, _) = await realHandoffTool(prepared: prepared, backend: Self.backend(prepared))
+        let security = try await verifiedSecurityContext(prepared)
+        let launch = Task {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("What does Feature hold?"), "response_type": .string("question")])
+            }
+        }
+
+        // At the launch boundary a roots change is admitted: it holds its claim, parked inside the
+        // store's commit, when the launch tries to take the roots.
+        await atLaunch.wait()
+        let commitParked = AsyncGate()
+        let releaseCommit = AsyncGate()
+        await prepared.runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired { _ in
+            await commitParked.open()
+            await releaseCommit.wait()
+        }
+        let addFolder: [String: Value] = ["action": .string("add_folder"), "folder_path": .string(extraRoot.path)]
+        let change = Task { try await self.manageWorkspaces(addFolder, prepared: prepared) }
+        await commitParked.wait()
+        await proceed.open()
+
+        let failure: MCPDomainToolFailure
+        do {
+            _ = try await launch.value
+            return XCTFail("A launch must not take roots a change is already rewriting")
+        } catch let error as MCPDomainToolFailure {
+            failure = error
+        }
+        XCTAssertEqual(failure.code, "oracle_failed_after_discovery")
+        XCTAssertEqual(failure.details["oracle_started"], .bool(false))
+        guard case let .object(handoff)? = failure.details["handoff"] else {
+            return XCTFail("Expected the typed launch refusal: \(failure.details)")
+        }
+        XCTAssertEqual(handoff["code"], .string("child_launch_context_changed"))
+        XCTAssertEqual(handoff["reason"], .string("roots_changing"))
+        XCTAssertEqual(handoff["oracle_started"], .bool(false))
+        XCTAssertTrue(failure.message.contains("roots was in flight"), failure.message)
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"], "no Oracle process ran")
+        await assertLaunchRootAuthorityIdle(prepared, claimsExpected: 1)
+
+        // The change that won applies.
+        await prepared.runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired(nil)
+        await releaseCommit.open()
+        let added = try await change.value
+        XCTAssertEqual(added["action"], .string("add_folder"))
+        let after = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(after.roots.map(\.path), committed.roots.map(\.path) + [extraRoot.resolvingSymlinksInPath().path])
+        await assertLaunchRootAuthorityIdle(prepared)
+    }
+
+    func testABindLandingDuringTheLaunchResolutionRefusesTheLaunch() async throws {
+        let fixture = try Fixture(name: "lease-bind-during-resolve", discovery: true)
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let other = try await Self.addContext(to: prepared)
+        let rebound = BarrierFlag()
+        let routing = prepared.runtime.routingCoordinator
+        // The launch's first resolution of the connection is overtaken by a bind to `other`: it
+        // lands after the binding was read and before the context read returns.
+        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+            await routing.testSetAfterReadTargetCaptured {
+                await routing.testSetAfterReadTargetCaptured(nil)
+                _ = try? await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
+                await rebound.set()
+            }
+        }
+        let (wrapped, _) = await realHandoffTool(prepared: prepared, backend: Self.backend(prepared))
+        let security = try await verifiedSecurityContext(prepared)
+
+        let failure: MCPDomainToolFailure
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("What does Feature hold?"), "response_type": .string("question")])
+            }
+            return XCTFail("A bind that lands during the launch's resolution must refuse the launch")
+        } catch let error as MCPDomainToolFailure {
+            failure = error
+        }
+        let barrierRan = await rebound.value
+        XCTAssertTrue(barrierRan)
+        guard case let .object(handoff)? = failure.details["handoff"] else {
+            return XCTFail("Expected the typed launch refusal: \(failure.details)")
+        }
+        XCTAssertEqual(handoff["reason"], .string("rebound"))
+        XCTAssertEqual(handoff["oracle_started"], .bool(false))
+        XCTAssertTrue(failure.message.contains("rebound to context \(other.contextID.uuidString)"), failure.message)
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"], "no Oracle process ran")
+        await assertLaunchRootAuthorityIdle(prepared)
+    }
+
+    func testAGroupedLaneStartedBeforeARebindKeepsItsAuthorityWhileALaterLaneIsRefused() async throws {
+        let fixture = try Fixture(name: "lease-group-rebind", discovery: true)
+        defer { fixture.cleanup() }
+        defer { fixture.openOracleGate() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "gated", additional: ["lane-1", "lane-2"])
+        fixture.openGate()
+        let other = try await Self.addContext(to: prepared)
+        let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let runID = try XCTUnwrap(prepared.principal.runID)
+        // Lane 2 reaches its launch only when the test lets it.
+        let laneTwoMayLaunch = AsyncGate()
+        await prepared.providerCoordinator.installPinnedLaunchProbe { carrier in
+            if carrier.oracleLaneID?.index == 2 { await laneTwoMayLaunch.wait() }
+        }
+        let (wrapped, _) = await realHandoffTool(prepared: prepared, backend: Self.backend(prepared))
+        let security = try await verifiedSecurityContext(prepared)
+        let task = Task {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("Where is the feature marker?"), "response_type": .string("plan")])
+            }
+        }
+
+        // Lane 0 runs (held), lane 1 runs to its exit, lane 2 has not launched.
+        try await fixture.waitForOracleGate()
+        try await Self.waitUntil {
+            guard (try? fixture.calls().contains { $0.kind == "oracle" && $0.model == "lane-1" }) == true else {
+                return false
+            }
+            return await prepared.context.launchRootAuthorityCounts().leases == 1
+        }
+        let calls = try fixture.calls()
+        let laneZero = try XCTUnwrap(calls.first { $0.kind == "oracle" && $0.model == "gated" })
+        let laneOne = try XCTUnwrap(calls.first { $0.kind == "oracle" && $0.model == "lane-1" })
+        // Lane 1's authority was released at its exit, which revoked its never-redeemed token.
+        let lateLaneOne = try await redeem(laneOne, prepared: prepared)
+        XCTAssertEqual(lateLaneOne, .revoked)
+
+        // Lane 0's child keeps the committed authority across a rebind of the parent connection.
+        let admitted = try await admitChild(of: laneZero, service: service, prepared: prepared)
+        let child = try XCTUnwrap(admitted)
+        _ = try await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
+        let childView = try await prepared.context.snapshot(connectionID: child, sessionID: runID)
+        XCTAssertEqual(childView.identity, committed.identity)
+        XCTAssertEqual(childView.roots.map(\.path), committed.roots.map(\.path))
+
+        // Lane 2 launches after the rebind and is refused; lane 0 completes.
+        await laneTwoMayLaunch.open()
+        fixture.openOracleGate()
+        guard case let .object(result) = try await task.value,
+              case let .array(lanes)? = result["oracle_results"]
+        else {
+            return XCTFail("Expected the grouped result")
+        }
+        XCTAssertEqual(result["selection_committed"], .bool(true))
+        XCTAssertEqual(result["status"], .string("partial_failure"))
+        let byLane = Dictionary(uniqueKeysWithValues: lanes.compactMap { lane -> (Int, [String: Value])? in
+            guard case let .object(fields) = lane, case let .int(index)? = fields["lane_index"] else { return nil }
+            return (index, fields)
+        })
+        XCTAssertEqual(byLane[0]?["status"], .string("completed"))
+        XCTAssertEqual(byLane[0]?["oracle_started"], .bool(true))
+        XCTAssertEqual(byLane[1]?["status"], .string("completed"))
+        XCTAssertEqual(byLane[1]?["oracle_started"], .bool(true))
+        XCTAssertEqual(byLane[2]?["status"], .string("failed"))
+        XCTAssertEqual(byLane[2]?["oracle_started"], .bool(false))
+        guard case let .object(laneTwoError)? = byLane[2]?["error"], case let .string(message)? = laneTwoError["message"] else {
+            return XCTFail("Expected lane 2's typed refusal: \(String(describing: byLane[2]))")
+        }
+        XCTAssertEqual(laneTwoError["code"], .string("child_launch_context_changed"))
+        XCTAssertTrue(message.contains("rebound to context \(other.contextID.uuidString)"), message)
+        let oracleCalls = try fixture.calls().filter { $0.kind == "oracle" }
+        XCTAssertEqual(Set(oracleCalls.map(\.model)), ["gated", "lane-1"], "lane 2's process never started")
+        XCTAssertTrue(oracleCalls.allSatisfy { $0.workingDirectory == fixture.physicalRootPath })
+        await assertLaunchRootAuthorityIdle(prepared)
+    }
+
+    func testAnOracleThatFailsToSpawnReleasesItsLaunchAuthorityAndReportsItNeverStarted() async throws {
+        let fixture = try Fixture(name: "lease-spawn-failure", discovery: true)
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let executable = fixture.executable
+        // The provider was resolved; the executable stops being executable before the spawn.
+        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: executable.path)
+        }
+        let (wrapped, _) = await realHandoffTool(prepared: prepared, backend: Self.backend(prepared))
+        let security = try await verifiedSecurityContext(prepared)
+
+        let failure: MCPDomainToolFailure
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("What does Feature hold?"), "response_type": .string("question")])
+            }
+            return XCTFail("A launch whose process cannot spawn must fail")
+        } catch let error as MCPDomainToolFailure {
+            failure = error
+        }
+        XCTAssertEqual(failure.code, "oracle_failed_after_discovery")
+        XCTAssertEqual(failure.details["oracle_started"], .bool(false))
+        XCTAssertNil(failure.details["handoff"], "a spawn failure is not a context change")
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"])
+        await assertLaunchRootAuthorityIdle(prepared)
+    }
+
+    func testCancellingARunningOracleReleasesItsLaunchAuthorityAndRevokesItsToken() async throws {
+        let fixture = try Fixture(name: "lease-cancel", discovery: true)
+        defer { fixture.cleanup() }
+        defer { fixture.openOracleGate() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let (task, oracle) = try await startGatedDirectLaunch(fixture: fixture, prepared: prepared)
+
+        task.cancel()
+        let failure: MCPDomainToolFailure
+        do {
+            _ = try await task.value
+            return XCTFail("A cancelled Oracle step must be reported")
+        } catch let error as MCPDomainToolFailure {
+            failure = error
+        }
+        XCTAssertEqual(failure.code, "oracle_cancelled_after_discovery")
+        XCTAssertEqual(failure.details["oracle_started"], .bool(true))
+        XCTAssertNil(failure.details["handoff"])
+        await assertLaunchRootAuthorityIdle(prepared)
+        let late = try await redeem(oracle, prepared: prepared)
+        XCTAssertEqual(late, .revoked, "the exited process's unredeemed token is dead")
+        let admitted = try await admitChild(of: oracle, service: service, prepared: prepared)
+        XCTAssertNil(admitted)
+    }
+
+    func testAnExpiredLaunchTokenAdmitsNoChildAndTheLaunchAuthorityIsStillReleasedAtExit() async throws {
+        let fixture = try Fixture(name: "lease-expiry", discovery: true)
+        defer { fixture.cleanup() }
+        defer { fixture.openOracleGate() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        let lifetime = Duration.milliseconds(300)
+        let (task, oracle) = try await startGatedDirectLaunch(
+            fixture: fixture,
+            prepared: prepared,
+            carrierLifetime: lifetime
+        )
+        try await Task.sleep(for: lifetime + .milliseconds(300))
+        let admitted = try await admitChild(of: oracle, service: service, prepared: prepared)
+        XCTAssertNil(admitted, "an expired token admits no child")
+        let counts = await prepared.context.launchRootAuthorityCounts()
+        XCTAssertEqual(counts.activeLeases, 1, "the process still runs under its authority")
+        XCTAssertEqual(counts.leasedConnections, 0)
+
+        fixture.openOracleGate()
+        _ = try await task.value
+        await assertLaunchRootAuthorityIdle(prepared)
+    }
+
+    func testAWorktreeOverlayChangeBeforeTheLaunchRefusesItAsRootsChanged() async throws {
+        let fixture = try Fixture(name: "lease-overlay-change", discovery: true)
+        defer { fixture.cleanup() }
+        let worktree = try Self.makeLinkedWorktree(of: fixture.root)
+        defer { try? FileManager.default.removeItem(at: worktree) }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let runID = try XCTUnwrap(prepared.principal.runID)
+        // Discovery commits over the root itself; the session then moves onto a linked worktree
+        // before the launch.
+        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+            _ = try await prepared.context.prepareSessionRootOverlay(
+                sessionID: runID,
+                sourceSessionID: nil,
+                arguments: ["worktree": .string(worktree.path)],
+                connectionID: prepared.connectionID
+            )
+        }
+        let failure = try await refusedLaunch(prepared: prepared)
+        guard case let .object(handoff)? = failure.details["handoff"] else {
+            return XCTFail("Expected the typed launch refusal: \(failure.details)")
+        }
+        XCTAssertEqual(handoff["reason"], .string("roots_changed"))
+        XCTAssertEqual(handoff["oracle_started"], .bool(false))
+        XCTAssertTrue(failure.message.contains("not the roots the selection was committed over"), failure.message)
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"], "no Oracle process ran")
+        await assertLaunchRootAuthorityIdle(prepared)
+    }
+
+    func testAnUnresolvableWorktreeOverlayAtTheLaunchIsATypedPreLaunchRefusal() async throws {
+        let fixture = try Fixture(name: "lease-overlay-gone", discovery: true)
+        defer { fixture.cleanup() }
+        let worktree = try Self.makeLinkedWorktree(of: fixture.root)
+        defer { try? FileManager.default.removeItem(at: worktree) }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let runID = try XCTUnwrap(prepared.principal.runID)
+        // The session reads through the worktree from the start, so discovery commits over it;
+        // the worktree disappears before the launch.
+        _ = try await prepared.context.prepareSessionRootOverlay(
+            sessionID: runID,
+            sourceSessionID: nil,
+            arguments: ["worktree": .string(worktree.path)],
+            connectionID: prepared.connectionID
+        )
+        await prepared.providerCoordinator.installPinnedLaunchProbe { _ in
+            try FileManager.default.removeItem(at: worktree)
+        }
+        let failure = try await refusedLaunch(prepared: prepared)
+        XCTAssertEqual(failure.code, "oracle_failed_after_discovery")
+        guard case let .object(handoff)? = failure.details["handoff"] else {
+            return XCTFail("A pre-launch overlay failure must be typed, not generic: \(failure.details)")
+        }
+        XCTAssertEqual(handoff["reason"], .string("roots_unavailable"))
+        XCTAssertEqual(handoff["oracle_started"], .bool(false))
+        XCTAssertEqual(failure.details["oracle_started"], .bool(false))
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"], "no Oracle process ran")
+        await assertLaunchRootAuthorityIdle(prepared)
+    }
+
     func testPinnedLaunchErrorClassification() {
         typealias Mismatch = DomainChildLaunchContextPin.Mismatch
         XCTAssertEqual(
@@ -896,8 +1348,13 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         )
         XCTAssertEqual(Mismatch(pinnedLaunchError: DomainRunLaunchTokenError.contextUnavailable), .contextUnavailable)
         XCTAssertEqual(Mismatch(pinnedLaunchError: Mismatch.workspaceRevisionChanged(expected: 1, actual: 2)), .workspaceRevisionChanged(expected: 1, actual: 2))
+        XCTAssertEqual(Mismatch(pinnedLaunchError: Mismatch.rootsChanging), .rootsChanging)
         XCTAssertNil(Mismatch(pinnedLaunchError: DomainRunLaunchTokenError.runContextConflict))
         XCTAssertNil(Mismatch(pinnedLaunchError: CancellationError()))
+        XCTAssertEqual(
+            [Mismatch.rootsChanged, .rootsUnavailable("gone"), .rootsChanging].map(\.reason),
+            ["roots_changed", "roots_unavailable", "roots_changing"]
+        )
     }
 
     func testDiscoveryPurposeAndOptInParsing() {
@@ -915,6 +1372,174 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// Runs a discovered single-Oracle question through the real handoff with a `gated` Oracle and
+    /// returns once that Oracle's process is running (held), with its logged call.
+    private func startGatedDirectLaunch(
+        fixture: Fixture,
+        prepared: DirectHeadlessMCPService.PreparedRuntime,
+        carrierLifetime: Duration = .seconds(60)
+    ) async throws -> (task: Task<Value, Error>, oracle: Fixture.Call) {
+        try await Self.setRoster(prepared, primary: "gated", additional: [])
+        // Discovery runs through; only the Oracle is held.
+        fixture.openGate()
+        let (wrapped, _) = await realHandoffTool(
+            prepared: prepared,
+            backend: Self.backend(prepared),
+            carrierLifetime: carrierLifetime
+        )
+        let security = try await verifiedSecurityContext(prepared)
+        let task = Task {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("What does Feature hold?"), "response_type": .string("question")])
+            }
+        }
+        try await fixture.waitForOracleGate()
+        let oracle = try XCTUnwrap(fixture.calls().first { $0.kind == "oracle" })
+        return (task, oracle)
+    }
+
+    /// A discovered single-Oracle question whose Oracle launch is expected to be refused.
+    private func refusedLaunch(
+        prepared: DirectHeadlessMCPService.PreparedRuntime
+    ) async throws -> MCPDomainToolFailure {
+        let (wrapped, _) = await realHandoffTool(prepared: prepared, backend: Self.backend(prepared))
+        let security = try await verifiedSecurityContext(prepared)
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("What does Feature hold?"), "response_type": .string("question")])
+            }
+        } catch let failure as MCPDomainToolFailure {
+            return failure
+        }
+        XCTFail("Expected the Oracle launch to be refused")
+        throw CancellationError()
+    }
+
+    /// Admits a private child exactly as the endpoint does, from the carrier a launched process
+    /// logged; returns its connection, or nil when the child was refused.
+    private func admitChild(
+        of call: Fixture.Call,
+        service: DirectHeadlessMCPService,
+        prepared: DirectHeadlessMCPService.PreparedRuntime
+    ) async throws -> UUID? {
+        let handshake = try DirectHeadlessChildBridge.handshake(environment: call.carrierEnvironment)
+        let connectionID = UUID()
+        let admitted = await service.admitPrivateChild(
+            connectionID: connectionID,
+            peerPID: nil,
+            handshake: handshake,
+            prepared: prepared
+        )
+        return admitted == nil ? nil : connectionID
+    }
+
+    private func redeem(
+        _ call: Fixture.Call,
+        prepared: DirectHeadlessMCPService.PreparedRuntime
+    ) async throws -> DomainRunLaunchRedemptionResult {
+        try await prepared.runtime.routingCoordinator.redeemLaunchToken(
+            material: XCTUnwrap(call.launchToken),
+            runtimeID: prepared.runtime.identity.runtimeID,
+            runtimeGeneration: prepared.runtime.identity.lifecycleGeneration,
+            connectionID: UUID(),
+            processID: nil,
+            clientPrincipal: XCTUnwrap(call.clientPrincipal),
+            providerIdentifier: XCTUnwrap(call.providerIdentifier)
+        )
+    }
+
+    /// `manage_workspaces` through the real backend, as the bound top-level client.
+    private func manageWorkspaces(
+        _ arguments: [String: Value],
+        prepared: DirectHeadlessMCPService.PreparedRuntime
+    ) async throws -> [String: Value] {
+        let request = try await DomainPhysicalToolRequest(
+            argumentsJSON: JSONEncoder().encode(arguments),
+            securityContext: securityContext(prepared)
+        )
+        let backend = DirectHeadlessGlobalBackend(
+            runtime: prepared.runtime,
+            scopeID: prepared.scopeID,
+            context: prepared.context,
+            settingsStore: prepared.settingsStore
+        )
+        let result = try await backend.manageWorkspaceLifecycle(request)
+        guard case let .object(fields) = try JSONDecoder().decode(Value.self, from: result.json) else {
+            throw MCPError.internalError("manage_workspaces returned a non-object result")
+        }
+        return fields
+    }
+
+    /// No launch holds or validates a root authority, and no launch token is outstanding.
+    private func assertLaunchRootAuthorityIdle(
+        _ prepared: DirectHeadlessMCPService.PreparedRuntime,
+        claimsExpected: Int = 0,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let counts = await prepared.context.launchRootAuthorityCounts()
+        XCTAssertEqual(counts.leases, 0, "a launch root authority is still held", file: file, line: line)
+        XCTAssertEqual(counts.claims, claimsExpected, "root-mutation claims", file: file, line: line)
+        let routing = await prepared.runtime.routingCoordinator.snapshot()
+        XCTAssertTrue(routing.pendingRunContexts.isEmpty, "a launch token is still outstanding", file: file, line: line)
+    }
+
+    private static func waitUntil(
+        timeout: Duration = .seconds(15),
+        _ condition: @escaping @Sendable () async -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while await !condition() {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Timed out waiting for the condition")
+                throw CancellationError()
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
+    private static func temporaryDirectory(_ name: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-discovery-\(name)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    /// Makes `root` a Git repository with one commit and returns a linked worktree of it.
+    private static func makeLinkedWorktree(of root: URL) throws -> URL {
+        let git = "/usr/bin/git"
+        guard FileManager.default.isExecutableFile(atPath: git) else { throw XCTSkip("git is unavailable") }
+        let home = try temporaryDirectory("git-home")
+        defer { try? FileManager.default.removeItem(at: home) }
+        func run(_ arguments: [String]) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: git)
+            process.arguments = [
+                "-C", root.path,
+                "-c", "user.name=RepoPrompt Tests",
+                "-c", "user.email=tests@example.invalid",
+                "-c", "commit.gpgsign=false"
+            ] + arguments
+            process.environment = ["PATH": "/usr/bin:/bin", "HOME": home.path, "GIT_CONFIG_NOSYSTEM": "1"]
+            let output = Pipe()
+            process.standardOutput = output
+            process.standardError = output
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                throw MCPError.internalError("git \(arguments.joined(separator: " ")): \(String(decoding: data, as: UTF8.self))")
+            }
+        }
+        let worktree = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-discovery-worktree-\(UUID().uuidString)", isDirectory: true)
+        try run(["init", "-q"])
+        try run(["add", "-A"])
+        try run(["commit", "-q", "-m", "fixture"])
+        try run(["worktree", "add", "-q", "--detach", worktree.path, "HEAD"])
+        return worktree.resolvingSymlinksInPath()
+    }
 
     private static func backend(_ prepared: DirectHeadlessMCPService.PreparedRuntime) -> DirectHeadlessConversationBackend {
         DirectHeadlessConversationBackend(
@@ -1202,6 +1827,25 @@ private actor BarrierFlag {
     }
 }
 
+/// Opens once; every waiter (earlier or later) passes after that.
+private actor AsyncGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func open() {
+        isOpen = true
+        for waiter in waiters {
+            waiter.resume()
+        }
+        waiters.removeAll()
+    }
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
 /// Runs one action once; every caller waits for that single run to finish.
 private actor OnceBarrier {
     private var run: Task<Void, Error>?
@@ -1242,6 +1886,25 @@ private struct Fixture {
         let providerIdentifier: String?
         /// The provider process's physical working directory.
         let workingDirectory: String?
+        let runID: String?
+        let oracleGroupID: String?
+        let oracleGroupClaimID: String?
+
+        /// The private launch carrier this process was started with, as the child bridge reads it.
+        var carrierEnvironment: [String: String] {
+            var environment: [String: String] = [:]
+            environment[DomainChildLaunchCarrier.launchTokenEnvironmentKey] = launchToken
+            environment[DomainChildLaunchCarrier.clientPrincipalEnvironmentKey] = clientPrincipal
+            environment[DomainChildLaunchCarrier.providerIdentifierEnvironmentKey] = providerIdentifier
+            environment[DomainChildLaunchCarrier.runIDEnvironmentKey] = runID
+            environment[DomainChildLaunchCarrier.launchIDEnvironmentKey] = launchID
+            environment[DomainChildLaunchCarrier.oracleGroupIDEnvironmentKey] = oracleGroupID
+            environment[DomainChildLaunchCarrier.oracleGroupClaimIDEnvironmentKey] = oracleGroupClaimID
+            if lane != "none" {
+                environment[DomainChildLaunchCarrier.oracleLaneIDEnvironmentKey] = lane
+            }
+            return environment
+        }
     }
 
     let root: URL
@@ -1286,10 +1949,11 @@ private struct Fixture {
           *"\#(ContextBuilderDiscoveryPrompt.protocolVersion)"*) kind=discovery ;;
         esac
         /usr/bin/printf '%s' "$input" > '\#(inputs.path)/'"$kind-$lane-$$.txt"
-        /usr/bin/printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$lane" "$model" "$sandbox" \
+        /usr/bin/printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$lane" "$model" "$sandbox" \
           "${REPOPROMPT_MCP_LAUNCH_ID:-}" "$$" "${REPOPROMPT_MCP_LAUNCH_TOKEN:-}" \
           "${REPOPROMPT_MCP_CLIENT_PRINCIPAL:-}" "${REPOPROMPT_MCP_PROVIDER_IDENTIFIER:-}" \
-          "$(/bin/pwd -P)" >> '\#(callLog.path)'
+          "$(/bin/pwd -P)" "${REPOPROMPT_MCP_RUN_ID:-}" "${REPOPROMPT_MCP_ORACLE_GROUP_ID:-}" \
+          "${REPOPROMPT_MCP_ORACLE_GROUP_CLAIM_ID:-}" >> '\#(callLog.path)'
         if [ "$kind" = discovery ]; then
           if [ "$model" = gated ]; then
             case "$input" in
@@ -1372,7 +2036,10 @@ private struct Fixture {
                     launchToken: optional(6),
                     clientPrincipal: optional(7),
                     providerIdentifier: optional(8),
-                    workingDirectory: optional(9)
+                    workingDirectory: optional(9),
+                    runID: optional(10),
+                    oracleGroupID: optional(11),
+                    oracleGroupClaimID: optional(12)
                 )
             }
     }

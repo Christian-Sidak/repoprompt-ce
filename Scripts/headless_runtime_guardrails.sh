@@ -163,12 +163,21 @@ if ! grep -q 'try pin.validate(handle)' Sources/RepoPromptMCP/DirectHeadlessChil
   echo "error: the child-launch coordinator must refuse a handoff whose current context is not the pinned one" >&2
   exit 1
 fi
-# M20: the Oracle processes launch in that same pinned context (working directory included),
-# revalidated at the launch, so process directory and token authority are one context.
-if [[ "$(grep -c 'launchPin: pin' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift)" -lt 2 ]] \
-  || ! grep -q 'context.pinnedLaunchSnapshot(' Sources/RepoPromptMCP/DirectHeadlessProviderCoordinator.swift \
+# M20/M21: every discovered Oracle lane launches under one launch-scoped root authority, acquired at
+# the launch from the committed pin and physical roots. The process working directory, the lane
+# token's redemption, and the child connection's roots all derive from it; workspace-root
+# mutations serialize against it; and read-context resolution never pairs one binding's context
+# with another's revisions.
+if ! grep -q 'let launch = DirectHeadlessPinnedLaunch(pin: pin, committedRoots: outcome.roots)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
+  || ! grep -q 'pinnedLane: launch.lane(carrier)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift \
+  || ! grep -q 'pinnedLane: launch?.lane(carrier)' Sources/RepoPromptMCP/DirectHeadlessOracleAdapter.swift \
+  || ! grep -q 'context.acquireLaunchRootLease(' Sources/RepoPromptMCP/DirectHeadlessProviderCoordinator.swift \
+  || ! grep -q 'launchScopedRoots: pin != nil' Sources/RepoPromptMCP/DirectHeadlessChildEndpoint.swift \
+  || ! grep -q 'attachLaunchConnection(connectionID, redemption: accepted)' Sources/RepoPromptMCP/DirectHeadlessMCPService.swift \
+  || [[ "$(grep -c 'withRootMutationClaim(' Sources/RepoPromptMCP/DirectHeadlessWorkspaceBackends.swift)" -lt 3 ]] \
+  || ! grep -q 'guard try readTarget(registration) == target else { continue }' Sources/RepoPromptDomainRuntime/DomainRoutingCoordinator.swift \
   || ! grep -q 'Mismatch(pinnedLaunchError: error)' Sources/RepoPromptMCP/DirectHeadlessCapabilityBackends.swift; then
-  echo "error: discovered Oracle launches must run in the pinned committed context and settle pre-launch changes" >&2
+  echo "error: discovered Oracle lanes must launch under one launch-scoped root authority and settle pre-launch changes" >&2
   exit 1
 fi
 

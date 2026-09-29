@@ -53,4 +53,7 @@ package enum DomainReadContextResolutionError: Error, Equatable, Sendable {
     case contextUnavailable
     case contextRemoved
     case runtimeGenerationMismatch
+    /// The connection's binding kept changing while its context was being read, so no single
+    /// binding could be paired with the revisions observed (bounded re-resolution gave up).
+    case bindingChanged
 }

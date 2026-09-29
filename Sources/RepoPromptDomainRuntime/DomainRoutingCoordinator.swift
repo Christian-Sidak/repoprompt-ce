@@ -101,6 +101,10 @@ package struct DomainRunLaunchReservationRequest {
     package let additionalTools: Set<String>
     package let expectedProcessID: Int32?
     package let lifetime: Duration
+    /// The launched child's roots are not the context's live roots but a launch-scoped root
+    /// authority the host holds for the child's lifetime; the host must attach the redeeming
+    /// connection to it and refuse the connection when it is gone.
+    package let launchScopedRoots: Bool
 
     package init(
         runID: UUID,
@@ -117,8 +121,10 @@ package struct DomainRunLaunchReservationRequest {
         restrictedTools: Set<String> = [],
         additionalTools: Set<String> = [],
         expectedProcessID: Int32? = nil,
-        lifetime: Duration = .seconds(60)
+        lifetime: Duration = .seconds(60),
+        launchScopedRoots: Bool = false
     ) {
+        self.launchScopedRoots = launchScopedRoots
         self.runID = runID
         self.launchID = launchID
         self.oracleGroupID = oracleGroupID
@@ -145,6 +151,8 @@ package struct DomainRunLaunchRedemption: Equatable, Sendable {
     package let oracleGroupClaimID: UUID?
     package let restrictedTools: Set<String>
     package let additionalTools: Set<String>
+    /// See `DomainRunLaunchReservationRequest.launchScopedRoots`.
+    package let launchScopedRoots: Bool
 
     package init(
         binding: DomainConnectionBindingSnapshot,
@@ -153,8 +161,10 @@ package struct DomainRunLaunchRedemption: Equatable, Sendable {
         oracleLaneID: OracleLaneID? = nil,
         oracleGroupClaimID: UUID? = nil,
         restrictedTools: Set<String>,
-        additionalTools: Set<String>
+        additionalTools: Set<String>,
+        launchScopedRoots: Bool = false
     ) {
+        self.launchScopedRoots = launchScopedRoots
         self.binding = binding
         self.launchID = launchID
         self.oracleGroupID = oracleGroupID
@@ -187,6 +197,7 @@ package enum DomainRunLaunchTokenError: Error, Equatable {
 package actor DomainRoutingCoordinator {
     static let maximumRoutingOperations = 4096
     static let maximumTokenRecords = 1024
+    package static let maximumReadContextResolutionAttempts = 4
 
     private enum TokenState: Equatable {
         case active
@@ -222,6 +233,9 @@ package actor DomainRoutingCoordinator {
     private var routingOperations: [UUID: DomainRoutingOutcome] = [:]
     private var routingOperationOrder: [UUID] = []
     private var routingOperationOrderHead = 0
+    #if DEBUG
+        private var testAfterReadTargetCaptured: (@Sendable () async -> Void)?
+    #endif
 
     init(
         identity: DomainRuntimeIdentity,
@@ -254,30 +268,73 @@ package actor DomainRoutingCoordinator {
         return current.registration
     }
 
+    /// Resolves the context `registration` is bound to, with that context's current revisions.
+    ///
+    /// The binding is read before the context-store read suspends this actor, so a `bind` (or an
+    /// app-presentation window change) can land in between. The target is therefore read again after
+    /// the suspension and the resolution is repeated when it moved, so a handle never pairs one
+    /// binding's context with revisions or a routing revision observed under another. After
+    /// `maximumReadContextResolutionAttempts` moving targets this throws `.bindingChanged`.
     package func resolveReadContext(
         connection registration: DomainConnectionRegistration
     ) async throws -> DomainReadContextHandle {
         guard registration.runtimeID == identity.runtimeID else {
             throw DomainReadContextResolutionError.runtimeGenerationMismatch
         }
+        for _ in 0 ..< Self.maximumReadContextResolutionAttempts {
+            let target = try readTarget(registration)
+            let workspace = await contextStore.workspaceSnapshot(target.context.workspaceID)
+            #if DEBUG
+                await testAfterReadTargetCaptured?()
+            #endif
+            // The target read before the suspension must still be the connection's target now.
+            guard try readTarget(registration) == target else { continue }
+            guard let workspace else {
+                throw DomainReadContextResolutionError.contextUnavailable
+            }
+            guard let context = workspace.contexts.first(where: {
+                $0.metadata.identity == target.context
+            }) else {
+                throw DomainReadContextResolutionError.contextUnavailable
+            }
+            if case .removed = context.health {
+                throw DomainReadContextResolutionError.contextRemoved
+            }
+            return DomainReadContextHandle(
+                runtimeID: identity.runtimeID,
+                runtimeGeneration: identity.lifecycleGeneration,
+                connectionID: registration.connectionID,
+                connectionGeneration: registration.generation,
+                context: target.context,
+                workspaceRevision: workspace.revisions.workingRevision,
+                contextRevision: context.revisions.workingRevision,
+                routingRevision: revision,
+                bindingKind: target.bindingKind
+            )
+        }
+        throw DomainReadContextResolutionError.bindingChanged
+    }
+
+    private struct ReadTarget: Equatable {
+        let context: DomainContextIdentity
+        let bindingKind: DomainReadBindingKind
+    }
+
+    /// The context the live connection incarnation currently reads from. Never suspends.
+    private func readTarget(_ registration: DomainConnectionRegistration) throws -> ReadTarget {
         guard let current = connections[registration.connectionID] else {
             throw DomainReadContextResolutionError.connectionUnavailable
         }
         guard current.registration == registration else {
             throw DomainReadContextResolutionError.staleConnectionGeneration
         }
-
-        let contextIdentity: DomainContextIdentity
-        let bindingKind: DomainReadBindingKind
         switch current.binding {
         case .unbound:
             throw DomainReadContextResolutionError.unboundConnection
         case let .context(context, explicit):
-            contextIdentity = context
-            bindingKind = explicit ? .explicit : .appPresentation
+            return ReadTarget(context: context, bindingKind: explicit ? .explicit : .appPresentation)
         case let .runScoped(runID, context):
-            contextIdentity = context
-            bindingKind = .runScoped(runID: runID)
+            return ReadTarget(context: context, bindingKind: .runScoped(runID: runID))
         case let .appPresentationWindow(windowID):
             guard let window = windows[windowID], !window.isClosing else {
                 throw DomainReadContextResolutionError.presentationWindowUnavailable
@@ -287,33 +344,20 @@ package actor DomainRoutingCoordinator {
             else {
                 throw DomainReadContextResolutionError.presentationContextUnavailable
             }
-            contextIdentity = DomainContextIdentity(workspaceID: workspaceID, contextID: contextID)
-            bindingKind = .appPresentation
+            return ReadTarget(
+                context: DomainContextIdentity(workspaceID: workspaceID, contextID: contextID),
+                bindingKind: .appPresentation
+            )
         }
-
-        guard let workspace = await contextStore.workspaceSnapshot(contextIdentity.workspaceID) else {
-            throw DomainReadContextResolutionError.contextUnavailable
-        }
-        guard let context = workspace.contexts.first(where: {
-            $0.metadata.identity == contextIdentity
-        }) else {
-            throw DomainReadContextResolutionError.contextUnavailable
-        }
-        if case .removed = context.health {
-            throw DomainReadContextResolutionError.contextRemoved
-        }
-        return DomainReadContextHandle(
-            runtimeID: identity.runtimeID,
-            runtimeGeneration: identity.lifecycleGeneration,
-            connectionID: registration.connectionID,
-            connectionGeneration: registration.generation,
-            context: contextIdentity,
-            workspaceRevision: workspace.revisions.workingRevision,
-            contextRevision: context.revisions.workingRevision,
-            routingRevision: revision,
-            bindingKind: bindingKind
-        )
     }
+
+    #if DEBUG
+        /// Test seam: runs inside `resolveReadContext` after the context-store read, before the
+        /// target is re-read (a `bind` issued here lands exactly in the window the re-read closes).
+        package func testSetAfterReadTargetCaptured(_ hook: (@Sendable () async -> Void)?) {
+            testAfterReadTargetCaptured = hook
+        }
+    #endif
 
     /// Revalidates only the authority actually consumed by a read: runtime generation,
     /// connection incarnation, bound context identity, and that context's current revisions.
@@ -647,7 +691,8 @@ package actor DomainRoutingCoordinator {
             oracleLaneID: record.request.oracleLaneID,
             oracleGroupClaimID: record.request.oracleGroupClaimID,
             restrictedTools: record.request.restrictedTools,
-            additionalTools: record.request.additionalTools
+            additionalTools: record.request.additionalTools,
+            launchScopedRoots: record.request.launchScopedRoots
         ))
     }
 

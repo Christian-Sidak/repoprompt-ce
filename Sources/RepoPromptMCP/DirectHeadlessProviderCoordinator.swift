@@ -76,9 +76,10 @@ actor DirectHeadlessProviderCoordinator {
     private var providerTasks: [UUID: Task<String, Error>] = [:]
     private var conversations: [UUID: Conversation] = [:]
     private var isShuttingDown = false
-    /// Test seam: runs at a pinned launch's boundary, after its carriers were minted and before
-    /// the launch revalidates the pin and resolves the process's working directory.
-    private var pinnedLaunchProbe: (@Sendable () async throws -> Void)?
+    /// Test seam: runs at a pinned lane launch's boundary, after its carriers were minted and before
+    /// the launch acquires its root authority (and so its working directory). Receives the lane's
+    /// carrier.
+    private var pinnedLaunchProbe: (@Sendable (DomainChildLaunchCarrier) async throws -> Void)?
 
     init(
         runtime: MCPDomainRuntime,
@@ -137,16 +138,20 @@ actor DirectHeadlessProviderCoordinator {
         }
     }
 
-    func installPinnedLaunchProbe(_ probe: (@Sendable () async throws -> Void)?) {
+    func installPinnedLaunchProbe(_ probe: (@Sendable (DomainChildLaunchCarrier) async throws -> Void)?) {
         pinnedLaunchProbe = probe
     }
 
-    /// Runs one provider process. Without `launchPin` it runs in the connection's current context.
-    /// With one (an Oracle step whose carriers were minted for a committed context), it runs in the
-    /// pinned context: the working directory comes from that context, not from the connection's
-    /// binding, and the connection must still resolve to the pin at this launch boundary, else the
-    /// launch fails closed with `DomainChildLaunchContextPin.Mismatch` and no process starts. So the
-    /// process's directory and its carriers' token authority are always the same context.
+    /// Runs one provider process. Without `pinnedLane` it runs in the connection's current context.
+    ///
+    /// With one (a discovered Oracle lane whose carrier was minted for the committed context), the
+    /// launch first acquires the lane's launch-scoped root authority
+    /// (`DirectHeadlessDomainContext.acquireLaunchRootLease`): the connection must still resolve to
+    /// the pin and the roots to the committed ones, else it fails closed with
+    /// `DomainChildLaunchContextPin.Mismatch` and no process starts. The process then runs in the
+    /// lease's working directory with the lane's carrier, whose token redemption attaches the child
+    /// connection to the same lease, and the lease is released when the process exits, fails to
+    /// spawn, or is cancelled. The lane's ledger records whether the process actually started.
     func runProviderOnce(
         message: String,
         providerID: String?,
@@ -155,7 +160,7 @@ actor DirectHeadlessProviderCoordinator {
         sessionID: UUID? = nil,
         purpose: ExecutionPurpose,
         carrierEnvironment: [String: String]? = nil,
-        launchPin: DomainChildLaunchContextPin? = nil
+        pinnedLane: DirectHeadlessPinnedLaunch.Lane? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
         let descriptor = try resolveProvider(providerID)
@@ -166,36 +171,64 @@ actor DirectHeadlessProviderCoordinator {
             throw DirectHeadlessDomainContext.Error.routingUnavailable
         }
         let effectiveSessionID = sessionID ?? request.securityContext?.principal.runID
-        let snapshot: DirectHeadlessDomainContext.Snapshot
-        if let launchPin {
-            try await pinnedLaunchProbe?()
-            snapshot = try await context.pinnedLaunchSnapshot(
-                launchPin,
+        let workingDirectory: URL?
+        let carrier: [String: String]
+        let lease: DirectHeadlessLaunchRootLease?
+        if let pinnedLane {
+            guard pinnedLane.launch.ledger.begin(pinnedLane.carrier.launchID) else {
+                throw MCPError.internalError("An Oracle lane carrier was launched twice.")
+            }
+            try await pinnedLaunchProbe?(pinnedLane.carrier)
+            let acquired = try await context.acquireLaunchRootLease(
+                pinnedLane,
                 connectionID: connectionID,
                 sessionID: effectiveSessionID
             )
+            if isShuttingDown || Task.isCancelled {
+                await context.releaseLaunchRootLease(acquired)
+                throw CancellationError()
+            }
+            lease = acquired
+            workingDirectory = acquired.workingDirectory
+            carrier = pinnedLane.carrier.environment
         } else {
-            snapshot = try await context.snapshot(
+            let snapshot = try await context.snapshot(
                 connectionID: connectionID,
                 sessionID: effectiveSessionID
             )
+            guard !isShuttingDown else { throw CancellationError() }
+            try Task.checkCancellation()
+            lease = nil
+            workingDirectory = snapshot.activeRoot
+            carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         }
-        // No suspension from here to the spawn: the process starts in the snapshot just validated.
-        guard !isShuttingDown else { throw CancellationError() }
-        try Task.checkCancellation()
         let arguments = Self.codexExecArguments(model: model, purpose: purpose)
-        let carrier = carrierEnvironment ?? DomainChildLaunchContext.current?.environment ?? [:]
         var childEnvironment = DirectProcess.withoutPrivateCarrier(from: environment)
         childEnvironment.merge(carrier) { _, supplied in supplied }
         let taskID = UUID()
+        let domainContext = context
+        let ledger = pinnedLane?.launch.ledger
+        let leasedLaunchID = lease?.launchID
         let task = Task {
-            let output = try await DirectProcess.run(
-                executable,
-                arguments: arguments,
-                input: Data(message.utf8),
-                environment: childEnvironment,
-                currentDirectory: snapshot.activeRoot
-            )
+            // The process's lifetime bounds the lease's: it is released on every exit from here,
+            // including a spawn failure and cancellation (which terminates the process first).
+            let output: String
+            do {
+                output = try await DirectProcess.run(
+                    executable,
+                    arguments: arguments,
+                    input: Data(message.utf8),
+                    environment: childEnvironment,
+                    currentDirectory: workingDirectory,
+                    didStart: {
+                        if let leasedLaunchID { ledger?.markStarted(leasedLaunchID) }
+                    }
+                )
+            } catch {
+                if let lease { await domainContext.releaseLaunchRootLease(lease) }
+                throw error
+            }
+            if let lease { await domainContext.releaseLaunchRootLease(lease) }
             return Self.finalAssistantText(from: output)
         }
         providerTasks[taskID] = task
@@ -417,7 +450,7 @@ actor DirectHeadlessProviderCoordinator {
         message: String,
         model: String?,
         request: DomainPhysicalToolRequest,
-        launchPin: DomainChildLaunchContextPin? = nil
+        pinnedLane: DirectHeadlessPinnedLaunch.Lane? = nil
     ) async throws -> (UUID, String) {
         let descriptor = try resolveProvider(providerID)
         let text = try await runProviderOnce(
@@ -426,7 +459,7 @@ actor DirectHeadlessProviderCoordinator {
             model: model,
             request: request,
             purpose: .directOracle,
-            launchPin: launchPin
+            pinnedLane: pinnedLane
         )
         let id = UUID()
         conversations[id] = Conversation(

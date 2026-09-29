@@ -852,8 +852,10 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     /// single-use handoff, pinned to the committed context and the revisions the commit produced: if
     /// the connection was rebound or either revision moved since, nothing is minted and no Oracle
     /// runs, so the Oracle never gets another context's authority for this context's pack. The same
-    /// pin then governs each Oracle process launch: it runs in the pinned context (working directory
-    /// included), and a rebind or revision move between the handoff and the launch refuses it.
+    /// pin, with the physical roots the commit was made over, then governs each Oracle lane launch:
+    /// the lane acquires a launch-scoped root authority (a rebind, revision move, or roots/overlay
+    /// change between the handoff and the launch refuses it), and its working directory, its token
+    /// redemption, and its child tool calls' roots all derive from that authority until it exits.
     private func buildDiscoveredContext(
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         arguments: [String: Value],
@@ -877,14 +879,18 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         var fields = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
         guard route.oracle != .none, let handoff else { return try .object(fields) }
         let pin = Self.committedContextPin(outcome)
+        let launch = DirectHeadlessPinnedLaunch(pin: pin, committedRoots: outcome.roots)
+        var preparedBundle: DomainChildLaunchCarrierBundle?
         do {
             let bundle = try await handoff.prepare(pinnedTo: pin)
+            preparedBundle = bundle
             let oracleFields = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
                 try await DomainChildLaunchContext.$current.withValue(bundle.singleCarrier) {
                     try await self.runDiscoveredOracle(
                         route: route,
                         outcome: outcome,
-                        pin: pin,
+                        launch: launch,
+                        bundle: bundle,
                         arguments: arguments,
                         request: request
                     )
@@ -899,7 +905,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                 cancelled: Task.isCancelled,
                 outcome: outcome,
                 route: route,
-                request: request
+                request: request,
+                launch: launch,
+                bundle: preparedBundle
             )
         }
     }
@@ -916,7 +924,8 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     private func runDiscoveredOracle(
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         outcome: ContextBuilderDiscoveryOutcome,
-        pin: DomainChildLaunchContextPin,
+        launch: DirectHeadlessPinnedLaunch,
+        bundle: DomainChildLaunchCarrierBundle,
         arguments: [String: Value],
         request: DomainPhysicalToolRequest
     ) async throws -> [String: Value] {
@@ -924,12 +933,15 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         case .none:
             return [:]
         case let .direct(modelID):
+            guard let carrier = bundle.singleCarrier else {
+                throw DirectHeadlessOracleAdapter.AdapterError.childCarrierMismatch
+            }
             let (id, response) = try await providerCoordinator.createConversation(
                 providerID: route.discoveryModel.providerID,
                 message: outcome.pack.content,
                 model: modelID,
                 request: request,
-                launchPin: pin
+                pinnedLane: launch.lane(carrier)
             )
             return [
                 "chat_id": .string(id.uuidString),
@@ -940,13 +952,33 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                 arguments: arguments,
                 request: request,
                 discoveredInput: outcome.oracleInput(),
-                launchPin: pin
+                launch: launch
             )
             guard case let .object(groupFields) = grouped else {
                 throw MCPError.internalError("The grouped Oracle step returned a non-object result.")
             }
-            return groupFields
+            return Self.annotatingLaneLaunches(groupFields, launch: launch, bundle: bundle)
         }
+    }
+
+    /// Adds each grouped lane's `oracle_started`: whether its provider process actually started,
+    /// as the launch ledger recorded it (a lane refused at its launch, or failing to spawn, did not).
+    static func annotatingLaneLaunches(
+        _ fields: [String: Value],
+        launch: DirectHeadlessPinnedLaunch,
+        bundle: DomainChildLaunchCarrierBundle
+    ) -> [String: Value] {
+        guard case let .array(lanes)? = fields["oracle_results"] else { return fields }
+        var annotated = fields
+        annotated["oracle_results"] = .array(lanes.map { lane in
+            guard case var .object(object) = lane,
+                  case let .int(index)? = object["lane_index"],
+                  let carrier = bundle.carriers.first(where: { $0.oracleLaneID?.index == index })
+            else { return lane }
+            object["oracle_started"] = .bool(launch.ledger.hasStarted(carrier.launchID))
+            return .object(object)
+        })
+        return annotated
     }
 
     /// Reports an Oracle step that did not complete after discovery committed. The failure says
@@ -956,17 +988,22 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     /// instructions rediscovers over the committed selection (an identical selection is a no-op
     /// commit). A committed selection is never reported as retryable, so a host does not replay it
     /// blindly. A change of the pinned context before any Oracle process started (a refusal at the
-    /// handoff or at the launch, or a launch-token issuance that rejected the moved revision) is
-    /// reported as such, with the committed authority under `handoff`; over a no-op commit it is
-    /// retryable, since nothing was written and no Oracle ran.
+    /// handoff or at the launch, including a roots or worktree-overlay change, or a launch-token
+    /// issuance that rejected the moved revision) is reported as such, with the committed authority
+    /// under `handoff`; over a no-op commit it is retryable, since nothing was written and no Oracle
+    /// ran. `oracle_started` (and, grouped, `oracle_lanes_started`) says which Oracle processes
+    /// actually started, from the launch ledger.
     static func settlementAfterDiscovery(
         _ error: Error,
         cancelled taskCancelled: Bool,
         outcome: ContextBuilderDiscoveryOutcome,
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
-        request: DomainPhysicalToolRequest
+        request: DomainPhysicalToolRequest,
+        launch: DirectHeadlessPinnedLaunch? = nil,
+        bundle: DomainChildLaunchCarrierBundle? = nil
     ) -> MCPDomainToolFailure {
         let contextMoved = DomainChildLaunchContextPin.Mismatch(pinnedLaunchError: error)
+        let oracleStarted = launch?.ledger.anyStarted ?? false
         let cancelled = contextMoved == nil && (taskCancelled || MCPToolExecutionCancelledError.matches(error))
         let underlying = if cancelled {
             "The Oracle step was cancelled."
@@ -978,12 +1015,19 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         let committed = outcome.receipt.applied
         var details = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
         details["status"] = .string(cancelled ? "oracle_cancelled" : "oracle_failed")
+        details["oracle_started"] = .bool(oracleStarted)
+        if case .group = route.oracle, let launch, let bundle {
+            details["oracle_lanes_started"] = .array(bundle.carriers.compactMap { carrier in
+                guard launch.ledger.hasStarted(carrier.launchID), let lane = carrier.oracleLaneID else { return nil }
+                return .int(lane.index)
+            })
+        }
         if let contextMoved {
-            // Refused before any Oracle process started: say which authority the pack belongs to.
+            // Refused before its Oracle process started: say which authority the pack belongs to.
             details["handoff"] = .object([
                 "code": .string(DomainChildLaunchContextPin.Mismatch.code),
                 "reason": .string(contextMoved.reason),
-                "oracle_started": .bool(false),
+                "oracle_started": .bool(oracleStarted),
                 "committed_context_id": .string(outcome.context.contextID.uuidString),
                 "committed_workspace_revision": .int(Int(clamping: outcome.receipt.workspaceRevision)),
                 "committed_context_revision": .int(Int(clamping: outcome.receipt.contextRevision))
@@ -1337,19 +1381,23 @@ enum DirectProcess {
         return environment
     }
 
+    /// `didStart` runs once the process is running (never when it fails to spawn or is cancelled
+    /// before spawning).
     static func run(
         _ executable: String,
         arguments: [String],
         input: Data? = nil,
         environment: [String: String] = [:],
-        currentDirectory: URL? = nil
+        currentDirectory: URL? = nil,
+        didStart: (@Sendable () -> Void)? = nil
     ) async throws -> String {
         try await DirectProcessInvocation(
             executable: executable,
             arguments: arguments,
             input: input,
             environment: environment,
-            currentDirectory: currentDirectory
+            currentDirectory: currentDirectory,
+            didStart: didStart
         ).run()
     }
 }
@@ -1411,6 +1459,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
     private let pipe = Pipe()
     private let inputPipe: Pipe?
     private let input: Data?
+    private let didStart: (@Sendable () -> Void)?
     private var cancellationRequested = false
 
     init(
@@ -1418,9 +1467,11 @@ private final class DirectProcessInvocation: @unchecked Sendable {
         arguments: [String],
         input: Data?,
         environment overrides: [String: String],
-        currentDirectory: URL?
+        currentDirectory: URL?,
+        didStart: (@Sendable () -> Void)? = nil
     ) {
         self.input = input
+        self.didStart = didStart
         inputPipe = input == nil ? nil : Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -1465,6 +1516,7 @@ private final class DirectProcessInvocation: @unchecked Sendable {
                 }
                 do {
                     try process.run()
+                    didStart?()
                     if let inputPipe, let input {
                         inputPipe.fileHandleForWriting.write(input)
                         try? inputPipe.fileHandleForWriting.close()

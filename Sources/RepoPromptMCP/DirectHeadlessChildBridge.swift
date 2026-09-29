@@ -25,33 +25,13 @@ enum DirectHeadlessChildBridge {
     }
 
     static func run(environment: [String: String] = ProcessInfo.processInfo.environment) async throws {
-        guard let endpoint = environment[DomainChildLaunchCarrier.endpointEnvironmentKey],
-              let launchToken = environment[DomainChildLaunchCarrier.launchTokenEnvironmentKey],
-              let principal = environment[DomainChildLaunchCarrier.clientPrincipalEnvironmentKey],
-              let provider = environment[DomainChildLaunchCarrier.providerIdentifierEnvironmentKey],
-              let rawRunID = environment[DomainChildLaunchCarrier.runIDEnvironmentKey],
-              let runID = UUID(uuidString: rawRunID)
-        else {
+        guard let endpoint = environment[DomainChildLaunchCarrier.endpointEnvironmentKey] else {
             throw BridgeError.incompleteCarrier
         }
+        let handshake = try handshake(environment: environment)
         try validatePrivateEndpoint(path: endpoint)
         let fd = try connect(path: endpoint)
         defer { Darwin.close(fd) }
-        let handshake = DirectHeadlessChildEndpoint.Handshake(
-            launchToken: launchToken,
-            clientPrincipal: principal,
-            providerIdentifier: provider,
-            runID: runID,
-            launchID: environment[DomainChildLaunchCarrier.launchIDEnvironmentKey].flatMap(UUID.init(uuidString:)),
-            oracleGroupID: environment[DomainChildLaunchCarrier.oracleGroupIDEnvironmentKey]
-                .flatMap(UUID.init(uuidString:))
-                .map(OracleGroupID.init(rawValue:)),
-            oracleLaneID: environment[DomainChildLaunchCarrier.oracleLaneIDEnvironmentKey]
-                .flatMap(Int.init)
-                .flatMap { try? OracleLaneID(index: $0) },
-            oracleGroupClaimID: environment[DomainChildLaunchCarrier.oracleGroupClaimIDEnvironmentKey]
-                .flatMap(UUID.init(uuidString:))
-        )
         var bytes = try JSONEncoder().encode(handshake)
         bytes.append(0x0A)
         try writeAll(bytes, to: fd)
@@ -78,6 +58,33 @@ enum DirectHeadlessChildBridge {
                 }
             }
         }
+    }
+
+    /// The handshake a launched child presents for the private launch carrier in `environment`.
+    static func handshake(environment: [String: String]) throws -> DirectHeadlessChildEndpoint.Handshake {
+        guard let launchToken = environment[DomainChildLaunchCarrier.launchTokenEnvironmentKey],
+              let principal = environment[DomainChildLaunchCarrier.clientPrincipalEnvironmentKey],
+              let provider = environment[DomainChildLaunchCarrier.providerIdentifierEnvironmentKey],
+              let rawRunID = environment[DomainChildLaunchCarrier.runIDEnvironmentKey],
+              let runID = UUID(uuidString: rawRunID)
+        else {
+            throw BridgeError.incompleteCarrier
+        }
+        return DirectHeadlessChildEndpoint.Handshake(
+            launchToken: launchToken,
+            clientPrincipal: principal,
+            providerIdentifier: provider,
+            runID: runID,
+            launchID: environment[DomainChildLaunchCarrier.launchIDEnvironmentKey].flatMap(UUID.init(uuidString:)),
+            oracleGroupID: environment[DomainChildLaunchCarrier.oracleGroupIDEnvironmentKey]
+                .flatMap(UUID.init(uuidString:))
+                .map(OracleGroupID.init(rawValue:)),
+            oracleLaneID: environment[DomainChildLaunchCarrier.oracleLaneIDEnvironmentKey]
+                .flatMap(Int.init)
+                .flatMap { try? OracleLaneID(index: $0) },
+            oracleGroupClaimID: environment[DomainChildLaunchCarrier.oracleGroupClaimIDEnvironmentKey]
+                .flatMap(UUID.init(uuidString:))
+        )
     }
 
     private static func validatePrivateEndpoint(path: String) throws {

@@ -17,7 +17,9 @@ package enum DomainChildLaunchContext {
 /// when it is not this pin (the connection was rebound, or either revision moved). Launch tokens are
 /// then issued for the pinned context and revision, so issuance re-checks the revision too. The
 /// child process launched with those carriers runs in the pinned context as well (its working
-/// directory is the pinned context's root), revalidated against the connection at the launch.
+/// directory is the pinned context's root), revalidated against the connection at the launch. A
+/// host that pins the child's roots for its lifetime (a launch-scoped root authority) refuses the
+/// launch with the `roots*` reasons when those roots are no longer the committed ones.
 package struct DomainChildLaunchContextPin: Equatable, Sendable {
     package let context: DomainContextIdentity
     package let workspaceRevision: UInt64
@@ -36,6 +38,13 @@ package struct DomainChildLaunchContextPin: Equatable, Sendable {
         case contextRevisionChanged(expected: UInt64, actual: UInt64)
         /// The connection no longer resolves to a context, or the pinned context is gone.
         case contextUnavailable
+        /// The roots the launch would run in (worktree overlays applied) are not the roots the
+        /// commit was made over: a roots or overlay change reached the launch first.
+        case rootsChanged
+        /// The committed roots, or their worktree mapping, no longer resolve.
+        case rootsUnavailable(String)
+        /// A change of the pinned workspace's roots was already in flight when the launch began.
+        case rootsChanging
 
         package static let code = "child_launch_context_changed"
 
@@ -46,6 +55,9 @@ package struct DomainChildLaunchContextPin: Equatable, Sendable {
             case .workspaceRevisionChanged: "workspace_revision_changed"
             case .contextRevisionChanged: "context_revision_changed"
             case .contextUnavailable: "context_unavailable"
+            case .rootsChanged: "roots_changed"
+            case .rootsUnavailable: "roots_unavailable"
+            case .rootsChanging: "roots_changing"
             }
         }
 
@@ -59,6 +71,12 @@ package struct DomainChildLaunchContextPin: Equatable, Sendable {
                 "the context revision moved from \(expected) to \(actual)"
             case .contextUnavailable:
                 "the connection no longer resolves to the committed context"
+            case .rootsChanged:
+                "the roots the launch would run in are not the roots the selection was committed over"
+            case let .rootsUnavailable(detail):
+                "the committed roots no longer resolve (\(detail))"
+            case .rootsChanging:
+                "a change of the committed workspace's roots was in flight"
             }
             return "\(Self.code): \(detail) after the committed context was pinned; "
                 + "no child was launched under it."

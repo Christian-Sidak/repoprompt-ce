@@ -1481,6 +1481,133 @@ passed. Not run: the full root suite, a live MCP smoke, and a release build.
 - `ContextBuilderDiscoveryTests`: a trailing-space root is headed by its absolute path, and every
   heading round-trips through `get_file_tree(path:)`.
 
+### M21 — one launch-scoped root authority per discovered Oracle lane
+
+M21 closes an architecture gap that M20's launch-boundary snapshot check could not. It came from
+independent review (P1 plus two follow-ups). Behavior changes are confined to pinned discovery
+Oracle launches. Unpinned routes, and every non-discovery Oracle and agent route, are unchanged.
+
+- **The gap (P1).** M20 checked the pin once, at the spawn, and the process's working directory came
+  from that snapshot. But the token's redemption bound the child connection only to a context
+  identity. Every child tool call resolved that context's *live* roots and worktree overlay. So a
+  `manage_workspaces add_folder`/`remove_folder` (or an overlay change) after `Process.run()` could
+  point the child's tools at root B while its working directory stayed root A.
+- **Invariant.** For each pinned lane there is exactly one `DirectHeadlessLaunchRootLease`, held by
+  `DirectHeadlessDomainContext` from the launch until the process exits. Three things derive from
+  it:
+  - The process working directory is the lease's active root.
+  - The lane token is minted with `DomainRunLaunchReservationRequest.launchScopedRoots`, so its
+    redemption must attach the child connection to the lane's active lease
+    (`DirectHeadlessMCPService.admitPrivateChild` → `attachLaunchConnection`). It is refused, and
+    unregistered, otherwise.
+  - Every snapshot a leased connection resolves takes its canonical roots, physical overlay, and
+    active root from the lease. That covers tool requests, read-request handles, the post-commit
+    snapshot of `mutate`, and the security context. It never falls back to live resolution: a
+    released lease fails with `launch_root_authority_released`, and drifted canonical roots fail
+    with `launch_root_authority_changed`.
+- **Acquisition** (`acquireLaunchRootLease`, from `runProviderOnce(pinnedLane:)`). The lease is
+  registered, pending, synchronously and before any read. It then validates:
+  - the connection resolves to the pin;
+  - the pinned context is at the pinned workspace and context revisions;
+  - the physical roots it resolves to (overlays applied) are the ones discovery committed over (the
+    new `ContextBuilderDiscoveryOutcome.roots`);
+  - the connection *still* resolves to the pin after those reads.
+
+  Only then is the lease active. Every refusal is a typed `DomainChildLaunchContextPin.Mismatch` and
+  no process starts. The new reasons are `roots_changed` (an overlay or roots change reached the
+  launch first), `roots_unavailable` (the root mapping or worktree no longer resolves; previously
+  this surfaced as a generic `rootMappingUnavailable` or `MCPError` settlement), and
+  `roots_changing` (a roots mutation was already in flight). Unresolvable bindings are
+  `context_unavailable`.
+- **Mutations serialize against leases.** `manage_workspaces` `add_folder`, `remove_folder`, and
+  `delete` claim the workspace's roots; `close_tab` claims the closed context
+  (`withRootMutationClaim`). Each claim is taken synchronously and held across `willCommit` and the
+  store command. Claims and pending or active leases try-lock each other inside one actor:
+  - a claim that exists first refuses the launch (`roots_changing`);
+  - a lease that exists first refuses the mutation with a typed, retryable, `not_applied`
+    `root_authority_leased` failure naming the holder's run, launch, and context. The same change
+    succeeds once the lease is released.
+
+  `prepareSessionRootOverlay` refuses in the same way for a session whose overlay a lease resolved.
+  A rebind of the parent connection after a lane started does not move that lane: its token is
+  run-scoped to the committed context and its roots are the lease's. Lanes that launch after the
+  rebind are refused (`rebound`).
+- **Release.** The provider task releases the lease on every exit: normal exit, spawn failure,
+  cancellation (after the process is terminated), and a shutdown or cancellation between acquisition
+  and spawn. Release also revokes the lane's launch token, so a token the exited process never
+  redeemed cannot admit a connection later. A token that expires before redemption admits no child,
+  and the lease is still released at exit.
+- **Read-context resolution across its suspension.** `DomainRoutingCoordinator.resolveReadContext`
+  read the connection's binding and then awaited the context store. A `bind` landing in that window
+  paired the old binding's context with the later routing revision. The target (context identity and
+  binding kind, including an app-presentation window's active context) is now re-read after the
+  await and the resolution repeats when it moved. After
+  `maximumReadContextResolutionAttempts` (4) it throws the new typed
+  `DomainReadContextResolutionError.bindingChanged`. Where there is no race, the result is
+  unchanged.
+- **Settlement.** A per-invocation `DirectHeadlessLaunchLedger` is fed by a `didStart` hook that
+  `DirectProcess.run` calls only once `Process.run()` succeeded. Discovery results report whether each
+  grouped lane's process actually started, as `oracle_results[].oracle_started`. Post-commit failures
+  report `oracle_started` (and, when grouped, `oracle_lanes_started`) from the ledger, never from the
+  shape of an error. The `handoff` block's `oracle_started` comes from the ledger too.
+- **Not claimed.**
+  - Writers this runtime does not serialize are not blocked: another process replacing the workspace
+    file (reloaded by the store), or a direct store command. A leased child detects the canonical-root
+    change and fails closed. The running Oracle process keeps its working directory until it exits.
+  - Plain roots replaced on disk (a rename or a symlink swap) are not detected. Worktree mappings are
+    re-verified at each use.
+  - A hung Oracle holds its roots until it exits, is cancelled, or the runtime shuts down. There is
+    no wall-clock lease expiry.
+- **Guardrail.** `headless_runtime_guardrails.sh` now requires, in place of M20's snapshot hook:
+  - the pinned launch built from the pin and the committed roots, and its lane passed on both routes;
+  - lease acquisition in `runProviderOnce`, and `launchScopedRoots` on pinned tokens;
+  - attachment at admission, and the three root-mutation claims;
+  - the re-read in `resolveReadContext`.
+
+Tests (deterministic, through the real long-running provider, coordinator, routing tokens, and the
+child admission path):
+
+- `DomainRoutingBindingCASTests`:
+  - a bind injected during the resolution's store read yields the new binding's handle (re-resolved
+    once);
+  - a binding that never settles is a typed `bindingChanged` after exactly the bound, and resolves
+    once settled.
+- `DirectHeadlessContextDiscoveryTests`:
+  - **Roots change after start.** A roots change and a close of the launch's context lose to a
+    running direct Oracle: `root_authority_leased`, retryable, `not_applied`. The admitted child still
+    reads the committed roots. An overlay change for the launch's session is refused, and closing
+    another context succeeds. After the process exits, the child fails closed and the same
+    `add_folder` applies.
+  - **External writer.** A store-level roots replacement under a running launch fails the child
+    closed (`launch_root_authority_changed`); it is never retargeted.
+  - **Roots change in flight at the launch.** A roots change parked inside the store commit (claim
+    held) wins: the launch is refused as `roots_changing` and no process runs. The parked change then
+    applies.
+  - **Bind during the resolution.** A bind injected into the launch's own read-context resolution
+    refuses the launch (`rebound`).
+  - **Grouped lanes, one started and then a rebind.** Lane 0 is running (held) and lane 1 ran to its
+    exit, so its never-redeemed token is `revoked`. The parent then rebinds: lane 0's child keeps the
+    committed context and roots, lane 2 launches afterwards and is refused as a typed lane failure,
+    and the result is `partial_failure` with per-lane `oracle_started` true/true/false.
+  - **Cleanup.** A spawn failure reports `oracle_started: false` with no `handoff` block. Cancellation
+    reports `oracle_started: true` and revokes the token. An expired token admits no child while the
+    process still holds its authority. Each case leaves no lease, claim, or pending launch token.
+  - **Pre-start overlay classification.** On a real linked Git worktree:
+    - an overlay change for the launch's session before the launch is `roots_changed`;
+    - a worktree that disappears before the launch is `roots_unavailable` (typed, not generic).
+
+Conductor evidence:
+- `swift-build --product repoprompt-mcp` (`8c2df118`).
+- The focused discovery and routing suites (`67c622e2`): 29/29 `DirectHeadlessContextDiscoveryTests`,
+  19 existing plus 10 new, and 4/4 `DomainRoutingBindingCASTests`. All passed on the first run,
+  including the two real-Git worktree cases.
+- `format` (one file reformatted), then `lint` (`3ce4ff79`) clean, and `make guardrails` passed.
+- The full root suite (`bdad8caa`): 3,933 tests (3,921 at M20 plus 12 new), 2 opt-in skips, 0
+  failures. That run compiled every target, the app included, against the domain-runtime changes.
+- Not run: a live MCP smoke with a real `codex` child (the private-socket admission is covered
+  through `admitPrivateChild`, not a socket-connected bridge) and a release build. The Oracle
+  review could not run: the review session was bound to another tab's selection.
+
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 
 The M8A–M13 branch was merged onto `origin/main` `a5586936`, which had independently landed #1081

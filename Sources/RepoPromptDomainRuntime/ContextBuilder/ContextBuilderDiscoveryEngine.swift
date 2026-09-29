@@ -380,6 +380,7 @@ package struct ContextBuilderDiscoveryEngine: Sendable {
         // Committed: nothing below may throw or observe cancellation.
         return ContextBuilderDiscoveryOutcome(
             context: workspace.snapshot.identity,
+            roots: workspace.snapshot.roots,
             selection: files.map(\.absolutePath),
             displayPaths: files.map(\.displayPath),
             prompt: decision.prompt,
