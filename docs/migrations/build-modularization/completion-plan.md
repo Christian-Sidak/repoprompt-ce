@@ -107,6 +107,7 @@ AI                        [==== 8 ====][===== 9 =====]
 
 - T6, cross-worktree cache sharing (conditional).
 - Everything in the appendix, "Later / further efficiencies".
+- The CI `SentryTelemetryPrivacyTests` filter matches no tests (conductor ticket `6b988fb3`, found in PR 2), so that job is not privacy-test evidence. Fix the filter or the test names.
 
 ---
 
