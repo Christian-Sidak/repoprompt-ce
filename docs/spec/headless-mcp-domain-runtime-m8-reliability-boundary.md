@@ -995,6 +995,103 @@ compares only an app/core/app agreement, retrying a disagreeing sample within a 
 the locally restored, untracked official Sparkle 2.9.2 dSYMs for Xcode 27; no Vendor file is part of
 this change. Not run: the full root test suite, live MCP smoke, and a release-configuration build.
 
+### M16 — shared Context Builder route/stream settlement core
+
+Before M16, a nested discovery run's race between its provider stream and MCP routing lived on the
+main actor in the app. `ContextBuilderRouteSettlementCoordinator` owned exactly-once settlement and
+the bounded pre-route event buffer. `ContextBuilderAgentViewModel.consumeContextBuilderProviderStreamWhileAwaitingRoute`
+and its helpers started route-wait, stream, and watchdog tasks, applied every precedence rule
+inline, and buffered the app-only `AIStreamResult`. None of it was reachable from a headless host.
+
+- **Core (`RepoPromptDomainRuntime/ContextBuilder`, `package` access, no MainActor).**
+  `ContextBuilderPreRouteEventBuffer` holds provider-neutral events described by
+  `ContextBuilderPreRouteEventDescriptor` (type, content/progress/protected kind, and payload
+  character count). Coalescing, both eviction orders, and the dropped totals are unchanged.
+  `droppedSummary` is the single source of the "Dropped … while waiting for MCP routing." log line.
+  `ContextBuilderRouteSettlementMachine` is the exactly-once settlement plus the buffer as one value.
+  It buffers events while pending and delivers each routed event only after an atomic drain, so the
+  replay always comes first. It rejects events after any other settlement.
+  `ContextBuilderRouteSettlementPolicy` holds the precedence tables:
+  - the route-wait outcome → settlement mapping (a timeout means ownership was lost);
+  - the provider-completion step (a routing signal observed first, otherwise the completion
+    authority);
+  - the per-settlement join plan: which tasks are cancelled and joined, whether unrouted events are
+    replayed, and the outcome.
+- **Race.** `ContextBuilderRouteSettlementRace.run(_:host:limits:isolation:)` owns the route-wait,
+  stream, and watchdog tasks and the outer-cancellation relay, and applies the join plan in a fixed
+  order: cancel, join the stream, join the route wait, replay, return. The caller's actor is a
+  required `isolated any Actor` parameter. Every task captures it, so the whole race runs on that
+  actor and settlement, buffering, and delivery never interleave within a step. A nonisolated
+  caller cannot run it. Outer cancellation cancels the tasks and hands `.cancelled` to the actor
+  through a relay task, as the former `Task { @MainActor in settle(.cancelled) }` did.
+  `ContextBuilderRouteSettlementHost` is the port. It supplies:
+  - the route authority (wait, current routing signal, completion authority);
+  - the watchdog sleep, connection probe, and report;
+  - admission (accepts events, run progress) and the provider-error rendering;
+  - the event descriptor;
+  - synchronous delivery (route commit, routed event, unrouted replay), each paired with an
+    asynchronous `publish`;
+  - observation hooks.
+- **App adapter.** `ContextBuilderAgentViewModel.ProviderRouteSettlementHost` is a main-actor
+  host with an isolated conformance. It keeps the bootstrap lease (behind
+  `ContextBuilderRunRouteAuthority`, adapted by `ContextBuilderLeaseRouteAuthority`), session and
+  run-registry admission, the run log, bindings, preview, discovery activity, and the DEBUG test
+  hooks. The `AIStreamResult` descriptor mapping and the outcome mapping to
+  `ContextBuilderRunTerminalOutcome` also stay in the app; the mapping keeps the
+  `mcp_completed_without_route` and `mcp_routing_failed` text. The view model calls the race with
+  `isolation: MainActor.shared`. `ContextBuilderRouteSettlementCoordinator` is deleted. The host's
+  async witnesses are explicitly `@MainActor`. Under an isolated conformance, an async member of a
+  `@MainActor` class that witnesses a `nonisolated(nonsending)` requirement otherwise takes the
+  requirement's isolation. It still runs on the main actor, because the race calls it there, but
+  it cannot touch main-actor state synchronously.
+- **Guardrail.** `headless_runtime_guardrails.sh` requires the race core. It rejects
+  `AIStreamResult`, `ViewModel`, `WindowState`, and `MCPBootstrapLease` in the core directory and
+  any return of the coordinator. It also requires the view model to settle through the core. The
+  existing domain-runtime MainActor and UI import checks cover the new files.
+- **Not changed.** Buffer limits (64,000 characters and 256 events), event accounting, the
+  protected-event retention order, and the settlement precedence. The route-commit sequence is
+  unchanged: begin provider-stream progress, then drain, replay, and log in one step, then report
+  activity. The per-event checks and DEBUG hook order, the watchdog, and the error text are
+  unchanged too.
+- **Not claimed.** Direct headless still has no nested discovery. Its `context_builder` goes to
+  `DirectHeadlessOracleAdapter` (a frozen pack or instructions straight to the Oracle), so there is
+  no headless route authority or provider host in production. M16 makes the settlement boundary
+  consumable by such a host. Headless discovery parity is not claimed.
+
+Evidence: `ContextBuilderRouteSettlementTests` (domain runtime) covers descriptor classification and
+grapheme counting, zero limits, coalescing, both eviction orders with exact dropped totals and
+summary text, machine dispositions (including a lazy descriptor once routed), and every precedence
+table. Twelve race tests (fifteen scripted scenarios) run on the main actor and on a private actor
+with its own serial executor. Each asserts the same report and ordered host trace on both, and that
+every host callback ran on the race's actor. The scenarios are: route commit with buffered replay before later events;
+completion fenced without a route; completion committed by the authority; provider failure before
+the route; ownership loss; outer cancellation; rejected admission; provider failure after the
+route; routing signals observed at completion; the watchdog with and without an observed
+connection; a detached host; and overflow accounting reaching the commit.
+`ContextBuilderRouteSettlementAppParityTests` checks the `AIStreamResult` mapping against a
+verbatim copy of the retired coordinator over a seeded corpus (7 limit configurations × 3 seeds ×
+300 operations; drained order, dropped totals, and buffered size compared after every step). It
+checks the outcome and route mappings, then runs the production view-model race (a registered run
+record, a scripted route authority) and a headless actor host over the same core and route
+authority for six scripted runs, comparing output, drop summaries, and outcomes.
+
+Conductor evidence: the first focused run (`02027dd8`) failed to compile the app host. Its async
+witnesses had taken the requirement's `nonisolated(nonsending)` isolation (see the app adapter
+bullet) and were marked `@MainActor`. The focused rerun `0ba18582` then passed 83/83:
+
+- `RepoPromptTests` 64/64. The two new app suites ran, plus the existing Context Builder suites that
+  drive real provider streams and routing: `ContextBuilderMultiRootDiscoveryTests` (27, real MCP
+  routing), `ContextBuilderGracefulShutdownTests`, `ContextBuilderGroupedSupervisionTests`,
+  `ContextBuilderSelectionPrerequisiteTests`, `ContextBuilderWatchdogStabilityTests`, and
+  `ContextBuilderRunStateContractTests`.
+- `RepoPromptDomainRuntimeTests` 19/19.
+
+A repeat of the two new suites passed 24/24 (`75d654d8`). `conductor lint` (`d593bd06`),
+`conductor guardrails` (`5df0f07d`: source layout, allowlist, licenses, and headless runtime), and
+`swift-build --product all` (`3846c965`) passed. The builds used the locally restored, untracked
+official Sparkle 2.9.2 dSYMs for Xcode 27; no Vendor file is part of this change. Not run: the full
+root test suite, live MCP smoke, and a release-configuration build.
+
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 
 The M8A–M13 branch was merged onto `origin/main` `a5586936`, which had independently landed #1081

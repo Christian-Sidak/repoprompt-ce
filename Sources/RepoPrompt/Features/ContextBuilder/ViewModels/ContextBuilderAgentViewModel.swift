@@ -116,6 +116,35 @@ private enum ContextBuilderMCPRoutingError: LocalizedError {
     }
 }
 
+extension ContextBuilderRunTerminalOutcome {
+    /// Maps the shared route/stream outcome onto the run's terminal outcome and its user-facing text.
+    init(_ outcome: ContextBuilderRouteRunOutcome, agentKind: AgentProviderKind) {
+        let clientName = agentKind.mcpClientNameHint ?? agentKind.displayName
+        self = switch outcome {
+        case .completed:
+            .completed
+        case .cancelled:
+            .cancelled
+        case let .failed(.provider(message)):
+            .failed(message)
+        case .failed(.completedWithoutRoute):
+            .failed(
+                ContextBuilderMCPRoutingError.completedWithoutRoute(
+                    agentDisplayName: agentKind.displayName,
+                    clientName: clientName
+                ).localizedDescription
+            )
+        case .failed(.routingOwnershipLost):
+            .failed(
+                ContextBuilderMCPRoutingError.routingFailed(
+                    agentDisplayName: agentKind.displayName,
+                    clientName: clientName
+                ).localizedDescription
+            )
+        }
+    }
+}
+
 @MainActor
 final class ContextBuilderAgentViewModel: ObservableObject {
     typealias ProviderFactory = (
@@ -600,6 +629,24 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         func replaceSessionForTesting(tabID: UUID) {
             sessions[tabID] = TabSession(tabID: tabID)
+        }
+
+        @discardableResult
+        func registerRunForTesting(_ record: ContextBuilderRunRecord) -> Bool {
+            runRegistry.register(record)
+        }
+
+        /// Runs the production route/stream race for `record` against a scripted route authority.
+        func consumeProviderStreamAwaitingRouteForTesting(
+            _ stream: AsyncThrowingStream<AIStreamResult, Error>,
+            record: ContextBuilderRunRecord,
+            routeAuthority: any ContextBuilderRunRouteAuthority
+        ) async -> ContextBuilderRunTerminalOutcome {
+            await consumeContextBuilderProviderStreamWhileAwaitingRoute(
+                stream,
+                record: record,
+                routeAuthority: routeAuthority
+            )
         }
 
         func hasFollowUpOracleGroupTaskForTesting(tabID: UUID) -> Bool {
@@ -2920,7 +2967,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 let streamOutcome = await consumeContextBuilderProviderStreamWhileAwaitingRoute(
                     stream,
                     record: record,
-                    lease: lease
+                    routeAuthority: ContextBuilderLeaseRouteAuthority(lease: lease, runID: record.runID)
                 )
                 guard streamOutcome == .completed else {
                     return streamOutcome
@@ -2987,84 +3034,100 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func consumeContextBuilderProviderStreamWhileAwaitingRoute(
         _ stream: AsyncThrowingStream<AIStreamResult, Error>,
         record: ContextBuilderRunRecord,
-        lease: MCPBootstrapLease
+        routeAuthority: any ContextBuilderRunRouteAuthority
     ) async -> ContextBuilderRunTerminalOutcome {
-        let coordinator = ContextBuilderRouteSettlementCoordinator(
-            maxBufferedTextCharacters: ContextBuilderDefaults.mcpPreRouteBufferedTextCharacterLimit,
-            maxBufferedEventCount: ContextBuilderDefaults.mcpPreRouteBufferedEventLimit
+        let host = ProviderRouteSettlementHost(viewModel: self, record: record, routeAuthority: routeAuthority)
+        let report = await ContextBuilderRouteSettlementRace.run(
+            stream,
+            host: host,
+            limits: ContextBuilderDefaults.mcpPreRouteBufferLimits,
+            isolation: MainActor.shared
         )
+        return ContextBuilderRunTerminalOutcome(report.outcome, agentKind: record.agentKind)
+    }
 
-        let routeTask = Task { @MainActor [weak self, weak record] in
-            guard let self, let record else {
-                _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-                return
+    /// Delivers drained pre-route provider events in arrival order, then records any that were dropped.
+    private func replayProviderEvents(
+        _ drain: ContextBuilderPreRouteDrain<AIStreamResult>,
+        record: ContextBuilderRunRecord,
+        reportDiscoveryActivity: Bool
+    ) -> [ContextBuilderRunRecord.ProviderActivity] {
+        var activity: [ContextBuilderRunRecord.ProviderActivity] = []
+        for event in drain.events {
+            if reportDiscoveryActivity {
+                activity.append(contentsOf: record.captureProviderActivity(event))
             }
-            let outcome = await lease.releaseWhenRoutedIndefinitely(
+            processContextBuilderProviderEvent(event, record: record)
+        }
+        if let droppedSummary = drain.droppedSummary,
+           record.session.appendLogEntry(
+               AgentLogEntry(timestamp: Date(), type: .system, message: droppedSummary)
+           )
+        {
+            updateAgentLogBinding(from: record.session)
+        }
+        return activity
+    }
+
+    /// Main-actor host for one run's shared route/stream race. It keeps the route authority,
+    /// session admission, presentation, and `AIStreamResult` mapping; the race in
+    /// `RepoPromptDomainRuntime` owns the tasks, exactly-once settlement, pre-route buffering,
+    /// and precedence.
+    ///
+    /// Async witnesses are explicitly `@MainActor`: without it they would inherit the protocol's
+    /// `nonisolated(nonsending)` isolation and could not touch main-actor state synchronously.
+    @MainActor
+    private final class ProviderRouteSettlementHost: @MainActor ContextBuilderRouteSettlementHost {
+        typealias Event = AIStreamResult
+        typealias Publication = [ContextBuilderRunRecord.ProviderActivity]
+
+        private weak var viewModel: ContextBuilderAgentViewModel?
+        private let record: ContextBuilderRunRecord
+        private let routeAuthority: any ContextBuilderRunRouteAuthority
+
+        init(
+            viewModel: ContextBuilderAgentViewModel,
+            record: ContextBuilderRunRecord,
+            routeAuthority: any ContextBuilderRunRouteAuthority
+        ) {
+            self.viewModel = viewModel
+            self.record = record
+            self.routeAuthority = routeAuthority
+        }
+
+        var isAttached: Bool {
+            viewModel != nil
+        }
+
+        @MainActor func waitForRoute() async -> ContextBuilderRouteWaitResult {
+            let outcome = await routeAuthority.waitForRoute(
                 progressReporter: { [weak record] progress in
                     guard let record else { return }
-                    let phase: ContextBuilderMCPProgressPhase = switch progress {
-                    case .waitingForChildConnection:
-                        .waitingForChildConnection
-                    case .childConnectionObserved:
-                        .childConnectionObserved
-                    case .waitingForRouting:
-                        .waitingForRouting
-                    case .routingConfirmed:
-                        .routingConfirmed
-                    case .routingTimeoutBeforeConnection:
-                        .routingTimeoutBeforeConnection
-                    case .routingTimeoutAfterConnection:
-                        .routingTimeoutAfterConnection
-                    }
-                    await record.reportRoutingProgress(phase)
+                    await record.reportRoutingProgress(Self.progressPhase(for: progress))
                 }
             )
-            debugLog("Routing result for run \(record.runID): outcome=\(outcome)")
-
-            switch outcome {
-            case .routed:
-                guard coordinator.settle(.routed) else { return }
-                await record.beginProviderStreamProgress()
-                await handleContextBuilderRouteCommitted(coordinator: coordinator, record: record)
-            case .failed:
-                _ = coordinator.settle(.routingOwnershipLost)
-            case .cancelled:
-                _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-            case .timedOutBeforeConnection, .timedOutAfterConnection:
-                // The indefinite Context Builder path never schedules elapsed-time deadlines.
-                _ = coordinator.settle(.routingOwnershipLost)
-            }
+            viewModel?.debugLog("Routing result for run \(record.runID): outcome=\(outcome)")
+            return ContextBuilderRouteWaitResult(outcome)
         }
 
-        let streamTask = Task { @MainActor [weak self, weak record] in
-            guard let self, let record else {
-                _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-                return ContextBuilderRunTerminalOutcome.cancelled
-            }
-            return await consumeContextBuilderProviderStream(
-                stream,
-                record: record,
-                lease: lease,
-                coordinator: coordinator
-            )
+        @MainActor func currentRoutingOutcome() async -> ContextBuilderRouteWaitResult? {
+            guard let outcome = await routeAuthority.currentRoutingTerminalOutcome() else { return nil }
+            return ContextBuilderRouteWaitResult(outcome)
         }
 
-        let watchdogTask = Task { @MainActor [weak self, weak record] in
-            do {
-                try await Task.sleep(for: .seconds(ContextBuilderDefaults.mcpRoutingWatchdogSeconds))
-            } catch {
-                return
-            }
-            guard let self, let record,
-                  coordinator.isPending,
-                  acceptsEvents(from: record)
-            else { return }
-            let connectionWasObserved = await MCPRoutingWaiter.connectionWasObserved(runID: record.runID)
-            guard !connectionWasObserved,
-                  coordinator.isPending,
-                  acceptsEvents(from: record)
-            else { return }
+        @MainActor func resolveCompletionAuthority() async -> ContextBuilderRouteCompletionAuthority {
+            await ContextBuilderRouteCompletionAuthority(routeAuthority.resolveRouteAuthorityAtProviderCompletion())
+        }
 
+        @MainActor func sleepUntilRoutingWatchdog() async throws {
+            try await Task.sleep(for: .seconds(ContextBuilderDefaults.mcpRoutingWatchdogSeconds))
+        }
+
+        @MainActor func childConnectionWasObserved() async -> Bool {
+            await routeAuthority.childConnectionWasObserved()
+        }
+
+        @MainActor func reportRoutingWatchdog() async {
             await record.reportProgress(.waitingForChildConnection)
             if record.session.appendLogEntry(
                 AgentLogEntry(
@@ -3074,230 +3137,102 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 ),
                 dedupeKey: "context-builder-routing-watchdog-\(record.runID.uuidString)"
             ) {
-                updateAgentLogBinding(from: record.session)
+                viewModel?.updateAgentLogBinding(from: record.session)
             }
         }
 
-        return await withTaskCancellationHandler {
-            let settlement = await coordinator.waitForSettlement()
-            watchdogTask.cancel()
-
-            switch settlement {
-            case .routed:
-                let streamOutcome = await streamTask.value
-                _ = await routeTask.value
-                return streamOutcome
-            case .completedWithoutRoute:
-                routeTask.cancel()
-                _ = await routeTask.value
-                replayBufferedProviderEvents(
-                    from: coordinator,
-                    record: record,
-                    reportDiscoveryActivity: false
-                )
-                let clientName = record.agentKind.mcpClientNameHint ?? record.agentKind.displayName
-                return .failed(
-                    ContextBuilderMCPRoutingError.completedWithoutRoute(
-                        agentDisplayName: record.agentKind.displayName,
-                        clientName: clientName
-                    ).localizedDescription
-                )
-            case let .failedWithoutRoute(message):
-                routeTask.cancel()
-                _ = await routeTask.value
-                replayBufferedProviderEvents(
-                    from: coordinator,
-                    record: record,
-                    reportDiscoveryActivity: false
-                )
-                return .failed(message)
-            case .routingOwnershipLost:
-                streamTask.cancel()
-                _ = await streamTask.value
-                _ = await routeTask.value
-                let clientName = record.agentKind.mcpClientNameHint ?? record.agentKind.displayName
-                return .failed(
-                    ContextBuilderMCPRoutingError.routingFailed(
-                        agentDisplayName: record.agentKind.displayName,
-                        clientName: clientName
-                    ).localizedDescription
-                )
-            case .cancelled:
-                streamTask.cancel()
-                routeTask.cancel()
-                _ = await streamTask.value
-                _ = await routeTask.value
-                return .cancelled
-            }
-        } onCancel: {
-            watchdogTask.cancel()
-            streamTask.cancel()
-            routeTask.cancel()
-            Task { @MainActor in
-                _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-            }
-        }
-    }
-
-    private func consumeContextBuilderProviderStream(
-        _ stream: AsyncThrowingStream<AIStreamResult, Error>,
-        record: ContextBuilderRunRecord,
-        lease: MCPBootstrapLease,
-        coordinator: ContextBuilderRouteSettlementCoordinator
-    ) async -> ContextBuilderRunTerminalOutcome {
-        let session = record.session
-
-        do {
-            for try await result in stream {
-                #if DEBUG
-                    await runTestHooks?.beforeProcessingProviderEvent?(result, record.runID)
-                #endif
-                guard !Task.isCancelled, acceptsEvents(from: record) else {
-                    #if DEBUG
-                        runTestHooks?.providerEventDisposition?(result, record.runID, false)
-                    #endif
-                    _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-                    return .cancelled
-                }
-                if case .rejected = session.recordRunProgress(
-                    ownership: record.ownership,
-                    kind: .providerEvent,
-                    stage: .running
-                ) {
-                    #if DEBUG
-                        runTestHooks?.providerEventDisposition?(result, record.runID, false)
-                    #endif
-                    _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-                    return .cancelled
-                }
-
-                // Retry and child-process lifecycle notifications are ordinary stream events.
-                // Only termination of this outer stream is authoritative before routing commits.
-                if coordinator.isPending {
-                    coordinator.appendWhilePending(result)
-                } else if coordinator.isRouted {
-                    var activity = replayBufferedProviderEvents(
-                        from: coordinator,
-                        record: record,
-                        reportDiscoveryActivity: true
-                    )
-                    activity.append(contentsOf: record.captureProviderActivity(result))
-                    processContextBuilderProviderEvent(result, record: record)
-                    await record.reportProviderActivity(activity)
-                } else {
-                    #if DEBUG
-                        runTestHooks?.providerEventDisposition?(result, record.runID, false)
-                    #endif
-                    return .cancelled
-                }
-                #if DEBUG
-                    runTestHooks?.providerEventDisposition?(result, record.runID, true)
-                #endif
-            }
-        } catch is CancellationError {
-            _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-            return .cancelled
-        } catch {
-            guard acceptsEvents(from: record) else {
-                _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-                return .cancelled
-            }
-            let message = extractVerboseErrorMessage(from: error)
-            _ = coordinator.settle(.failedWithoutRoute(message))
-            return .failed(message)
+        func acceptsProviderEvents() -> Bool {
+            viewModel?.acceptsEvents(from: record) ?? false
         }
 
-        guard coordinator.isPending else { return .completed }
-        if let currentRoutingOutcome = await lease.currentRoutingTerminalOutcome() {
-            switch currentRoutingOutcome {
-            case .routed:
-                if coordinator.settle(.routed) {
-                    await record.beginProviderStreamProgress()
-                    await handleContextBuilderRouteCommitted(coordinator: coordinator, record: record)
-                }
-                return .completed
-            case .failed:
-                _ = coordinator.settle(.routingOwnershipLost)
-                return .completed
-            case .cancelled:
-                _ = coordinator.settle(ContextBuilderRouteSettlementCoordinator.Settlement.cancelled)
-                return .cancelled
-            case .timedOutBeforeConnection, .timedOutAfterConnection:
-                break
+        func recordProviderEventProgress() -> Bool {
+            if case .rejected = record.session.recordRunProgress(
+                ownership: record.ownership,
+                kind: .providerEvent,
+                stage: .running
+            ) {
+                return false
             }
+            return true
         }
 
-        guard coordinator.isPending else { return .completed }
-        switch await lease.resolveRouteAuthorityAtProviderCompletion() {
-        case .committed:
-            if coordinator.settle(.routed) {
-                await record.beginProviderStreamProgress()
-                await handleContextBuilderRouteCommitted(coordinator: coordinator, record: record)
-            }
-        case .revocationFenced:
-            _ = coordinator.settle(.completedWithoutRoute)
+        func failureMessage(for error: any Error) -> String {
+            viewModel?.extractVerboseErrorMessage(from: error) ?? error.localizedDescription
         }
-        return .completed
-    }
 
-    private func handleContextBuilderRouteCommitted(
-        coordinator: ContextBuilderRouteSettlementCoordinator,
-        record: ContextBuilderRunRecord
-    ) async {
-        let activity = replayBufferedProviderEvents(
-            from: coordinator,
-            record: record,
-            reportDiscoveryActivity: true
-        )
-        record.finalContextConnectionIDForDiagnostics =
-            mcpServer.contextBuilderFinalContextConnectionID(runID: record.runID)
-        record.session.appendLogEntry(
-            AgentLogEntry(
-                timestamp: Date(),
-                type: .system,
-                message: record.origin.isMCP
-                    ? "\(record.agentKind.displayName) connected via MCP, analyzing workspace..."
-                    : "\(record.agentKind.displayName) connected, analyzing workspace..."
-            )
-        )
-        updateRuntimeBindings(from: record.session)
-        await record.reportProviderActivity(activity)
-    }
-
-    @discardableResult
-    private func replayBufferedProviderEvents(
-        from coordinator: ContextBuilderRouteSettlementCoordinator,
-        record: ContextBuilderRunRecord,
-        reportDiscoveryActivity: Bool
-    ) -> [ContextBuilderRunRecord.ProviderActivity] {
-        let buffered = coordinator.drainBufferedEvents()
-        var activity: [ContextBuilderRunRecord.ProviderActivity] = []
-        for event in buffered.events {
-            if reportDiscoveryActivity {
-                activity.append(contentsOf: record.captureProviderActivity(event))
-            }
-            processContextBuilderProviderEvent(event, record: record)
+        func preRouteDescriptor(for event: AIStreamResult) -> ContextBuilderPreRouteEventDescriptor {
+            event.contextBuilderPreRouteDescriptor
         }
-        if buffered.droppedTextCharacterCount > 0 || buffered.droppedNonterminalEventCount > 0 {
-            let details = [
-                buffered.droppedTextCharacterCount > 0
-                    ? "\(buffered.droppedTextCharacterCount) characters of early provider payload"
-                    : nil,
-                buffered.droppedNonterminalEventCount > 0
-                    ? "\(buffered.droppedNonterminalEventCount) early provider events"
-                    : nil
-            ].compactMap(\.self).joined(separator: " and ")
-            if record.session.appendLogEntry(
+
+        @MainActor func beginRoutedStream() async {
+            await record.beginProviderStreamProgress()
+        }
+
+        func commitRoute(replaying drain: ContextBuilderPreRouteDrain<AIStreamResult>) -> Publication {
+            guard let viewModel else { return [] }
+            let activity = viewModel.replayProviderEvents(drain, record: record, reportDiscoveryActivity: true)
+            record.finalContextConnectionIDForDiagnostics =
+                viewModel.mcpServer.contextBuilderFinalContextConnectionID(runID: record.runID)
+            record.session.appendLogEntry(
                 AgentLogEntry(
                     timestamp: Date(),
                     type: .system,
-                    message: "Dropped \(details) while waiting for MCP routing."
+                    message: record.origin.isMCP
+                        ? "\(record.agentKind.displayName) connected via MCP, analyzing workspace..."
+                        : "\(record.agentKind.displayName) connected, analyzing workspace..."
                 )
-            ) {
-                updateAgentLogBinding(from: record.session)
+            )
+            viewModel.updateRuntimeBindings(from: record.session)
+            return activity
+        }
+
+        func deliverRoutedEvent(
+            _ event: AIStreamResult,
+            replaying drain: ContextBuilderPreRouteDrain<AIStreamResult>
+        ) -> Publication {
+            guard let viewModel else { return [] }
+            var activity = viewModel.replayProviderEvents(drain, record: record, reportDiscoveryActivity: true)
+            activity.append(contentsOf: record.captureProviderActivity(event))
+            viewModel.processContextBuilderProviderEvent(event, record: record)
+            return activity
+        }
+
+        func replayUnroutedEvents(_ drain: ContextBuilderPreRouteDrain<AIStreamResult>) {
+            _ = viewModel?.replayProviderEvents(drain, record: record, reportDiscoveryActivity: false)
+        }
+
+        @MainActor func publish(_ publication: Publication) async {
+            await record.reportProviderActivity(publication)
+        }
+
+        @MainActor func willProcessProviderEvent(_ event: AIStreamResult) async {
+            #if DEBUG
+                await viewModel?.runTestHooks?.beforeProcessingProviderEvent?(event, record.runID)
+            #endif
+        }
+
+        func didDisposeProviderEvent(_ event: AIStreamResult, accepted: Bool) {
+            #if DEBUG
+                viewModel?.runTestHooks?.providerEventDisposition?(event, record.runID, accepted)
+            #endif
+        }
+
+        private static func progressPhase(for progress: MCPBootstrapRoutingProgress) -> ContextBuilderMCPProgressPhase {
+            switch progress {
+            case .waitingForChildConnection:
+                .waitingForChildConnection
+            case .childConnectionObserved:
+                .childConnectionObserved
+            case .waitingForRouting:
+                .waitingForRouting
+            case .routingConfirmed:
+                .routingConfirmed
+            case .routingTimeoutBeforeConnection:
+                .routingTimeoutBeforeConnection
+            case .routingTimeoutAfterConnection:
+                .routingTimeoutAfterConnection
             }
         }
-        return activity
     }
 
     private func processContextBuilderProviderEvent(

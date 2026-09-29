@@ -111,6 +111,27 @@ if grep -n -E '@MainActor|MainActor\.|ViewModel|WindowState|^[[:space:]]*import[
   exit 1
 fi
 
+route_settlement_core="$runtime_sources/ContextBuilder/ContextBuilderRouteSettlementRace.swift"
+if [[ ! -f "$route_settlement_core" ]] \
+  || ! grep -q 'enum ContextBuilderRouteSettlementRace' "$route_settlement_core"; then
+  echo "error: missing shared Context Builder route/stream settlement core" >&2
+  exit 1
+fi
+if grep -R -n --include='*.swift' -E 'AIStreamResult|ViewModel|WindowState|MCPBootstrapLease' \
+  "$runtime_sources/ContextBuilder"; then
+  echo "error: the Context Builder route settlement core must stay provider-, lease-, and UI-neutral" >&2
+  exit 1
+fi
+if grep -R -n --include='*.swift' 'ContextBuilderRouteSettlementCoordinator' Sources; then
+  echo "error: the retired MainActor route settlement coordinator must not return" >&2
+  exit 1
+fi
+if ! grep -q 'ContextBuilderRouteSettlementRace.run' \
+  Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift; then
+  echo "error: nested discovery must settle its route/stream race through the shared core" >&2
+  exit 1
+fi
+
 if grep -R -n --include='MCP*ToolProvider.swift' \
   -E 'dependencies:[[:space:]]+MCPAppPhysicalCapabilityAdapters([[:space:],?)]|$)' \
   Sources/RepoPrompt/Infrastructure/MCP/WindowTools; then

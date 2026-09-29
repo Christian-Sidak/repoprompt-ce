@@ -21,28 +21,6 @@ final class ContextBuilderRunStateContractTests: XCTestCase {
         XCTAssertFalse(record.claimTerminal(.cancelled))
     }
 
-    func testRouteSettlementCoordinatorRejectsEventsAfterSettlement() {
-        let coordinator = ContextBuilderRouteSettlementCoordinator(
-            maxBufferedTextCharacters: 100,
-            maxBufferedEventCount: 10
-        )
-        coordinator.appendWhilePending(
-            AIStreamResult(type: "content", text: "before")
-        )
-
-        XCTAssertTrue(coordinator.settle(.routed))
-        XCTAssertFalse(coordinator.isPending)
-        XCTAssertTrue(coordinator.isRouted)
-
-        coordinator.appendWhilePending(
-            AIStreamResult(type: "content", text: "after")
-        )
-        XCTAssertEqual(
-            coordinator.drainBufferedEvents().events.map(\.text),
-            ["before"]
-        )
-    }
-
     private func makeRecord(
         tabID: UUID,
         session: ContextBuilderAgentViewModel.TabSession,
