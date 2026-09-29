@@ -15,7 +15,9 @@ package enum DomainChildLaunchContext {
 ///
 /// Preparation resolves the connection's current read context and refuses, before minting anything,
 /// when it is not this pin (the connection was rebound, or either revision moved). Launch tokens are
-/// then issued for the pinned context and revision, so issuance re-checks the revision too.
+/// then issued for the pinned context and revision, so issuance re-checks the revision too. The
+/// child process launched with those carriers runs in the pinned context as well (its working
+/// directory is the pinned context's root), revalidated against the connection at the launch.
 package struct DomainChildLaunchContextPin: Equatable, Sendable {
     package let context: DomainContextIdentity
     package let workspaceRevision: UInt64
@@ -32,8 +34,20 @@ package struct DomainChildLaunchContextPin: Equatable, Sendable {
         case rebound(current: DomainContextIdentity)
         case workspaceRevisionChanged(expected: UInt64, actual: UInt64)
         case contextRevisionChanged(expected: UInt64, actual: UInt64)
+        /// The connection no longer resolves to a context, or the pinned context is gone.
+        case contextUnavailable
 
         package static let code = "child_launch_context_changed"
+
+        /// Stable machine-readable reason.
+        package var reason: String {
+            switch self {
+            case .rebound: "rebound"
+            case .workspaceRevisionChanged: "workspace_revision_changed"
+            case .contextRevisionChanged: "context_revision_changed"
+            case .contextUnavailable: "context_unavailable"
+            }
+        }
 
         package var errorDescription: String? {
             let detail = switch self {
@@ -43,8 +57,30 @@ package struct DomainChildLaunchContextPin: Equatable, Sendable {
                 "the workspace revision moved from \(expected) to \(actual)"
             case let .contextRevisionChanged(expected, actual):
                 "the context revision moved from \(expected) to \(actual)"
+            case .contextUnavailable:
+                "the connection no longer resolves to the committed context"
             }
-            return "\(Self.code): \(detail) after the committed context was pinned; no carrier was minted."
+            return "\(Self.code): \(detail) after the committed context was pinned; "
+                + "no child was launched under it."
+        }
+
+        /// Classifies an error raised while minting or launching under a pin, before any child
+        /// process started: a refusal by the pin itself, or a launch-token issuance that rejected
+        /// the pinned context (its revision moved after the pin was validated, or it is gone).
+        /// Returns nil for every other error.
+        package init?(pinnedLaunchError error: Error) {
+            if let mismatch = error as? Self {
+                self = mismatch
+                return
+            }
+            switch error as? DomainRunLaunchTokenError {
+            case let .staleContextRevision(expected, actual)?:
+                self = .contextRevisionChanged(expected: expected, actual: actual)
+            case .contextUnavailable?:
+                self = .contextUnavailable
+            default:
+                return nil
+            }
         }
     }
 

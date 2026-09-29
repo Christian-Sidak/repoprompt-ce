@@ -256,9 +256,16 @@ actor DirectHeadlessChildLaunchCoordinator {
     private var runtime: MCPDomainRuntime?
     private var harness: DomainPrivateChildLaunchHarness?
     private var oracleAdapter: DirectHeadlessOracleAdapter?
+    /// Test seam: runs in a pinned preparation after the pin was validated, before any token is
+    /// issued.
+    private let pinnedIssuanceProbe: (@Sendable () async throws -> Void)?
 
-    init(carrierLifetime: Duration = .seconds(60)) {
+    init(
+        carrierLifetime: Duration = .seconds(60),
+        pinnedIssuanceProbe: (@Sendable () async throws -> Void)? = nil
+    ) {
         self.carrierLifetime = carrierLifetime
+        self.pinnedIssuanceProbe = pinnedIssuanceProbe
     }
 
     func configure(
@@ -323,7 +330,10 @@ actor DirectHeadlessChildLaunchCoordinator {
             connectionID: securityContext.connectionID
         )
         let handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
-        try pin?.validate(handle)
+        if let pin {
+            try pin.validate(handle)
+            try await pinnedIssuanceProbe?()
+        }
         let context = pin?.context ?? handle.context
         let contextRevision = pin?.contextRevision ?? handle.contextRevision
         var carriers: [DomainChildLaunchCarrier] = []

@@ -193,11 +193,13 @@ actor DirectHeadlessOracleAdapter {
     }
 
     /// Runs the retained grouped discovery plan with the discovered pack as its input, exactly as a
-    /// `context_pack_ref` naming that pack would.
+    /// `context_pack_ref` naming that pack would. Every lane launches in `launchPin`, the committed
+    /// context its carriers were minted for (see `DirectHeadlessProviderCoordinator.runProviderOnce`).
     func buildContext(
         arguments: [String: Value],
         request: DomainPhysicalToolRequest,
-        discoveredInput: OracleInput
+        discoveredInput: OracleInput,
+        launchPin: DomainChildLaunchContextPin
     ) async throws -> Value {
         var plan = try await consumePlan(toolName: "context_builder", arguments: arguments, request: request)
         guard let discovery = plan.discovery, discovery.consumesOracle, discovery.mode == discoveredInput.mode,
@@ -206,7 +208,7 @@ actor DirectHeadlessOracleAdapter {
             throw AdapterError.missingPreparedInvocation
         }
         plan.input = discoveredInput
-        return try await execute(plan, request: request)
+        return try await execute(plan, request: request, launchPin: launchPin)
     }
 
     func log(chatID: String?, limit: Int) async throws -> Value {
@@ -552,7 +554,11 @@ actor DirectHeadlessOracleAdapter {
         )
     }
 
-    private func execute(_ plan: InvocationPlan, request: DomainPhysicalToolRequest) async throws -> Value {
+    private func execute(
+        _ plan: InvocationPlan,
+        request: DomainPhysicalToolRequest,
+        launchPin: DomainChildLaunchContextPin? = nil
+    ) async throws -> Value {
         guard let input = plan.input else { throw AdapterError.missingPreparedInvocation }
         switch plan.route {
         case .direct:
@@ -578,7 +584,8 @@ actor DirectHeadlessOracleAdapter {
                     )
                 ),
                 bundle: bundle,
-                request: request
+                request: request,
+                launchPin: launchPin
             )
             return Self.groupValue(completion.result)
         case let .continueGroup(groupID, expectedRevision, roster):
@@ -602,7 +609,8 @@ actor DirectHeadlessOracleAdapter {
                     )
                 ),
                 bundle: bundle,
-                request: request
+                request: request,
+                launchPin: launchPin
             )
             return Self.groupValue(completion.result)
         }
@@ -611,7 +619,8 @@ actor DirectHeadlessOracleAdapter {
     private func executeGrouped(
         _ request: OracleGroupRuntime.Request,
         bundle: DomainChildLaunchCarrierBundle,
-        request physicalRequest: DomainPhysicalToolRequest
+        request physicalRequest: DomainPhysicalToolRequest,
+        launchPin: DomainChildLaunchContextPin?
     ) async throws -> OracleGroupRuntime.Completion {
         let provider = provider
         do {
@@ -627,14 +636,24 @@ actor DirectHeadlessOracleAdapter {
                             laneIndex: invocation.member.laneID.index,
                             next: invocation.context.input.userMessage
                         )
-                        let response = try await provider.runProviderOnce(
-                            message: prompt,
-                            providerID: invocation.member.model.providerID,
-                            model: invocation.member.model.modelID,
-                            request: physicalRequest,
-                            purpose: .oracleGroup,
-                            carrierEnvironment: carrier.environment
-                        )
+                        let response: String
+                        do {
+                            response = try await provider.runProviderOnce(
+                                message: prompt,
+                                providerID: invocation.member.model.providerID,
+                                model: invocation.member.model.modelID,
+                                request: physicalRequest,
+                                purpose: .oracleGroup,
+                                carrierEnvironment: carrier.environment,
+                                launchPin: launchPin
+                            )
+                        } catch let refusal as DomainChildLaunchContextPin.Mismatch {
+                            // The lane's launch was refused before its process started.
+                            throw OracleLaneFailure(
+                                code: DomainChildLaunchContextPin.Mismatch.code,
+                                message: refusal.errorDescription ?? String(describing: refusal)
+                            )
+                        }
                         return OracleLaneExecutionResponse(response: response)
                     }
                 )

@@ -851,7 +851,9 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     /// child-launch carriers are prepared only here, after the commit, through the invocation's
     /// single-use handoff, pinned to the committed context and the revisions the commit produced: if
     /// the connection was rebound or either revision moved since, nothing is minted and no Oracle
-    /// runs, so the Oracle never gets another context's authority for this context's pack.
+    /// runs, so the Oracle never gets another context's authority for this context's pack. The same
+    /// pin then governs each Oracle process launch: it runs in the pinned context (working directory
+    /// included), and a rebind or revision move between the handoff and the launch refuses it.
     private func buildDiscoveredContext(
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         arguments: [String: Value],
@@ -874,13 +876,15 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         // Committed from here on.
         var fields = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
         guard route.oracle != .none, let handoff else { return try .object(fields) }
+        let pin = Self.committedContextPin(outcome)
         do {
-            let bundle = try await handoff.prepare(pinnedTo: Self.committedContextPin(outcome))
+            let bundle = try await handoff.prepare(pinnedTo: pin)
             let oracleFields = try await DomainChildLaunchContext.$bundle.withValue(bundle) {
                 try await DomainChildLaunchContext.$current.withValue(bundle.singleCarrier) {
                     try await self.runDiscoveredOracle(
                         route: route,
                         outcome: outcome,
+                        pin: pin,
                         arguments: arguments,
                         request: request
                     )
@@ -912,6 +916,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     private func runDiscoveredOracle(
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         outcome: ContextBuilderDiscoveryOutcome,
+        pin: DomainChildLaunchContextPin,
         arguments: [String: Value],
         request: DomainPhysicalToolRequest
     ) async throws -> [String: Value] {
@@ -923,7 +928,8 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
                 providerID: route.discoveryModel.providerID,
                 message: outcome.pack.content,
                 model: modelID,
-                request: request
+                request: request,
+                launchPin: pin
             )
             return [
                 "chat_id": .string(id.uuidString),
@@ -933,7 +939,8 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
             let grouped = try await oracleAdapter.buildContext(
                 arguments: arguments,
                 request: request,
-                discoveredInput: outcome.oracleInput()
+                discoveredInput: outcome.oracleInput(),
+                launchPin: pin
             )
             guard case let .object(groupFields) = grouped else {
                 throw MCPError.internalError("The grouped Oracle step returned a non-object result.")
@@ -948,7 +955,10 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
     /// `context_pack_ref`; a roster of one has no pack-reference route, so replaying the raw
     /// instructions rediscovers over the committed selection (an identical selection is a no-op
     /// commit). A committed selection is never reported as retryable, so a host does not replay it
-    /// blindly.
+    /// blindly. A change of the pinned context before any Oracle process started (a refusal at the
+    /// handoff or at the launch, or a launch-token issuance that rejected the moved revision) is
+    /// reported as such, with the committed authority under `handoff`; over a no-op commit it is
+    /// retryable, since nothing was written and no Oracle ran.
     static func settlementAfterDiscovery(
         _ error: Error,
         cancelled taskCancelled: Bool,
@@ -956,7 +966,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         route: DirectHeadlessOracleAdapter.DiscoveryRoute,
         request: DomainPhysicalToolRequest
     ) -> MCPDomainToolFailure {
-        let contextMoved = error as? DomainChildLaunchContextPin.Mismatch
+        let contextMoved = DomainChildLaunchContextPin.Mismatch(pinnedLaunchError: error)
         let cancelled = contextMoved == nil && (taskCancelled || MCPToolExecutionCancelledError.matches(error))
         let underlying = if cancelled {
             "The Oracle step was cancelled."
@@ -968,10 +978,12 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
         let committed = outcome.receipt.applied
         var details = DirectHeadlessContextDiscovery.resultFields(outcome, responseType: route.responseType)
         details["status"] = .string(cancelled ? "oracle_cancelled" : "oracle_failed")
-        if contextMoved != nil {
-            // The handoff refused before minting: say which authority the pack belongs to.
+        if let contextMoved {
+            // Refused before any Oracle process started: say which authority the pack belongs to.
             details["handoff"] = .object([
                 "code": .string(DomainChildLaunchContextPin.Mismatch.code),
+                "reason": .string(contextMoved.reason),
+                "oracle_started": .bool(false),
                 "committed_context_id": .string(outcome.context.contextID.uuidString),
                 "committed_workspace_revision": .int(Int(clamping: outcome.receipt.workspaceRevision)),
                 "committed_context_revision": .int(Int(clamping: outcome.receipt.contextRevision))

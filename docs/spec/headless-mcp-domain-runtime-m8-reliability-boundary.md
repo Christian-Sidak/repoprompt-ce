@@ -1418,6 +1418,69 @@ suite, a live MCP smoke, and a release build.
 Not claimed or changed: a `context_pack_ref` resume still runs under the connection's binding at
 resume time. The pack's provenance is not compared with that binding.
 
+### M20 — Oracle launch in the pinned context, pre-launch settlement
+
+M20 repairs two M19 gaps found in independent review. No feature scope was added.
+
+- **Pinned launch (P1).** M19 pinned the handoff: the carriers' launch tokens authorize the
+  committed context A. But `DirectHeadlessProviderCoordinator.runProviderOnce` then snapshotted the
+  connection *again* for the Oracle process's working directory. A `bind_context`, or a
+  workspace-roots change, landing between the pin validation and the launch could therefore start
+  an Oracle in B's root while its token authorized A. The backend now builds the pin once
+  (`let pin = Self.committedContextPin(outcome)`) and passes it to the handoff and to every Oracle
+  launch: to the direct route through `createConversation(launchPin:)`, and to each grouped lane
+  through `DirectHeadlessOracleAdapter.buildContext(discoveredInput:launchPin:)`. A pinned
+  `runProviderOnce` takes its snapshot from `DirectHeadlessDomainContext.pinnedLaunchSnapshot`. That
+  function revalidates the connection's read context against the pin at the launch boundary, reads
+  the *pinned* context (never the connection's current one), and checks that the snapshot is at the
+  pinned workspace and context revisions. Workspace roots are covered by the workspace revision.
+  Any difference throws `DomainChildLaunchContextPin.Mismatch`. An unresolvable binding or a missing
+  context is the new `.contextUnavailable`. No suspension point separates that snapshot from the
+  spawn. The process's working directory and its token authority are therefore always the same
+  context. On the direct route the refusal settles as "not started". A grouped lane's refusal is a
+  typed lane failure (`child_launch_context_changed`) in the group result, like any other lane
+  failure. Routes without a pin (all non-discovery routes) are unchanged.
+- **Pre-launch settlement (P2).** Token issuance re-checks the pinned context revision after
+  `pin.validate`. `settlementAfterDiscovery` recognized only `Mismatch`, so an issuance refusal
+  (`DomainRunLaunchTokenError.staleContextRevision`, or `.contextUnavailable`) was reported as a
+  generic Oracle failure. Over a no-op commit it was also `permanent`. `Mismatch(pinnedLaunchError:)`
+  now classifies those issuance refusals as the corresponding pre-launch change. The settlement says
+  the Oracle step was not started. Its `handoff` details add `reason` (`rebound`,
+  `workspace_revision_changed`, `context_revision_changed`, `context_unavailable`) and
+  `oracle_started: false`. It is `retryable` over a no-op commit and stays `indeterminate` over an
+  applied one.
+- **Root heading whitespace.** The path tools trim a relative spelling, so a root whose folder name
+  has leading or trailing whitespace (`app `) was headed `app ` and read back as `app`. Such a
+  label is never the heading now; the root's absolute path is. The label still prefixes file
+  spellings.
+- **Guardrail.** `headless_runtime_guardrails.sh` requires the shared pin at the handoff and at
+  both launch routes, the pinned launch snapshot, and the pre-launch classifier.
+
+Conductor evidence. The first run of the discovery suite (`1d253e65`) failed one M19 test. That was
+a test-harness defect: the new `realHandoffTool(afterPinValidation:)` parameter captured the
+unlabeled trailing closure of the M19 rebind test. The rebind therefore moved past the pin
+validation, where the new launch-boundary check refused both lanes. `50702293` reproduced it in
+isolation. With the closure labelled `atHandoff:`, the three focused suites below (`8154b4d1`)
+passed 52/52: 19 + 22 + 11. `9c138f94` failed as intended with the whitespace guard reverted; the
+guard was then restored. After that, `conductor lint` (`c8ac5d80`), `swift-build --product all`
+(`557afb2a`), and every `DirectHeadless*` suite (`7cca04f5`, 59/59) passed. `make guardrails`
+passed. Not run: the full root suite, a live MCP smoke, and a release build.
+
+- `DirectHeadlessContextDiscoveryTests`, through the real long-running provider, coordinator, and
+  routing tokens:
+  - With a probe after the handoff minted the carrier and before the Oracle launch, a rebind
+    refuses the direct Oracle launch. No process runs, the failure is `rebound` under `handoff`,
+    and the commit stays in the committed context.
+  - A workspace-roots replacement at the same point is refused as `workspace_revision_changed`.
+  - In a grouped rebind, the single rebind completes before either lane's boundary; both lanes
+    fail typed and neither process runs.
+  - With a probe inside the pinned preparation, after `pin.validate` and before issuance, a
+    context edit over a no-op commit is a `retryable`, `not_applied` pre-launch
+    `context_revision_changed`.
+  - The direct Oracle's recorded working directory is the committed root.
+- `ContextBuilderDiscoveryTests`: a trailing-space root is headed by its absolute path, and every
+  heading round-trips through `get_file_tree(path:)`.
+
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 
 The M8A–M13 branch was merged onto `origin/main` `a5586936`, which had independently landed #1081

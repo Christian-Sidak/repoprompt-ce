@@ -451,6 +451,7 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let calls = try fixture.calls()
         XCTAssertEqual(calls.map(\.kind), ["discovery", "discovery", "oracle"])
         XCTAssertNotNil(calls[2].launchID, "the direct Oracle ran with the carrier prepared at the handoff")
+        XCTAssertEqual(calls[2].workingDirectory, fixture.physicalRootPath, "the Oracle ran in the committed context's root")
     }
 
     func testSlowDiscoveryPreparesRedeemableGroupedCarriersAtTheHandoff() async throws {
@@ -548,10 +549,10 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let rebound = BarrierFlag()
         // The barrier lands after the commit, at the handoff, just before the coordinator resolves
         // the connection's context: a concurrent bind_context moves the connection to `other`.
-        let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend) {
+        let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend, atHandoff: {
             _ = try await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
             await rebound.set()
-        }
+        })
         let security = try await verifiedSecurityContext(prepared)
 
         let failure: MCPDomainToolFailure
@@ -614,9 +615,9 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         let feature = try XCTUnwrap(before.roots.first).path + "/Sources/Feature.swift"
         let editRequest = try await toolRequest(prepared)
         // Same binding, but the committed context is edited between the commit and the handoff.
-        let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend) {
+        let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend, atHandoff: {
             _ = try await prepared.context.mutate(request: editRequest, mutation: .setPrompt("edited after the commit"))
-        }
+        })
         let security = try await verifiedSecurityContext(prepared)
 
         let failure: MCPDomainToolFailure
@@ -654,6 +655,251 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         XCTAssertGreaterThan(after.context.revisions.workingRevision, UInt64(pinnedRevision))
     }
 
+    // MARK: - M20 Oracle launch pinned to the committed context
+
+    func testRebindAfterTheHandoffRefusesTheOracleLaunchUnderTheCommittedAuthority() async throws {
+        let fixture = try Fixture(name: "launch-rebind", discovery: true)
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let backend = Self.backend(prepared)
+        let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let other = try await Self.addContext(to: prepared)
+        let feature = try XCTUnwrap(committed.roots.first).path + "/Sources/Feature.swift"
+        let rebound = BarrierFlag()
+        // The barrier lands after the handoff validated the pin and minted the Oracle's carrier for
+        // the committed context, and before the Oracle process launches: a concurrent
+        // bind_context moves the connection to `other`.
+        await prepared.providerCoordinator.installPinnedLaunchProbe {
+            _ = try await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
+            await rebound.set()
+        }
+        let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend)
+        let security = try await verifiedSecurityContext(prepared)
+
+        let failure: MCPDomainToolFailure
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("What does Feature hold?"), "response_type": .string("question")])
+            }
+            return XCTFail("An Oracle launch after a rebind must be refused")
+        } catch let error as MCPDomainToolFailure {
+            failure = error
+        }
+        let barrierRan = await rebound.value
+        XCTAssertTrue(barrierRan)
+
+        // The carrier was minted for the committed context, and its process never started.
+        let bundles = await preparations.bundles
+        XCTAssertEqual(bundles.count, 1)
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"])
+        XCTAssertEqual(failure.code, "oracle_failed_after_discovery")
+        XCTAssertEqual(failure.mutationState, "applied")
+        XCTAssertEqual(failure.retryability, .indeterminate)
+        XCTAssertEqual(failure.settlement, "discovery_committed")
+        XCTAssertEqual(failure.details["context_id"], .string(committed.identity.contextID.uuidString))
+        guard case let .object(handoff)? = failure.details["handoff"] else {
+            return XCTFail("Expected the launch refusal: \(failure.details)")
+        }
+        XCTAssertEqual(handoff["code"], .string("child_launch_context_changed"))
+        XCTAssertEqual(handoff["reason"], .string("rebound"))
+        XCTAssertEqual(handoff["oracle_started"], .bool(false))
+        XCTAssertEqual(handoff["committed_context_id"], .string(committed.identity.contextID.uuidString))
+        XCTAssertTrue(
+            failure.message.contains(
+                "The Oracle step was not started: child_launch_context_changed: the connection was rebound to context "
+                    + other.contextID.uuidString
+            ),
+            failure.message
+        )
+        XCTAssertTrue(failure.message.contains("resume while bound to it"), failure.message)
+
+        // The commit stands in the committed context; the rebound one is untouched.
+        let now = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(now.identity, other)
+        XCTAssertEqual(now.selection, [])
+        _ = try await prepared.runtime.standaloneScopeCoordinator.bind(
+            scopeID: prepared.scopeID,
+            context: committed.identity
+        )
+        let original = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(original.selection, [feature])
+    }
+
+    func testWorkspaceRootsChangeAfterTheHandoffRefusesTheOracleLaunch() async throws {
+        let fixture = try Fixture(name: "launch-roots", discovery: true)
+        defer { fixture.cleanup() }
+        let movedRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-headless-discovery-moved-root-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: movedRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: movedRoot) }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let backend = Self.backend(prepared)
+        let committed = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        // Same binding, but the workspace's roots are replaced between the handoff and the launch:
+        // resolving the working directory now would name `movedRoot`, not the committed root.
+        await prepared.providerCoordinator.installPinnedLaunchProbe {
+            try await Self.replaceRoots(of: prepared, with: [movedRoot])
+        }
+        let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend)
+        let security = try await verifiedSecurityContext(prepared)
+
+        let failure: MCPDomainToolFailure
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("What does Feature hold?"), "response_type": .string("question")])
+            }
+            return XCTFail("An Oracle launch after a roots change must be refused")
+        } catch let error as MCPDomainToolFailure {
+            failure = error
+        }
+
+        let bundles = await preparations.bundles
+        XCTAssertEqual(bundles.count, 1, "the carrier was minted before the roots changed")
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"], "no Oracle process ran")
+        XCTAssertEqual(failure.code, "oracle_failed_after_discovery")
+        XCTAssertEqual(failure.mutationState, "applied")
+        XCTAssertEqual(failure.retryability, .indeterminate)
+        guard case let .object(handoff)? = failure.details["handoff"],
+              case let .int(pinnedRevision)? = handoff["committed_workspace_revision"]
+        else {
+            return XCTFail("Expected the launch refusal: \(failure.details)")
+        }
+        XCTAssertEqual(handoff["reason"], .string("workspace_revision_changed"))
+        XCTAssertEqual(handoff["oracle_started"], .bool(false))
+        XCTAssertTrue(
+            failure.message.contains("not started: child_launch_context_changed: the workspace revision moved from \(pinnedRevision) to "),
+            failure.message
+        )
+        XCTAssertFalse(failure.message.contains("resume while bound"), "the binding did not change")
+        let after = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(after.identity, committed.identity)
+        XCTAssertEqual(after.roots.map(\.path), [movedRoot.resolvingSymlinksInPath().path])
+    }
+
+    func testGroupedLanesRefuseToLaunchAfterARebindAndReportTypedLaneFailures() async throws {
+        let fixture = try Fixture(name: "launch-rebind-group", discovery: true)
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
+        let backend = Self.backend(prepared)
+        let other = try await Self.addContext(to: prepared)
+        // Each lane reaches its launch boundary only after the single rebind finished.
+        let rebind = OnceBarrier {
+            _ = try await prepared.runtime.standaloneScopeCoordinator.bind(scopeID: prepared.scopeID, context: other)
+        }
+        await prepared.providerCoordinator.installPinnedLaunchProbe { try await rebind.pass() }
+        let (wrapped, preparations) = await realHandoffTool(prepared: prepared, backend: backend)
+        let security = try await verifiedSecurityContext(prepared)
+
+        let value = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+            try await wrapped(["instructions": .string("Where is the feature marker?"), "response_type": .string("plan")])
+        }
+        let barrierRan = await rebind.ran
+        XCTAssertTrue(barrierRan)
+        guard case let .object(result) = value, case let .array(lanes)? = result["oracle_results"] else {
+            return XCTFail("Expected the grouped result: \(value)")
+        }
+        XCTAssertEqual(result["selection_committed"], .bool(true))
+        XCTAssertEqual(lanes.count, 2)
+        for lane in lanes {
+            guard case let .object(fields) = lane, case let .object(error)? = fields["error"],
+                  case let .string(message)? = error["message"]
+            else {
+                return XCTFail("Expected a typed lane failure: \(lane)")
+            }
+            XCTAssertEqual(fields["status"], .string("failed"))
+            XCTAssertEqual(error["code"], .string("child_launch_context_changed"))
+            XCTAssertTrue(message.contains("rebound to context \(other.contextID.uuidString)"), message)
+        }
+        let bundles = await preparations.bundles
+        XCTAssertEqual(bundles.count, 1)
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery"], "no lane process ran")
+    }
+
+    func testRevisionMoveRejectedAtTokenIssuanceOverANoOpCommitIsARetryablePreLaunchChange() async throws {
+        let fixture = try Fixture(name: "issuance-revision", discovery: true)
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: [])
+        let backend = Self.backend(prepared)
+        let before = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        let feature = try XCTUnwrap(before.roots.first).path + "/Sources/Feature.swift"
+        // A first discovery commits the selection, so the second one's identical selection is a no-op.
+        _ = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            arguments: ["instructions": .string("Find the feature"), "response_type": .string("clarify")]
+        )
+        let editRequest = try await toolRequest(prepared)
+        // The pin validates, then the committed context is edited before the token is issued.
+        let (wrapped, preparations) = await realHandoffTool(
+            prepared: prepared,
+            backend: backend,
+            afterPinValidation: {
+                _ = try await prepared.context.mutate(request: editRequest, mutation: .setPrompt("edited before issuance"))
+            }
+        )
+        let security = try await verifiedSecurityContext(prepared)
+
+        let failure: MCPDomainToolFailure
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(security) {
+                try await wrapped(["instructions": .string("What does Feature hold?"), "response_type": .string("question")])
+            }
+            return XCTFail("A launch token for a moved revision must not be issued")
+        } catch let error as MCPDomainToolFailure {
+            failure = error
+        }
+
+        XCTAssertEqual(failure.details["selection_committed"], .bool(false), "the second commit was a no-op")
+        XCTAssertEqual(failure.code, "oracle_failed_after_discovery")
+        XCTAssertEqual(failure.mutationState, DomainProtectedMutationState.notApplied.rawValue)
+        XCTAssertEqual(failure.retryability, .retryable, "nothing was written and no Oracle ran")
+        XCTAssertNil(failure.operationID)
+        guard case let .object(handoff)? = failure.details["handoff"],
+              case let .int(pinnedRevision)? = handoff["committed_context_revision"]
+        else {
+            return XCTFail("Expected the pre-launch refusal: \(failure.details)")
+        }
+        XCTAssertEqual(handoff["code"], .string("child_launch_context_changed"))
+        XCTAssertEqual(handoff["reason"], .string("context_revision_changed"))
+        XCTAssertEqual(handoff["oracle_started"], .bool(false))
+        XCTAssertTrue(
+            failure.message.contains(
+                "The Oracle step was not started: child_launch_context_changed: the context revision moved from \(pinnedRevision) to "
+            ),
+            failure.message
+        )
+        let bundles = await preparations.bundles
+        XCTAssertTrue(bundles.isEmpty)
+        XCTAssertEqual(try fixture.calls().map(\.kind), ["discovery", "discovery", "discovery", "discovery"])
+        let after = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        XCTAssertEqual(after.selection, [feature])
+        XCTAssertEqual(after.prompt, "edited before issuance")
+    }
+
+    func testPinnedLaunchErrorClassification() {
+        typealias Mismatch = DomainChildLaunchContextPin.Mismatch
+        XCTAssertEqual(
+            Mismatch(pinnedLaunchError: DomainRunLaunchTokenError.staleContextRevision(expected: 4, actual: 5)),
+            .contextRevisionChanged(expected: 4, actual: 5)
+        )
+        XCTAssertEqual(Mismatch(pinnedLaunchError: DomainRunLaunchTokenError.contextUnavailable), .contextUnavailable)
+        XCTAssertEqual(Mismatch(pinnedLaunchError: Mismatch.workspaceRevisionChanged(expected: 1, actual: 2)), .workspaceRevisionChanged(expected: 1, actual: 2))
+        XCTAssertNil(Mismatch(pinnedLaunchError: DomainRunLaunchTokenError.runContextConflict))
+        XCTAssertNil(Mismatch(pinnedLaunchError: CancellationError()))
+    }
+
     func testDiscoveryPurposeAndOptInParsing() {
         XCTAssertEqual(
             DirectHeadlessProviderCoordinator.codexExecArguments(model: "m", purpose: .contextDiscovery),
@@ -685,9 +931,13 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         prepared: DirectHeadlessMCPService.PreparedRuntime,
         backend: DirectHeadlessConversationBackend,
         carrierLifetime: Duration = .seconds(60),
-        atHandoff: (@Sendable () async throws -> Void)? = nil
+        atHandoff: (@Sendable () async throws -> Void)? = nil,
+        afterPinValidation: (@Sendable () async throws -> Void)? = nil
     ) async -> (tool: MCPDomainToolBinding, preparations: BundleRecorder) {
-        let coordinator = DirectHeadlessChildLaunchCoordinator(carrierLifetime: carrierLifetime)
+        let coordinator = DirectHeadlessChildLaunchCoordinator(
+            carrierLifetime: carrierLifetime,
+            pinnedIssuanceProbe: afterPinValidation
+        )
         await coordinator.configure(
             runtime: prepared.runtime,
             endpointDescriptor: prepared.childEndpoint.socketURL.path,
@@ -758,6 +1008,29 @@ final class DirectHeadlessContextDiscoveryTests: XCTestCase {
         ))
         XCTAssertEqual(outcome.disposition, .applied)
         return DomainContextIdentity(workspaceID: current.identity.workspaceID, contextID: contextID)
+    }
+
+    /// Replaces the bound workspace's roots (a workspace-roots change; the binding is kept).
+    private static func replaceRoots(
+        of prepared: DirectHeadlessMCPService.PreparedRuntime,
+        with roots: [URL]
+    ) async throws {
+        let current = try await prepared.context.snapshot(connectionID: prepared.connectionID)
+        var document = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: current.workspace.document.documentBytes) as? [String: Any]
+        )
+        document["repoPaths"] = roots.map(\.path)
+        let replacement = try DomainWorkspaceDocument.decode(
+            documentBytes: JSONSerialization.data(withJSONObject: document, options: [.sortedKeys]),
+            fileURL: current.workspace.document.fileURL
+        )
+        let outcome = await prepared.runtime.workspaceStore.execute(DomainWorkspaceCommandEnvelope(
+            operationID: UUID(),
+            expectedWorkspaceRevision: current.workspace.revisions.workingRevision,
+            origin: .standalone,
+            command: .replaceWorkingDocument(replacement)
+        ))
+        XCTAssertEqual(outcome.disposition, .applied)
     }
 
     private static func setRoster(
@@ -929,6 +1202,25 @@ private actor BarrierFlag {
     }
 }
 
+/// Runs one action once; every caller waits for that single run to finish.
+private actor OnceBarrier {
+    private var run: Task<Void, Error>?
+    private let action: @Sendable () async throws -> Void
+
+    init(_ action: @escaping @Sendable () async throws -> Void) {
+        self.action = action
+    }
+
+    var ran: Bool {
+        run != nil
+    }
+
+    func pass() async throws {
+        if run == nil { run = Task { try await action() } }
+        try await run?.value
+    }
+}
+
 private actor BundleRecorder {
     private(set) var bundles: [DomainChildLaunchCarrierBundle] = []
 
@@ -948,6 +1240,8 @@ private struct Fixture {
         let launchToken: String?
         let clientPrincipal: String?
         let providerIdentifier: String?
+        /// The provider process's physical working directory.
+        let workingDirectory: String?
     }
 
     let root: URL
@@ -992,9 +1286,10 @@ private struct Fixture {
           *"\#(ContextBuilderDiscoveryPrompt.protocolVersion)"*) kind=discovery ;;
         esac
         /usr/bin/printf '%s' "$input" > '\#(inputs.path)/'"$kind-$lane-$$.txt"
-        /usr/bin/printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$lane" "$model" "$sandbox" \
+        /usr/bin/printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$kind" "$lane" "$model" "$sandbox" \
           "${REPOPROMPT_MCP_LAUNCH_ID:-}" "$$" "${REPOPROMPT_MCP_LAUNCH_TOKEN:-}" \
-          "${REPOPROMPT_MCP_CLIENT_PRINCIPAL:-}" "${REPOPROMPT_MCP_PROVIDER_IDENTIFIER:-}" >> '\#(callLog.path)'
+          "${REPOPROMPT_MCP_CLIENT_PRINCIPAL:-}" "${REPOPROMPT_MCP_PROVIDER_IDENTIFIER:-}" \
+          "$(/bin/pwd -P)" >> '\#(callLog.path)'
         if [ "$kind" = discovery ]; then
           if [ "$model" = gated ]; then
             case "$input" in
@@ -1076,7 +1371,8 @@ private struct Fixture {
                     processID: fields[5],
                     launchToken: optional(6),
                     clientPrincipal: optional(7),
-                    providerIdentifier: optional(8)
+                    providerIdentifier: optional(8),
+                    workingDirectory: optional(9)
                 )
             }
     }
@@ -1118,6 +1414,13 @@ private struct Fixture {
             contentsOf: inputs.appendingPathComponent("\(call.kind)-\(call.lane)-\(call.processID).txt"),
             encoding: .utf8
         )
+    }
+
+    /// The kernel spelling of `root`, as the provider process's `pwd -P` reports it.
+    var physicalRootPath: String? {
+        guard let resolved = realpath(root.path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     func cleanup() {

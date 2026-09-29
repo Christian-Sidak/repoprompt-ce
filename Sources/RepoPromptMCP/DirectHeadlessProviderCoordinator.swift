@@ -76,6 +76,9 @@ actor DirectHeadlessProviderCoordinator {
     private var providerTasks: [UUID: Task<String, Error>] = [:]
     private var conversations: [UUID: Conversation] = [:]
     private var isShuttingDown = false
+    /// Test seam: runs at a pinned launch's boundary, after its carriers were minted and before
+    /// the launch revalidates the pin and resolves the process's working directory.
+    private var pinnedLaunchProbe: (@Sendable () async throws -> Void)?
 
     init(
         runtime: MCPDomainRuntime,
@@ -134,6 +137,16 @@ actor DirectHeadlessProviderCoordinator {
         }
     }
 
+    func installPinnedLaunchProbe(_ probe: (@Sendable () async throws -> Void)?) {
+        pinnedLaunchProbe = probe
+    }
+
+    /// Runs one provider process. Without `launchPin` it runs in the connection's current context.
+    /// With one (an Oracle step whose carriers were minted for a committed context), it runs in the
+    /// pinned context: the working directory comes from that context, not from the connection's
+    /// binding, and the connection must still resolve to the pin at this launch boundary, else the
+    /// launch fails closed with `DomainChildLaunchContextPin.Mismatch` and no process starts. So the
+    /// process's directory and its carriers' token authority are always the same context.
     func runProviderOnce(
         message: String,
         providerID: String?,
@@ -141,7 +154,8 @@ actor DirectHeadlessProviderCoordinator {
         request: DomainPhysicalToolRequest,
         sessionID: UUID? = nil,
         purpose: ExecutionPurpose,
-        carrierEnvironment: [String: String]? = nil
+        carrierEnvironment: [String: String]? = nil,
+        launchPin: DomainChildLaunchContextPin? = nil
     ) async throws -> String {
         guard !isShuttingDown else { throw CancellationError() }
         let descriptor = try resolveProvider(providerID)
@@ -152,10 +166,21 @@ actor DirectHeadlessProviderCoordinator {
             throw DirectHeadlessDomainContext.Error.routingUnavailable
         }
         let effectiveSessionID = sessionID ?? request.securityContext?.principal.runID
-        let snapshot = try await context.snapshot(
-            connectionID: connectionID,
-            sessionID: effectiveSessionID
-        )
+        let snapshot: DirectHeadlessDomainContext.Snapshot
+        if let launchPin {
+            try await pinnedLaunchProbe?()
+            snapshot = try await context.pinnedLaunchSnapshot(
+                launchPin,
+                connectionID: connectionID,
+                sessionID: effectiveSessionID
+            )
+        } else {
+            snapshot = try await context.snapshot(
+                connectionID: connectionID,
+                sessionID: effectiveSessionID
+            )
+        }
+        // No suspension from here to the spawn: the process starts in the snapshot just validated.
         guard !isShuttingDown else { throw CancellationError() }
         try Task.checkCancellation()
         let arguments = Self.codexExecArguments(model: model, purpose: purpose)
@@ -391,7 +416,8 @@ actor DirectHeadlessProviderCoordinator {
         providerID: String?,
         message: String,
         model: String?,
-        request: DomainPhysicalToolRequest
+        request: DomainPhysicalToolRequest,
+        launchPin: DomainChildLaunchContextPin? = nil
     ) async throws -> (UUID, String) {
         let descriptor = try resolveProvider(providerID)
         let text = try await runProviderOnce(
@@ -399,7 +425,8 @@ actor DirectHeadlessProviderCoordinator {
             providerID: descriptor.id,
             model: model,
             request: request,
-            purpose: .directOracle
+            purpose: .directOracle,
+            launchPin: launchPin
         )
         let id = UUID()
         conversations[id] = Conversation(

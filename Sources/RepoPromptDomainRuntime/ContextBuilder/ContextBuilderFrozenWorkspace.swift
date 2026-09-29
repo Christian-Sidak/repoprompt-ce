@@ -328,10 +328,14 @@ package struct ContextBuilderFrozenWorkspace: Sendable {
     }
 
     /// The spelling of the root directory itself: its label when that resolves back to exactly this
-    /// root (the rule `displayPath` applies to files), else its absolute path.
+    /// root (the rule `displayPath` applies to files), else its absolute path. The path tools trim a
+    /// relative spelling, so a label with leading or trailing whitespace is never the heading.
     private func rootHeading(_ index: Int) -> String {
         let label = rootLabel(index)
         guard !label.hasPrefix("/") else { return label }
+        guard label == label.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return snapshot.roots[index].path
+        }
         let root = URL(fileURLWithPath: snapshot.roots[index].path).standardizedFileURL.path
         return (try? resolveSpelling(label)) == root ? label : snapshot.roots[index].path
     }

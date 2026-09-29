@@ -101,6 +101,46 @@ actor DirectHeadlessDomainContext {
         return try await snapshot(identity: handle.context, sessionID: sessionID)
     }
 
+    /// The snapshot a child launched under `pin` runs in: the pinned context, never whatever the
+    /// connection is bound to by now. At this launch boundary the connection must still resolve to
+    /// exactly the pin (same context, same workspace and context revisions, so the same roots), and
+    /// the snapshot itself must be at the pinned revisions; otherwise this throws
+    /// `DomainChildLaunchContextPin.Mismatch` and nothing may be launched.
+    func pinnedLaunchSnapshot(
+        _ pin: DomainChildLaunchContextPin,
+        connectionID: UUID,
+        sessionID: UUID? = nil
+    ) async throws -> Snapshot {
+        let handle: DomainReadContextHandle
+        do {
+            let registration = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+            handle = try await runtime.routingCoordinator.resolveReadContext(connection: registration)
+        } catch is DomainReadContextResolutionError {
+            throw DomainChildLaunchContextPin.Mismatch.contextUnavailable
+        }
+        try pin.validate(handle)
+        let snapshot: Snapshot
+        do {
+            snapshot = try await self.snapshot(identity: pin.context, sessionID: sessionID)
+        } catch Error.workspaceUnavailable, Error.contextUnavailable {
+            throw DomainChildLaunchContextPin.Mismatch.contextUnavailable
+        }
+        // The snapshot is read after the handle; it must still be the pinned authority.
+        guard snapshot.context.revisions.workingRevision == pin.contextRevision else {
+            throw DomainChildLaunchContextPin.Mismatch.contextRevisionChanged(
+                expected: pin.contextRevision,
+                actual: snapshot.context.revisions.workingRevision
+            )
+        }
+        guard snapshot.workspace.revisions.workingRevision == pin.workspaceRevision else {
+            throw DomainChildLaunchContextPin.Mismatch.workspaceRevisionChanged(
+                expected: pin.workspaceRevision,
+                actual: snapshot.workspace.revisions.workingRevision
+            )
+        }
+        return snapshot
+    }
+
     func snapshot(identity: DomainContextIdentity, sessionID: UUID? = nil) async throws -> Snapshot {
         guard let workspace = await runtime.contextStore.workspaceSnapshot(identity.workspaceID) else {
             throw Error.workspaceUnavailable

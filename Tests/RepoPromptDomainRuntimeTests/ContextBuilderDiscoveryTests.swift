@@ -700,6 +700,37 @@ final class ContextBuilderDiscoveryTests: XCTestCase {
         }
     }
 
+    func testRootHeadingWithEdgeWhitespaceIsSpelledAbsoluteAndRoundTrips() async throws {
+        let fixture = try MultiRootFixture()
+        defer { fixture.cleanup() }
+        // A root whose folder name ends in a space: the path tools trim a relative spelling, so the
+        // bare label `app ` would be read back as `app`, which names nothing.
+        let spaced = fixture.base.appendingPathComponent("spaced/app ", isDirectory: true)
+        try FileManager.default.createDirectory(at: spaced, withIntermediateDirectories: true)
+        try Data("let value = \"SPACED_MARKER\"\n".utf8).write(to: spaced.appendingPathComponent("Spaced.swift"))
+        let spacedRoot = spaced.standardizedFileURL.resolvingSymlinksInPath()
+        let roots = [spacedRoot, fixture.lib]
+        let workspace = fixture.workspace(roots: roots)
+        let expectedHeadings = [spacedRoot.path, "lib"]
+        XCTAssertEqual(workspace.rootSpellings.map(\.heading), expectedHeadings)
+        XCTAssertEqual(workspace.rootSpellings.map(\.label), ["app ", "lib"], "the label still prefixes file spellings")
+        let overview = try await workspace.executeRead(
+            tool: "get_file_tree",
+            arguments: ["max_depth": .int(1)],
+            stagedSelection: []
+        )
+        for (root, heading) in zip(roots, expectedHeadings) {
+            XCTAssertTrue(overview.contains(heading + "/\n"), "\(heading) in \(overview)")
+            let subtree = try await workspace.executeRead(
+                tool: "get_file_tree",
+                arguments: ["path": .string(heading), "max_depth": .int(1)],
+                stagedSelection: []
+            )
+            XCTAssertEqual(subtree.contains("Spaced.swift"), root == spacedRoot, "\(heading) names its own root: \(subtree)")
+            XCTAssertEqual(subtree.contains("Only.swift"), root == fixture.lib, "\(heading) names its own root: \(subtree)")
+        }
+    }
+
     func testPromptBudgetElidesOldestToolResultsFirst() async throws {
         let fixture = try WorkspaceFixture()
         defer { fixture.cleanup() }
