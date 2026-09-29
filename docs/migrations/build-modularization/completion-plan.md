@@ -1,7 +1,422 @@
-# Build Modularization: Completion Plan
+# Build Modularization: Completion Plan (minimum-complete scope)
+
+Status: **Proposed**, revision 2 (2026-09-29), against `origin/main` `944854b7`. It replaces the first draft (`c90109d7`), which aimed for an app target at ≤ 10% of the code in 150–220 PRs over 4–7 months. That draft is kept in full as the appendix, [Later / further efficiencies](#appendix-later--further-efficiencies).
+
+Inputs:
+- [`../build-modularization-2026-09-28.md`](../build-modularization-2026-09-28.md), the program plan (architecture, seams S1–S17, slice protocol);
+- [`ledger.md`](ledger.md), with the Phase 0 evidence and ADR-01…09;
+- the frozen headless handoff note (`git show 7eaf24b2:docs/spec/headless-option-b-handoff.md`), read as input only.
+
+This document does not change the architecture. It picks the smallest set of slices that meets the two goals below, sizes and orders them, and defers everything else.
+
+Legend:
+- **[M]**: measured for this plan.
+- **[L]**: from the ledger.
+- **[E]**: estimate.
+- **G1** / **G2**: the goal a slice or criterion serves (§1.1).
+- Labels on each PR:
+  - **L**: logic change (behavior-preserving);
+  - **A**: access-level only, meaning a separate access and `import` PR;
+  - **M**: pure move, meaning `git mv` plus the access and `import` edits the move needs, byte-identical otherwise, as checked by the audit in §4.4.
+- Time is in **agent-days**: one writer doing the pre-work, the move, validation, and review fixes.
+
+---
+
+## 0. Summary
+
+- **Finish line.** Two goals:
+  - **G1:** a majority of day-to-day edits run their own module's tests without building `RepoPromptApp`, and new code cannot land in the old app or add wrong-way edges;
+  - **G2:** headless MCP can be finished on stable, app-free seams.
+- **How each is measured (§1.3).**
+  - G1: ≥ 55% of Swift file edits land in app-free modules (15% today [M]); module edit→test p50 ≤ 60 s; the CI critical path ≤ 15 min with one app build (25 min longest job and five app builds today [M]); ratchets and an edge matrix enforced in CI.
+  - G2: seven named headless seams exist in app-free targets, each with contract tests.
+  - App share is tracked, not targeted. It lands near **40%** (88.4% today).
+- **Scope.** 29 slices, and 6 of them are tooling (plus a conditional T6):
+  - tooling T0–T5;
+  - foundations A1–A5;
+  - platform B1–B4;
+  - WorkspaceContext C1–C3;
+  - MCP server D1–D4;
+  - AI E1–E2;
+  - agent runtime F1–F4;
+  - exit X.
+- **Total [E].** About **77–110 PRs** and **89–147 agent-days** (midpoint ≈ 118). With **2 worktrees** that is **9–15 weeks, ≈ 12 expected**. The critical path runs through WorkspaceContext, then the MCP server move, then the agent-runtime move. The previous draft needed 17–30 weeks.
+- **Headless checkpoint.** At about **week 6–7**, WorkspaceContext (C3) and S5/S6 (D1/D2) have landed. The port-vs-rebuild decision can then be made. Porting settlement/admission waits for D3 (week 7).
+- **Deferred** (appendix): the design system and fonts (S1); feature UI splits (Settings, Prompt, Chat, ContextBuilder, Workspaces, WorkspaceFiles, AgentMode UI, MCP presentation, Diagnostics); window capabilities (S2) and the composition-root slimming; the full god-file decompositions (`WorkspaceFileContextStore`, `MCPConnectionManager`, `AgentModeViewModel`, `GitService`); Presets; the SwiftSyntax codemod toolkit; the no-change focused test ≤ 15 s; the test-sleep ratchet; cross-worktree caching (conditional, T6).
+
+---
+
+## 1. Goals, evidence, and exit criteria
+
+### 1.1 Goals (define "done")
+
+- **G1: developer productivity.** Build and test inefficiencies are removed where most editing happens, and new features cannot get tangled into the old app.
+- **G2: headless readiness.** Headless MCP can be finished without revisiting modularization-related architectural flaws. The seams it needs are request settlement/admission, DomainRuntime, WorkspaceContext, the MCP window tools, and VCS.
+
+### 1.2 Evidence that sets the scope [M]
+
+**Where edits land.** The sample is 90 days of `main` (since 2026-07-01), 677 commits that touch Swift sources, and 3,951 Swift file touches. Each row adds modules on top of the row above it.
+
+| Code outside `RepoPromptApp` | Share of file touches | Commits touching only module code |
+| --- | --- | --- |
+| Today (DomainRuntime, MCP CLI/Core, Shared, CodeMapCore, RegexCore, WorkspaceCore, provider package) | 15% | 6% |
+| + leaf adapters (Foundation, Regex, Process, FileSystem, VCS, Security, Persistence) | 23% | 12% |
+| + WorkspaceContext (incl. Search, CodeMap orchestration) | 28% | 17% |
+| + MCP server (`Infrastructure/MCP` minus `ViewModels/`, `WindowTools/`) | 38% | 22% |
+| + AI (contracts and providers) | 47% | 29% |
+| + agent runtime (`AgentMode/{Runtime,History,Routing,Services,Providers,Models,Recommendations}`) | **60%** | 38% |
+
+- **What this means.**
+  - The agent runtime is what takes G1 past a majority. Without it, the reach is 47%.
+  - The remaining app-side hot spots are UI and view models: `AgentMode/ViewModels` 291 touches, `MCP/WindowTools` 177, `AgentMode/Views` 160, `MCP/ViewModels` 129, `Settings/Views` 103.
+  - Feature commits span logic and UI, so the whole-commit share stays lower. The edit→test loop is per file edited, so file touches are the measure.
+- **Probe findings [M].**
+  - **Agent runtime to providers.** 10 runtime files reference concrete provider types: `CodexNativeSessionController`, `CodexAppServerClient`, `ACPAgentSessionController`, `ClaudeNativeProcessSessionController`, and others. Most of them are in `Runtime/Codex` and `ProviderConversationCleanupRegistry`. The providers (E2) therefore move before the runtime (F4).
+  - **Settings store.** `GlobalSettingsStore` is declared inside the 2,780-line `Settings/Models/GlobalSettingsManager.swift`. It imports Foundation only, with no `Bundle.main`. Its app couplings are `PromptViewModel.PlanActMode` and one app notification. `GlobalSettingsDocument` (648 lines) and `GlobalSettingsFileStore` (742) have none. The consumers that matter here are 7 MCP-server files and 6 runtime files, plus 0 in WorkspaceContext. A small pre-work step plus a move replaces the facet redesign.
+  - **Small folders.**
+    - `Infrastructure/Diffing` has one consumer, in AI, so it folds into E2.
+    - `Security` is used by runtime (1 file), AI (2), the app (3) and other UI (3). `BundleIdentityDefaultsMigration` and `RuntimeCodeSigningPolicy` read `Bundle.main`, so the target is app-only.
+    - `Persistence/CodeMapArtifacts` is used by WorkspaceContext (2 files).
+    - `Persistence/DurableArtifacts` has no external references.
+    - `Persistence/Presets` is used only by AI (1) and UI (2), so it is deferred.
+- **CI [M].**
+  - Run `34618892604` on main took 36.5 min wall.
+  - The longest single job was 25.3 min (root shard 1). The four test shards took 15.9–25.3 min each, and the Sentry build 23.2 min.
+  - That is **five app builds per run**. Recent main runs took 26–39 min wall, including runner queueing.
+- **Edit→test [L].**
+  - App aggregate path: median 2.9–4.7 min, p90 9–12 min.
+  - Module path (ADR-07): median 33.5–48.1 s on the two measured targets.
+  - Heavy-slot wait: p90 8.8 min, with waits up to 35 min seen.
+
+### 1.3 Exit criteria (done when all hold)
+
+| # | Goal | Criterion | Target | Measured by |
+| --- | --- | --- | --- | --- |
+| X1 | G1 | **Edit locality:** share of Swift file touches, over the trailing 60 days of `main`, that land in targets whose owning test target does not build `RepoPromptApp` | **≥ 55%** (15% today; 60% projected from the §1.2 history) | `modularization_metrics.py edit-locality` (added in T2) |
+| X2 | G1 | Module edit → owning tests pass, excluding queue | p50 ≤ 60 s, p90 ≤ 3 min over ≥ 20 `--module` jobs | `conductor_job_timings.py` |
+| X3 | G1 | Every family moved by this plan has an owning `<Module>Tests` target. Tests for moved code live there, with no `@testable import RepoPromptApp` | Owning target for each; `tests_testable_import_app_files` ≤ 175 (325 today [M]; [E] from the test folders that move) | Module catalog, gated ratchet |
+| X4 | G1 | CI critical path, excluding runner queueing | Longest job ≤ 15 min, and **one** app build per PR run (the Sentry variant is conditional or off the PR path). Fallback: ≥ 40% below the baseline measured at T5 start | `gh run view` job timings |
+| X5 | G1 | Heavy-slot wait with 2 active worktrees | p90 ≤ 5 min | `conductor_job_timings.py` |
+| X6 | G1 | The cycle is broken along the seams that matter | No SwiftPM target cycle. Every moved family has zero edges into `RepoPromptApp` (compiler-enforced). The index shows 0 remaining wrong-way edges through seams S3–S6, S8, S9, S12, S17. The largest app SCC is reported, not targeted | Compiler; `modularization_index_graph.py report` |
+| X7 | G1 | Guardrails stop regressions | In CI: `--explicit-target-dependency-import-check error`; the allowed-edge matrix; a placement guardrail for each moved family (new files for that family go in its module); the ratchets in §1.5 gated | CI and `make guardrails` |
+| X8 | G2 | Headless seams exist in app-free targets, each with a contract test in its module | (a) `ToolInvocationContext` (`Sendable`, no window references); (b) an admission-policy value plus a settlement-result type in `RepoPromptMCPServer`; (c) the file-tool authority snapshot in the server layer; (d) a read-only, root-scoped WorkspaceContext snapshot; (e) non-`@MainActor` VCS worktree and repository queries; (f) an `IgnoreMatcher`-shaped API in FileSystem; (g) a global-ignore settings facet. DomainRuntime gains no app dependency and nothing is moved out of it | Module catalog; contract tests; §3 notes |
+| X9 | G1 | No regression > 10% | Release build time, launch time, peak memory, Repo Bench | At C3, D4, F4 |
+
+### 1.4 Tracked, not goals
+
+| Number | Today [M] | Projected at exit [E] |
+| --- | --- | --- |
+| App share of first-party Swift | 88.4% (652,086 / 737,191) | **≈ 40%** (≈ 350–370k lines out), before feature growth |
+| Index wrong-way edges / largest file SCC | 1,364 / 640 of 1,161 | Reported at each move; no target |
+| Feature edit → debug package | 13.2 / 60 min [L] | Reported at C3, D4, F4 |
+| No-change focused test | 22 s on the module path [L] | Deferred (appendix, X7) |
+
+### 1.5 Ratchets: each is gated as soon as its slice lands
+
+| Ratchet or guardrail | Gated in | Notes |
+| --- | --- | --- |
+| `tests_testable_import_app_files` (non-increasing) | T1 | The regex is exact. Every test move lowers the baseline in the same PR |
+| `app_files_over_2000_lines` | T1 | Exact line counts |
+| `app_target_swift_lines` as a ceiling | T1 | Baseline plus a fixed headroom for feature work; each move PR lowers the ceiling by what it moved |
+| Import check `error` and the allowed-edge matrix | T1 | Covers the existing targets; each new target adds its row in its move PR |
+| Placement guardrail ("new files for a moved family go in its module") | T1, then extended by each move PR | This is the main "no new code in the old app" lever |
+| Per-target guardrails: no SwiftUI/AppKit in logic targets, no `RepoPromptApp` import, `bundle_main_allowed_roots` | Each target's move PR | P0.6 checklist |
+| Index wrong-way edges and largest SCC (non-increasing); type-check budgets (≥ 1,000 ms bodies = 10, ≥ 500 ms expressions = 6) | T5 | Needs the build-producing CI job and trusted freshness (T3) |
+| `app_files_over_5000_lines`, `app_static_shared_declarations` | Already gated | — |
+
+---
+
+## 2. Slices
+
+Sizes come from text measurements in the first draft [M]. "Days" is agent-days [E]. Each PR lands within about a day, so a slice is its PR count. Readiness is re-run at the start of every slice (program plan §7 step 1), and a slice is re-estimated if its blockers differ.
+
+### 2.1 Tooling (runs alongside wave A; the move audit comes first)
+
+| ID | Scope (first-draft ID) | Goal | Size | Labels (PRs) | Days | Depends on |
+| --- | --- | --- | --- | --- | --- | --- |
+| **T0** | `Scripts/modularization_move_audit.py` plus tests (§4.4); a diagnostics-driven **access-lift script** (parses "inaccessible due to `internal`" errors, adds `package`); a test-import retarget helper; `make new-module NAME= FAMILY=` template (P1-a) | G1 | ~500–800 script lines | tooling ×1–2 | 1–1.5 | — |
+| T1 | `modules.json` and `docs/architecture/modules.md`; CI import check `error`; allowed-edge matrix; placement guardrail; gate the §1.5 T1 ratchets (P1-b) | G1 | Manifest, guardrails, CI | tooling ×1–2 | 1–2 | T0 |
+| T2 | `dev-test MODULE=`; `FILTER` → owning-target resolution; `edit-locality` metric (X1) (P1-c) | G1 | conductor, metrics | tooling ×1–2 | 1–2 | T1 |
+| T3 | Index freshness by content hash, not mtime (P1-d) | G1 | `modularization_index_graph.py` | tooling ×1 | 0.5 | — |
+| T4 | **ADR-08 admission v2**, weighted by measured `peakRss` (module jobs ≈ 1.5 GiB, app and aggregate links 3–5 GiB [L]) (P1-f) | G1 | conductor | tooling ×2–3 | 2–3 | T2 |
+| T5 | CI: one app build per run (build once, then fan out test shards); module-test jobs for extracted targets; affected-target selection; the index and type-check gates (P1-e) | G1 | `.github/workflows/ci.yml`, runner | tooling ×2–4 | 2–4 | T3 |
+| *T6* | *Conditional:* ADR-08 §5.5 cross-worktree cache sharing, **only if** after T4 the cold per-worktree scratch builds still cost > 10% of agent build time, and clean-vs-cached equivalence passes | G1 | conductor | tooling ×1–2 | 1.5–3 | T4 |
+
+T6 is not in the totals.
+
+### 2.2 Wave A: foundations
+
+| ID | Scope, target | Goal | Size [M] | Labels (PRs) | Days | Depends on |
+| --- | --- | --- | --- | --- | --- | --- |
+| A1 | `RepoPromptFoundation`: Concurrency, Utilities, Networking, SyntaxParsing; plus the `Notification.Name` constants used by the moved closures (a slim S13) (W1-1) | G1 | 22 files, ~1.4k lines; 3 blockers (`CustomOpenAIProvider` error enum, `LineRange`, `SliceRangeMath`) [L] | L×1 → M×1 (+M×1 names) | 2–3 | T0 |
+| A2 | S12 `RepoPromptInstrumentation`: event and sink contracts and a no-op sink for `AgentModePerfDiagnostics`, `MCPToolExecutionDiagnostics`, `WorkspaceRestorePerfLog`/`WorktreeStartupInstrumentation`, `AgentSessionLinkCatalogDiagnostics`; Telemetry. Implementations stay in Diagnostics (W1-4) | G1 | ~3.9k lines; removes ~83 index wrong-way edges | L×3 (one per family) → M×1 | 3–5 | A1 |
+| A3 | `Infrastructure/Regex` adapters → `RepoPromptRegexCore` (W1-2) | G1 | 3 files, 1.7k | M×1 (+L×1 if readiness finds app references) | 1–1.5 | A1 |
+| A4 | `RepoPromptProcess`: `Infrastructure/Process` (+CLI) (W1-5) | G1+G2 | 24 files, 5.7k; inbound 46 files / 179 symbols; 4 non-Foundation blockers [L] | L×1 → A×1 → M×1 | 2–3 | A1 |
+| A5 | `RepoPromptSecureStorage` (app-only; added to `bundle_main_allowed_roots`) (W1-6) | G1 | 14 files, 3.9k; consumers: runtime 1, AI 2, app 3, UI 3 | L×0–1 → M×1 | 1.5–2.5 | A1 |
+
+### 2.3 Wave B: platform
+
+| ID | Scope, target | Goal | Size [M] | Labels (PRs) | Days | Depends on |
+| --- | --- | --- | --- | --- | --- | --- |
+| B1 | `RepoPromptFileSystem`: FSEvents, `FileSystemService`, `GitignoreCompiler` behind an `IgnoreMatcher`-shaped API, disk writer; `WorkspaceDiskWriter.shared` (40 uses) to injection (W2-1) | G1+G2 | 33 files, 18.9k; tests 5 files | L×2–3 → M×1 (A×1 if > 50 files need access) | 4–6 | A4 |
+| B2 | `RepoPromptVCS`: evict feature references; expose worktree and repository queries as non-`@MainActor`, app-free APIs; move. **No `GitService` decomposition** (W2-2, reduced) | G2+G1 | 54 files, 32.2k; tests 14 files | L×2–3 → M×1–2 | 4–6 | A4, B1 |
+| B3 | `RepoPromptPersistence`: `CodeMapArtifacts` (+`DurableArtifacts`). **Presets deferred** (W2-3, reduced) | G1 | ~10k [E] of 15k; CodeMap artifact goldens must stay byte-identical | L×0–1 → M×1 | 1.5–3 | B1 |
+| B4 | `RepoPromptSettingsCore` (app-only): split `GlobalSettingsStore` out of its 2,780-line mixed file; drop its `PromptViewModel.PlanActMode` and app-notification couplings; move store, document, and file store, **keeping `.shared` for now**; add a global-ignore facet (W2-4, reduced) | G1+G2 | ~3.4k lines [E]; 7 MCP-server and 6 runtime consumers; settings goldens and `testGlobalSettingsDocumentPersistedKeysArePinned` must hold | L×2 → M×1 → L×1 (facet) | 3–5 | A1 |
+
+### 2.4 Wave C: WorkspaceContext
+
+| ID | Scope | Goal | Size [M] | Labels (PRs) | Days | Depends on |
+| --- | --- | --- | --- | --- | --- | --- |
+| C1 | S9 `WorkspaceModel` values downward (37 edges); S8 `WorkspaceFilesViewModel` selection and projection contracts (10 edges); S17 `PromptViewModel` (26) and `WorkspaceManagerViewModel` (20) consumers (W3-1) | G1+G2 | ~40 consumer files [E] | L×4–5 | 4–6 | B3 |
+| C2 | A **read-only, root-scoped snapshot** value type separate from the mutating selection store, plus only the `WorkspaceFileContextStore` carve-outs the move needs. **No full 22.8k-line split** (W3-2, reduced) | G2 | 22.8k-line file; 2–4 extractions | L×2–4 | 3–5 | C1 |
+| C3 | Move `RepoPromptWorkspaceContext` (+`…Search`, + `…CodeMapOrchestration` if the closure warrants), including `Features/Search` and `Features/CodeMap` orchestration; the codemap binding engine moves whole (W3-4, W3-5) | G1+G2 | ~110 files, ~85k; tests 28 + part of 14 files | L×1 → A×1 → M×2–3 | 5–9 | C2 |
+
+### 2.5 Wave D: MCP server
+
+| ID | Scope | Goal | Size [M] | Labels (PRs) | Days | Depends on |
+| --- | --- | --- | --- | --- | --- | --- |
+| D1 | S5: hoist immutable invocation-context values out of `MCPServerViewModel`: `RequestMetadata` (63 refs / 16 files), `TabContextSnapshot` (47/14), `ResolvedTabContextSnapshot` (34/10), `FrozenFileToolAuthority` (25/6), `ConnectionBindingSnapshot` (13/3) (W5-1) | G2 | ~5.1k plus ~40 consumer files | L×3–5 | 4–7 | A2 |
+| D2 | S6: an explicit `ToolInvocationContext` threaded through dispatch, replacing ambient `ServerNetworkManager.shared` state (31 files). Fails closed; idempotent against duplicate request IDs and cancellation. **High risk** (W5-2) | G2 | 31 files | L×1 (type plus dual path) → L×3–4 (by tool family) → L×1 (remove fallback) | 6–9 | D1 |
+| D3 | An admission and settlement **policy seam** extracted from `MCPConnectionManager`; the authority snapshot type moves into the server layer. **No full 16.9k-line split** (W5-3, reduced) | G2 | 2–4 extractions | L×2–4 | 3–5 | D2 |
+| D4 | Move `RepoPromptMCPServer` (transport, dispatch, admission, policy). `WindowTools` stay app adapters registered by composition (W5-4) | G1+G2 | ~45–60k [E]; tests `MCP` 43 files | L×1–2 (evict VM and `App` edges) → M×1–2 | 4–7 | C3, D3, B4 |
+
+### 2.6 Wave E: AI
+
+| ID | Scope | Goal | Size [M] | Labels (PRs) | Days | Depends on |
+| --- | --- | --- | --- | --- | --- | --- |
+| E1 | `RepoPromptAIContracts`: provider-neutral model and catalog DTOs, `AgentACPModelRegistry.shared` to injection, `AgentRuntimeProviderService` vocabulary. Raw values unchanged (W4-1) | G1 | ~5.1k; 150 index edges from 61 files | L×3 → M×1 | 4–6 | A2 |
+| E2 | Provider families to their own targets: Codex app-server (`CodexNativeSessionController` 9.4k), ACP, the Claude bridge (two-bridge rule kept), the rest. `Infrastructure/Diffing` folds in (its only consumer is AI); the one Presets reference is inverted (W4-2) | G1 | ~125 files, ~56k (+1.9k Diffing); tests 16 files | L×3 → M×3–4 | 7–12 | E1, A4, A5 |
+
+### 2.7 Wave F: agent runtime
+
+| ID | Scope | Goal | Size [M] | Labels (PRs) | Days | Depends on |
+| --- | --- | --- | --- | --- | --- | --- |
+| F1 | S3: hoist neutral values out of `AgentModeViewModel+Types` (144 nested types used from 53 files) to top level. A nested `typealias` is left behind, so **consumers do not change**. Type-name identity is checked by P0.6 item 3 (W6-1, no codemod) | G1 | ~1.1k; 22 edges | L×2–3 | 2–4 | E1 |
+| F2 | S4: Codex turn **state** out of `AgentTabSession` (156 Codex members used from 19 files) into a store owned by the Codex runtime (W6-2) | G1 | 19 files | L×3–4 | 4–6 | F1 |
+| F3 | A runtime-owned session store; the 13 stored runtime→`AgentModeViewModel` references inverted; provider-neutral seams where the runtime needs them. **The full 21.8k-line VM decomposition is deferred** (W6-3, reduced) | G1 | 13 references [L]; 10 runtime files with concrete provider references [M] | L×4–6 | 6–10 | F2 |
+| F4 | Move `RepoPromptAgentRuntime` (+ a Codex runtime sub-target; History, Routing, Services, Providers, Models, Recommendations) and retarget its tests (W6-4) | G1 | Runtime 100 files, 67.2k, plus ~13k; tests: the runtime part of `AgentMode`'s 132 files | A×1 → M×3–5 → M×1–2 (tests) | 6–11 | F3, E2, D4, B4 |
+
+### 2.8 Exit
+
+| ID | Scope | Goal | Labels | Days |
+| --- | --- | --- | --- | --- |
+| X | Measure X1–X9, flip any remaining ceilings, finalize the catalog, record in the ledger | G1+G2 | tooling ×1 | 1–2 |
+
+### 2.9 Totals, order, and schedule [E]
+
+| Group | PRs | Agent-days |
+| --- | --- | --- |
+| Tooling T0–T5 | 8–14 | 7.5–13 |
+| A (foundations) | 11–14 | 9.5–15 |
+| B (platform) | 11–16 | 12.5–20 |
+| C (WorkspaceContext) | 10–14 | 12–20 |
+| D (MCP server) | 12–19 | 17–28 |
+| E (AI) | 10–11 | 11–18 |
+| F (agent runtime) | 14–21 | 18–31 |
+| X | 1 | 1–2 |
+| **Total** | **≈ 77–110** | **≈ 89–147 (mid ≈ 118)** |
+
+Two worktrees, one of them on the critical path. Weeks use the midpoints and 5 agent-days a week.
+
+| Weeks | Lane A (critical path) | Lane B |
+| --- | --- | --- |
+| 1–2 | T0 → A1 → A4 | T1 → T2 → T4 → T3 → T5 |
+| 2–4 | B1 → B3 | A2 → A3 → A5 |
+| 4–6 | C1 → C2 → C3 | D1 → D2 |
+| **6–7: headless checkpoint** | C3 lands | D2 lands; D3 |
+| 7–8 | B4 → D4 | E1 |
+| 8–12 | E2 → F4 | F1 → F2 → F3 → B2 |
+| 12 | X | — |
+
+- **Critical path:** T0 → A1 → A4 → B1 → B3 → C1 → C2 → C3 → D4 → F4. D3 and F3 must land before D4 and F4. The calendar is set by the load on both lanes: **9–15 weeks, about 12 expected.**
+- **Lane rules.** Only one lane may hold a god file at a time. D1/D2 edit the MCP view model and dispatch in place, while C edits the workspace store, so they do not collide.
+- **B2 (VCS) runs late** because it is off the critical path. If headless VCS work is wanted at the week 6–7 checkpoint, swap B2 ahead of E1 on lane B, at a cost of about 1 week to F.
+- **Merge latency.** The next independent slice starts while a PR waits to merge. Dependent slices wait for the merge; nothing is stacked.
+
+---
+
+## 3. Headless plug-in notes (boundaries only; no headless code is ported or rewritten)
+
+The frozen branch touched these areas (`git diff --stat` [M]): MCP CLI 15 files, DomainRuntime 25, VCS 10, FileSystem 8, WindowTools 6, WorkspaceContext 6.
+
+- **Process (A4).** Keep `RepoPromptProcess` free of `Bundle.main` and `UserDefaults.standard`. The bounded read backends and the direct-headless coordinator can then link it from `RepoPromptMCPCore` unchanged.
+- **FileSystem ignore (B1) and Settings (B4).** The branch unified global ignore behind a DomainRuntime ignore engine (M8K–Q, M14). `IgnoreMatcher` in FileSystem and the global-ignore facet in SettingsCore are the only two owners a port changes. Ignore logic is not moved into DomainRuntime here.
+- **VCS (B2).** Headless needs nested-Git parity and worktree root overlays, including the M22 P2 "worktree opt-out ineffective" fix in `prepareSessionRootOverlay`. The non-`@MainActor`, app-free worktree and repository queries are what a CLI-side lane calls.
+- **WorkspaceContext (C2/C3).** Headless read backends need a read-only, root-scoped projection with root authority and leases (M21–M22) and an app-independent code-structure query core (M15). The C2 snapshot type is that input. The code-structure entry point in `…CodeMapOrchestration` takes the snapshot, not the store. No AppKit, `Bundle.main`, or `UserDefaults.standard`.
+- **DomainRuntime (all waves).** It stays the single MCP catalog, registry, and workspace/context authority. It gains no app dependency, and nothing moves out of it into app-only targets. The branch's `Ignore/`, `Search/`, and `ContextBuilder/` settlement cores can therefore land there later without reshaping. New targets depend on DomainRuntime, never the reverse.
+- **Request settlement and admission (D2/D3).** The branch built proxy startup and terminal settlement, shared direct-headless admission, off-main `tools/call` routing, disconnected replay, and typed retry errors (M8A–J). D3's admission-policy value and settlement-result type are consumed by dispatch. The app supplies today's policy and a headless port supplies its own, without forking dispatch. `ToolInvocationContext` (D2) carries connection identity, the authorization snapshot, and the request ID. It is `Sendable` with no window references.
+- **MCP window tools (D4).** They stay app adapters registered by composition against the one DomainRuntime tool definition. A headless implementation registers as a second backend of that definition, never as a second registry. The authority snapshot lives in `RepoPromptMCPServer`, so either backend can recheck it after `await` (M9–M11).
+- **Agent session host (F3).** The M22 P2 bug "early cancel can be lost" is a design input: launch state, including pending-start cancellation, is stored before a session becomes visible. The session-store contract sits in `RepoPromptAgentRuntime`, so a headless host implements it instead of subclassing app types.
+
+---
+
+## 4. Rules for every slice
+
+### 4.1 PR shape
+
+1. **Its own PR, targeting `main`.** Never stacked on another PR branch; a dependent slice waits for its predecessor to merge. Branch from the current `origin/main`.
+2. **Lands within about a day.** If review or CI pushes it past that, rebase by replaying the mechanical step (the move script or the access-lift script) on the current `main`, not by resolving move conflicts by hand.
+3. **Logic pre-work and pure moves are separate PRs.**
+   - An **L** PR is a behavior-preserving logic change with tests.
+   - An **M** PR contains only:
+     - `git mv`;
+     - `Package.swift`;
+     - the catalog, guardrail, conductor-index, and ratchet-baseline updates;
+     - the access-modifier and `import` edits the move requires.
+   - An **A** PR is used only when the access edits alone exceed about 50 files.
+4. **Ledger entry in the same PR:**
+   - the move manifest (old → new path);
+   - symbol access changes;
+   - conductor tickets;
+   - before/after timings;
+   - ratchet deltas;
+   - P0.6 checklist results.
+5. `preflight.sh commit` and `preflight.sh push` on every PR; `pr-ready` for manifest, Xcode-workspace, or CI changes.
+
+### 4.2 Independent review
+
+- Every PR is reviewed by someone who did not write it: a human, or a separate review agent with a fresh context.
+- **Each finding is confirmed or refuted with evidence:**
+  - *Confirmed:* fixed, with the fixing commit.
+  - *Refuted:* the file:line, command output, test ticket, or index `edge` query that shows it is not a defect.
+  - *Deferred:* only with an issue link and maintainer agreement.
+- Nothing is closed with "looks fine".
+- For **M** and **A** PRs the reviewer re-runs the move audit (§4.4) and checks its report instead of reading moved bodies.
+
+### 4.3 Validation
+
+| Check | L | A | M | Wave exit |
+| --- | --- | --- | --- | --- |
+| `make guardrails` (runtime identity, ratchets, placement, edge matrix) | ✓ | ✓ | ✓ | ✓ |
+| Move audit (§4.4) | — | ✓ | ✓ | — |
+| `make dev-swift-build PRODUCT=all` | ✓ | ✓ | ✓ | ✓ |
+| Owning module tests, `dev-test MODULE=<T>Tests` | ✓ | ✓ | ✓ | ✓ |
+| Dependents' focused tests | ✓ | ✓ | ✓ | — |
+| Full suite, `make dev-test` (same test count, 0 failures) | If the PR touches app sources | ✓ | ✓ | ✓ |
+| `ModularizationCompatibilityGoldenTests` plus the P0.6 checklist ([ledger](ledger.md), "Slice checklist") | If identity sites are touched | ✓ | ✓ | ✓ |
+| `make dev-lint` | ✓ | ✓ | ✓ | ✓ |
+| Index `report` recorded | — | — | ✓ | ✓ |
+| `make dev-smoke` | MCP, agent, or packaging slices | — | MCP, agent, or packaging slices | ✓ |
+| Release build plus Repo Bench | Hot paths (C, D) | — | Hot paths (C, D) | ✓ (X9) |
+
+### 4.4 Byte-identical move audit (T0)
+
+`Scripts/modularization_move_audit.py --base origin/main [--head HEAD] [--json out.json]`. Its tests run in `make conductor-selftest`. The script exits 1 on any violation.
+
+1. **Rename report.** It runs `git diff --name-status -M100%` and lists each moved file with its similarity.
+   - `R100` files pass.
+   - Any `R<100` file, or `D`+`A` pair, goes to check 2.
+2. **Normalized hash.** Normalize both sides, then require equal SHA-256. The normalization:
+   - strips access keywords (`open`, `public`, `package`, `internal`) from declaration heads, only where they are the line's sole difference;
+   - drops `import` lines, which are checked against the first-party allowlist instead;
+   - leaves whitespace untouched.
+3. **Line-class diff.** In every modified, non-moved Swift file, each `-U0` hunk line is either an access-modifier-only change or a first-party `import` added or removed.
+4. **Allowed non-Swift files:**
+   - `Package.swift`;
+   - `modules.json`, `modules.md`;
+   - `source_layout_guardrails.sh`;
+   - `ratchets.json`;
+   - the ledger;
+   - the conductor module index;
+   - `generate_xcode_workspace.py`.
+5. **Discovery parity.** Given `--tests-before N --tests-after M` from the full-suite tickets, N must equal M.
+6. **Output.** A human report plus JSON (manifest, similarity, hashes, violations) for the ledger.
+
+---
+
+## 5. Defaults applied, and where evidence changed them
+
+| Default | Applied as | Change and evidence |
+| --- | --- | --- |
+| ADR-08 goes early | **T4 (admission v2) in weeks 1–2** | The evidence supports it. With 2 worktrees and the default heavy capacity of 1, heavy jobs serialize. Waits reached 35 min [L]. Module jobs peak at about 1.5 GiB versus 3–5 GiB for app links [L], so admitting by RSS lets module jobs run in parallel. The caching half of ADR-08 (§5.5) stays conditional (T6), because the ADR requires clean-vs-cached correctness evidence first |
+| P1 tooling alongside wave 1, with the move audit first | T0 first; T1–T5 on lane B in weeks 1–2 | Unchanged |
+| Swift Testing allowed in new module test targets; no conversion | Adopted | ADR-07 verified Swift Testing on the module path [L] |
+| 2 parallel worktrees | Adopted | 3 is possible after T4; see decision U2 |
+| Each ratchet gated as soon as its slice lands | §1.5 | Unchanged. `tests_sleep_calls` has no slice here (it needs a regex fix for fake-clock `sleep` declarations) and moves to the appendix |
+| Codemod toolkit only if the remaining large moves justify it | **Not built** | The large edits in this scope are handled without a toolkit:<br>- The 179-symbol access lift (A4) and the C3/F4 access PRs use the T0 diagnostics-driven access-lift script.<br>- The 144 nested-type hoists (F1) use nested `typealias` shims, with zero consumer edits.<br>- Test retargets are `import` swaps.<br>The toolkit returns with the deferred feature splits (appendix P1-g) |
+| Headless unfreezes once the WorkspaceContext and MCP server seams (S5/S6) exist | The **decision** unfreezes at the week 6–7 checkpoint (C3 + D2) | Refinement: **porting of settlement/admission (M8A–J) waits for D3**, and ports touching `MCPConnectionManager` or dispatch avoid D4's move window, using the move manifest as a path map. The branch's first milestones sit exactly in the code D3 restructures |
+
+---
+
+## 6. Risks (condensed; the full table is in the appendix, §4)
+
+| Risk | Mitigation |
+| --- | --- |
+| **Ordering or cancellation changes** in the carve-outs of god files (C2, D2, D3, F2, F3) | A split map in the ledger before the first PR, listing responsibilities, the actor or queue each runs on, and the invariants each must keep. A characterization test per invariant before its code moves. Review focused on ordering and cancellation. Never combine a carve-out with a move |
+| **S6 threading (D2)** fails open, or double-settles on duplicate request IDs or cancellation | The dual-path PR first, with fail-closed tests; migrate by tool family; remove the ambient fallback last |
+| **Concurrency diagnostics at new boundaries** blow the one-day budget | Build the candidate target in a scratch path during pre-work and fix the diagnostics there (ADR-09) |
+| **Merge churn on a busy `main`** (the app grew 3,995 lines in a day [M]) | Scripted, replayable moves; one target per move PR; announced merge windows for C3, D4, F4 |
+| **Heavy-slot contention and approval overhead** | T4 first; module-scoped validation while iterating; one full suite per PR; pre-approved command classes per slice |
+| **Estimates for the reduced god-file work** (C2, D3, F3) are wide | Each reruns `readiness` and publishes its split map before the first PR, and the estimate is re-issued then |
+
+---
+
+## 7. Decisions still needed
+
+| # | Decision | Options | Recommendation |
+| --- | --- | --- | --- |
+| U1 | **Scope vs. calendar.** Agent runtime (F, 18–31 agent-days) is what takes G1 past a majority (47% → 60% of edits) | (a) Keep F: 9–15 weeks. (b) Defer F: about 7–11 weeks, but G1's X1 falls to about 47% and the AgentMode cycle stays | **(a)** AgentMode is the most-edited area |
+| U2 | **Worktrees after T4** | 2, or 3 from week 3 | 2 as the default. 3 cuts the calendar to about **7–11 weeks** (then bound by the critical path: 33.5–56.5 agent-days), at the cost of more review and merge load. Only one worktree may hold a god file |
+| U3 | **X1 threshold and window** | ≥ 55% over 60 days, or a stricter ≥ 60% | ≥ 55%, because future churn may shift toward UI |
+| U4 | **X4 Sentry build** | Keep it on the PR path, make it conditional (paths or labels), or move it to `main` only | Conditional, or `main` only. Otherwise every PR pays a second app build |
+| U5 | **Plan location** | `docs/migrations/build-modularization/completion-plan.md` (allowlisted, next to the ledger), as done here, or promote it to `docs/architecture/` | Keep it next to the ledger |
+
+---
+
+## Appendix: Later / further efficiencies
+
+This appendix is the complete first draft (`c90109d7`), kept so the deferred work stays sized and ordered for later. Only the headings (demoted two levels) and the relative links have changed. **Where it disagrees with the core plan above, the core plan wins.**
+
+Core slices map back to first-draft IDs as follows:
+
+| First-draft ID | Core slice |
+| --- | --- |
+| P1-a | T0 |
+| P1-b | T1 |
+| P1-c | T2 |
+| P1-d | T3 |
+| P1-f | T4 |
+| P1-e | T5 |
+| W1-1 | A1 |
+| W1-4 | A2 |
+| W1-2 | A3 |
+| W1-5 | A4 |
+| W1-6 | A5 |
+| W2-1 | B1 |
+| W2-2 | B2 (reduced) |
+| W2-3 | B3 (reduced) |
+| W2-4 | B4 (reduced) |
+| W3-1 | C1 |
+| W3-2 | C2 (reduced) |
+| W3-4, W3-5 | C3 |
+| W5-1 | D1 |
+| W5-2 | D2 |
+| W5-3 | D3 (reduced) |
+| W5-4 | D4 |
+| W4-1 | E1 |
+| W4-2 | E2 |
+| W1-3 | Folded into E2 |
+| W6-1 | F1 |
+| W6-2 | F2 |
+| W6-3 | F3 (reduced) |
+| W6-4 | F4 |
+
+**Deferred**, with the "(reduced)" rows keeping their unreduced remainder:
+- P1-g (codemod toolkit);
+- W1-7 (fonts, S1) and W1-8 (DesignSystem);
+- the `GitService` decomposition (rest of W2-2);
+- Presets (rest of W2-3);
+- the S7 facet rollout (rest of W2-4);
+- the full `WorkspaceFileContextStore` split (rest of W3-2);
+- W3-3 (codemap engine split);
+- the full `MCPConnectionManager` split (rest of W5-3);
+- the full `AgentModeViewModel` decomposition (rest of W6-3);
+- all of W7 (feature and UI splits, S2 window capabilities, S13 intents, the composition root);
+- exit criteria X1 (≤ 10% app share), X3–X5 (targets), X7, and X8 as gates;
+- the `tests_sleep_calls` ratchet.
 
 Status: **Proposed**. Drafted 2026-09-29 against `origin/main` `944854b7` (Phase 0, #1108 bridging header retired, #1109 `RepoPromptMCPCore` split).
-Inputs: [`../migrations/build-modularization-2026-09-28.md`](../migrations/build-modularization-2026-09-28.md) (the program plan: §2 goals, §3 architecture, §4 seams S1–S17, §7 slice protocol, §8 waves) and [`../migrations/build-modularization/ledger.md`](../migrations/build-modularization/ledger.md) (P0.1–P0.6 evidence and ADRs). This document does not change the architecture. It turns the remaining waves into sized, ordered PRs with an exit line.
+Inputs: [`../build-modularization-2026-09-28.md`](../build-modularization-2026-09-28.md) (the program plan: §2 goals, §3 architecture, §4 seams S1–S17, §7 slice protocol, §8 waves) and [`ledger.md`](ledger.md) (P0.1–P0.6 evidence and ADRs). This document does not change the architecture. It turns the remaining waves into sized, ordered PRs with an exit line.
 
 Priority (user decision, 2026-09-29): modularization runs first and goes through to completion. The headless port-vs-rebuild decision waits until after it. The frozen headless branch (`7eaf24b2`, archived as `origin/archive/headless-option-b-m8-m22`) is an **input** only. No headless code is ported or rewritten in this plan. Where a boundary touches an area headless depends on, a short **headless plug-in note** says how headless logic would attach later.
 
@@ -9,7 +424,7 @@ Legend: **[M]** = measured on `944854b7` for this plan; **[L]** = measured earli
 
 ---
 
-## 0. Summary
+### 0. Summary
 
 **Where we are [M].** `RepoPromptApp` holds 1,161 files and 652,086 lines, **88.4%** of first-party Swift (737,191 lines). Five extracted logic modules have their own test targets: DomainRuntime, CodeMapCore, RegexCore, WorkspaceCore, and MCPCore. The index graph shows **1,364** wrong-way file edges into 255 files; the largest cycle spans **66 of 75** components and the largest file SCC **640 of 1,161** files. **325 of 402** test files (81%) `@testable import RepoPromptApp`. The module test executor (ADR-07) already cuts edit→owning-test time by 77–95% [L], but only for code that has left the app.
 
@@ -27,9 +442,9 @@ Legend: **[M]** = measured on `944854b7` for this plan; **[L]** = measured earli
 
 ---
 
-## 1. Finish line
+### 1. Finish line
 
-### 1.1 Current baseline
+#### 1.1 Current baseline
 
 | Measure | Program baseline (plan §1–2) | Now (`944854b7`) | Source |
 | --- | --- | --- | --- |
@@ -52,7 +467,7 @@ Legend: **[M]** = measured on `944854b7` for this plan; **[L]** = measured earli
 
 Drift since the ratchet re-baseline is from `main` feature work, not from a slice: +594 app lines, +1 `@testable` file, +6 regex sleeps. From the 2026-09-28 baseline to now the app grew by 3,995 lines [M]. Every wave has to outrun that growth (R7).
 
-### 1.2 Exit criteria (the program is done when all hold)
+#### 1.2 Exit criteria (the program is done when all hold)
 
 | # | Criterion | Target | Measured by |
 | --- | --- | --- | --- |
@@ -75,7 +490,7 @@ Drift since the ratchet re-baseline is from `main` feature work, not from a slic
 - **M3 (after W6).** App share ≈ 25–30%. `AgentModeViewModel` split. MCP server headless.
 - **Finish (after W7).** X1–X12.
 
-### 1.3 Ratchets that become gated
+#### 1.3 Ratchets that become gated
 
 | Ratchet | Today | Becomes gated | Why then |
 | --- | --- | --- | --- |
@@ -92,7 +507,7 @@ Drift since the ratchet re-baseline is from `main` feature work, not from a slic
 
 ---
 
-## 2. Remaining slices and phases (dependency order)
+### 2. Remaining slices and phases (dependency order)
 
 Sizes are text measurements of the file set [M] (with the §0 caveat). "Readiness" means P0.2 `readiness` output where it was sampled [L]; otherwise it is estimated [E] and gets re-run at slice start. PR counts separate **pre-work** (behavior-preserving semantic edits) from **move** (pure `git mv` plus mechanical access and import edits). Change types:
 - **Move**: pure move;
@@ -101,7 +516,7 @@ Sizes are text measurements of the file set [M] (with the §0 caveat). "Readines
 
 Each row is sized so that every PR lands in ≤ 1 day. A slice that would need longer is already split into several PRs.
 
-### P1 — Tooling (see decision D2 on ordering)
+#### P1 — Tooling (see decision D2 on ordering)
 
 | ID | Scope | Depends on | Size | Change type | PRs | Agent-days |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -114,7 +529,7 @@ Each row is sized so that every PR lands in ≤ 1 day. A slice that would need l
 | P1-g | P1.2: SwiftSyntax codemod toolkit (hoist nested type, lift access from diagnostics, retarget test imports) in a separate tools package | — | New tools package | Tooling | 2–4 | 2–4 |
 | **P1 total** | | | | | **10–18** | **9.5–17** |
 
-### W1-rest — Foundations (S12, S1, plus the leaf adapters)
+#### W1-rest — Foundations (S12, S1, plus the leaf adapters)
 
 | ID | Scope, target | Depends on | Size [M] | Readiness | Change type and PR split | PRs | Agent-days |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -130,7 +545,7 @@ Each row is sized so that every PR lands in ≤ 1 day. A slice that would need l
 
 > **Headless plug-in note: Foundation and Process (W1-1, W1-5).** The frozen branch's bounded read backends and `DirectHeadlessProviderCoordinator` use process launch and cancellation primitives. Keep `RepoPromptProcess` free of `Bundle.main` and `UserDefaults.standard` so a later port can link it from `RepoPromptMCPCore` without a semantic change (P0.6 checklist item 5).
 
-### W2 — Platform adapters
+#### W2 — Platform adapters
 
 | ID | Scope, target | Depends on | Size [M] | Change type and PR split | PRs | Agent-days |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -146,7 +561,7 @@ Each row is sized so that every PR lands in ≤ 1 day. A slice that would need l
 >
 > **Headless plug-in note: Settings (W2-4).** The branch changed global-ignore migration and load handling. Make "global ignore" the first S7 facet, so a later port changes one facet type and one owner.
 
-### W3 — Workspace engine (S8, S9, S17, S16)
+#### W3 — Workspace engine (S8, S9, S17, S16)
 
 | ID | Scope | Depends on | Size [M] | Change type and PR split | PRs | Agent-days |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -161,7 +576,7 @@ Each row is sized so that every PR lands in ≤ 1 day. A slice that would need l
 >
 > **Headless plug-in note: DomainRuntime (all waves).** `RepoPromptDomainRuntime` stays the single MCP catalog, registry, and workspace/context authority. The branch put `Ignore/`, `Search/`, and `ContextBuilder/` settlement cores there. This plan adds no app dependency to DomainRuntime and moves nothing *out* of it into app-only targets, so those subfolders can land later without reshaping. New targets depend on DomainRuntime, never the reverse (plan §3.2 edges).
 
-### W4 — AI (S10), off the critical path
+#### W4 — AI (S10), off the critical path
 
 | ID | Scope | Depends on | Size [M] | Change type and PR split | PRs | Agent-days |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -169,7 +584,7 @@ Each row is sized so that every PR lands in ≤ 1 day. A slice that would need l
 | W4-2 | `RepoPromptAIProviders…`: Codex app-server as its own target (6 files, 12.7k; `CodexNativeSessionController` 9.4k), Codex shared and AppOnly; ACP (4 files, 5.2k); the other provider families; `AI/Agents`, `ModelCatalog`, `Prompts` | W4-1, W1-5 | 125 files, ~56k. Tests `AI` 16 files, 3.2k | Pre-work per family (Codex 2, ACP 1, the rest 1). Move per family (3–4). The Claude two-bridge rule is kept | 6–9 | 8–14 |
 | **W4 total** | | | **≈ 140 files, ≈ 61k lines out** | | **10–14** | **12–20** |
 
-### W5 — MCP server (S5, S6, S11)
+#### W5 — MCP server (S5, S6, S11)
 
 | ID | Scope | Depends on | Size [M] | Change type and PR split | PRs | Agent-days |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -183,7 +598,7 @@ Each row is sized so that every PR lands in ≤ 1 day. A slice that would need l
 >
 > **Headless plug-in note: MCP window tools (W5-4, W7).** Window-bound tools stay app adapters registered by composition, against the one DomainRuntime tool definition. A headless implementation of the same tool registers as a *second backend of that definition*, never as a second registry or schema. The branch rechecks file-tool authority after `await` (M9–M11). Keep the authority snapshot type in `RepoPromptMCPServer`, not in the window adapter, so either backend can recheck it.
 
-### W6 — Agent orchestration (S3, S4)
+#### W6 — Agent orchestration (S3, S4)
 
 | ID | Scope | Depends on | Size [M] | Change type and PR split | PRs | Agent-days |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -195,7 +610,7 @@ Each row is sized so that every PR lands in ≤ 1 day. A slice that would need l
 
 > **Headless plug-in note: agent session host (W6-3, W6-4).** The branch's `DirectHeadlessProviderCoordinator` runs headless agent, Oracle, and grouped lanes. Its M22 P2 bug ("early cancel can be lost": the session is published before its launch task is stored) is a design input for the session-host contract: launch state, including pending-start cancellation, is stored before the session becomes visible. Put the contract in `RepoPromptAgentRuntime`. A headless host then implements the contract instead of subclassing app types.
 
-### W7 — Features, UI, composition (S2, S13, rest of S7 and S12)
+#### W7 — Features, UI, composition (S2, S13, rest of S7 and S12)
 
 | ID | Scope | Depends on | Size [M] | PRs | Agent-days |
 | --- | --- | --- | --- | --- | --- |
@@ -212,7 +627,7 @@ Each row is sized so that every PR lands in ≤ 1 day. A slice that would need l
 
 > **Headless plug-in note: Context Builder (W7-4).** The branch's shared Context Builder route/stream settlement core (M16) and opt-in direct-headless discovery (M17–M20) live in DomainRuntime. Keep `RepoPromptContextBuilder` feature logic consuming a settlement *result* contract, not owning settlement, so the later port swaps the producer rather than the feature.
 
-### 2.1 Totals and critical path [E]
+#### 2.1 Totals and critical path [E]
 
 | Phase | PRs | Agent-days | Lines out of app |
 | --- | --- | --- | --- |
@@ -235,9 +650,9 @@ The sized waves alone leave the app at about 10–17%, before new feature growth
 
 ---
 
-## 3. Per-slice process rules
+### 3. Per-slice process rules
 
-### 3.1 PR shape
+#### 3.1 PR shape
 
 1. **One PR, targeting `main`.** Never stacked on another PR branch; a dependent slice waits for its predecessor to merge. Branch from current `origin/main`.
 2. **Lands within about one working day** of opening. If review or CI pushes it past that, rebase by *replaying* the mechanical step (codemod or script) on current `main`, not by hand-resolving move conflicts.
@@ -245,7 +660,7 @@ The sized waves alone leave the app at about 10–17%, before new feature growth
 4. **Ledger entry in the same PR:** move manifest (old → new path), symbol access changes, conductor tickets, before/after timings, ratchet deltas, compatibility checklist results.
 5. Commit and push preflights (`preflight.sh commit` / `push`) on every PR. Use `pr-ready` for manifest, Xcode-workspace, or CI boundary changes.
 
-### 3.2 Independent review
+#### 3.2 Independent review
 
 - Every PR is reviewed by someone who did not write it (a human, or a separate review agent with a fresh context).
 - **Each finding gets a disposition with evidence:**
@@ -255,7 +670,7 @@ The sized waves alone leave the app at about 10–17%, before new feature growth
 - No finding is closed with "looks fine". Refutations cite evidence.
 - For move PRs the reviewer re-runs the move audit (§3.4) and checks its report instead of reading moved bodies.
 
-### 3.3 Validation matrix
+#### 3.3 Validation matrix
 
 | Check | Pre-work PR (Logic) | Access PR | Move PR | App-touching (any PR changing `RepoPromptApp` sources) | Wave exit |
 | --- | --- | --- | --- | --- | --- |
@@ -280,7 +695,7 @@ The sized waves alone leave the app at about 10–17%, before new feature growth
 5. Moving `Bundle.main` or `UserDefaults.standard` readers into a CLI-linked target is a semantic PR of its own.
 6. Update the inventory rows.
 
-### 3.4 Byte-identical move audit (reusable script, added in P1-a)
+#### 3.4 Byte-identical move audit (reusable script, added in P1-a)
 
 `Scripts/modularization_move_audit.py --base origin/main [--head HEAD] [--json out.json]`, with tests in `Scripts/test_modularization_move_audit.py` (run by `make conductor-selftest`). It fails a move or access PR unless every check passes.
 
@@ -298,7 +713,7 @@ Pre-work PRs are not audited by this script. They get normal review, because the
 
 ---
 
-## 4. Risks and mitigations
+### 4. Risks and mitigations
 
 | # | Risk | Mitigation |
 | --- | --- | --- |
@@ -315,7 +730,7 @@ Pre-work PRs are not audited by this script. They get normal review, because the
 
 ---
 
-## 5. Decisions you need to make
+### 5. Decisions you need to make
 
 | # | Decision | Options | Recommendation |
 | --- | --- | --- | --- |
@@ -332,7 +747,7 @@ Pre-work PRs are not audited by this script. They get normal review, because the
 
 ---
 
-## Appendix: measurement notes
+### Appendix: measurement notes
 
 - **[M] commands:** `python3 Scripts/modularization_metrics.py report --details`; `python3 Scripts/modularization_index_graph.py dump` then `report --top 40` on the index after conductor tickets `e7b25e19` (no-op, 22 s) and `7da84fad` (2 min 14 s); per-folder `find … | wc -l` over `Sources/RepoPrompt` and `Tests/RepoPromptTests`; `grep -rl` for `.shared` accessors and `@testable` imports.
 - **Index caveat:** 17 of 1,160 files are stale in the index; slice sizes for those files are from text measurement. They are the #1108/#1109-touched files plus a few SessionLinks, Oracle, and VCS files. They recompiled with identical content, and their units were not rewritten.
