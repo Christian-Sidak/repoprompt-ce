@@ -172,6 +172,35 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Loads, in the background, the persisted state of this window's compose tabs bound to one of
+    /// `sessionIDs`, so saved oversight pairs can be restored at launch.
+    ///
+    /// Passive by construction: `ensureSessionReady` with its default arguments only reads the
+    /// session payload from disk. It does not select the tab, focus the window, or start or reconnect
+    /// a provider. Tabs already hydrated or already loading are skipped (the load joins in-flight
+    /// work anyway).
+    func agentSessionLinkRequestRestorationHydration(sessionIDs: Set<UUID>) {
+        for descriptor in agentSessionLinkComposeTabDescriptors()
+            where sessionIDs.contains(descriptor.sessionID)
+        {
+            let tabID = descriptor.tabID
+            if let existing = sessions[tabID],
+               existing.hasLoadedPersistedState || existing.persistedLoadTask != nil
+            {
+                continue
+            }
+            Task { @MainActor [weak self] in
+                guard let self,
+                      // Re-read after the hop: the tab may have been closed or rebound meanwhile.
+                      agentSessionLinkComposeTabDescriptors().contains(where: {
+                          $0.tabID == tabID && $0.sessionID == descriptor.sessionID
+                      })
+                else { return }
+                _ = await ensureSessionReady(tabID: tabID)
+            }
+        }
+    }
+
     /// The exact live endpoint incarnation bound to one compose tab of this window.
     ///
     /// This is the single conversion used to turn server-owned connection routing

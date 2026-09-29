@@ -192,14 +192,18 @@ eligible observer to add nor an existing relationship to unlink. A row may legit
 sidebar eyes at once; their fill, color, placement, interaction, tooltip, and directional
 accessibility wording must remain distinct.
 
-## Auto-approval is an exact, process-local link choice
+## Auto-approval is an exact link choice, saved with its oversight pair
 
 The observer dashboard can opt an individual outbound link into automatic acceptance of the target's
 **provider permission prompts**, or select/deselect all links that are active at the instant of the
-bulk action. Every link starts off. The selection is keyed by the exact observer endpoint, target
-endpoint, and generation-qualified link reference. It is not an Auto-wake preference, a provider-wide
-permission mode, or a durable session-UUID selection. Unlink, relink, endpoint replacement, and app
-restart return to manual approval; bulk selection never opts in a future link.
+bulk action. Every link starts off. The live selection is keyed by the exact observer endpoint, target
+endpoint, and generation-qualified link reference. It is not an Auto-wake preference or a
+provider-wide permission mode. The user's choice is also recorded on the saved observer → target
+oversight intent (`agentSessionOversightLinks.json`, optional `delegations` rows), so an app relaunch
+— or an explicit re-add of a pair that is still saved — re-applies it to the fresh grant through the
+same eligibility-checked setter. Stop, lifecycle end (tab/window close, workspace switch, rebind), and
+session deletion remove the saved pair and its delegation together, so a later link starts on manual
+approval; bulk selection never opts in a future link.
 
 At a newly observed provider prompt, the target checks the selected link against the current authority
 grant and both live endpoint candidates, then checks its own exact session incarnation and pending
@@ -211,8 +215,9 @@ the ordinary manual option-selection path. The ordinary manual path remains in p
 link is selected. User questions, MCP elicitation, Codex
 hook reviews, app-owned apply-edits and worktree-merge reviews, GitHub/destructive approvals, and
 unrelated app permission controls never call this gate. A permission request already pending when the
-choice is enabled remains manual; the setting applies to new prompts. This deliberately narrow
-process-local policy avoids promoting UUID-keyed saved Auto-wake state into permission authority.
+choice is enabled remains manual; the setting applies to new prompts. Saved Auto-wake target selection
+is never promoted into permission authority: only the user's own auto-approval toggle on that exact
+pair is saved, and it is re-applied only to a grant the user's saved relationship re-created.
 
 ## Management is an authority-owned grant capability
 
@@ -229,7 +234,7 @@ fence all read the same record.
 | --- | --- |
 | Default | Off. `DomainAgentSessionLinkCapability.version1` never contains `.manage`; existing links behave exactly as before |
 | Change | Only an explicit user action on one exact link generation (`setManagement`), in place: the link keeps its ID, generation, cursors, waiters, queued send, and Auto-wake lane |
-| Lifetime | Process-local. Unlink, relink, endpoint replacement, and restart return the link to watch-only; a Handoff/Fork's fresh grants never inherit it |
+| Lifetime | Lives on the grant, and the user's choice is saved with the observer → target oversight intent. A relaunch (or re-add of a still-saved pair) re-applies it to the fresh grant via `setManagement`, re-proving eligibility. Stop, lifecycle end, and deletion remove the saved pair and its delegation, returning any later link to watch-only; a Handoff/Fork's fresh grants never inherit it |
 | Granting | Requires both exact endpoints live and eligible now |
 | Withdrawing | Allowed whenever the grant exists, and effective at the next fence of any operation already in flight |
 | Independence | Neither management nor auto-approval implies the other |
