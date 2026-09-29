@@ -291,6 +291,9 @@ The frozen branch touched these areas (`git diff --stat` [M]): MCP CLI 15 files,
   - no behavior drift across the PRs;
   - ratchets actually gated.
   The next wave does not start until its findings are dispositioned.
+- **Timing.** An independent review starts as soon as a PR is pushed, in parallel with CI; neither waits for the other.
+  - The reviewer is pinned to the exact head SHA and records it in its report.
+  - If a push moves the head during review, the report notes it; the review does not restart.
 - **Reviewers are read-only:** no GitHub writes and no edits. Reports go to `/tmp/rpce-pr-reviews/<PR>.md`, and end-of-wave reports to `/tmp/rpce-pr-reviews/wave-<X>.md`, with evidence alongside.
 - **The author dispositions each finding against the code and tests:**
   - **CONFIRMED:** fixed, with a regression test.
