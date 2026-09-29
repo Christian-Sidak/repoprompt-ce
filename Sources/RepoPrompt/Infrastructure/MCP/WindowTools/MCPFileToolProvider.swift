@@ -291,71 +291,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 operation: MCPWindowToolName.getCodeStructure
             ) {
                 try Task.checkCancellation()
-                let allowedKeys: Set = ["paths", "expand", "depth", "signatures", "size"]
-                guard Set(args.keys).isSubset(of: allowedKeys) else {
-                    throw MCPError.invalidParams("unknown get_code_structure parameter")
-                }
-
-                let direction: WorkspaceCodemapStructureTraversalDirection?
-                if let value = args["expand"] {
-                    guard let raw = value.stringValue else {
-                        throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
-                    }
-                    direction = switch raw {
-                    case "uses": .referencedDefinitions
-                    case "used_by": .referrers
-                    case "both": .both
-                    default: throw MCPError.invalidParams("expand must be 'uses', 'used_by', or 'both'")
-                    }
-                } else {
-                    direction = nil
-                }
-
-                let suppliedDepth: Int
-                if let value = args["depth"] {
-                    guard let depth = value.intValue else {
-                        throw MCPError.invalidParams("depth must be an integer")
-                    }
-                    suppliedDepth = depth
-                } else {
-                    suppliedDepth = 1
-                }
-                guard (1 ... 4).contains(suppliedDepth) else {
-                    throw MCPError.invalidParams("depth must be between 1 and 4")
-                }
-
-                let includesSignatures: Bool
-                if let value = args["signatures"] {
-                    guard let signatures = value.boolValue else {
-                        throw MCPError.invalidParams("signatures must be a boolean")
-                    }
-                    includesSignatures = signatures
-                } else {
-                    includesSignatures = true
-                }
-
-                let size: WorkspaceCodemapGraphOutputSize
-                if let value = args["size"] {
-                    guard let rawSize = value.stringValue,
-                          let parsedSize = WorkspaceCodemapGraphOutputSize(rawValue: rawSize)
-                    else {
-                        throw MCPError.invalidParams("size must be 'small', 'medium', or 'large'")
-                    }
-                    size = parsedSize
-                } else {
-                    size = .medium
-                }
-                let budget = WorkspaceCodemapGraphPolicy.initial.queryBudget(
-                    size: size,
-                    includesSignatures: includesSignatures
-                )
-                let request = MCPServerViewModel.CodeStructureRequest(
-                    direction: direction,
-                    maximumDepth: direction == nil ? 0 : suppliedDepth,
-                    includesSignatures: includesSignatures,
-                    size: size,
-                    budget: budget
-                )
+                let request = try MCPCodeStructureQueryRequest.parse(args)
 
                 await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureSeedResolution)
                 let metadata = authority.metadata
@@ -370,14 +306,9 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                 let files: [WorkspaceFileRecord]
                 var requestedPaths: [String] = []
                 if let pathsValue = args["paths"] {
-                    guard let rawPaths = pathsValue.arrayValue,
-                          !rawPaths.isEmpty,
-                          rawPaths.count <= 256,
-                          rawPaths.allSatisfy({ $0.stringValue != nil })
-                    else {
-                        throw MCPError.invalidParams("paths must contain one to 256 strings")
-                    }
-                    let translated = lookupContext.translateInputPaths(rawPaths.compactMap(\.stringValue))
+                    let translated = try lookupContext.translateInputPaths(
+                        MCPCodeStructureQueryRequest.requestedPaths(from: pathsValue)
+                    )
                     requestedPaths = translated
                     for path in translated {
                         try Task.checkCancellation()
@@ -394,7 +325,7 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     files = try await dependencies.files.resolveFilesForCodeStructure(
                         translated,
                         lookupContext.rootScope,
-                        MCPServerViewModel.codeStructureSeedLimit(for: request)
+                        MCPCodeStructureQueryRequest.maximumSeedCount
                     )
                 } else {
                     if !authority.isRunlessOneShotHint {
@@ -405,10 +336,13 @@ final class MCPFileToolProvider: MCPAppToolProviding {
                     files = try await dependencies.context.resolveSelectedFilesForCodeStructure(
                         metadata,
                         lookupContext,
-                        MCPServerViewModel.codeStructureSeedLimit(for: request)
+                        MCPCodeStructureQueryRequest.maximumSeedCount
                     )
                 }
                 try Task.checkCancellation()
+                // Graph query, revalidation, signature demand, and assembly run off the main actor
+                // in `MCPCodeStructureQueryOrchestrator`. Authority can change at any suspension in
+                // there, so it is revalidated before the reply is encoded and again after.
                 let reply = try await dependencies.files.buildCodeStructureDTO(
                     files,
                     request,

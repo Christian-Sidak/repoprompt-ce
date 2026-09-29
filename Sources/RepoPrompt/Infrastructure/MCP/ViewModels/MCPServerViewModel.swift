@@ -514,37 +514,9 @@ final class MCPServerViewModel: ObservableObject {
 
     // -----------------------------------------------------------------
 
-    // MARK: Configuration constants
+    // MARK: get_code_structure test diagnostics
 
-    /// -----------------------------------------------------------------
-    struct CodeStructureRequest: Equatable {
-        let direction: WorkspaceCodemapStructureTraversalDirection?
-        let maximumDepth: Int
-        let includesSignatures: Bool
-        let size: WorkspaceCodemapGraphOutputSize
-        let budget: WorkspaceCodemapGraphQueryBudget
-
-        init(
-            direction: WorkspaceCodemapStructureTraversalDirection?,
-            maximumDepth: Int,
-            includesSignatures: Bool,
-            size: WorkspaceCodemapGraphOutputSize,
-            budget: WorkspaceCodemapGraphQueryBudget
-        ) {
-            self.direction = direction
-            self.maximumDepth = maximumDepth
-            self.includesSignatures = includesSignatures
-            self.size = size
-            self.budget = budget
-        }
-    }
-
-    private static let maximumCodeStructureSeedCount = 8192
-
-    static func codeStructureSeedLimit(for _: CodeStructureRequest) -> Int {
-        maximumCodeStructureSeedCount
-    }
-
+    // -----------------------------------------------------------------
     #if DEBUG
         struct CodeStructureAdmissionWorkCounts: Equatable {
             let uniqueSeedCandidatesVisited: Int
@@ -552,17 +524,15 @@ final class MCPServerViewModel: ObservableObject {
             let coordinatorInvocations: Int
         }
 
-        /// The seed-order keys projected on the main actor and the order the worker returned.
-        struct CodeStructureSeedOrderForTesting: Equatable {
-            let keys: [MCPCodeStructureReplyProjection.SeedOrderKey]
-            let orderedFileIDs: [UUID]
-        }
+        /// Observes each `get_code_structure` orchestration phase as it begins, on the orchestrating
+        /// executor (off the main actor). Captured when a query starts.
+        var codeStructureQueryPhaseObserverForTesting: (@Sendable (MCPCodeStructureQueryOrchestrator.Phase) -> Void)?
 
         private var codeStructureUniqueSeedCandidatesVisitedForTesting = 0
         private var codeStructureLogicalPathComputationsForTesting = 0
         private var codeStructureCoordinatorInvocationsForTesting = 0
-        private var lastCodeStructureRequestForTesting: CodeStructureRequest?
-        private var lastCodeStructureSeedOrderForTesting: CodeStructureSeedOrderForTesting?
+        private var lastCodeStructureRequestForTesting: MCPCodeStructureQueryRequest?
+        private var lastCodeStructureSeedOrderForTesting: MCPCodeStructureQueryOrchestrator.SeedOrder?
 
         func resetCodeStructureAdmissionWorkCountsForTesting() {
             codeStructureUniqueSeedCandidatesVisitedForTesting = 0
@@ -583,11 +553,11 @@ final class MCPServerViewModel: ObservableObject {
             lastCodeStructureSeedOrderForTesting = nil
         }
 
-        func capturedCodeStructureRequestForTesting() -> CodeStructureRequest? {
+        func capturedCodeStructureRequestForTesting() -> MCPCodeStructureQueryRequest? {
             lastCodeStructureRequestForTesting
         }
 
-        func capturedCodeStructureSeedOrderForTesting() -> CodeStructureSeedOrderForTesting? {
+        func capturedCodeStructureSeedOrderForTesting() -> MCPCodeStructureQueryOrchestrator.SeedOrder? {
             lastCodeStructureSeedOrderForTesting
         }
     #endif
@@ -5971,9 +5941,13 @@ final class MCPServerViewModel: ObservableObject {
         return resolved
     }
 
+    /// The MainActor adapter for `MCPCodeStructureQueryOrchestrator`. It captures the store and the
+    /// global Code Maps switch from the window's prompt model, runs the query off the main actor, and
+    /// returns its reply. The caller owns routing, frozen authority capture and validation, seed
+    /// resolution, and the post-query authority fence.
     func buildCodeStructureDTO(
         fromRecords files: [WorkspaceFileRecord],
-        request: CodeStructureRequest,
+        request: MCPCodeStructureQueryRequest,
         includePathNotFoundIssue: Bool,
         requestedPaths: [String] = [],
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
@@ -5981,189 +5955,32 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         #if DEBUG
             lastCodeStructureRequestForTesting = request
+            let phaseWillBegin = codeStructureQueryPhaseObserverForTesting ?? { _ in }
+        #else
+            let phaseWillBegin: @Sendable (MCPCodeStructureQueryOrchestrator.Phase) -> Void = { _ in }
         #endif
-        let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(
-            from: lookupContext.bindingProjection
+        let orchestrator = MCPCodeStructureQueryOrchestrator(
+            backend: WorkspaceStoreCodeStructureQueryBackend(store: promptVM.workspaceFileContextStore),
+            phaseWillBegin: phaseWillBegin
         )
-        if promptVM.codeMapsGloballyDisabled {
-            return MCPCodeStructureReplyProjection.unavailableReply(
-                issue: .init(
-                    code: "codemaps_disabled",
-                    phase: "graph_snapshot",
-                    path: nil,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: nil,
-                    limit: nil,
-                    message: "Codemap generation is disabled."
-                ),
-                size: request.size,
-                worktreeScope: worktreeScope
-            )
-        }
-
-        let store = promptVM.workspaceFileContextStore
-        switch await store.rootScopeAvailability(lookupContext.rootScope) {
-        case .available:
-            break
-        case .sessionWorktreeUnavailable:
-            return MCPCodeStructureReplyProjection.unavailableReply(
-                issue: .init(
-                    code: "git_root_unavailable",
-                    phase: "seed_resolution",
-                    path: nil,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: nil,
-                    limit: nil,
-                    message: "The session-bound worktree root is unavailable."
-                ),
-                size: request.size,
-                worktreeScope: worktreeScope
-            )
-        }
-
-        let roots = await store.rootRefs(scope: lookupContext.rootScope)
-        let allowedRootIDs = Set(roots.map(\.id))
-        var uniqueFilesByStandardizedFullPath: [String: WorkspaceFileRecord] = [:]
-        for file in files where allowedRootIDs.contains(file.rootID) {
-            if uniqueFilesByStandardizedFullPath[file.standardizedFullPath] == nil {
-                uniqueFilesByStandardizedFullPath[file.standardizedFullPath] = file
-            }
-        }
-        if uniqueFilesByStandardizedFullPath.isEmpty, includePathNotFoundIssue {
-            return MCPCodeStructureReplyProjection.unavailableReply(
-                issue: .init(
-                    code: "path_not_found",
-                    phase: "seed_resolution",
-                    path: requestedPaths.first,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: nil,
-                    limit: nil,
-                    message: "No requested path resolved to a file."
-                ),
-                size: request.size,
-                worktreeScope: worktreeScope
-            )
-        }
-
-        let logicalRootNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
-        // Each unique seed's logical path is projected exactly once, here, by the lookup-context
-        // owner. Only the immutable keys cross to the projection worker for ordering.
-        let seedOrderKeys = uniqueFilesByStandardizedFullPath.values.map { file in
-            #if DEBUG
-                codeStructureLogicalPathComputationsForTesting += 1
-            #endif
-            return Self.codeStructureSeedOrderKey(
-                for: file,
-                roots: roots,
-                lookupContext: lookupContext,
-                logicalRootDisplayNamesByRootID: logicalRootNames
-            )
-        }
-        let orderedSeedFileIDs = try await MCPCodeStructureReplyProjection.orderSeedFileIDs(seedOrderKeys)
-        try Task.checkCancellation()
-        #if DEBUG
-            lastCodeStructureSeedOrderForTesting = CodeStructureSeedOrderForTesting(
-                keys: seedOrderKeys,
-                orderedFileIDs: orderedSeedFileIDs
-            )
-        #endif
-
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphSnapshot)
-        let aggregate = try await store.queryCodemapStructureGraphs(
-            seedFileIDs: orderedSeedFileIDs,
-            direction: request.direction,
-            maximumDepth: request.maximumDepth,
-            budget: request.budget,
-            rootScope: lookupContext.rootScope,
-            logicalRootDisplayNamesByRootID: logicalRootNames
-        )
-        try Task.checkCancellation()
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphTraversal)
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphRevalidation)
-        let initialRevalidation = await store.revalidateCodemapStructureGraphs(aggregate)
-        let renderableFileIDs = aggregate.roots.flatMap { root -> [UUID] in
-            if case .invalid? = initialRevalidation[root.rootEpoch] { return [] }
-            return root.nodes.map(\.fileID)
-        }
-
-        let presentation: WorkspaceCodemapOperationPresentation?
-        if request.includesSignatures, !renderableFileIDs.isEmpty {
-            #if DEBUG
-                codeStructureCoordinatorInvocationsForTesting += 1
-            #endif
-            presentation = try await WorkspaceCodemapPresentationCoordinator(
-                store: store,
-                policy: WorkspaceCodemapPresentationRequestPolicy(
-                    maximumReadinessRounds: 4096,
-                    initialBackoffMilliseconds: 25,
-                    maximumBackoffMilliseconds: 250,
-                    maximumTotalWait: .milliseconds(workspaceCodemapProductionDemandWaitMilliseconds),
-                    maximumCandidateDemandCount: request.budget.maximumNodeCount
-                ),
-                structurePhaseDidChange: { phase in
-                    await MCPToolExecutionHandlerPhaseContext.report(phase.mcpToolExecutionHandlerPhase)
-                }
-            ).structureSignaturePresentation(
-                fileIDs: renderableFileIDs,
-                rootScope: lookupContext.rootScope,
-                logicalRootDisplayNamesByRootID: logicalRootNames
-            )
-        } else {
-            presentation = nil
-        }
-        try Task.checkCancellation()
-
-        let finalRevalidation = await store.revalidateCodemapStructureGraphs(aggregate)
-        var revalidation = initialRevalidation
-        for (rootEpoch, result) in finalRevalidation {
-            if case .invalid? = revalidation[rootEpoch] { continue }
-            revalidation[rootEpoch] = result
-        }
-        try Task.checkCancellation()
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureAssembly)
-        return try await MCPCodeStructureReplyProjection.assembleReply(.init(
-            aggregate: aggregate,
-            presentation: presentation,
-            revalidation: revalidation,
-            includesSignatures: request.includesSignatures,
-            budget: request.budget,
-            size: request.size,
-            worktreeScope: worktreeScope
+        let outcome = try await orchestrator.run(MCPCodeStructureQueryInput(
+            request: request,
+            seeds: files,
+            requestedPaths: requestedPaths,
+            includePathNotFoundIssue: includePathNotFoundIssue,
+            lookupContext: lookupContext,
+            codeMapsGloballyDisabled: promptVM.codeMapsGloballyDisabled
         ))
-    }
-
-    static func codeStructureSeedOrderKey(
-        for file: WorkspaceFileRecord,
-        roots: [WorkspaceRootRef],
-        lookupContext: WorkspaceLookupContext,
-        logicalRootDisplayNamesByRootID: [UUID: String]
-    ) -> MCPCodeStructureReplyProjection.SeedOrderKey {
-        MCPCodeStructureReplyProjection.SeedOrderKey(
-            logicalPath: logicalCodeStructurePath(
-                for: file,
-                roots: roots,
-                lookupContext: lookupContext,
-                logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
-            ),
-            fileID: file.id
-        )
-    }
-
-    private static func logicalCodeStructurePath(
-        for file: WorkspaceFileRecord,
-        roots: [WorkspaceRootRef],
-        lookupContext: WorkspaceLookupContext,
-        logicalRootDisplayNamesByRootID: [UUID: String]
-    ) -> String {
-        lookupContext.logicalDisplayPath(
-            for: file,
-            roots: roots,
-            rootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
-            display: .relative
-        ) ?? file.standardizedRelativePath
+        #if DEBUG
+            if let seedOrder = outcome.seedOrder {
+                codeStructureLogicalPathComputationsForTesting += seedOrder.keys.count
+                lastCodeStructureSeedOrderForTesting = seedOrder
+            }
+            if outcome.signatureDemandInvoked {
+                codeStructureCoordinatorInvocationsForTesting += 1
+            }
+        #endif
+        return outcome.reply
     }
 
     /// Reads a file with optional slicing. Supports 1-based indices and a negative sentinel
@@ -7272,20 +7089,5 @@ final class MCPServerViewModel: ObservableObject {
             slices: sliceSnapshot,
             autoEnabled: selection.codemapAutoEnabled
         )
-    }
-}
-
-private extension WorkspaceCodemapStructureExecutionPhase {
-    var mcpToolExecutionHandlerPhase: MCPToolExecutionHandlerPhase {
-        switch self {
-        case .seedResolution: .getCodeStructureSeedResolution
-        case .graphSnapshot: .getCodeStructureGraphSnapshot
-        case .graphTraversal: .getCodeStructureGraphTraversal
-        case .graphRevalidation: .getCodeStructureGraphRevalidation
-        case .renderDemand: .getCodeStructureRenderDemand
-        case .freeze: .getCodeStructureFreeze
-        case .render: .getCodeStructureRender
-        case .assembly: .getCodeStructureAssembly
-        }
     }
 }

@@ -4,37 +4,39 @@ import MCP
 // Explicit checked conformances are intentional actor-boundary contracts.
 // swiftformat:disable redundantSendable
 
-/// Sendable `get_code_structure` reply assembly used by the MainActor provider path.
+/// Pure `get_code_structure` reply projection: seed-order keys and their order, root and signature
+/// ordering, signature token-budget accounting, issue mapping, status rollup, and `Value` encoding.
 ///
-/// Authority capture, ingress waits, seed resolution, logical-path projection, graph query and
-/// revalidation, and signature demand stay with their existing owners (the MainActor tab context,
-/// `WorkspaceLookupContext`, `WorkspaceFileContextStore`, and
-/// `WorkspaceCodemapPresentationCoordinator`). What remains is a pure function of immutable inputs:
-/// seed ordering over precomputed keys, root and signature ordering, signature token-budget
-/// accounting, issue mapping, status rollup, and `Value` encoding. It runs on
-/// `MCPProviderProjectionWorker`, never on the main actor.
+/// Everything here except `encodeReply` is a synchronous function of immutable inputs with no actor
+/// isolation. `MCPCodeStructureQueryOrchestrator` calls it off the main actor; the MainActor provider
+/// encodes the final reply on `MCPProviderProjectionWorker`.
 enum MCPCodeStructureReplyProjection {
     typealias DTO = ToolResultDTOs.CodeStructureReplyDTO
 
-    /// Immutable seed-order key. `logicalPath` is projected once per unique seed on the main actor
-    /// by the existing lookup-context owner; only this value and the file identity cross to the
-    /// worker, so no lookup, window, or binding authority leaves the actor.
+    /// Immutable seed-order key: the logical path, projected once per admitted seed, and the file
+    /// identity. The sort compares keys instead of re-projecting paths on every comparison.
     struct SeedOrderKey: Sendable, Equatable {
         let logicalPath: String
         let fileID: UUID
     }
 
-    /// Orders seed file IDs on the projection worker. Zero or one key is already ordered and returns
-    /// without a hop. Cancellation follows the worker contract.
-    @MainActor
-    static func orderSeedFileIDs(_ keys: [SeedOrderKey]) async throws -> [UUID] {
-        guard keys.count > 1 else { return keys.map(\.fileID) }
-        return try await MCPProviderProjectionWorker.run(
-            toolName: MCPWindowToolName.getCodeStructure,
-            phase: "seed_ordering"
-        ) {
-            orderedSeedFileIDs(keys)
-        }
+    /// Projects one seed's order key. The logical path is the lookup context's relative display path,
+    /// or the file's standardized relative path when the context cannot label its root.
+    static func seedOrderKey(
+        for file: WorkspaceFileRecord,
+        roots: [WorkspaceRootRef],
+        lookupContext: WorkspaceLookupContext,
+        logicalRootDisplayNamesByRootID: [UUID: String]
+    ) -> SeedOrderKey {
+        SeedOrderKey(
+            logicalPath: lookupContext.logicalDisplayPath(
+                for: file,
+                roots: roots,
+                rootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+                display: .relative
+            ) ?? file.standardizedRelativePath,
+            fileID: file.id
+        )
     }
 
     /// The pure seed order: logical path by UTF-8 bytes (paths equal as `String` fall through), then
@@ -50,7 +52,7 @@ enum MCPCodeStructureReplyProjection {
     }
 
     /// Immutable assembly input. Explicitly `Sendable` so the compiler checks the graph aggregate,
-    /// signature presentation, and revalidation values before they cross to the worker.
+    /// signature presentation, and revalidation values that cross from the store actor.
     struct AssemblyInput: Sendable {
         let aggregate: WorkspaceCodemapStructureAggregateResult
         let presentation: WorkspaceCodemapOperationPresentation?
@@ -59,17 +61,6 @@ enum MCPCodeStructureReplyProjection {
         let budget: WorkspaceCodemapGraphQueryBudget
         let size: WorkspaceCodemapGraphOutputSize
         let worktreeScope: ToolResultDTOs.WorktreeScopeDTO?
-    }
-
-    /// Assembles the reply on the projection worker. Cancellation follows the worker contract.
-    @MainActor
-    static func assembleReply(_ input: AssemblyInput) async throws -> DTO {
-        try await MCPProviderProjectionWorker.run(
-            toolName: MCPWindowToolName.getCodeStructure,
-            phase: "reply_assembly"
-        ) {
-            assemble(input)
-        }
     }
 
     /// Encodes the reply `Value` on the projection worker.

@@ -99,6 +99,18 @@ if grep -q '@dynamicMemberLookup' "$capability_adapters"; then
   exit 1
 fi
 
+code_structure_query_core="Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPCodeStructureQuery.swift"
+if [[ ! -f "$code_structure_query_core" ]] \
+  || ! grep -q 'struct MCPCodeStructureQueryOrchestrator' "$code_structure_query_core"; then
+  echo "error: missing app-independent get_code_structure query core" >&2
+  exit 1
+fi
+if grep -n -E '@MainActor|MainActor\.|ViewModel|WindowState|^[[:space:]]*import[[:space:]]+(AppKit|SwiftUI|Combine)([[:space:]]|$)' \
+  "$code_structure_query_core"; then
+  echo "error: the get_code_structure query core must stay actor-free and hold no window or UI model" >&2
+  exit 1
+fi
+
 if grep -R -n --include='MCP*ToolProvider.swift' \
   -E 'dependencies:[[:space:]]+MCPAppPhysicalCapabilityAdapters([[:space:],?)]|$)' \
   Sources/RepoPrompt/Infrastructure/MCP/WindowTools; then

@@ -926,6 +926,75 @@ with three new negative/zero/above-maximum parity scenarios, `DirectHeadlessComp
 and `conductor guardrails` ticket `65d98249` passed. The build used the locally restored, untracked
 official Sparkle 2.9.2 dSYMs; no Vendor file is part of this change.
 
+### M15 — app-independent `get_code_structure` query core
+
+Before M15 the app ran the whole `get_code_structure` query on the main actor in
+`MCPServerViewModel.buildCodeStructureDTO`: the Code Maps and scope checks, seed admission,
+logical-path projection, graph query, initial and final revalidation, signature demand through
+`WorkspaceCodemapPresentationCoordinator`, and assembly. Only seed ordering and assembly hopped to
+`MCPProviderProjectionWorker` (M9/M10). `MCPFileToolProvider` parsed the arguments inline, next to
+authority, ingress, and seed resolution.
+
+- **Value request.** `MCPCodeStructureQueryRequest` (Sendable) parses every option except `paths`
+  in the historical order (unknown keys, `expand`, `depth`, `signatures`, `size`) with the same
+  messages. `requestedPaths(from:)` validates `paths` where it always ran, after the ingress wait,
+  so an invalid list keeps its cancellation ordering. It replaces `MCPServerViewModel.CodeStructureRequest`
+  and `codeStructureSeedLimit(for:)` (`maximumSeedCount` stays 8192).
+- **Core.** `MCPCodeStructureQueryOrchestrator.run(_:)` takes a Sendable `MCPCodeStructureQueryInput`
+  (request, resolved seeds, translated requested paths, lookup context, and the global Code Maps
+  switch as a captured value) and an `MCPCodeStructureQueryBackend` port: scope availability, root
+  refs, logical root names, graph query, revalidation, and signature demand.
+  `WorkspaceStoreCodeStructureQueryBackend` is the production port over the store actor and the
+  presentation coordinator, with the demand policy unchanged. The body is the former MainActor body
+  with its order intact: every cancellation check, every `MCPToolExecutionHandlerPhase` report, the
+  early answers (`codemaps_disabled`, `git_root_unavailable`, `path_not_found`), and the rule that a
+  root invalid at the initial revalidation is excluded from demand and stays invalid after the
+  final revalidation. `run` is a nonisolated `async` function, so all of it runs off the main actor,
+  including the pure seed ordering and assembly, which no longer hop to the projection worker. It
+  returns the reply, the seed order, and whether demand ran; the adapter records the last two only
+  as DEBUG diagnostics. The pure seed-key projection moved to `MCPCodeStructureReplyProjection`.
+- **What stays in the app.** Window and tab routing and `FrozenFileToolAuthority` capture
+  (`readAuthority`), the ingress wait, explicit-path resolution issues, seed resolution for paths and
+  for the selection (including the read auto-selection prerequisite), capturing the store and
+  `codeMapsGloballyDisabled` on the main actor (`MCPServerViewModel.buildCodeStructureDTO`, now a
+  thin adapter), and the fence. The fence validates authority after the core returns, encodes the
+  reply on the projection worker, and validates again. The main actor is free for the whole query,
+  so authority can change at any suspension inside the core; as before, only the fence decides
+  whether the reply is released.
+- **Guardrail.** `headless_runtime_guardrails.sh` requires the core and rejects `@MainActor`,
+  `MainActor.`, any `ViewModel` or `WindowState` reference, and AppKit, SwiftUI, or Combine imports
+  in it.
+- **Not changed.** Reply DTOs, error messages, retry guidance, stale-root presentation, seed order
+  (UTF-8 logical path, then UUID string), and Context Builder. The only diagnostics change is that
+  the DEBUG `provider_projection_*` MainActor handoff events for `seed_ordering` and
+  `reply_assembly` are gone, because there is no handoff; `value_encoding` remains.
+
+Evidence: `MCPCodeStructureQueryOrchestratorTests` uses a scripted backend. It covers parsing order
+and messages, reply parity with direct assembly, and the exact backend call sequence from a
+MainActor caller with every phase off the main thread. It also covers a root invalidated during
+demand reported unavailable, no demand when every root is already invalid, early answers without a
+graph query, and cancellation during the graph query and during demand. Cancellation stops before
+revalidation and assembly whether or not the backend observes it. `MCPCodeStructureProviderWorkerTests`
+drives a real window. It covers phases off the main actor, cancellation at seed ordering and at the
+graph query, and fail-closed replies when authority is superseded at seed ordering, graph query,
+signature demand, assembly, and encoding. Over a settled non-Git index with graph expansion and
+signatures, the headless core, given only the store actor and a value request, returns a reply equal
+to the full app provider reply. `MCPCodeStructureReplyAssemblyTests` and `MCPBackendParityHarnessTests`
+were updated for the retired hops.
+
+Conductor evidence: the focused suites (`MCPCodeStructure*`, `MCPBackendParityHarness`,
+`WorkspaceCodemapRetryExhaustionStructure`, `BindContextFileAuthority`, `MCPSelectionPrerequisiteError`,
+`CodeStructureToolCard`, `MCPReadFileProviderAuthority`) passed 113/113 (`eb6c386d`), and a repeat of
+the two M15 suites passed 20/20 (`35b622f5`). `conductor lint` (`28a28fca`), `conductor guardrails`
+(`a5ebcc86`), and `swift-build --product RepoPrompt` (`b5a2206a`) passed. Two earlier focused runs
+failed in the parity test only. `08b379f3` failed on an assertion that expected the root-relative
+display path; graph paths carry the root label. `c9948022` sampled the core while a graph update was
+still in flight (`updates_pending`, so `partial`) between two equal `ok` app replies, because the
+test helper skipped the app adapter's ingress wait. The helper now mirrors that wait, and the test
+compares only an app/core/app agreement, retrying a disagreeing sample within a bound. Builds used
+the locally restored, untracked official Sparkle 2.9.2 dSYMs for Xcode 27; no Vendor file is part of
+this change. Not run: the full root test suite, live MCP smoke, and a release-configuration build.
+
 ### Integration onto main (#1081 typed prerequisites, #994 non-Git Code Maps)
 
 The M8A–M13 branch was merged onto `origin/main` `a5586936`, which had independently landed #1081

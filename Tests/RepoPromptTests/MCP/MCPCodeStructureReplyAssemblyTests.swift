@@ -8,7 +8,9 @@ import XCTest
 #if DEBUG
     /// M9: `get_code_structure` reply assembly (ordering, signature token-budget accounting, issue
     /// mapping, status rollup) is a pure function of immutable inputs. These tests pin its exact
-    /// output with a golden captured from the pre-extraction MainActor implementation.
+    /// output with a golden captured from the pre-extraction MainActor implementation. Since M15 the
+    /// query core calls it off the main actor (`MCPCodeStructureQueryOrchestratorTests`); only the
+    /// final `Value` encoding still hops to the projection worker.
     final class MCPCodeStructureReplyAssemblyTests: XCTestCase {
         private typealias Fixture = CodeStructureReplyAssemblyFixture
 
@@ -22,23 +24,6 @@ import XCTest
             )
             XCTAssertEqual(reply, golden)
             XCTAssertEqual(try Fixture.formattedText(reply), Self.goldenText)
-        }
-
-        @MainActor
-        func testReplyAssemblyRunsOnProjectionWorkerWithIdenticalOutput() async throws {
-            let input = try Fixture.input()
-            let recorder = ProjectionExecutionRecorder()
-            MCPProviderProjectionWorker.executionObserverForTesting = recorder.observer
-            defer { MCPProviderProjectionWorker.executionObserverForTesting = nil }
-
-            let reply = try await MCPCodeStructureReplyProjection.assembleReply(input)
-
-            XCTAssertEqual(reply, MCPCodeStructureReplyProjection.assemble(input))
-            XCTAssertEqual(recorder.events, [.init(
-                toolName: MCPWindowToolName.getCodeStructure,
-                phase: "reply_assembly",
-                ranOnMainThread: false
-            )])
         }
 
         @MainActor
@@ -86,11 +71,11 @@ import XCTest
             XCTAssertEqual(MCPCodeStructureReplyProjection.orderedSeedFileIDs(Array(keys[4...] + keys[..<4])), expected)
         }
 
-        /// M10: keys projected once by the lookup-context owner and ordered by the pure sort give
-        /// exactly the order of the former comparator, which re-projected both logical paths on every
-        /// comparison: single-root relative paths, labelled multi-root paths, and an unlabelled root
-        /// whose relative-path fallback ties with a labelled path and falls through to the UUID.
-        @MainActor
+        /// M10: keys projected once per seed and ordered by the pure sort give exactly the order of
+        /// the former comparator, which re-projected both logical paths on every comparison:
+        /// single-root relative paths, labelled multi-root paths, and an unlabelled root whose
+        /// relative-path fallback ties with a labelled path and falls through to the UUID.
+        /// Nonisolated: since M15 the key projection is actor-free.
         func testSeedOrderKeysReproduceFormerComparatorOrder() {
             let alpha = WorkspaceRootRef(id: Fixture.uuid(901), name: "Alpha", fullPath: "/repo/alpha")
             let beta = WorkspaceRootRef(id: Fixture.uuid(902), name: "Beta", fullPath: "/repo/beta")
@@ -112,7 +97,7 @@ import XCTest
 
             for (roots, files, expected) in cases {
                 let keys = files.map {
-                    MCPServerViewModel.codeStructureSeedOrderKey(
+                    MCPCodeStructureReplyProjection.seedOrderKey(
                         for: $0,
                         roots: roots,
                         lookupContext: .visibleWorkspace,
@@ -128,31 +113,6 @@ import XCTest
                     "roots: \(roots.map(\.name))"
                 )
             }
-        }
-
-        @MainActor
-        func testSeedOrderingHopsToProjectionWorkerOnlyWithMoreThanOneKey() async throws {
-            let recorder = ProjectionExecutionRecorder()
-            MCPProviderProjectionWorker.executionObserverForTesting = recorder.observer
-            defer { MCPProviderProjectionWorker.executionObserverForTesting = nil }
-
-            let none = try await MCPCodeStructureReplyProjection.orderSeedFileIDs([])
-            let single = try await MCPCodeStructureReplyProjection.orderSeedFileIDs([Self.seedKey("src/a.swift", 1)])
-            XCTAssertEqual(none, [])
-            XCTAssertEqual(single, [Fixture.uuid(1)])
-            XCTAssertEqual(recorder.events, [])
-
-            let ordered = try await MCPCodeStructureReplyProjection.orderSeedFileIDs([
-                Self.seedKey("src/b.swift", 2),
-                Self.seedKey("src/a.swift", 1)
-            ])
-
-            XCTAssertEqual(ordered, [Fixture.uuid(1), Fixture.uuid(2)])
-            XCTAssertEqual(recorder.events, [.init(
-                toolName: MCPWindowToolName.getCodeStructure,
-                phase: "seed_ordering",
-                ranOnMainThread: false
-            )])
         }
 
         private static func seedKey(_ logicalPath: String, _ id: Int) -> MCPCodeStructureReplyProjection.SeedOrderKey {

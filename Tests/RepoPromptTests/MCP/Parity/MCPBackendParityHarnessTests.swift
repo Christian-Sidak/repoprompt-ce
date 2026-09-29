@@ -78,9 +78,10 @@ import XCTest
             try assertGate(report, scenarios: scenarios, attachmentName: "mcp-backend-parity-non-git-report.json")
         }
 
-        /// M9: the real app `get_code_structure` path assembles and encodes its reply on the
-        /// projection worker, never on the main thread, in that order.
-        func testAppCodeStructureAssemblesAndEncodesOnProjectionWorker() async throws {
+        /// M9/M15: the real app `get_code_structure` path encodes its reply on the projection worker,
+        /// never on the main thread. Since M15 assembly runs in the off-main query core, so encoding
+        /// is the only projection-worker hop (`MCPCodeStructureProviderWorkerTests` covers the core).
+        func testAppCodeStructureEncodesOnProjectionWorker() async throws {
             let root = try makeNonGitFixture()
             try await pinGlobalIgnoreDefaults()
             let harness = try await Harness.make(root: root, globalPatterns: Self.globalPatterns)
@@ -96,7 +97,7 @@ import XCTest
 
             XCTAssertNotNil(value.decode(ToolResultDTOs.CodeStructureReplyDTO.self))
             let events = recorder.events.filter { $0.toolName == MCPWindowToolName.getCodeStructure }
-            XCTAssertEqual(events.map(\.phase), ["reply_assembly", "value_encoding"])
+            XCTAssertEqual(events.map(\.phase), ["value_encoding"])
             XCTAssertFalse(events.contains(where: \.ranOnMainThread), "\(events)")
         }
 
