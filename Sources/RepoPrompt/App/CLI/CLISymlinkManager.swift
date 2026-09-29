@@ -1,7 +1,7 @@
-import RepoPromptProcess
 import Darwin
 import Foundation
 import OSLog
+import RepoPromptProcess
 import RepoPromptShared
 
 /// Maintains the flavor-specific CE user-space link. The link is repaired only

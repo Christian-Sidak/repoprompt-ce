@@ -7,9 +7,9 @@
 //
 // This allows users to invoke the CLI directly from their terminal.
 
-import RepoPromptProcess
 import Foundation
 import OSLog
+import RepoPromptProcess
 import RepoPromptShared
 
 enum CLIPathInstaller {

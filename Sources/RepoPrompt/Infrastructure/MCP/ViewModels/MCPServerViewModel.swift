@@ -1,3 +1,5 @@
+import RepoPromptInstrumentation
+
 //
 //  MCPServerViewModel.swift
 //  RepoPrompt
@@ -5,18 +7,18 @@
 //  Created by Repo Prompt – MCP integration
 //
 
-import RepoPromptFoundation
-import RepoPromptRegexCore
 import AppKit
 import Combine
 import Foundation
-import RepoPromptWorkspaceCore
 import JSONSchema
 import Logging
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptRegexCore
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 enum ReadFileAutoSelectionCoverageCertificateMissReason: String, CaseIterable, Hashable {
     case noCertificate = "no_certificate"

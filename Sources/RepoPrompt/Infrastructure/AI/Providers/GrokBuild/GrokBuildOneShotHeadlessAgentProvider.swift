@@ -1,5 +1,5 @@
-import RepoPromptProcess
 import Foundation
+import RepoPromptProcess
 
 /// Prompt-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
 /// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented

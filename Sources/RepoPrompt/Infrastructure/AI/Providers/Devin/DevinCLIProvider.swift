@@ -1,5 +1,5 @@
-import RepoPromptProcess
 import Foundation
+import RepoPromptProcess
 
 final class DevinCLIProvider: AIProvider {
     private let config: DevinAgentConfig

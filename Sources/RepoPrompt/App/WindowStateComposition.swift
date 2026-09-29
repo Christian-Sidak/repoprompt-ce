@@ -190,7 +190,8 @@ enum WindowStateCompositionFactory {
             oracleViewModel: oracleViewModel,
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,
-            modelRouterRuntime: modelRouterRuntime
+            modelRouterRuntime: modelRouterRuntime,
+            catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink()
         )
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]

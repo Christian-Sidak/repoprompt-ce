@@ -1,9 +1,10 @@
-import RepoPromptFoundation
 import Combine
 import CryptoKit
 import Foundation
-import RepoPromptWorkspaceCore
 import MCP
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 import SwiftUI
 
 struct AgentContextUsage: Codable, Equatable {
@@ -699,6 +700,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let mcpRunToolCanceller: MCPRunToolCanceller
     private var providerConversationCleanupRegistry: ProviderConversationCleanupRegistry
     let codexCoordinator: CodexAgentModeCoordinator
+    let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
@@ -2309,7 +2311,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
         skillCatalog: AgentSkillCatalog? = nil,
         modelRouterSettingsStore: GlobalSettingsStore = .shared,
-        modelRouterRuntime: AgentTaskRouterRuntime? = nil
+        modelRouterRuntime: AgentTaskRouterRuntime? = nil,
+        catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink()
     ) {
         self.windowID = windowID
         self.promptManager = promptManager
@@ -2320,6 +2323,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.modelRouterSettingsStore = modelRouterSettingsStore
         self.modelRouterRuntime = modelRouterRuntime
+        self.catalogDiagnosticsSink = catalogDiagnosticsSink
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
@@ -2424,6 +2428,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             stallWatchdogProbeThreshold: 90,
             stallWatchdogRecoveryThreshold: 300,
+            catalogDiagnosticsSink: catalogDiagnosticsSink,
             initialLastUsedReasoningEffort: CodexAgentToolPreferences.lastUsedReasoningEffort(),
             initialLastUsedReasoningEffortsByModelSlug: CodexAgentToolPreferences.lastUsedReasoningEffortsByModelSlug()
         )
@@ -2579,7 +2584,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
             testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
             testOpenCodeModelParameterStreamProvider: ((String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>)? = nil,
-            testModelRouterSettingsStore: GlobalSettingsStore = .shared
+            testModelRouterSettingsStore: GlobalSettingsStore = .shared,
+            testCatalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink()
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -2588,6 +2594,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             mcpServer = testMCPServer
             modelRouterSettingsStore = testModelRouterSettingsStore
             self.applyEditsApprovalStore = applyEditsApprovalStore
+            catalogDiagnosticsSink = testCatalogDiagnosticsSink
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
             attachmentWorkspaceDirectoryProvider = {
                 if let testWorkspaceDirectory {
@@ -2665,6 +2672,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 stallWatchdogProbeThreshold: testWatchdogProbeThreshold,
                 stallWatchdogRecoveryThreshold: testWatchdogRecoveryThreshold,
                 transportClosedRecoveryGraceInterval: testCodexTransportClosedRecoveryGraceInterval ?? 1.5,
+                catalogDiagnosticsSink: testCatalogDiagnosticsSink,
                 initialLastUsedReasoningEffort: CodexAgentToolPreferences.lastUsedReasoningEffort(),
                 initialLastUsedReasoningEffortsByModelSlug: CodexAgentToolPreferences.lastUsedReasoningEffortsByModelSlug()
             )

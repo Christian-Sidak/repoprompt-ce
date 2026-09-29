@@ -2,8 +2,8 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
-@testable import RepoPromptFoundation
 import RepoPromptDomainRuntime
+@testable import RepoPromptFoundation
 import XCTest
 
 #if DEBUG

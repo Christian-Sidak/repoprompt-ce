@@ -1,11 +1,11 @@
 // MARK: - DEBUG MCP Apply-Edits Stable-Rebase Diagnostics
 
-import RepoPromptFoundation
 import CryptoKit
 import Foundation
-import RepoPromptWorkspaceCore
 import MCP
+import RepoPromptFoundation
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 #if DEBUG
     final class MCPApplyEditsRebaseProbeState: @unchecked Sendable {

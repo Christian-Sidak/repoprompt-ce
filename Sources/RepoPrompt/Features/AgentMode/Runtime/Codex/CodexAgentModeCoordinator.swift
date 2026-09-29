@@ -1,6 +1,7 @@
-import RepoPromptFoundation
 import Foundation
 import MCP
+import RepoPromptFoundation
+import RepoPromptInstrumentation
 #if canImport(Darwin)
     import Darwin
 #endif
@@ -368,6 +369,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private static let repeatedResumeTimeoutFallbackThreshold = 2
     private let preferenceDefaults: UserDefaults
+    private let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
 
     init(
         windowID: Int,
@@ -389,6 +391,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         transportClosedRecoveryGraceInterval: TimeInterval = 1.5,
         recoveryProbeTimeout: TimeInterval = 2.0,
         preferenceDefaults: UserDefaults = .standard,
+        catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
         initialLastUsedReasoningEffort: CodexReasoningEffort? = nil,
         initialLastUsedReasoningEffortsByModelSlug: [String: CodexReasoningEffort] = [:]
     ) {
@@ -418,6 +421,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         codexTransportClosedRecoveryGraceInterval = max(0.1, transportClosedRecoveryGraceInterval)
         codexRecoveryProbeTimeout = max(0.1, recoveryProbeTimeout)
         self.preferenceDefaults = preferenceDefaults
+        self.catalogDiagnosticsSink = catalogDiagnosticsSink
         lastUsedReasoningEffort = initialLastUsedReasoningEffort
         lastUsedReasoningEffortByModelSlug = initialLastUsedReasoningEffortsByModelSlug.reduce(into: [:]) { result, entry in
             let key = entry.key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -4059,11 +4063,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // Closed before any teardown rotates the controller generation: leaving it would encode a
             // spent repair cycle on a session that no longer has a Codex catalog to repair.
             if session.codexSessionLinkCatalogRepairCycle != nil {
-                AgentSessionLinkCatalogDiagnostics.repairTransition(
+                catalogDiagnosticsSink.record(.repairTransition(
                     runID: session.runID,
                     tabID: session.tabID,
                     outcome: .closedProviderChanged
-                )
+                ))
             }
             session.codexSessionLinkCatalogRepairCycle = nil
             cancelCodexThreadNameSync(for: session.tabID)
@@ -5851,11 +5855,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSessionLink) else {
             session.codexSessionLinkCatalogRepairCycle = nil
             logCodex("[AgentModeVM][CodexSessionLinkRepair] closed tab=\(session.tabID) reason=tool-disabled")
-            AgentSessionLinkCatalogDiagnostics.repairTransition(
+            catalogDiagnosticsSink.record(.repairTransition(
                 runID: cycleRunID,
                 tabID: session.tabID,
                 outcome: .closedToolDisabled
-            )
+            ))
             return
         }
         guard isQuiescentForControllerReplacement(session) else {
@@ -5882,11 +5886,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 AgentModeProcessRunIdentity.clearProcessRunID(for: session)
                 session.codexSessionLinkCatalogRepairCycle = nil
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] retired-stranded-run tab=\(session.tabID)")
-                AgentSessionLinkCatalogDiagnostics.repairTransition(
+                catalogDiagnosticsSink.record(.repairTransition(
                     runID: cycleRunID,
                     tabID: session.tabID,
                     outcome: .spentStrandedRunRetired
-                )
+                ))
             } else {
                 logCodex("[AgentModeVM][CodexSessionLinkRepair] consumed tab=\(session.tabID)")
             }
@@ -5904,11 +5908,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 preserveRunID: false
             )
             logCodex("[AgentModeVM][CodexSessionLinkRepair] replaced tab=\(session.tabID)")
-            AgentSessionLinkCatalogDiagnostics.repairTransition(
+            catalogDiagnosticsSink.record(.repairTransition(
                 runID: cycleRunID,
                 tabID: session.tabID,
                 outcome: .spentReplaced
-            )
+            ))
             viewModel?.agentSessionLinkRedriveCurrentPassiveSnapshot(for: session)
         }
     }

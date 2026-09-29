@@ -1,5 +1,5 @@
-import RepoPromptProcess
 import Foundation
+import RepoPromptProcess
 
 /// Configuration for Codex Exec agent provider.
 struct CodexExecAgentConfig {

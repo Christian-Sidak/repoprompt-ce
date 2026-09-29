@@ -1,5 +1,5 @@
-import RepoPromptWorkspaceCore
 import Foundation
+import RepoPromptWorkspaceCore
 
 struct WorkspaceFileTreePresentationSnapshot {
     let roots: [WorkspaceFileTreeFolderPresentation]

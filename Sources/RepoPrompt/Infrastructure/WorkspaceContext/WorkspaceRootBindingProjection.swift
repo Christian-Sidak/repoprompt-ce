@@ -1,7 +1,7 @@
-import RepoPromptFoundation
 import Foundation
-import RepoPromptWorkspaceCore
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 struct WorkspaceRootBindingProjection: Equatable {
     let sessionID: UUID

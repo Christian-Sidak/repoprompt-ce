@@ -1,5 +1,5 @@
-import RepoPromptFoundation
 import Foundation
+import RepoPromptFoundation
 import RepoPromptWorkspaceCore
 
 enum SelectedGitDiffArtifactPolicy {

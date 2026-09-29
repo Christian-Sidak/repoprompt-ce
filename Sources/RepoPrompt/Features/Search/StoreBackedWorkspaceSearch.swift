@@ -1,6 +1,6 @@
 import Foundation
-import RepoPromptWorkspaceCore
 import RepoPromptShared
+import RepoPromptWorkspaceCore
 
 enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
     case worktreeScopeUnavailable(missingPhysicalRootPaths: [String])

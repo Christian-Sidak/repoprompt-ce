@@ -1,10 +1,10 @@
-import RepoPromptFoundation
 import Combine
 import CoreServices
 import Dispatch
 import Foundation
-import RepoPromptWorkspaceCore
 import RepoPromptCodeMapCore
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 #if DEBUG
     import CryptoKit
 #endif

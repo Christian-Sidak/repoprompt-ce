@@ -1,6 +1,6 @@
 import Foundation
-import RepoPromptWorkspaceCore
 import MCP
+import RepoPromptWorkspaceCore
 
 struct MCPGitArtifactAdvertisementCheckout: Hashable {
     let logicalRootPath: String

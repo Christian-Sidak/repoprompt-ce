@@ -1,6 +1,6 @@
-import RepoPromptWorkspaceCore
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptWorkspaceCore
 
 struct WorkspaceCodemapLogicalPresentationPath: Hashable {
     let rootDisplayName: String

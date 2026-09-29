@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
-import RepoPromptWorkspaceCore
 import RepoPromptDomainRuntime
+import RepoPromptWorkspaceCore
 
 enum GitWorktreeIncludeCopier {
     private static let includeFileName = ".worktreeinclude"

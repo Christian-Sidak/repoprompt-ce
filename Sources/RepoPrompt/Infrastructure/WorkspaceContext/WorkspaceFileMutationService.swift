@@ -1,6 +1,6 @@
 import Foundation
-import RepoPromptWorkspaceCore
 import RepoPromptDomainRuntime
+import RepoPromptWorkspaceCore
 
 enum WorkspaceFileCreatePathResolutionPolicy {
     case literalPreferredIfStronger

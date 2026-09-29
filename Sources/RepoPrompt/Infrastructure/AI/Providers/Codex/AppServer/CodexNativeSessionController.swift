@@ -1,6 +1,6 @@
-import RepoPromptFoundation
 import Foundation
 import OSLog
+import RepoPromptFoundation
 
 private actor CodexInboundStreamTaskStartGate {
     private var continuation: CheckedContinuation<Void, Never>?

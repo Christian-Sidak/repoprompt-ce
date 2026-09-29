@@ -1,9 +1,9 @@
-import RepoPromptProcess
-import RepoPromptSecureStorage
 import AppKit
 import Darwin
 import Foundation
 import Logging
+import RepoPromptProcess
+import RepoPromptSecureStorage
 import Sparkle
 import SwiftUI
 
@@ -91,6 +91,9 @@ struct RepoPromptSwiftUIApp: App {
                 flushStdout: true
             )
             do {
+                await ServerNetworkManager.shared.installCatalogDiagnosticsSink(AppAgentSessionLinkCatalogEventSink())
+                await ServerNetworkManager.shared.installExecutionDiagnosticsSink(AppMCPToolExecutionEventSink())
+                await ServerNetworkManager.shared.installPhaseRecorderFactory(AppMCPToolExecutionHandlerPhaseRecorderFactory())
                 try await ServerController.shared.startServer()
                 SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
             } catch {

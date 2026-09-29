@@ -1,7 +1,8 @@
 import Foundation
-import RepoPromptWorkspaceCore
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 
 @MainActor
 final class MCPPromptContextToolProvider {

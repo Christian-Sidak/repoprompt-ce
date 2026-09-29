@@ -1,7 +1,7 @@
 #if DEBUG
     import CryptoKit
     import Foundation
-import RepoPromptWorkspaceCore
+    import RepoPromptWorkspaceCore
 
     enum DebugWorktreeStartupBenchmarkError: Error, Equatable {
         case disabled

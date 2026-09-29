@@ -1,6 +1,6 @@
-import RepoPromptFoundation
 import Foundation
 import OSLog
+import RepoPromptFoundation
 
 struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
     struct DuplicateWorkspaceRow: Identifiable, Equatable {

@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptInstrumentation
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import XCTest
@@ -324,6 +325,11 @@ final class CodexRuntimeAuthorityTests: XCTestCase {
                 provisionsRepoPromptMCPOnStart: false
             )
         }
+
+        XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.capturedLoginShell), "captured_login_shell")
+        XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.enrichedFallback), "enriched_fallback")
+        XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.inheritedRichEnvironment), "inherited_rich_environment")
+        XCTAssertEqual(SentryTelemetryValue.formatShellEnvironmentSource(.previousCapturedFallback), "previous_captured_fallback")
 
         let first = try await makeClient().prepareRuntimeForLaunch()
         let newlyPrepared = try await makeClient().prepareRuntimeForLaunch()
