@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptInstrumentation
 import SwiftUI
 
 #if DEBUG
@@ -448,6 +449,7 @@ enum ChatSessionScope: String, CaseIterable, Identifiable {
 
 @MainActor
 class OracleViewModel: ObservableObject {
+    let restorePerfRecorder: any WorkspaceRestorePerfRecording
     @Published var messages: [AIChatMessage] = []
     @Published private(set) var streamingSessions: Set<UUID> = []
     @Published private(set) var messageStoreRevision: Int = 0
@@ -1153,8 +1155,10 @@ class OracleViewModel: ObservableObject {
         aiQueriesService: AIQueriesService,
         promptViewModel: PromptViewModel,
         workspaceManager: WorkspaceManagerViewModel,
-        chatData: ChatDataService
+        chatData: ChatDataService,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
+        self.restorePerfRecorder = restorePerfRecorder
         self.aiQueriesService = aiQueriesService
         headlessRuntime = OracleHeadlessRuntime(aiQueriesService: aiQueriesService)
         self.promptViewModel = promptViewModel
@@ -1969,14 +1973,14 @@ class OracleViewModel: ObservableObject {
         let chatSessionLoadGeneration = workspaceChatSessionLoadGeneration
 
         #if DEBUG
-            let chatWorkspaceSwitchStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-            WorkspaceRestorePerfLog.event(
+            let chatWorkspaceSwitchStartMS = restorePerfRecorder.timestampMSIfEnabled()
+            restorePerfRecorder.event(
                 "chat.workspaceSwitch.begin",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(newWorkspace?.id),
+                    "workspaceID": restorePerfRecorder.shortID(newWorkspace?.id),
                     "hasWorkspace": "\(newWorkspace != nil)",
                     "sessionsBefore": "\(sessions.count)",
-                    "currentSessionID": WorkspaceRestorePerfLog.shortID(currentSessionID)
+                    "currentSessionID": restorePerfRecorder.shortID(currentSessionID)
                 ]
             )
         #endif
@@ -1984,7 +1988,7 @@ class OracleViewModel: ObservableObject {
         guard let workspace = newWorkspace else {
             // Clear sessions
             #if DEBUG
-                let clearStateStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                let clearStateStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
             sessions.removeAll()
             dropMessagesSafely()
@@ -1992,21 +1996,21 @@ class OracleViewModel: ObservableObject {
             clearAllSessionStorage()
             currentSessionID = nil
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "chat.workspaceSwitch.clearState",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(nil),
-                        "duration": clearStateStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "workspaceID": restorePerfRecorder.shortID(nil),
+                        "duration": clearStateStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "chat.workspaceSwitch.end",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(nil),
+                        "workspaceID": restorePerfRecorder.shortID(nil),
                         "sessionsAfter": "\(sessions.count)",
-                        "currentSessionID": WorkspaceRestorePerfLog.shortID(currentSessionID),
+                        "currentSessionID": restorePerfRecorder.shortID(currentSessionID),
                         "outcome": "clearedNoWorkspace",
-                        "duration": chatWorkspaceSwitchStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": chatWorkspaceSwitchStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -2015,7 +2019,7 @@ class OracleViewModel: ObservableObject {
 
         // 1) Clear any current sessions
         #if DEBUG
-            let clearStateStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let clearStateStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         sessions.removeAll()
         dropMessagesSafely()
@@ -2023,11 +2027,11 @@ class OracleViewModel: ObservableObject {
         clearAllSessionStorage()
         currentSessionID = nil
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "chat.workspaceSwitch.clearState",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
-                    "duration": clearStateStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "workspaceID": restorePerfRecorder.shortID(workspace.id),
+                    "duration": clearStateStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -2035,7 +2039,7 @@ class OracleViewModel: ObservableObject {
         // 2) Load all sessions from the newly active workspace's Chats/ folder
         #if DEBUG
             var listedFiles: [URL] = []
-            let listSessionsStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let listSessionsStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         do {
             let files = try await chatData.listChatSessions(for: workspace)
@@ -2043,18 +2047,18 @@ class OracleViewModel: ObservableObject {
                 listedFiles = files
             #endif
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "chat.workspaceSwitch.listSessions",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "fileCount": "\(files.count)",
                         "outcome": "success",
-                        "duration": listSessionsStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": listSessionsStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
             #if DEBUG
-                let loadStubsStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                let loadStubsStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
             let batch = await chatData.loadChatSessionStubs(
                 from: files,
@@ -2065,27 +2069,27 @@ class OracleViewModel: ObservableObject {
                   workspaceManager.activeWorkspace?.id == workspace.id
             else {
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "chat.workspaceSwitch.loadStubs",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "fileCount": "\(files.count)",
                             "loaded": "\(batch.loadedCount)",
                             "failed": "\(batch.failedCount)",
                             "mode": "boundedConcurrent",
                             "concurrencyLimit": "\(workspaceSwitchChatStubLoadConcurrency)",
                             "outcome": "staleDiscarded",
-                            "duration": loadStubsStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": loadStubsStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "chat.workspaceSwitch.end",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "sessionsAfter": "\(sessions.count)",
-                            "currentSessionID": WorkspaceRestorePerfLog.shortID(currentSessionID),
+                            "currentSessionID": restorePerfRecorder.shortID(currentSessionID),
                             "outcome": "staleDiscarded",
-                            "duration": chatWorkspaceSwitchStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": chatWorkspaceSwitchStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -2097,29 +2101,29 @@ class OracleViewModel: ObservableObject {
             }
             sessions = batch.sessions
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "chat.workspaceSwitch.loadStubs",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "fileCount": "\(batch.requestedCount)",
                         "loaded": "\(batch.loadedCount)",
                         "failed": "\(batch.failedCount)",
                         "mode": "boundedConcurrent",
                         "concurrencyLimit": "\(workspaceSwitchChatStubLoadConcurrency)",
                         "outcome": "success",
-                        "duration": loadStubsStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": loadStubsStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
         } catch {
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "chat.workspaceSwitch.listSessions",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "fileCount": "\(listedFiles.count)",
                         "outcome": "error",
-                        "duration": listSessionsStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": listSessionsStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -2130,14 +2134,14 @@ class OracleViewModel: ObservableObject {
               workspaceManager.activeWorkspace?.id == workspace.id
         else {
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "chat.workspaceSwitch.end",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "sessionsAfter": "\(sessions.count)",
-                        "currentSessionID": WorkspaceRestorePerfLog.shortID(currentSessionID),
+                        "currentSessionID": restorePerfRecorder.shortID(currentSessionID),
                         "outcome": "staleBeforeEnsureActiveSession",
-                        "duration": chatWorkspaceSwitchStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": chatWorkspaceSwitchStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -2150,25 +2154,25 @@ class OracleViewModel: ObservableObject {
         skipAutosaveCurrentSessionOnce = true
 
         #if DEBUG
-            let ensureActiveSessionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let ensureActiveSessionStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         await ensureActiveSessionForCurrentTab(createIfMissing: true)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "chat.workspaceSwitch.ensureActiveSession",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
-                    "duration": ensureActiveSessionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "workspaceID": restorePerfRecorder.shortID(workspace.id),
+                    "duration": ensureActiveSessionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "chat.workspaceSwitch.end",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                    "workspaceID": restorePerfRecorder.shortID(workspace.id),
                     "sessionsAfter": "\(sessions.count)",
-                    "currentSessionID": WorkspaceRestorePerfLog.shortID(currentSessionID),
+                    "currentSessionID": restorePerfRecorder.shortID(currentSessionID),
                     "outcome": "completed",
-                    "duration": chatWorkspaceSwitchStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": chatWorkspaceSwitchStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif

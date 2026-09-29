@@ -701,6 +701,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var providerConversationCleanupRegistry: ProviderConversationCleanupRegistry
     let codexCoordinator: CodexAgentModeCoordinator
     let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
+    let restorePerfRecorder: any WorkspaceRestorePerfRecording
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
@@ -2312,7 +2313,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         skillCatalog: AgentSkillCatalog? = nil,
         modelRouterSettingsStore: GlobalSettingsStore = .shared,
         modelRouterRuntime: AgentTaskRouterRuntime? = nil,
-        catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink()
+        catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
         self.windowID = windowID
         self.promptManager = promptManager
@@ -2324,6 +2326,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.modelRouterSettingsStore = modelRouterSettingsStore
         self.modelRouterRuntime = modelRouterRuntime
         self.catalogDiagnosticsSink = catalogDiagnosticsSink
+        self.restorePerfRecorder = restorePerfRecorder
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
@@ -2585,7 +2588,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
             testOpenCodeModelParameterStreamProvider: ((String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>)? = nil,
             testModelRouterSettingsStore: GlobalSettingsStore = .shared,
-            testCatalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink()
+            testCatalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
+            testRestorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -2595,6 +2599,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             modelRouterSettingsStore = testModelRouterSettingsStore
             self.applyEditsApprovalStore = applyEditsApprovalStore
             catalogDiagnosticsSink = testCatalogDiagnosticsSink
+            restorePerfRecorder = testRestorePerfRecorder
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
             attachmentWorkspaceDirectoryProvider = {
                 if let testWorkspaceDirectory {
@@ -4045,7 +4050,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             self?.finishInitialSystemWorkspaceSessionListRefreshDeferral(refreshIfStillSystem: true)
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.log(
+            restorePerfRecorder.log(
                 "agentSessionIndex.initialSystemRefreshDeferral armed windowID=\(windowID) reason=\(reason) fallbackMS=10000"
             )
         #endif
@@ -4057,7 +4062,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         initialSystemWorkspaceSessionListRefreshDeferralFallbackTask = nil
         initialSystemWorkspaceSessionListRefreshDeferralReason = nil
         #if DEBUG
-            WorkspaceRestorePerfLog.log(
+            restorePerfRecorder.log(
                 "agentSessionIndex.initialSystemRefreshDeferral cleared windowID=\(windowID) reason=\(reason) refreshIfStillSystem=\(refreshIfStillSystem)"
             )
         #endif
@@ -4086,16 +4091,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Toggle whether agent mode UI is active (used to defer heavy session loads).
     func setAgentModeActive(_ isActive: Bool) {
         #if DEBUG
-            let activationStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-            let activationCount = isActive ? WorkspaceRestorePerfLog.nextAgentActivationTrueCount() : nil
+            let activationStartMS = restorePerfRecorder.timestampMSIfEnabled()
+            let activationCount = isActive ? restorePerfRecorder.nextAgentActivationTrueCount() : nil
             let workspaceIDForLog = workspaceManager?.activeWorkspace?.id
         #endif
         isAgentModeActive = isActive
         NotificationService.shared.agentNotifications.visibilityMayHaveChanged()
         guard isActive else {
             #if DEBUG
-                WorkspaceRestorePerfLog.log(
-                    "agentActivation.inactive windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspaceIDForLog))"
+                restorePerfRecorder.log(
+                    "agentActivation.inactive windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspaceIDForLog))"
                 )
             #endif
             codexCoordinator.stop()
@@ -4109,8 +4114,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let targetTabID = pendingTabIDForLoad ?? currentTabID
         #if DEBUG
             let targetTabIDForLog = targetTabID?.uuidString.prefix(8).description ?? "nil"
-            WorkspaceRestorePerfLog.log(
-                "agentActivation.begin windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspaceIDForLog)) activationTrueCount=\(activationCount ?? 0) targetTabID=\(targetTabIDForLog) sessionCount=\(sessions.count) indexedSessionCount=\(sessionIndex.count)"
+            restorePerfRecorder.log(
+                "agentActivation.begin windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspaceIDForLog)) activationTrueCount=\(activationCount ?? 0) targetTabID=\(targetTabIDForLog) sessionCount=\(sessions.count) indexedSessionCount=\(sessionIndex.count)"
             )
         #endif
         pendingTabIDForLoad = nil
@@ -4124,14 +4129,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             refreshSessionListCache(for: workspace, owner: owner)
         }
         #if DEBUG
-            let tabChangeStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let tabChangeStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         onTabChanged(targetTabID)
         #if DEBUG
             if let activationStartMS {
-                let tabChangeDuration = tabChangeStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                WorkspaceRestorePerfLog.log(
-                    "agentActivation.end windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspaceIDForLog)) activationTrueCount=\(activationCount ?? 0) targetTabID=\(targetTabIDForLog) onTabChanged=\(tabChangeDuration) total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: activationStartMS))"
+                let tabChangeDuration = tabChangeStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
+                restorePerfRecorder.log(
+                    "agentActivation.end windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspaceIDForLog)) activationTrueCount=\(activationCount ?? 0) targetTabID=\(targetTabIDForLog) onTabChanged=\(tabChangeDuration) total=\(restorePerfRecorder.formatElapsedMS(since: activationStartMS))"
                 )
             }
         #endif
@@ -5348,20 +5353,20 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func loadSessionFromDisk(for session: TabSession) async {
         #if DEBUG
-            let loadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let loadStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let debugTabID = session.tabID
             let debugStartRevision = session.sourceItemsRevision
             let debugExpectedSessionID = explicitActiveSessionID(for: session.tabID)
             func logLoadTask(outcome: String) {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentSessionHydration.loadTask",
                     fields: [
                         "windowID": "\(windowID)",
-                        "tabID": WorkspaceRestorePerfLog.shortID(debugTabID),
-                        "sessionID": WorkspaceRestorePerfLog.shortID(debugExpectedSessionID),
+                        "tabID": restorePerfRecorder.shortID(debugTabID),
+                        "sessionID": restorePerfRecorder.shortID(debugExpectedSessionID),
                         "outcome": outcome,
                         "startRevision": "\(debugStartRevision)",
-                        "duration": loadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": loadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -5438,25 +5443,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) async {
         let expectedSessionID = hydrationToken?.requestedSessionID
         #if DEBUG
-            let performStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let performStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var prepareDurationMS: Double?
             var applyDurationMS: Double?
             func logPerform(outcome: String, currentRevision: Int? = nil, error: Error? = nil) {
                 var fields: [String: String] = [
                     "windowID": "\(windowID)",
-                    "tabID": WorkspaceRestorePerfLog.shortID(session.tabID),
-                    "sessionID": WorkspaceRestorePerfLog.shortID(expectedSessionID),
+                    "tabID": restorePerfRecorder.shortID(session.tabID),
+                    "sessionID": restorePerfRecorder.shortID(expectedSessionID),
                     "outcome": outcome,
                     "startRevision": "\(startRevision)",
                     "currentRevision": "\(currentRevision ?? session.sourceItemsRevision)",
-                    "prepareDuration": prepareDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun",
-                    "applyDuration": applyDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun",
-                    "total": performStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "prepareDuration": prepareDurationMS.map(restorePerfRecorder.formatMS) ?? "notRun",
+                    "applyDuration": applyDurationMS.map(restorePerfRecorder.formatMS) ?? "notRun",
+                    "total": performStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
                 if let error {
                     fields["error"] = String(describing: error)
                 }
-                WorkspaceRestorePerfLog.event("agentSessionHydration.perform", fields: fields)
+                restorePerfRecorder.event("agentSessionHydration.perform", fields: fields)
             }
         #endif
         if AppLaunchConfiguration.current.suppressesAgentSessionPersistence {
@@ -5496,7 +5501,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         #endif
         do {
             #if DEBUG
-                prepareStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                prepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
             let preparedPayload = try await dataService.preparePersistedHydration(request)
             guard persistentBindingTransitionIsCurrent(hydrationToken.transition) else {
@@ -5508,7 +5513,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard let payload = preparedPayload else {
                 #if DEBUG
                     if let prepareStartMS {
-                        prepareDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: prepareStartMS)
+                        prepareDurationMS = restorePerfRecorder.elapsedMS(since: prepareStartMS)
                     }
                 #endif
                 // Recorded before the completion latch: `hasLoadedPersistedState` is about to say
@@ -5523,7 +5528,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             #if DEBUG
                 if let prepareStartMS {
-                    prepareDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: prepareStartMS)
+                    prepareDurationMS = restorePerfRecorder.elapsedMS(since: prepareStartMS)
                 }
             #endif
             guard !Task.isCancelled else {
@@ -5572,7 +5577,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
 
             #if DEBUG
-                let applyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                let applyStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
             guard await applyPersistedHydration(payload, to: session, token: hydrationToken) else {
                 #if DEBUG
@@ -5582,7 +5587,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             #if DEBUG
                 if let applyStartMS {
-                    applyDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: applyStartMS)
+                    applyDurationMS = restorePerfRecorder.elapsedMS(since: applyStartMS)
                 }
                 logPerform(outcome: "applied")
             #endif
@@ -5598,7 +5603,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             #if DEBUG
                 if let prepareStartMS, prepareDurationMS == nil {
-                    prepareDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: prepareStartMS)
+                    prepareDurationMS = restorePerfRecorder.elapsedMS(since: prepareStartMS)
                 }
                 let outcome = (error is CancellationError || Task.isCancelled) ? "cancelledDuringPrepare" : "error"
                 logPerform(outcome: outcome, error: error)
@@ -5914,47 +5919,47 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         let payload: AgentSessionHydrationPayload
         #if DEBUG
-            let routePrepareStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let routePrepareStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         do {
             guard let preparedPayload = try await dataService.preparePersistedHydration(hydrationRequest) else {
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "agentSessionHydration.routeActivationPrepare",
                         fields: [
                             "windowID": "\(windowID)",
-                            "tabID": WorkspaceRestorePerfLog.shortID(tabID),
-                            "sessionID": WorkspaceRestorePerfLog.shortID(sessionID),
+                            "tabID": restorePerfRecorder.shortID(tabID),
+                            "sessionID": restorePerfRecorder.shortID(sessionID),
                             "outcome": "notFound",
-                            "duration": routePrepareStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": routePrepareStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
                 return .sessionNotFound
             }
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentSessionHydration.routeActivationPrepare",
                     fields: [
                         "windowID": "\(windowID)",
-                        "tabID": WorkspaceRestorePerfLog.shortID(tabID),
-                        "sessionID": WorkspaceRestorePerfLog.shortID(sessionID),
+                        "tabID": restorePerfRecorder.shortID(tabID),
+                        "sessionID": restorePerfRecorder.shortID(sessionID),
                         "outcome": "payload",
-                        "duration": routePrepareStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": routePrepareStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
             payload = preparedPayload
         } catch {
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentSessionHydration.routeActivationPrepare",
                     fields: [
                         "windowID": "\(windowID)",
-                        "tabID": WorkspaceRestorePerfLog.shortID(tabID),
-                        "sessionID": WorkspaceRestorePerfLog.shortID(sessionID),
+                        "tabID": restorePerfRecorder.shortID(tabID),
+                        "sessionID": restorePerfRecorder.shortID(sessionID),
                         "outcome": "error",
-                        "duration": routePrepareStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured",
+                        "duration": routePrepareStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured",
                         "error": String(describing: error)
                     ]
                 )
@@ -14043,17 +14048,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // owner can never settle a level it does not own.
         let discoveryEpoch = beginAgentSessionLinkDiscoveryEpoch(workspaceID: workspace?.id)
         #if DEBUG
-            let workspaceSwitchStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let workspaceSwitchStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let workspaceSwitchInitialSessions = sessions.count
             let workspaceSwitchInitialActiveTabID = workspace?.activeComposeTabID
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "agentMode.workspaceSwitch.begin",
                 fields: [
                     "windowID": "\(windowID)",
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace?.id),
+                    "workspaceID": restorePerfRecorder.shortID(workspace?.id),
                     "hasWorkspace": "\(workspace != nil)",
                     "sessionsBefore": "\(workspaceSwitchInitialSessions)",
-                    "activeTabID": WorkspaceRestorePerfLog.shortID(workspaceSwitchInitialActiveTabID),
+                    "activeTabID": restorePerfRecorder.shortID(workspaceSwitchInitialActiveTabID),
                     "isSystemWorkspace": "\(workspace?.isSystemWorkspace ?? false)"
                 ]
             )
@@ -14075,7 +14080,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         pendingAssistantPresentationByTabID.removeAll()
 
         #if DEBUG
-            let teardownStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let teardownStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let teardownSessionCount = sessions.count
         #endif
         let discardContexts = sessions.values.map {
@@ -14105,16 +14110,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         codexCoordinator.stop()
         claudeCoordinator.stop()
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "agentMode.workspaceSwitch.discardPrepared",
                 fields: [
                     "windowID": "\(windowID)",
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace?.id),
+                    "workspaceID": restorePerfRecorder.shortID(workspace?.id),
                     "sessionCount": "\(teardownSessionCount)",
-                    "duration": teardownStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": teardownStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
-            let clearStateStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let clearStateStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         sessions.removeAll()
         lastProcessedTabID = nil
@@ -14147,12 +14152,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "agentMode.workspaceSwitch.clearState",
                 fields: [
                     "windowID": "\(windowID)",
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace?.id),
-                    "duration": clearStateStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "workspaceID": restorePerfRecorder.shortID(workspace?.id),
+                    "duration": clearStateStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -14165,13 +14170,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // on a window that will never register a binding.
             completeAgentSessionLinkDiscoveryEpoch(discoveryEpoch)
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentMode.workspaceSwitch.end",
                     fields: [
                         "windowID": "\(windowID)",
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(nil),
+                        "workspaceID": restorePerfRecorder.shortID(nil),
                         "outcome": "noWorkspace",
-                        "duration": workspaceSwitchStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": workspaceSwitchStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -14179,12 +14184,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         refreshSessionListCache(for: workspace, owner: owner)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "agentMode.workspaceSwitch.refreshScheduled",
                 fields: [
                     "windowID": "\(windowID)",
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
-                    "activeTabID": WorkspaceRestorePerfLog.shortID(workspace.activeComposeTabID),
+                    "workspaceID": restorePerfRecorder.shortID(workspace.id),
+                    "activeTabID": restorePerfRecorder.shortID(workspace.activeComposeTabID),
                     "frozenOrderTabs": "\(sidebarRestoreFrozenOrderByTabID.count)"
                 ]
             )
@@ -14197,13 +14202,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             completeAgentSessionLinkDiscoveryEpoch(discoveryEpoch)
             onTabChanged(resolvedActiveTabID, allowDuringWorkspaceSwitch: true)
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentMode.workspaceSwitch.end",
                     fields: [
                         "windowID": "\(windowID)",
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "outcome": "activeTabChanged",
-                        "duration": workspaceSwitchStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": workspaceSwitchStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -14215,26 +14220,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workspaceSwitchInFlight = false
             clearBindings()
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentMode.workspaceSwitch.end",
                     fields: [
                         "windowID": "\(windowID)",
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "outcome": "emptyWorkspace",
-                        "duration": workspaceSwitchStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": workspaceSwitchStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
         } else {
             setActiveTranscriptBindingsHydrated(true)
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentMode.workspaceSwitch.end",
                     fields: [
                         "windowID": "\(windowID)",
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "outcome": "bindingsHydrated",
-                        "duration": workspaceSwitchStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": workspaceSwitchStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -14270,7 +14275,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         #if DEBUG
-            let requestBuildStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let requestBuildStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         let persistedTabs = persistedSidebarTabs(for: workspace)
         var tabNameByID: [UUID: String] = [:]
@@ -14302,19 +14307,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             prioritizedTabID: nil
         )
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "agentSessionIndex.requestBuilt",
                 fields: [
                     "windowID": "\(windowID)",
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                    "workspaceID": restorePerfRecorder.shortID(workspace.id),
                     "activationEpoch": "\(owner.activationEpoch)",
-                    "duration": requestBuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured",
+                    "duration": requestBuildStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured",
                     "persistedTabs": "\(persistedTabs.count)",
                     "validTabs": "\(validTabIDs.count)",
                     "boundSessions": "\(boundSessionIDByTabID.count)",
                     "frozenOrderTabs": "\(ownerValidatedSidebarRestoreFrozenOrderByTabID.count)",
                     "hasPrioritizedTab": "\(prioritizedTabID != nil)",
-                    "prioritizedTabID": WorkspaceRestorePerfLog.shortID(prioritizedTabID),
+                    "prioritizedTabID": restorePerfRecorder.shortID(prioritizedTabID),
                     "isSystemWorkspace": "\(workspace.isSystemWorkspace)",
                     "deferralArmed": "\(initialSystemWorkspaceSessionListRefreshDeferralReason != nil)"
                 ]
@@ -14352,7 +14357,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionListCacheTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             #if DEBUG
-                let taskStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                let taskStartMS = restorePerfRecorder.timestampMSIfEnabled()
                 var prioritizedDurationMS: Double?
                 var streamDurationMS: Double?
                 var streamBatchCount = 0
@@ -14363,7 +14368,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     let prioritizedBoundSessionIDByTabID = boundSessionIDByTabID[prioritizedTabID]
                         .map { [prioritizedTabID: $0] } ?? [:]
                     #if DEBUG
-                        let prioritizedStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                        let prioritizedStartMS = restorePerfRecorder.timestampMSIfEnabled()
                     #endif
                     let prioritizedResult = try await prioritizedBuilder(
                         AgentSessionSidebarBuildRequest(
@@ -14375,7 +14380,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     )
                     #if DEBUG
                         if let prioritizedStartMS {
-                            prioritizedDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: prioritizedStartMS)
+                            prioritizedDurationMS = restorePerfRecorder.elapsedMS(since: prioritizedStartMS)
                         }
                     #endif
                     guard !Task.isCancelled else { return }
@@ -14400,7 +14405,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 while true {
                     do {
                         #if DEBUG
-                            let streamStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                            let streamStartMS = restorePerfRecorder.timestampMSIfEnabled()
                         #endif
                         let stream = await streamBuilder(fullRequest, restoreBatchSize)
                         for try await batch in stream {
@@ -14418,7 +14423,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         guard !Task.isCancelled else { return }
                         #if DEBUG
                             if let streamStartMS {
-                                streamDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: streamStartMS)
+                                streamDurationMS = restorePerfRecorder.elapsedMS(since: streamStartMS)
                             }
                         #endif
                         break
@@ -14431,8 +14436,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         }
                         streamRetryCount += 1
                         #if DEBUG
-                            WorkspaceRestorePerfLog.log(
-                                "agentSessionIndex.refreshRetry windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) retry=\(streamRetryCount) error=\(String(describing: error))"
+                            restorePerfRecorder.log(
+                                "agentSessionIndex.refreshRetry windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) retry=\(streamRetryCount) error=\(String(describing: error))"
                             )
                         #endif
                         await Task.yield()
@@ -14440,8 +14445,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
                 #if DEBUG
                     if let taskStartMS {
-                        WorkspaceRestorePerfLog.log(
-                            "agentSessionIndex.refreshComplete windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) retries=\(streamRetryCount) prioritized=\(prioritizedDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notRun") stream=\(streamDurationMS.map(WorkspaceRestorePerfLog.formatMS) ?? "notMeasured") total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: taskStartMS))"
+                        restorePerfRecorder.log(
+                            "agentSessionIndex.refreshComplete windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) retries=\(streamRetryCount) prioritized=\(prioritizedDurationMS.map(restorePerfRecorder.formatMS) ?? "notRun") stream=\(streamDurationMS.map(restorePerfRecorder.formatMS) ?? "notMeasured") total=\(restorePerfRecorder.formatElapsedMS(since: taskStartMS))"
                         )
                     }
                 #endif
@@ -14450,8 +14455,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 guard !Task.isCancelled else { return }
                 #if DEBUG
                     if let taskStartMS {
-                        WorkspaceRestorePerfLog.log(
-                            "agentSessionIndex.refreshFailure windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) total=\(WorkspaceRestorePerfLog.formatElapsedMS(since: taskStartMS)) error=\(String(describing: error))"
+                        restorePerfRecorder.log(
+                            "agentSessionIndex.refreshFailure windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspace.id)) activationEpoch=\(owner.activationEpoch) generation=\(token.generation) batches=\(streamBatchCount) streamEntries=\(streamEntryCount) total=\(restorePerfRecorder.formatElapsedMS(since: taskStartMS)) error=\(String(describing: error))"
                         )
                     }
                 #endif
@@ -14484,8 +14489,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sessionIndexStore.setSessionListCacheReady(true, for: token.owner)
         sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
         #if DEBUG
-            WorkspaceRestorePerfLog.log(
-                "agentSessionIndex.refreshSkipped windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(token.owner.activationEpoch) generation=\(token.generation) reason=\(reason) managerInitialized=\(workspaceManager?.isInitialized == true) managerSwitching=\(workspaceManager?.isSwitchingWorkspace == true)"
+            restorePerfRecorder.log(
+                "agentSessionIndex.refreshSkipped windowID=\(windowID) workspaceID=\(restorePerfRecorder.shortID(workspace.id)) activationEpoch=\(token.owner.activationEpoch) generation=\(token.generation) reason=\(reason) managerInitialized=\(workspaceManager?.isInitialized == true) managerSwitching=\(workspaceManager?.isSwitchingWorkspace == true)"
             )
         #endif
     }
@@ -14537,7 +14542,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         isFullRefresh: Bool
     ) {
         #if DEBUG
-            let applyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applyStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         guard activeSessionIndexRefreshToken == token,
               sessionIndexStore.isOwnerCurrent(token.owner)
@@ -14573,7 +14578,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         let resumeTriggered = resumePendingActiveSessionLoadIfNeeded(updatedTabIDs: updatedTabIDs)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "agentSessionIndex.applyBatch",
                 fields: [
                     "windowID": "\(windowID)",
@@ -14585,7 +14590,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     "updatedTabs": "\(updatedTabIDs.count)",
                     "sessionIndexAfter": "\(sessionIndex.count)",
                     "resumeTriggered": "\(resumeTriggered)",
-                    "total": applyStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "total": applyStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -14669,17 +14674,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         prioritizedTabID: UUID?
     ) -> Bool {
         #if DEBUG
-            let waitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let waitStartMS = restorePerfRecorder.timestampMSIfEnabled()
             func logActiveRestoreWait(outcome: String, waited: Bool) {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "agentSessionIndex.activeRestoreWait",
                     fields: [
                         "windowID": "\(windowID)",
                         "generation": "\(token.generation)",
-                        "prioritizedTabID": WorkspaceRestorePerfLog.shortID(prioritizedTabID),
+                        "prioritizedTabID": restorePerfRecorder.shortID(prioritizedTabID),
                         "outcome": outcome,
                         "waited": "\(waited)",
-                        "duration": waitStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": waitStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }

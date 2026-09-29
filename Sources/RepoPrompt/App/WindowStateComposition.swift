@@ -49,16 +49,21 @@ enum WindowStateCompositionFactory {
         #if DEBUG
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
                 enableCatalogShardShadowValidation: false,
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled
+                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
             )
         #else
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled
+                nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
             )
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
         let workspaceSearchService = WorkspaceSearchService()
-        let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
+        let workspaceFilesViewModel = WorkspaceFilesViewModel(
+            workspaceFileContextStore: workspaceFileContextStore,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
+        )
         if injectedWorkspaceFileContextStore == nil {
             workspaceFilesViewModel.bindNonGitCodeMapsSetting(settingsStore)
         }
@@ -98,7 +103,8 @@ enum WindowStateCompositionFactory {
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
             domainWorkspaceAuthorityClient: domainWorkspaceClient,
-            switchTimingPolicy: workspaceSwitchTimingPolicy
+            switchTimingPolicy: workspaceSwitchTimingPolicy,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
         let routerSettingsViewModel = RouterSettingsViewModel(
             settingsStore: settingsStore,
@@ -124,7 +130,8 @@ enum WindowStateCompositionFactory {
             aiQueriesService: aiQueriesService,
             promptViewModel: promptManager,
             workspaceManager: workspaceManager,
-            chatData: chatDataService
+            chatData: chatDataService,
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
 
         // 11) MCP server (one listener app-wide, this window may be owner)
@@ -191,7 +198,8 @@ enum WindowStateCompositionFactory {
             applyEditsApprovalStore: applyEditsApprovalStore,
             modelRouterSettingsStore: settingsStore,
             modelRouterRuntime: modelRouterRuntime,
-            catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink()
+            catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
         )
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]

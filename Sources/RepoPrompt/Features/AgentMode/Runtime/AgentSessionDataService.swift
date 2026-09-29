@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 #if canImport(Darwin)
     import Darwin
 #else
@@ -167,6 +168,16 @@ private actor AgentSessionDiskWriter {
 /// An actor that reads/writes AgentSessions from each workspace's "AgentSessions" folder.
 actor AgentSessionDataService {
     static let shared = AgentSessionDataService()
+
+    private nonisolated let restorePerfRecorderSlot = WorkspaceRestorePerfRecorderBox()
+
+    nonisolated func installRestorePerfRecorder(_ recorder: any WorkspaceRestorePerfRecording) {
+        restorePerfRecorderSlot.install(recorder)
+    }
+
+    var restorePerfRecorder: any WorkspaceRestorePerfRecording {
+        restorePerfRecorderSlot.snapshot()
+    }
 
     static func defaultWorkspaceRootURL() -> URL {
         MCPFilesystemConstants.identity.applicationSupportRootURL()
@@ -657,7 +668,7 @@ actor AgentSessionDataService {
 
     private func readMetadataIndexIfAvailable(folder: URL, preferCache: Bool = true) async -> AgentSessionMetadataIndex? {
         #if DEBUG
-            let readStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let readStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         let key = canonicalMetadataFolderKey(folder)
         if preferCache, let cached = metadataIndexCacheByFolder[key] {
@@ -667,8 +678,8 @@ actor AgentSessionDataService {
             }
             #if DEBUG
                 if let readStartMS {
-                    WorkspaceRestorePerfLog.log(
-                        "agentSessionIndex.memoryRead status=hit entries=\(cached.entries.count) quarantined=\(cached.quarantinedFiles.count) duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: readStartMS))"
+                    restorePerfRecorder.log(
+                        "agentSessionIndex.memoryRead status=hit entries=\(cached.entries.count) quarantined=\(cached.quarantinedFiles.count) duration=\(restorePerfRecorder.formatElapsedMS(since: readStartMS))"
                     )
                 }
             #endif
@@ -679,8 +690,8 @@ actor AgentSessionDataService {
             metadataIndexCacheByFolder.removeValue(forKey: key)
             #if DEBUG
                 if let readStartMS {
-                    WorkspaceRestorePerfLog.log(
-                        "agentSessionIndex.diskRead status=missing duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: readStartMS))"
+                    restorePerfRecorder.log(
+                        "agentSessionIndex.diskRead status=missing duration=\(restorePerfRecorder.formatElapsedMS(since: readStartMS))"
                     )
                 }
             #endif
@@ -693,8 +704,8 @@ actor AgentSessionDataService {
                 metadataIndexCacheByFolder.removeValue(forKey: key)
                 #if DEBUG
                     if let readStartMS {
-                        WorkspaceRestorePerfLog.log(
-                            "agentSessionIndex.diskRead status=schemaMismatch entries=\(index.entries.count) duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: readStartMS))"
+                        restorePerfRecorder.log(
+                            "agentSessionIndex.diskRead status=schemaMismatch entries=\(index.entries.count) duration=\(restorePerfRecorder.formatElapsedMS(since: readStartMS))"
                         )
                     }
                 #endif
@@ -703,8 +714,8 @@ actor AgentSessionDataService {
             metadataIndexCacheByFolder[key] = index
             #if DEBUG
                 if let readStartMS {
-                    WorkspaceRestorePerfLog.log(
-                        "agentSessionIndex.diskRead status=hit entries=\(index.entries.count) quarantined=\(index.quarantinedFiles.count) bytes=\(data.count) duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: readStartMS))"
+                    restorePerfRecorder.log(
+                        "agentSessionIndex.diskRead status=hit entries=\(index.entries.count) quarantined=\(index.quarantinedFiles.count) bytes=\(data.count) duration=\(restorePerfRecorder.formatElapsedMS(since: readStartMS))"
                     )
                 }
             #endif
@@ -713,8 +724,8 @@ actor AgentSessionDataService {
             metadataIndexCacheByFolder.removeValue(forKey: key)
             #if DEBUG
                 if let readStartMS {
-                    WorkspaceRestorePerfLog.log(
-                        "agentSessionIndex.diskRead status=error duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: readStartMS)) error=\(String(describing: error))"
+                    restorePerfRecorder.log(
+                        "agentSessionIndex.diskRead status=error duration=\(restorePerfRecorder.formatElapsedMS(since: readStartMS)) error=\(String(describing: error))"
                     )
                 }
             #endif
@@ -823,7 +834,7 @@ actor AgentSessionDataService {
 
     private func agentSessionFiles(in folder: URL) throws -> [URL] {
         #if DEBUG
-            let scanStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let scanStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         let contents = try FileManager.default.contentsOfDirectory(
             at: folder,
@@ -841,8 +852,8 @@ actor AgentSessionDataService {
         }
         #if DEBUG
             if let scanStartMS {
-                WorkspaceRestorePerfLog.log(
-                    "agentSessionIndex.fileScan scannedSessionFiles=\(sorted.count) directoryEntries=\(contents.count) duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: scanStartMS))"
+                restorePerfRecorder.log(
+                    "agentSessionIndex.fileScan scannedSessionFiles=\(sorted.count) directoryEntries=\(contents.count) duration=\(restorePerfRecorder.formatElapsedMS(since: scanStartMS))"
                 )
             }
         #endif
@@ -851,15 +862,15 @@ actor AgentSessionDataService {
 
     private func metadataIndexNeedsFilenameReconciliation(_ index: AgentSessionMetadataIndex, folder: URL) throws -> Bool {
         #if DEBUG
-            let reconcileCheckStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let reconcileCheckStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         let fileNames = try Set(agentSessionFiles(in: folder).map(\.lastPathComponent))
         let indexedNames = Set(index.entries.map(\.filename))
         let needsReconciliation = fileNames != indexedNames
         #if DEBUG
             if let reconcileCheckStartMS {
-                WorkspaceRestorePerfLog.log(
-                    "agentSessionIndex.reconcileCheck needsRebuild=\(needsReconciliation) scannedSessionFiles=\(fileNames.count) indexedEntries=\(indexedNames.count) duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: reconcileCheckStartMS))"
+                restorePerfRecorder.log(
+                    "agentSessionIndex.reconcileCheck needsRebuild=\(needsReconciliation) scannedSessionFiles=\(fileNames.count) indexedEntries=\(indexedNames.count) duration=\(restorePerfRecorder.formatElapsedMS(since: reconcileCheckStartMS))"
                 )
             }
         #endif
@@ -869,7 +880,7 @@ actor AgentSessionDataService {
     private func rebuildMetadataIndex(folder: URL) async throws -> AgentSessionMetadataIndex {
         let key = canonicalMetadataFolderKey(folder)
         #if DEBUG
-            let rebuildStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let rebuildStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         let now = Date()
         let files = try agentSessionFiles(in: folder)
@@ -925,8 +936,8 @@ actor AgentSessionDataService {
         metadataIndexReconciledThisProcess.insert(key)
         #if DEBUG
             if let rebuildStartMS {
-                WorkspaceRestorePerfLog.log(
-                    "agentSessionIndex.rebuild scannedSessionFiles=\(files.count) records=\(records.count) quarantined=\(quarantinedFiles.count) duration=\(WorkspaceRestorePerfLog.formatElapsedMS(since: rebuildStartMS))"
+                restorePerfRecorder.log(
+                    "agentSessionIndex.rebuild scannedSessionFiles=\(files.count) records=\(records.count) quarantined=\(quarantinedFiles.count) duration=\(restorePerfRecorder.formatElapsedMS(since: rebuildStartMS))"
                 )
             }
         #endif
@@ -953,10 +964,10 @@ actor AgentSessionDataService {
         } ?? false
         let willSchedule = !alreadyReconciled && (!alreadyScheduled || promotesDelayedReconciliation)
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "agentSessionIndex.reconcileScheduled",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspaceID),
+                    "workspaceID": restorePerfRecorder.shortID(workspaceID),
                     "delayMS": "\(Int((effectiveDelaySeconds * 1000).rounded()))",
                     "reason": reason,
                     "alreadyScheduled": "\(alreadyScheduled)",
