@@ -1,6 +1,7 @@
 import Darwin
 import Dispatch
 import Foundation
+import RepoPromptInstrumentation
 import RepoPromptWorkspaceCore
 
 struct GitWorkspaceAuthorityRepositoryKey: Hashable {
