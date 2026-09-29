@@ -163,4 +163,3 @@ package enum GitProcessCommandFamily: String, Equatable, Sendable {
     case repositoryRead
     case mutation
 }
-
