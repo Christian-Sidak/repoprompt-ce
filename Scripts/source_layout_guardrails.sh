@@ -797,6 +797,7 @@ allowed_tracked_docs=(
   "docs/architecture/headless-mcp-runtime.md"
   "docs/architecture/mcp-lifecycle-diagnostics.md"
   "docs/architecture/model-routing.md"
+  "docs/architecture/modules.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
@@ -810,6 +811,7 @@ allowed_tracked_docs=(
   "docs/migrations/build-modularization/completion-plan.md"
   "docs/migrations/build-modularization/ledger.md"
   "docs/migrations/build-modularization/ratchets.json"
+  "docs/migrations/build-modularization/build-ratchets.json"
   "docs/open-source-readiness.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"
@@ -858,6 +860,7 @@ print_matches \
 # Targets linked into repoprompt-mcp are never allowlisted.
 bundle_main_allowed_roots=(
   "Sources/RepoPrompt/"
+  "Sources/RepoPromptSecureStorage/"
 )
 bundle_main_hits="$(grep -R -n -E '(^|[^A-Za-z0-9_])(Bundle\.main|NSImage\(named:)' Sources --include='*.swift' || true)"
 for allowed_root in "${bundle_main_allowed_roots[@]}"; do
@@ -867,6 +870,19 @@ if [[ -n "$bundle_main_hits" ]]; then
   fail "Bundle.main lookup outside an allowlisted app-only target"
   printf '%s\n' "$bundle_main_hits" >&2
 fi
+# Extracted logic targets are app-free. Process additionally cannot read ambient
+# process-wide defaults; an app adapter must supply such configuration.
+for logic_root in Sources/RepoPromptFoundation Sources/RepoPromptInstrumentation Sources/RepoPromptProcess Sources/RepoPromptRegexCore; do
+  if [[ -d "$logic_root" ]]; then
+    print_matches "UI framework import in app-free target $logic_root" \
+      grep -R -n -E '^[[:space:]]*import[[:space:]]+(SwiftUI|AppKit)([[:space:]]|$)' "$logic_root" --include='*.swift'
+  fi
+done
+if [[ -d Sources/RepoPromptProcess ]]; then
+  print_matches "ambient Bundle.main or UserDefaults.standard in RepoPromptProcess" \
+    grep -R -n -E 'Bundle[.]main|UserDefaults[.]standard' Sources/RepoPromptProcess --include='*.swift'
+fi
+
 # Swift class runtime names embed the module (`_TtC13RepoPromptApp...`), so these
 # APIs silently change identity when a type moves. Use explicit string identities.
 # The one allowed lookup names an Objective-C class, whose name has no module.

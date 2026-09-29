@@ -2,17 +2,17 @@
   "description": "Build-modularization ratchet baselines. Ratcheted metrics may only decrease; regenerate with `python3 Scripts/modularization_metrics.py update` after an improving slice.",
   "ratcheted": [
     "app_files_over_5000_lines",
-    "app_static_shared_declarations"
+    "app_files_over_2000_lines",
+    "app_static_shared_declarations",
+    "tests_testable_import_app_files"
   ],
   "tracked": [
     "app_target_swift_lines",
-    "app_files_over_2000_lines",
     "app_shared_accessor_uses",
     "app_userdefaults_standard_uses",
     "app_wrong_way_file_edges",
     "app_largest_cycle_components",
-    "tests_sleep_calls",
-    "tests_testable_import_app_files"
+    "tests_sleep_calls"
   ],
   "metrics": {
     "app_components": 75,
@@ -28,6 +28,7 @@
     "app_wrong_way_file_edges": 1104,
     "first_party_swift_lines": 736597,
     "tests_sleep_calls": 48,
-    "tests_testable_import_app_files": 324
-  }
+    "tests_testable_import_app_files": 326
+  },
+  "app_target_swift_lines_headroom": 2000
 }

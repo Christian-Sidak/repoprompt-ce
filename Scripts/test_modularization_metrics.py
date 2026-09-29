@@ -91,6 +91,7 @@ class RatchetCommandTests(unittest.TestCase):
         self.assertIn("tests_sleep_calls", mm.TRACKED_METRICS)
         self.assertEqual(len(mm._SLEEP.findall("func sleep(until deadline: Instant) {}")), 1)
         baseline = {name: 0 for name in mm.RATCHETED_METRICS}
+        baseline["app_target_swift_lines"] = 0
         current = {**baseline, "app_largest_cycle_components": 68, "tests_sleep_calls": 50}
         self.assertEqual(mm.regressions(current, baseline), [])
 
@@ -124,7 +125,7 @@ class RatchetCommandTests(unittest.TestCase):
 
     def test_regressions_reports_missing_metric(self) -> None:
         problems = mm.regressions({name: 0 for name in mm.RATCHETED_METRICS}, {})
-        self.assertEqual(len(problems), len(mm.RATCHETED_METRICS))
+        self.assertEqual(len(problems), len(mm.RATCHETED_METRICS) + 1)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence, TextIO
 
+from modularization_ci_artifact import validate as validate_ci_artifact
+
 XCTEST_BUNDLE_GLOB = "*.xctest"
 SANDBOX_MARKER_NAME = ".issue944-test-sandbox"
 CommandExecutor = Callable[[Sequence[str], Optional[Path], Mapping[str, str]], int]
@@ -52,9 +54,11 @@ def parse_suite_methods(list_output: str) -> dict[str, tuple[str, ...]]:
 def list_suite_methods(
     swift_binary: str,
     cwd: Path | None,
+    *,
+    skip_build: bool = False,
 ) -> dict[str, tuple[str, ...]]:
     result = subprocess.run(
-        [swift_binary, "test", "list"],
+        [swift_binary, "test", "list", *(["--skip-build"] if skip_build else [])],
         check=True,
         capture_output=True,
         cwd=cwd,
@@ -119,19 +123,22 @@ def discover_test_bundles(
     swift_binary: str,
     cwd: Path | None,
     scratch_path: Path | None = None,
+    prebuilt_bin_path: Path | None = None,
 ) -> dict[str, Path]:
-    try:
-        result = subprocess.run(
-            [swift_binary, "build", *scratch_path_args(scratch_path), "--show-bin-path"],
-            check=True,
-            capture_output=True,
-            cwd=cwd,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return {}
-
-    bin_path = Path(result.stdout.strip())
+    if prebuilt_bin_path is not None:
+        bin_path = prebuilt_bin_path
+    else:
+        try:
+            result = subprocess.run(
+                [swift_binary, "build", *scratch_path_args(scratch_path), "--show-bin-path"],
+                check=True,
+                capture_output=True,
+                cwd=cwd,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return {}
+        bin_path = Path(result.stdout.strip())
     if not bin_path.is_dir():
         return {}
     return {
@@ -182,8 +189,9 @@ def resolve_bundle_selection(
     swift_binary: str,
     cwd: Path | None,
     suites: Sequence[str],
+    prebuilt_bin_path: Path | None = None,
 ) -> BundleSelection:
-    discovered = discover_test_bundles(swift_binary, cwd)
+    discovered = discover_test_bundles(swift_binary, cwd, prebuilt_bin_path=prebuilt_bin_path)
     if not discovered:
         return BundleSelection(None, {}, None)
     if len(discovered) == 1:
@@ -739,11 +747,21 @@ def print_selection_summary(
     )
 
 
+def verify_transferred_build(root: Path) -> str | None:
+    """Fail closed before shard discovery when test products or gate attestations are missing."""
+    try:
+        validate_ci_artifact(root)
+    except ValueError as error:
+        return str(error)
+    return None
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run deterministic RepoPrompt CE XCTest suites."
     )
     parser.add_argument("--local", action="store_true", help="Build, then run sandboxed local tests with SwiftPM selection")
+    parser.add_argument("--skip-build", action="store_true", help="CI shard: discover and run transferred test bundles without compiling")
     parser.add_argument("--filter", dest="test_filter")
     parser.add_argument("--test-product")
     parser.add_argument("--module", help="Build and run only this test target (Swift Build engine)")
@@ -757,6 +775,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Measurement builds: extra SwiftPM build argument (use --build-arg=VALUE); requires --scratch-path",
     )
     args = parser.parse_args(argv)
+    if args.local and args.skip_build:
+        parser.error("--local cannot be combined with --skip-build")
     if args.local and (args.shard_count != 1 or args.shard_index != 1):
         parser.error("--local cannot be combined with sharding")
     if not args.local and (args.test_filter or args.test_product or args.module):
@@ -783,9 +803,21 @@ def main(argv: Sequence[str]) -> int:
             test_filter=args.test_filter, test_product=args.test_product,
             scratch_path=args.scratch_path, build_args=tuple(args.build_args),
         )
+    prebuilt_bin_path = None
+    if args.skip_build:
+        root = args.cwd or Path.cwd()
+        try:
+            prebuilt_bin_path = validate_ci_artifact(root)
+        except ValueError as error:
+            print(f"::error::{error}", file=sys.stderr)
+            return 2
     try:
         validate_shard_args(args.shard_count, args.shard_index)
-        suite_methods = list_suite_methods(args.swift_binary, args.cwd)
+        if args.skip_build:
+            listing = ((args.cwd or Path.cwd()) / '.build/modularization/ci-test-list.txt').read_text(encoding='utf-8')
+            suite_methods = parse_suite_methods(listing)
+        else:
+            suite_methods = list_suite_methods(args.swift_binary, args.cwd)
     except ValueError as error:
         print(f"::error::{error}")
         return 2
@@ -827,6 +859,7 @@ def main(argv: Sequence[str]) -> int:
             swift_binary=args.swift_binary,
             cwd=args.cwd,
             suites=selection.suites,
+            prebuilt_bin_path=prebuilt_bin_path,
         )
     except ValueError as error:
         print(f"::error::{error}")
