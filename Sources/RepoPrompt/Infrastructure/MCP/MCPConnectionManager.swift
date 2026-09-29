@@ -486,6 +486,12 @@ actor ServerNetworkManager {
     static let shared = ServerNetworkManager()
 
     private var catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
+    private var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
+
+    func installPerfRecorder(_ recorder: any AgentModePerfRecording) {
+        perfRecorder = recorder
+    }
+
     private var executionDiagnosticsSink: any MCPToolExecutionEventSink
     private var phaseRecorderFactory: any MCPToolExecutionHandlerPhaseRecorderFactory
 
@@ -3196,7 +3202,7 @@ actor ServerNetworkManager {
         }
 
         private func debugPolicyDiagnostic(_ name: String, connectionID: UUID, policy: (restricted: Set<String>, additional: Set<String>, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool)? = nil, extra: [String: String] = [:]) {
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "mcp.policy.\(name)",
                 fields: debugPolicyDiagnosticFields(connectionID: connectionID, policy: policy, extra: extra)
             )
@@ -11779,7 +11785,7 @@ actor ServerNetworkManager {
                     ]
                 )
             }
-            AgentModePerfDiagnostics.event("mcp.policy.pendingPolicyApplied", fields: [
+            perfRecorder.event("mcp.policy.pendingPolicyApplied", fields: [
                 "connectionID": connectionID.uuidString,
                 "clientName": clientName,
                 "clientPid": clientPid.map(String.init) ?? "nil",

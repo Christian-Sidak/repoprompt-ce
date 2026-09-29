@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 @MainActor
 final class AgentModeRunService {
@@ -53,6 +54,7 @@ final class AgentModeRunService {
     private let claudeRunner: ClaudeIntegratedAgentModeRunner
     private let acpRunner: ACPIntegratedAgentModeRunner
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
+    private let perfRecorder: any AgentModePerfRecording
 
     private static let enableSteeringDebugLogging = false
 
@@ -66,11 +68,13 @@ final class AgentModeRunService {
     init(
         dependencies: Dependencies,
         hooks: Hooks,
-        toolTrackingHooks: AgentToolTrackingHooks
+        toolTrackingHooks: AgentToolTrackingHooks,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.dependencies = dependencies
+        self.perfRecorder = perfRecorder
         self.hooks = hooks
-        let terminalCommitBarrier = AgentRunTerminalCommitBarrier()
+        let terminalCommitBarrier = AgentRunTerminalCommitBarrier(perfRecorder: perfRecorder)
         self.terminalCommitBarrier = terminalCommitBarrier
         dependencies.codexCoordinator.installTerminalCommitBarrier(
             terminalCommitBarrier,
@@ -165,6 +169,7 @@ final class AgentModeRunService {
             )
             return MCPBootstrapLease(
                 spec: leaseSpec,
+                perfRecorder: self.perfRecorder,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
                 expectedPIDPolicyArmer: expectedPIDPolicyArmer

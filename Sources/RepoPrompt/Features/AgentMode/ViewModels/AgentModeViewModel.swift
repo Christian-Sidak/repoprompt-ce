@@ -564,7 +564,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    let ui = AgentModeUIFacades()
+    lazy var ui = AgentModeUIFacades(perfRecorder: perfRecorder)
 
     /// Latest Oversee projections published by the cross-window link bridge, keyed by the **exact
     /// endpoint incarnation** each was addressed to.
@@ -702,6 +702,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let codexCoordinator: CodexAgentModeCoordinator
     let catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink
     let restorePerfRecorder: any WorkspaceRestorePerfRecording
+    let perfRecorder: any AgentModePerfRecording
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
@@ -762,7 +763,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private var antigravityModelsSubscriptionTask: Task<Void, Never>?
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
-    let sessionIndexStore = AgentWorkspaceSessionIndexStore()
+    lazy var sessionIndexStore = AgentWorkspaceSessionIndexStore(perfRecorder: perfRecorder)
     let workspaceSwitchProvider: AgentModeWorkspaceSwitchCleanupProvider
     private var sessionListCacheTask: Task<Void, Never>?
     private var sessionListCacheGeneration: UInt64 = 0
@@ -1484,8 +1485,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         func debugBeginSidebarDeleteRequest(tabID: UUID, source: String, reason: String? = nil) -> UUID {
             let sessionID = boundSessionID(for: tabID)
             let wasRunning = sessions[tabID]?.runState.isActive == true
-            return AgentModePerfDiagnostics.beginSidebarDelete(
-                AgentModePerfDiagnostics.SidebarDeleteBeginContext(
+            return perfRecorder.beginSidebarDelete(
+                AgentPerfSidebarDeleteBeginContext(
                     tabID: tabID,
                     sessionID: sessionID,
                     source: source,
@@ -2314,7 +2315,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         modelRouterSettingsStore: GlobalSettingsStore = .shared,
         modelRouterRuntime: AgentTaskRouterRuntime? = nil,
         catalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
-        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.windowID = windowID
         self.promptManager = promptManager
@@ -2327,6 +2329,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.modelRouterRuntime = modelRouterRuntime
         self.catalogDiagnosticsSink = catalogDiagnosticsSink
         self.restorePerfRecorder = restorePerfRecorder
+        self.perfRecorder = perfRecorder
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
@@ -2369,7 +2372,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 workspacePaths: workspacePaths,
                 options: options,
                 clientShutdownBehavior: .stopOnShutdown,
-                expectedMCPClientName: AgentProviderKind.codexExec.mcpClientNameHint
+                expectedMCPClientName: AgentProviderKind.codexExec.mcpClientNameHint,
+                perfRecorder: perfRecorder
             )
         }
         headlessProviderFactory = Self.defaultHeadlessProviderFactory
@@ -2432,6 +2436,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             stallWatchdogProbeThreshold: 90,
             stallWatchdogRecoveryThreshold: 300,
             catalogDiagnosticsSink: catalogDiagnosticsSink,
+            perfRecorder: perfRecorder,
             initialLastUsedReasoningEffort: CodexAgentToolPreferences.lastUsedReasoningEffort(),
             initialLastUsedReasoningEffortsByModelSlug: CodexAgentToolPreferences.lastUsedReasoningEffortsByModelSlug()
         )
@@ -2589,7 +2594,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testOpenCodeModelParameterStreamProvider: ((String?, String) async -> AsyncStream<OpenCodeACPModelParameterSnapshot>)? = nil,
             testModelRouterSettingsStore: GlobalSettingsStore = .shared,
             testCatalogDiagnosticsSink: any AgentSessionLinkCatalogEventSink = NoopAgentSessionLinkCatalogEventSink(),
-            testRestorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
+            testRestorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
+            testPerfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -2600,6 +2606,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             self.applyEditsApprovalStore = applyEditsApprovalStore
             catalogDiagnosticsSink = testCatalogDiagnosticsSink
             restorePerfRecorder = testRestorePerfRecorder
+            perfRecorder = testPerfRecorder
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
             attachmentWorkspaceDirectoryProvider = {
                 if let testWorkspaceDirectory {
@@ -2678,6 +2685,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 stallWatchdogRecoveryThreshold: testWatchdogRecoveryThreshold,
                 transportClosedRecoveryGraceInterval: testCodexTransportClosedRecoveryGraceInterval ?? 1.5,
                 catalogDiagnosticsSink: testCatalogDiagnosticsSink,
+                perfRecorder: testPerfRecorder,
                 initialLastUsedReasoningEffort: CodexAgentToolPreferences.lastUsedReasoningEffort(),
                 initialLastUsedReasoningEffortsByModelSlug: CodexAgentToolPreferences.lastUsedReasoningEffortsByModelSlug()
             )
@@ -2773,7 +2781,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             else {
                 return nil
             }
-            let ephemeralSession = TabSession(tabID: tabID)
+            let ephemeralSession = TabSession(tabID: tabID, perfRecorder: perfRecorder)
             ephemeralSession.selectedAgent = selectedAgent
             ephemeralSession.runState = runState
             return ephemeralSession
@@ -3262,7 +3270,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return AgentModeRunService(
             dependencies: dependencies,
             hooks: hooks,
-            toolTrackingHooks: toolTrackingHooks
+            toolTrackingHooks: toolTrackingHooks,
+            perfRecorder: perfRecorder
         )
     }
 
@@ -3273,8 +3282,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard sessions[session.tabID] === session else {
             session.mcpFollowUpRunPending = false
             #if DEBUG
-                AgentModePerfDiagnostics.increment("run.followUp.dropped.staleSession", tabID: session.tabID)
-                AgentModePerfDiagnostics.event(
+                perfRecorder.increment("run.followUp.dropped.staleSession", tabID: session.tabID)
+                perfRecorder.event(
                     "run.followUp.dropped",
                     tabID: session.tabID,
                     fields: ["reason": "staleSession"]
@@ -4418,7 +4427,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func makeSession(for tabID: UUID) -> TabSession {
-        let newSession = TabSession(tabID: tabID)
+        let newSession = TabSession(tabID: tabID, perfRecorder: perfRecorder)
         newSession.onSourceItemsChanged = { [weak self] session, mutation in
             guard let self else { return }
             if mutation.touchesUserItem {
@@ -4942,7 +4951,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             guard currentWorkspaceSessionID == previousSessionID else {
                 #if DEBUG
-                    AgentModePerfDiagnostics.event(
+                    perfRecorder.event(
                         "agentSessionBinding.workspaceConflict",
                         tabID: session.tabID,
                         fields: [
@@ -4991,7 +5000,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             case .runtimeOnly: false
             case .compareAndSet: true
             }
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "agentSessionBinding.mutated",
                 tabID: session.tabID,
                 fields: [
@@ -5139,7 +5148,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if !conflictingTabIDs.isEmpty || authoritativeCandidates.count > 1 {
             let candidates = authoritativeCandidates.union(conflictingTabIDs).sorted { $0.uuidString < $1.uuidString }
             #if DEBUG
-                AgentModePerfDiagnostics.event(
+                perfRecorder.event(
                     "mcp.routing.ambiguousAgentSession",
                     fields: [
                         "sessionID": sessionID.uuidString,
@@ -5632,7 +5641,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
               persistentBindingTransitionIsCurrent(token.transition)
         else {
             #if DEBUG
-                AgentModePerfDiagnostics.event(
+                perfRecorder.event(
                     "agentSessionHydration.rejected",
                     tabID: session.tabID,
                     fields: [
@@ -6473,7 +6482,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard matches.count == 1 else {
             if matches.count > 1 {
                 #if DEBUG
-                    AgentModePerfDiagnostics.event(
+                    perfRecorder.event(
                         "mcp.routing.ambiguousControlContext",
                         fields: [
                             "sessionID": sessionID.uuidString,
@@ -7562,7 +7571,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let didRefreshMCPPermissionProfile = assignedParent
             && refreshMCPPermissionProfileIfNeeded(for: session)
         #if DEBUG
-            AgentModePerfDiagnostics.event("mcp.routing.applySpawnParentSessionID", tabID: session.tabID, fields: [
+            perfRecorder.event("mcp.routing.applySpawnParentSessionID", tabID: session.tabID, fields: [
                 "sessionID": sessionID.uuidString,
                 "parentSessionID": effectiveParentSessionID.uuidString,
                 "assignedParent": String(assignedParent),
@@ -9512,7 +9521,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // they are top-level MCP starts without a parent session.
         session.permissionProfile = permissionProfileForMCPActivation(session: session)
         #if DEBUG
-            AgentModePerfDiagnostics.event("mcp.routing.activateControlContext", tabID: tabID, fields: [
+            perfRecorder.event("mcp.routing.activateControlContext", tabID: tabID, fields: [
                 "sessionID": sessionID.uuidString,
                 "parentSessionID": session.parentSessionID?.uuidString ?? "nil",
                 "originatingConnectionID": originatingConnectionID?.uuidString ?? "nil",
@@ -11735,7 +11744,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     #if DEBUG
         private func recordAgentPerfSessionSnapshot(_ session: TabSession, source: String) {
-            guard AgentModePerfDiagnostics.isEnabled else { return }
+            guard perfRecorder.isEnabled else { return }
             let projectionCacheRowCount = session.turnProjectionCaches.values.reduce(0) { partial, cache in
                 partial + cache.workingRows.count + cache.archivedRows.count
             }
@@ -11767,53 +11776,50 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let ownership = session.activeRunOwnership
             let liveness = session.activeRunLiveness
             let nowUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
-            let ageMilliseconds: (UInt64?) -> Any = { timestamp in
-                guard let timestamp, timestamp <= nowUptimeNanoseconds else { return NSNull() }
-                return Double(nowUptimeNanoseconds - timestamp) / 1_000_000
+            let ageMilliseconds: (UInt64?) -> AgentPerfSnapshotValue = { timestamp in
+                guard let timestamp, timestamp <= nowUptimeNanoseconds else { return .null }
+                return .double(Double(nowUptimeNanoseconds - timestamp) / 1_000_000)
             }
 
-            AgentModePerfDiagnostics.recordSessionSnapshot(
-                tabID: session.tabID,
-                fields: [
-                    "source": source,
-                    "agent": session.selectedAgent.rawValue,
-                    "runState": String(describing: session.runState),
-                    "runAttemptID": AgentModePerfDiagnostics.shortID(ownership?.attemptID),
-                    "runBindingTabID": AgentModePerfDiagnostics.shortID(ownership?.binding.tabID),
-                    "runBindingPersistentSessionID": AgentModePerfDiagnostics.shortID(ownership?.binding.persistentSessionID),
-                    "runBindingGeneration": AgentModePerfDiagnostics.shortID(ownership?.binding.generation),
-                    "runLifecycleStage": liveness?.stage.rawValue ?? "nil",
-                    "runRetryIntent": liveness?.retryIntent.rawValue ?? "nil",
-                    "runProgressSequence": liveness?.lastAcceptedSequence ?? 0,
-                    "runLastSignalAgeMS": ageMilliseconds(liveness?.lastSignalUptimeNanoseconds),
-                    "runLastRealProgressAgeMS": ageMilliseconds(liveness?.lastRealProgressUptimeNanoseconds),
-                    "runLastHeartbeatAgeMS": ageMilliseconds(liveness?.lastHeartbeatUptimeNanoseconds),
-                    "items": session.items.count,
-                    "turns": session.transcript.turns.count,
-                    "baseWorkingRows": session.baseTranscriptProjection.workingRows.count,
-                    "baseArchivedRows": session.baseTranscriptProjection.archivedRows.count,
-                    "fullWorkingRows": session.fullTranscriptProjection.workingRows.count,
-                    "fullArchivedRows": session.fullTranscriptProjection.archivedRows.count,
-                    "workingRows": session.workingTranscriptProjection.workingRows.count,
-                    "visibleRows": session.transcriptProjection.workingRows.count + session.transcriptProjection.archivedRows.count,
-                    "turnProjectionCaches": session.turnProjectionCaches.count,
-                    "projectionCacheRows": projectionCacheRowCount,
-                    "projectionCacheBlocks": projectionCacheBlockCount,
-                    "ephemeralPayloads": session.ephemeralToolResultPayloadByItemID.count,
-                    "ephemeralPayloadBytes": ephemeralPayloadBytes,
-                    "bashLiveExecutions": session.bashLiveExecutionByKey.count,
-                    "bashLiveOutputBytes": bashLiveOutputBytes,
-                    "pendingCommandRunning": session.pendingCommandRunningByKey.count,
-                    "pendingCommandOutputBytes": pendingCommandOutputBytes,
-                    "reasoningSegments": session.codexReasoningSegmentsByKey.count,
-                    "reasoningBytes": reasoningBytes,
-                    "runtimeFooters": session.agentMessageRuntimeFootersByItemID.count,
-                    "pendingInstructions": session.pendingInstructions.count,
-                    "pendingInstructionBytes": pendingInstructionBytes,
-                    "providerTokenUsageTurns": session.providerTokenUsageByTurn.count,
-                    "dirty": session.isDirty
-                ]
-            )
+            var snapshotFields: [String: AgentPerfSnapshotValue] = [:]
+            snapshotFields["source"] = AgentPerfSnapshotValue(source)
+            snapshotFields["agent"] = AgentPerfSnapshotValue(session.selectedAgent.rawValue)
+            snapshotFields["runState"] = AgentPerfSnapshotValue(String(describing: session.runState))
+            snapshotFields["runAttemptID"] = AgentPerfSnapshotValue(perfRecorder.shortID(ownership?.attemptID))
+            snapshotFields["runBindingTabID"] = AgentPerfSnapshotValue(perfRecorder.shortID(ownership?.binding.tabID))
+            snapshotFields["runBindingPersistentSessionID"] = AgentPerfSnapshotValue(perfRecorder.shortID(ownership?.binding.persistentSessionID))
+            snapshotFields["runBindingGeneration"] = AgentPerfSnapshotValue(perfRecorder.shortID(ownership?.binding.generation))
+            snapshotFields["runLifecycleStage"] = AgentPerfSnapshotValue(liveness?.stage.rawValue ?? "nil")
+            snapshotFields["runRetryIntent"] = AgentPerfSnapshotValue(liveness?.retryIntent.rawValue ?? "nil")
+            snapshotFields["runProgressSequence"] = AgentPerfSnapshotValue(liveness?.lastAcceptedSequence ?? 0)
+            snapshotFields["runLastSignalAgeMS"] = ageMilliseconds(liveness?.lastSignalUptimeNanoseconds)
+            snapshotFields["runLastRealProgressAgeMS"] = ageMilliseconds(liveness?.lastRealProgressUptimeNanoseconds)
+            snapshotFields["runLastHeartbeatAgeMS"] = ageMilliseconds(liveness?.lastHeartbeatUptimeNanoseconds)
+            snapshotFields["items"] = AgentPerfSnapshotValue(session.items.count)
+            snapshotFields["turns"] = AgentPerfSnapshotValue(session.transcript.turns.count)
+            snapshotFields["baseWorkingRows"] = AgentPerfSnapshotValue(session.baseTranscriptProjection.workingRows.count)
+            snapshotFields["baseArchivedRows"] = AgentPerfSnapshotValue(session.baseTranscriptProjection.archivedRows.count)
+            snapshotFields["fullWorkingRows"] = AgentPerfSnapshotValue(session.fullTranscriptProjection.workingRows.count)
+            snapshotFields["fullArchivedRows"] = AgentPerfSnapshotValue(session.fullTranscriptProjection.archivedRows.count)
+            snapshotFields["workingRows"] = AgentPerfSnapshotValue(session.workingTranscriptProjection.workingRows.count)
+            snapshotFields["visibleRows"] = AgentPerfSnapshotValue(session.transcriptProjection.workingRows.count + session.transcriptProjection.archivedRows.count)
+            snapshotFields["turnProjectionCaches"] = AgentPerfSnapshotValue(session.turnProjectionCaches.count)
+            snapshotFields["projectionCacheRows"] = AgentPerfSnapshotValue(projectionCacheRowCount)
+            snapshotFields["projectionCacheBlocks"] = AgentPerfSnapshotValue(projectionCacheBlockCount)
+            snapshotFields["ephemeralPayloads"] = AgentPerfSnapshotValue(session.ephemeralToolResultPayloadByItemID.count)
+            snapshotFields["ephemeralPayloadBytes"] = AgentPerfSnapshotValue(ephemeralPayloadBytes)
+            snapshotFields["bashLiveExecutions"] = AgentPerfSnapshotValue(session.bashLiveExecutionByKey.count)
+            snapshotFields["bashLiveOutputBytes"] = AgentPerfSnapshotValue(bashLiveOutputBytes)
+            snapshotFields["pendingCommandRunning"] = AgentPerfSnapshotValue(session.pendingCommandRunningByKey.count)
+            snapshotFields["pendingCommandOutputBytes"] = AgentPerfSnapshotValue(pendingCommandOutputBytes)
+            snapshotFields["reasoningSegments"] = AgentPerfSnapshotValue(session.codexReasoningSegmentsByKey.count)
+            snapshotFields["reasoningBytes"] = AgentPerfSnapshotValue(reasoningBytes)
+            snapshotFields["runtimeFooters"] = AgentPerfSnapshotValue(session.agentMessageRuntimeFootersByItemID.count)
+            snapshotFields["pendingInstructions"] = AgentPerfSnapshotValue(session.pendingInstructions.count)
+            snapshotFields["pendingInstructionBytes"] = AgentPerfSnapshotValue(pendingInstructionBytes)
+            snapshotFields["providerTokenUsageTurns"] = AgentPerfSnapshotValue(session.providerTokenUsageByTurn.count)
+            snapshotFields["dirty"] = AgentPerfSnapshotValue(session.isDirty)
+            perfRecorder.recordSessionSnapshot(tabID: session.tabID, fields: snapshotFields)
         }
 
         /// Diagnostic-only helper: record an `AgentModePerfDiagnostics` session snapshot for
@@ -11835,7 +11841,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             source: String,
             tabIDs: Set<UUID>? = nil
         ) -> [UUID] {
-            guard AgentModePerfDiagnostics.isEnabled else { return [] }
+            guard perfRecorder.isEnabled else { return [] }
             var recorded: [UUID] = []
             recorded.reserveCapacity(sessions.count)
             for session in sessions.values {
@@ -11855,10 +11861,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         scope: UIRefreshScope = .full
     ) {
         #if DEBUG
-            if AgentModePerfDiagnostics.isEnabled {
-                AgentModePerfDiagnostics.increment(urgent ? "ui.refresh.request.urgent" : "ui.refresh.request.coalesced", tabID: tabID)
-                AgentModePerfDiagnostics.increment("ui.refresh.request.scope.\(scope.rawValue)", tabID: tabID)
-                AgentModePerfDiagnostics.event(
+            if perfRecorder.isEnabled {
+                perfRecorder.increment(urgent ? "ui.refresh.request.urgent" : "ui.refresh.request.coalesced", tabID: tabID)
+                perfRecorder.increment("ui.refresh.request.scope.\(scope.rawValue)", tabID: tabID)
+                perfRecorder.event(
                     "ui.refresh.request",
                     tabID: tabID,
                     fields: [
@@ -11905,13 +11911,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         guard canAdmitAssistantPresentationRequest(request, session: session) else {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("ui.assistantPresentation.rejectedBeforeAdmission", tabID: session.tabID)
+                perfRecorder.increment("ui.assistantPresentation.rejectedBeforeAdmission", tabID: session.tabID)
             #endif
             return
         }
         pendingAssistantPresentationByTabID[session.tabID] = request
         #if DEBUG
-            AgentModePerfDiagnostics.increment("ui.assistantPresentation.admitted", tabID: session.tabID)
+            perfRecorder.increment("ui.assistantPresentation.admitted", tabID: session.tabID)
         #endif
         scheduleUIRefreshFlushIfNeeded()
     }
@@ -11956,7 +11962,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func flushPendingUIRefresh(cancelScheduled: Bool = false) {
         #if DEBUG
-            let diagnosticsStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let diagnosticsStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         if cancelScheduled {
             uiRefreshTask?.cancel()
@@ -11964,7 +11970,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         uiRefreshTask = nil
         guard !pendingUIRefreshScopesByTabID.isEmpty || !pendingAssistantPresentationByTabID.isEmpty else {
             #if DEBUG
-                AgentModePerfDiagnostics.event("ui.refresh.flushSkipped", fields: ["reason": "empty", "cancelScheduled": String(cancelScheduled)])
+                perfRecorder.event("ui.refresh.flushSkipped", fields: ["reason": "empty", "cancelScheduled": String(cancelScheduled)])
             #endif
             return
         }
@@ -11973,8 +11979,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         pendingUIRefreshScopesByTabID.removeAll()
         pendingAssistantPresentationByTabID.removeAll()
         #if DEBUG
-            AgentModePerfDiagnostics.increment("ui.refresh.flush")
-            AgentModePerfDiagnostics.event(
+            perfRecorder.increment("ui.refresh.flush")
+            perfRecorder.event(
                 "ui.refresh.flushStart",
                 fields: [
                     "tabCount": String(scopesByTabID.count),
@@ -11987,7 +11993,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard let session = sessions[tabID] else { continue }
             if scopes.contains(.full) {
                 #if DEBUG
-                    AgentModePerfDiagnostics.increment("ui.refresh.flush.scope.full", tabID: tabID)
+                    perfRecorder.increment("ui.refresh.flush.scope.full", tabID: tabID)
                 #endif
                 didRequestFullRefresh = true
                 updateBindingsFromSession(session)
@@ -12010,11 +12016,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         #if DEBUG
             if let diagnosticsStartMS {
-                AgentModePerfDiagnostics.event(
+                perfRecorder.event(
                     "ui.refresh.flushComplete",
                     fields: [
                         "tabCount": String(scopesByTabID.count),
-                        "duration": AgentModePerfDiagnostics.formatElapsedMS(since: diagnosticsStartMS)
+                        "duration": perfRecorder.formatElapsedMS(since: diagnosticsStartMS)
                     ]
                 )
             }
@@ -12035,7 +12041,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) {
         guard canAdmitAssistantPresentationRequest(request, session: session) else {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("ui.assistantPresentation.rejectedAtFlush", tabID: session.tabID)
+                perfRecorder.increment("ui.assistantPresentation.rejectedAtFlush", tabID: session.tabID)
             #endif
             return
         }
@@ -12045,7 +12051,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard canAdmitAssistantPresentationRequest(request, session: session) else {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("ui.assistantPresentation.rejectedAfterCatchUp", tabID: session.tabID)
+                perfRecorder.increment("ui.assistantPresentation.rejectedAfterCatchUp", tabID: session.tabID)
             #endif
             return
         }
@@ -12057,7 +12063,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         syncTranscriptUIState()
         #if DEBUG
-            AgentModePerfDiagnostics.increment("ui.assistantPresentation.published", tabID: session.tabID)
+            perfRecorder.increment("ui.assistantPresentation.published", tabID: session.tabID)
         #endif
     }
 
@@ -12067,12 +12073,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     ) {
         guard session.tabID == currentTabID else {
             #if DEBUG
-                AgentModePerfDiagnostics.event(
+                perfRecorder.event(
                     "ui.refresh.scopedSkipped",
                     tabID: session.tabID,
                     fields: [
                         "reason": "inactiveTab",
-                        "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
+                        "currentTabID": perfRecorder.shortID(currentTabID),
                         "scopes": scopes.map(\.rawValue).sorted().joined(separator: ",")
                     ]
                 )
@@ -12082,7 +12088,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if scopes.contains(.transcriptRuntime) {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("ui.refresh.flush.scope.transcriptRuntime", tabID: session.tabID)
+                perfRecorder.increment("ui.refresh.flush.scope.transcriptRuntime", tabID: session.tabID)
             #endif
             let nextLiveBashExecutionByItemID = session.bashLiveExecutionByTranscriptItemID
             if activeBashLiveExecutionByItemID != nextLiveBashExecutionByItemID {
@@ -12094,7 +12100,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if scopes.contains(.runtimeMetrics) {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("ui.refresh.flush.scope.runtimeMetrics", tabID: session.tabID)
+                perfRecorder.increment("ui.refresh.flush.scope.runtimeMetrics", tabID: session.tabID)
             #endif
             let didChangeUsage = contextUsage != session.codexContextUsage
             let didChangeSnapshot = contextUsageSnapshot != session.contextUsageSnapshot
@@ -12109,7 +12115,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "ui.refresh.scopedComplete",
                 tabID: session.tabID,
                 fields: [
@@ -12122,8 +12128,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func updateBindingsFromSession(_ session: TabSession) {
         #if DEBUG
             test_updateBindingsCallCount += 1
-            let diagnosticsStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
-            AgentModePerfDiagnostics.increment("ui.updateBindings.called", tabID: session.tabID)
+            let diagnosticsStartMS = perfRecorder.timestampMSIfEnabled()
+            perfRecorder.increment("ui.updateBindings.called", tabID: session.tabID)
         #endif
         // Run-state transition observation runs before the inactive-tab guard
         // so background sessions still raise sidebar attention badges when
@@ -12131,13 +12137,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         observeSidebarRunStateTransition(for: session)
         guard session.tabID == currentTabID else {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("ui.updateBindings.skippedInactive", tabID: session.tabID)
-                AgentModePerfDiagnostics.event(
+                perfRecorder.increment("ui.updateBindings.skippedInactive", tabID: session.tabID)
+                perfRecorder.event(
                     "ui.updateBindings.skipped",
                     tabID: session.tabID,
                     fields: [
                         "reason": "inactiveTab",
-                        "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID)
+                        "currentTabID": perfRecorder.shortID(currentTabID)
                     ]
                 )
             #endif
@@ -12307,7 +12313,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         if invalidation.isEmpty {
             #if DEBUG
-                AgentModePerfDiagnostics.event("ui.updateBindings.noUISync", tabID: session.tabID)
+                perfRecorder.event("ui.updateBindings.noUISync", tabID: session.tabID)
             #endif
         } else {
             syncActiveUIState(tabID: session.tabID, invalidation: invalidation)
@@ -12316,11 +12322,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let workingProjection = session.workingTranscriptProjection
         #if DEBUG
             if let diagnosticsStartMS {
-                AgentModePerfDiagnostics.event(
+                perfRecorder.event(
                     "ui.updateBindings.complete",
                     tabID: session.tabID,
                     fields: [
-                        "duration": AgentModePerfDiagnostics.formatElapsedMS(since: diagnosticsStartMS),
+                        "duration": perfRecorder.formatElapsedMS(since: diagnosticsStartMS),
                         "runState": String(describing: session.runState),
                         "items": String(session.items.count),
                         "workingRows": String(workingProjection.workingRows.count),
@@ -14910,7 +14916,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionIndexStore.removeSortDate(forTabID: tabID)
             }
             #if DEBUG
-                AgentModePerfDiagnostics.markSidebarDeleteAgentCleanupComplete(
+                perfRecorder.markSidebarDeleteAgentCleanupComplete(
                     tabID: tabID,
                     source: "AgentModeViewModel.handleComposeTabsDidRemove",
                     fields: ["reason": String(describing: reason)]
@@ -15049,11 +15055,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.saveRequestGeneration &+= 1
         #if DEBUG
             let replacedPendingSave = session.saveDebounceTask != nil
-            AgentModePerfDiagnostics.increment("save.schedule", tabID: tabID)
+            perfRecorder.increment("save.schedule", tabID: tabID)
             if replacedPendingSave {
-                AgentModePerfDiagnostics.increment("save.schedule.replaced", tabID: tabID)
+                perfRecorder.increment("save.schedule.replaced", tabID: tabID)
             }
-            AgentModePerfDiagnostics.event("save.schedule", tabID: tabID, fields: ["replaced": String(replacedPendingSave), "dirty": String(session.isDirty)])
+            perfRecorder.event("save.schedule", tabID: tabID, fields: ["replaced": String(replacedPendingSave), "dirty": String(session.isDirty)])
         #endif
         session.saveDebounceTask?.cancel()
         session.saveDebounceTask = Task { [weak self] in
@@ -15077,8 +15083,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
            now.timeIntervalSince(lastSaveAt) < minInterval
         {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("save.commandOutput.skipped", tabID: tabID)
-                AgentModePerfDiagnostics.event(
+                perfRecorder.increment("save.commandOutput.skipped", tabID: tabID)
+                perfRecorder.event(
                     "save.commandOutput.skipped",
                     tabID: tabID,
                     fields: [
@@ -15091,8 +15097,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         session.lastCommandOutputSaveAt = now
         #if DEBUG
-            AgentModePerfDiagnostics.increment("save.commandOutput.scheduled", tabID: tabID)
-            AgentModePerfDiagnostics.event("save.commandOutput.scheduled", tabID: tabID, fields: ["minInterval": String(format: "%.2fs", minInterval)])
+            perfRecorder.increment("save.commandOutput.scheduled", tabID: tabID)
+            perfRecorder.event("save.commandOutput.scheduled", tabID: tabID, fields: ["minInterval": String(format: "%.2fs", minInterval)])
         #endif
         scheduleSave(for: tabID)
     }
@@ -15113,26 +15119,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func saveSessionCore(for tabID: UUID) async -> AgentSessionSaveCoreResult {
         #if DEBUG
-            let diagnosticsStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
-            AgentModePerfDiagnostics.increment("save.session.invoked", tabID: tabID)
+            let diagnosticsStartMS = perfRecorder.timestampMSIfEnabled()
+            perfRecorder.increment("save.session.invoked", tabID: tabID)
         #endif
         guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence
             || bypassesAgentSessionPersistenceSuppressionForTesting
         else {
             #if DEBUG
-                AgentModePerfDiagnostics.event("save.session.skipped", tabID: tabID, fields: ["reason": "suppressed"])
+                perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "suppressed"])
             #endif
             return .notRequired
         }
         guard let session = sessions[tabID] else {
             #if DEBUG
-                AgentModePerfDiagnostics.event("save.session.skipped", tabID: tabID, fields: ["reason": "missing"])
+                perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "missing"])
             #endif
             return .notRequired
         }
         guard session.isDirty || session.activeAgentSessionID == nil else {
             #if DEBUG
-                AgentModePerfDiagnostics.event("save.session.skipped", tabID: tabID, fields: ["reason": "clean"])
+                perfRecorder.event("save.session.skipped", tabID: tabID, fields: ["reason": "clean"])
             #endif
             return .notRequired
         }
@@ -15188,8 +15194,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 session.isDirty = true
                 refreshDerivedTranscriptState(for: session, reason: .saveSession)
                 #if DEBUG
-                    AgentModePerfDiagnostics.increment("save.session.localPendingToolRepair", tabID: tabID)
-                    AgentModePerfDiagnostics.event(
+                    perfRecorder.increment("save.session.localPendingToolRepair", tabID: tabID)
+                    perfRecorder.event(
                         "save.session.localPendingToolRepair",
                         tabID: tabID,
                         fields: [
@@ -15266,12 +15272,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 projectionProtection: projectionProtection
             )
             #if DEBUG
-                AgentModePerfDiagnostics.increment("save.session.persistenceOnlySnapshot", tabID: tabID)
-                AgentModePerfDiagnostics.event(
+                perfRecorder.increment("save.session.persistenceOnlySnapshot", tabID: tabID)
+                perfRecorder.event(
                     "save.session.persistenceOnlySnapshot",
                     tabID: tabID,
                     fields: [
-                        "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
+                        "currentTabID": perfRecorder.shortID(currentTabID),
                         "sourceItemsRevision": String(session.sourceItemsRevision)
                     ]
                 )
@@ -15318,19 +15324,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             // persistence-only saves must not feed back into UI projection work.
             if isActiveOwnedForSave {
                 #if DEBUG
-                    AgentModePerfDiagnostics.increment("save.session.innerRefresh", tabID: tabID)
-                    AgentModePerfDiagnostics.event("save.session.innerRefresh", tabID: tabID)
+                    perfRecorder.increment("save.session.innerRefresh", tabID: tabID)
+                    perfRecorder.event("save.session.innerRefresh", tabID: tabID)
                 #endif
                 requestUIRefresh(tabID: tabID)
             } else {
                 #if DEBUG
-                    AgentModePerfDiagnostics.increment("save.session.innerRefreshSkippedInactive", tabID: tabID)
-                    AgentModePerfDiagnostics.event(
+                    perfRecorder.increment("save.session.innerRefreshSkippedInactive", tabID: tabID)
+                    perfRecorder.event(
                         "save.session.innerRefreshSkipped",
                         tabID: tabID,
                         fields: [
                             "reason": "inactiveTab",
-                            "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID)
+                            "currentTabID": perfRecorder.shortID(currentTabID)
                         ]
                     )
                 #endif
@@ -15435,11 +15441,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             #if DEBUG
                 if let diagnosticsStartMS {
-                    AgentModePerfDiagnostics.event(
+                    perfRecorder.event(
                         "save.session.complete",
                         tabID: tabID,
                         fields: [
-                            "duration": AgentModePerfDiagnostics.formatElapsedMS(since: diagnosticsStartMS),
+                            "duration": perfRecorder.formatElapsedMS(since: diagnosticsStartMS),
                             "itemCount": String(canonicalItemCount)
                         ]
                     )
@@ -15456,7 +15462,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .durablySaved(durableBindingToken)
         } catch {
             #if DEBUG
-                AgentModePerfDiagnostics.event("save.session.error", tabID: tabID, fields: ["error": String(describing: error)])
+                perfRecorder.event("save.session.error", tabID: tabID, fields: ["error": String(describing: error)])
             #endif
             let failure = AgentSessionPersistenceFailure(
                 operation: .save,
@@ -19582,17 +19588,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             "[AgentCancelTarget] rejected reason=\(reason) targetTab=\(target.tabID) expectedRun=\(target.expectedRunID?.uuidString ?? "nil") liveRun=\(session?.runID?.uuidString ?? "nil")"
         )
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "agent.cancelTarget.rejected",
                 tabID: target.tabID,
                 fields: [
                     "reason": reason,
-                    "expectedRunID": AgentModePerfDiagnostics.shortID(target.expectedRunID),
-                    "liveRunID": AgentModePerfDiagnostics.shortID(session?.runID),
-                    "expectedAgentSessionID": AgentModePerfDiagnostics.shortID(target.expectedActiveAgentSessionID),
-                    "liveAgentSessionID": AgentModePerfDiagnostics.shortID(session?.activeAgentSessionID),
-                    "expectedRunAttemptID": AgentModePerfDiagnostics.shortID(target.expectedRunAttemptID),
-                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeRunAttemptID),
+                    "expectedRunID": perfRecorder.shortID(target.expectedRunID),
+                    "liveRunID": perfRecorder.shortID(session?.runID),
+                    "expectedAgentSessionID": perfRecorder.shortID(target.expectedActiveAgentSessionID),
+                    "liveAgentSessionID": perfRecorder.shortID(session?.activeAgentSessionID),
+                    "expectedRunAttemptID": perfRecorder.shortID(target.expectedRunAttemptID),
+                    "liveRunAttemptID": perfRecorder.shortID(session?.activeRunAttemptID),
                     "expectedPendingInputRequestID": target.expectedPendingUserInputRequestID?.displayValue ?? "nil",
                     "livePendingInputRequestID": session?.pendingUserInputRequest?.requestID.displayValue ?? "nil",
                     "liveRunState": session?.runState.rawValue ?? "missing"
@@ -19820,35 +19826,35 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             "[AgentSubmitTarget] rejected reason=\(reason) attempt=\(reportedAttempt?.id.uuidString ?? "nil") activeClaim=\(reportedActiveAttempt?.id.uuidString ?? "nil") route=\(target.route.rawValue) targetTab=\(target.tabID) expectedRun=\(target.expectedRunID?.uuidString ?? "nil") liveRun=\(session?.runID?.uuidString ?? "nil")"
         )
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "agent.submitTarget.rejected",
                 tabID: target.tabID,
                 fields: [
                     "reason": reason,
-                    "attemptID": AgentModePerfDiagnostics.shortID(reportedAttempt?.id),
-                    "activeClaimID": AgentModePerfDiagnostics.shortID(reportedActiveAttempt?.id),
+                    "attemptID": perfRecorder.shortID(reportedAttempt?.id),
+                    "activeClaimID": perfRecorder.shortID(reportedActiveAttempt?.id),
                     "route": target.route.rawValue,
-                    "targetTabID": AgentModePerfDiagnostics.shortID(target.tabID),
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
+                    "targetTabID": perfRecorder.shortID(target.tabID),
+                    "currentTabID": perfRecorder.shortID(currentTabID),
                     "expectedSourceTabSessionIdentity": String(describing: target.expectedSourceTabSessionIdentity),
                     "liveSourceTabSessionIdentity": session.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
-                    "expectedSourceAgentSessionID": AgentModePerfDiagnostics.shortID(target.expectedSourceAgentSessionID),
-                    "liveSourceAgentSessionID": AgentModePerfDiagnostics.shortID(liveSourceAgentSessionID),
-                    "expectedPersistentBindingSessionID": AgentModePerfDiagnostics.shortID(target.expectedPersistentBindingIdentity?.sessionID),
-                    "livePersistentBindingSessionID": AgentModePerfDiagnostics.shortID(session?.persistentSessionBindingIdentity?.sessionID),
-                    "expectedPersistentBindingGeneration": AgentModePerfDiagnostics.shortID(target.expectedPersistentBindingIdentity?.generation),
-                    "livePersistentBindingGeneration": AgentModePerfDiagnostics.shortID(session?.persistentSessionBindingIdentity?.generation),
+                    "expectedSourceAgentSessionID": perfRecorder.shortID(target.expectedSourceAgentSessionID),
+                    "liveSourceAgentSessionID": perfRecorder.shortID(liveSourceAgentSessionID),
+                    "expectedPersistentBindingSessionID": perfRecorder.shortID(target.expectedPersistentBindingIdentity?.sessionID),
+                    "livePersistentBindingSessionID": perfRecorder.shortID(session?.persistentSessionBindingIdentity?.sessionID),
+                    "expectedPersistentBindingGeneration": perfRecorder.shortID(target.expectedPersistentBindingIdentity?.generation),
+                    "livePersistentBindingGeneration": perfRecorder.shortID(session?.persistentSessionBindingIdentity?.generation),
                     "expectedBindingTransitionGeneration": String(target.expectedBindingTransitionGeneration),
                     "liveBindingTransitionGeneration": session.map { String($0.bindingTransitionGeneration) } ?? "nil",
                     "liveBindingTransitionInProgress": String(session?.bindingTransitionInProgress ?? false),
                     "expectedRunState": target.expectedRunState.rawValue,
                     "liveRunState": session?.runState.rawValue ?? "idle",
-                    "expectedRunID": AgentModePerfDiagnostics.shortID(target.expectedRunID),
-                    "liveRunID": AgentModePerfDiagnostics.shortID(session?.runID),
-                    "expectedRunAttemptID": AgentModePerfDiagnostics.shortID(target.expectedRunAttemptID),
-                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeRunAttemptID),
-                    "expectedSubmissionToken": AgentModePerfDiagnostics.shortID(target.expectedSubmissionToken),
-                    "liveSubmissionToken": AgentModePerfDiagnostics.shortID(session?.composerSubmissionToken)
+                    "expectedRunID": perfRecorder.shortID(target.expectedRunID),
+                    "liveRunID": perfRecorder.shortID(session?.runID),
+                    "expectedRunAttemptID": perfRecorder.shortID(target.expectedRunAttemptID),
+                    "liveRunAttemptID": perfRecorder.shortID(session?.activeRunAttemptID),
+                    "expectedSubmissionToken": perfRecorder.shortID(target.expectedSubmissionToken),
+                    "liveSubmissionToken": perfRecorder.shortID(session?.composerSubmissionToken)
                 ]
             )
         #endif
@@ -19860,17 +19866,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             "[AgentSubmitClaim] accepted attempt=\(attempt.id) targetTab=\(attempt.sourceTabID) token=\(attempt.capturedSubmissionToken)"
         )
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "agent.submitClaim.accepted",
                 tabID: attempt.sourceTabID,
                 fields: [
-                    "attemptID": AgentModePerfDiagnostics.shortID(attempt.id),
+                    "attemptID": perfRecorder.shortID(attempt.id),
                     "sourceTabSessionIdentity": String(describing: attempt.sourceTabSessionIdentity),
-                    "capturedSubmissionToken": AgentModePerfDiagnostics.shortID(attempt.capturedSubmissionToken),
-                    "liveSubmissionToken": AgentModePerfDiagnostics.shortID(claim.sourceSession.composerSubmissionToken),
+                    "capturedSubmissionToken": perfRecorder.shortID(attempt.capturedSubmissionToken),
+                    "liveSubmissionToken": perfRecorder.shortID(claim.sourceSession.composerSubmissionToken),
                     "inputRevision": String(attempt.inputRevision),
-                    "persistentBindingSessionID": AgentModePerfDiagnostics.shortID(claim.sourceSession.persistentSessionBindingIdentity?.sessionID),
-                    "persistentBindingGeneration": AgentModePerfDiagnostics.shortID(claim.sourceSession.persistentSessionBindingIdentity?.generation),
+                    "persistentBindingSessionID": perfRecorder.shortID(claim.sourceSession.persistentSessionBindingIdentity?.sessionID),
+                    "persistentBindingGeneration": perfRecorder.shortID(claim.sourceSession.persistentSessionBindingIdentity?.generation),
                     "bindingTransitionGeneration": String(claim.sourceSession.bindingTransitionGeneration),
                     "composerTargetPublishedNil": String(currentTabID != attempt.sourceTabID || ui.composer.props.submitTarget == nil)
                 ]
@@ -19884,15 +19890,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             "[AgentSubmitClaim] release accepted=\(accepted) attempt=\(attempt.id) targetTab=\(attempt.sourceTabID) activeClaim=\(claim.sourceSession.activeComposerSubmitAttempt?.id.uuidString ?? "nil")"
         )
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 accepted ? "agent.submitClaim.released" : "agent.submitClaim.releaseSkipped",
                 tabID: attempt.sourceTabID,
                 fields: [
-                    "attemptID": AgentModePerfDiagnostics.shortID(attempt.id),
-                    "activeClaimID": AgentModePerfDiagnostics.shortID(claim.sourceSession.activeComposerSubmitAttempt?.id),
+                    "attemptID": perfRecorder.shortID(attempt.id),
+                    "activeClaimID": perfRecorder.shortID(claim.sourceSession.activeComposerSubmitAttempt?.id),
                     "sourceTabSessionIdentity": String(describing: attempt.sourceTabSessionIdentity),
                     "liveSourceTabSessionIdentity": String(describing: ObjectIdentifier(claim.sourceSession)),
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID)
+                    "currentTabID": perfRecorder.shortID(currentTabID)
                 ]
             )
         #endif
@@ -20674,7 +20680,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func buildConversationHistory(for session: TabSession) -> String {
-        AgentTranscriptIO.buildConversationHistory(from: session.transcript) { request in
+        AgentTranscriptIO.buildConversationHistory(from: session.transcript, perfRecorder: perfRecorder) { request in
             self.renderProviderMessage(
                 text: request.text,
                 attachments: request.attachments,
@@ -21010,7 +21016,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         reason: String
     ) async -> DeletedAgentSessionCleanupResult {
         #if DEBUG
-            let finalizeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let finalizeStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let cleanupRegistration = await AgentRunSessionStore.currentRegistration(for: sessionID)
         var affectedTabIDs = knownTabIDs
@@ -21132,7 +21138,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             clearedStashedTabIDs: clearedStashedTabIDs
         )
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "cleanup.vm.finalizeDeletedReferences",
                 startMS: finalizeStartMS,
                 fields: [
@@ -21153,7 +21159,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workspace: WorkspaceModel
     ) async throws -> ProviderConversationCleanupOutcome? {
         #if DEBUG
-            let deleteSessionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let deleteSessionStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let sessionID = boundSessionID(for: tabID)
         let liveSession = sessions[tabID]
@@ -21223,7 +21229,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             syncSidebarUIState(refresh: true, reason: .sessionIndex)
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "cleanup.vm.deleteSession",
                 startMS: deleteSessionStartMS,
                 tabID: tabID,

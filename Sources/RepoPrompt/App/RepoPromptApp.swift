@@ -79,6 +79,8 @@ struct RepoPromptSwiftUIApp: App {
         SentryTelemetryBootstrap.start()
 
         AgentSessionDataService.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
+        AgentSessionDataService.shared.installPerfRecorder(AppAgentModePerfRecorder())
+        AgentRunCoordinator.shared.installPerfRecorder(AppAgentModePerfRecorder())
         AgentSessionDeletionRegistry.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
         AgentSessionLinkRuntimeBridge.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
 
@@ -95,6 +97,7 @@ struct RepoPromptSwiftUIApp: App {
                 flushStdout: true
             )
             do {
+                await ServerNetworkManager.shared.installPerfRecorder(AppAgentModePerfRecorder())
                 await ServerNetworkManager.shared.installCatalogDiagnosticsSink(AppAgentSessionLinkCatalogEventSink())
                 await ServerNetworkManager.shared.installExecutionDiagnosticsSink(AppMCPToolExecutionEventSink())
                 await ServerNetworkManager.shared.installPhaseRecorderFactory(AppMCPToolExecutionHandlerPhaseRecorderFactory())

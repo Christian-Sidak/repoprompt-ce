@@ -170,6 +170,15 @@ actor AgentSessionDataService {
     static let shared = AgentSessionDataService()
 
     private nonisolated let restorePerfRecorderSlot = WorkspaceRestorePerfRecorderBox()
+    private nonisolated let perfRecorderSlot = AgentModePerfRecorderBox()
+
+    nonisolated func installPerfRecorder(_ recorder: any AgentModePerfRecording) {
+        perfRecorderSlot.install(recorder)
+    }
+
+    var perfRecorder: any AgentModePerfRecording {
+        perfRecorderSlot.snapshot()
+    }
 
     nonisolated func installRestorePerfRecorder(_ recorder: any WorkspaceRestorePerfRecording) {
         restorePerfRecorderSlot.install(recorder)
@@ -735,7 +744,7 @@ actor AgentSessionDataService {
 
     private func writeMetadataIndex(_ index: AgentSessionMetadataIndex, folder: URL) async throws {
         #if DEBUG
-            let writeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let writeStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let key = canonicalMetadataFolderKey(folder)
         var normalized = index
@@ -745,7 +754,7 @@ actor AgentSessionDataService {
         metadataIndexCacheByFolder[key] = normalized
         try data.write(to: metadataIndexFileURL(forAgentSessionsFolder: folder), options: .atomic)
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "cleanup.metadata.writeIndex",
                 startMS: writeStartMS,
                 fields: [
@@ -800,12 +809,12 @@ actor AgentSessionDataService {
         folder: URL
     ) async {
         #if DEBUG
-            let removeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let removeStartMS = perfRecorder.timestampMSIfEnabled()
             var debugEntriesBefore = 0
             var debugEntriesAfter = 0
             var debugChanged = false
             defer {
-                AgentModePerfDiagnostics.durationEvent(
+                perfRecorder.durationEvent(
                     "cleanup.metadata.removeRecords",
                     startMS: removeStartMS,
                     fields: [

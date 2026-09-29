@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 import RepoPromptShared
 
 struct OracleExportFile: Equatable {
@@ -356,6 +357,7 @@ struct AgentRunMCPToolService {
     }
 
     let toolName: String
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     let captureRequestMetadata: () async -> RequestMetadata
     let requireTargetWindow: () throws -> WindowState
     let resolveRequestedTabID: (_ args: [String: Value]) throws -> UUID?
@@ -473,7 +475,7 @@ struct AgentRunMCPToolService {
         let agentModeVM = targetWindow.agentModeViewModel
         let parentSourceTabID = await resolveSpawnParentSourceTabID(metadata)
         #if DEBUG
-            AgentModePerfDiagnostics.event("mcp.routing.agentRunStartResolvedSource", tabID: parentSourceTabID, fields: [
+            perfRecorder.event("mcp.routing.agentRunStartResolvedSource", tabID: parentSourceTabID, fields: [
                 "connectionID": metadata.connectionID?.uuidString ?? "nil",
                 "clientName": metadata.clientName ?? "nil",
                 "windowID": metadata.windowID.map(String.init) ?? "nil",
@@ -494,7 +496,7 @@ struct AgentRunMCPToolService {
         }
         let resolvedTabID = try resolveRequestedTabID(args)
         #if DEBUG
-            AgentModePerfDiagnostics.event("mcp.routing.agentRunStartParentResolved", tabID: parentSourceTabID, fields: [
+            perfRecorder.event("mcp.routing.agentRunStartParentResolved", tabID: parentSourceTabID, fields: [
                 "connectionID": metadata.connectionID?.uuidString ?? "nil",
                 "windowID": metadata.windowID.map(String.init) ?? "nil",
                 "parentSourceTabID": parentSourceTabID?.uuidString ?? "nil",
@@ -554,7 +556,7 @@ struct AgentRunMCPToolService {
                 routedReasoningEffortRaw = routed.reasoningEffortRaw
                 routerSelectedTarget = true
                 #if DEBUG
-                    AgentModePerfDiagnostics.event("modelRouter.subagent.selected", fields: [
+                    perfRecorder.event("modelRouter.subagent.selected", fields: [
                         "entryPoint": "agent_run.start",
                         "provider": routed.agentRaw,
                         "model": routed.modelRaw,
@@ -807,7 +809,7 @@ struct AgentRunMCPToolService {
             throw error
         }
         #if DEBUG
-            AgentModePerfDiagnostics.event("mcp.routing.agentRunStartTargetResolved", tabID: target.tabID, fields: [
+            perfRecorder.event("mcp.routing.agentRunStartTargetResolved", tabID: target.tabID, fields: [
                 "connectionID": metadata.connectionID?.uuidString ?? "nil",
                 "targetSessionID": target.sessionID?.uuidString ?? "nil",
                 "parentSessionID": spawnParentSessionID?.uuidString ?? "nil",

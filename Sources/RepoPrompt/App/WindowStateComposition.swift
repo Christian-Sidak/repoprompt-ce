@@ -50,12 +50,14 @@ enum WindowStateCompositionFactory {
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
                 enableCatalogShardShadowValidation: false,
                 nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
-                restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+                perfRecorder: AppAgentModePerfRecorder()
             )
         #else
             let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
                 nonGitCodeMapsEnabled: settingsStore.nonGitCodeMapsEnabled,
-                restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
+                restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+                perfRecorder: AppAgentModePerfRecorder()
             )
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
@@ -91,7 +93,8 @@ enum WindowStateCompositionFactory {
             apiSettingsViewModel: apiSettingsViewModel,
             windowID: windowID,
             settingsManager: settingsManager,
-            storedPromptPersistence: storedPromptPersistence
+            storedPromptPersistence: storedPromptPersistence,
+            perfRecorder: AppAgentModePerfRecorder()
         )
 
         // 7) Create the workspace manager with construction-time runtime persistence ownership.
@@ -138,6 +141,7 @@ enum WindowStateCompositionFactory {
         let applyEditsApprovalStore = ApplyEditsApprovalStore.shared
         let mcpServer = MCPServerViewModel(
             service: sharedMCPService,
+            perfRecorder: AppAgentModePerfRecorder(),
             promptVM: promptManager,
             oracleVM: oracleViewModel,
             workspaceManager: workspaceManager,
@@ -185,7 +189,8 @@ enum WindowStateCompositionFactory {
             oracleViewModel: oracleViewModel,
             settingsManager: settingsStore,
             providerFactory: contextBuilderProviderFactory,
-            codexModelPollingService: codexModelPollingService
+            codexModelPollingService: codexModelPollingService,
+            perfRecorder: AppAgentModePerfRecorder()
         )
 
         // 13) Agent mode (for minimal agent UI)
@@ -199,7 +204,8 @@ enum WindowStateCompositionFactory {
             modelRouterSettingsStore: settingsStore,
             modelRouterRuntime: modelRouterRuntime,
             catalogDiagnosticsSink: AppAgentSessionLinkCatalogEventSink(),
-            restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
+            restorePerfRecorder: AppWorkspaceRestorePerfRecorder(),
+            perfRecorder: AppAgentModePerfRecorder()
         )
         workspaceFilesViewModel.setSessionWorktreeBindingStatesProvider { [weak agentModeViewModel] sessionIDs in
             agentModeViewModel?.worktreeBindingStates(forAgentSessionIDs: sessionIDs) ?? [:]
