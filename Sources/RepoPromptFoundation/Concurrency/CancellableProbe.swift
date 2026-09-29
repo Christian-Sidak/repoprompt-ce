@@ -2,12 +2,12 @@ import Foundation
 
 /// Settles a probe's consumer independently of filesystem work that may not be interruptible.
 /// Each invocation owns its own settlement; adapters retain scheduling and capacity policy.
-enum CancellableProbe {
+package enum CancellableProbe {
     /// Calls `startWorker` exactly once, even if the consumer is already cancelled. An adapter
     /// that reserves capacity before entering must release it in the worker, before completion.
     /// Do cancellation admission checks before reserving, not between reservation and this call.
     /// Startup must promptly return a task; blocking work belongs in that task, not this closure.
-    static func run<Value: Sendable>(
+    package static func run<Value: Sendable>(
         startWorker: (_ complete: @escaping @Sendable (Result<Value, Error>) -> Void) -> Task<Void, Never>
     ) async throws -> Value {
         let settlement = Settlement<Value>()

@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 import MCP
 #if canImport(Darwin)

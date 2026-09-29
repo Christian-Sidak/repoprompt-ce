@@ -1,3 +1,4 @@
+import RepoPromptProcess
 import Cocoa
 import Combine
 import Darwin

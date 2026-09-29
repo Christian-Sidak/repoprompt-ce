@@ -1,5 +1,5 @@
 import Foundation
 
-protocol FriendlyErrorRepresentable: Error {
+package protocol FriendlyErrorRepresentable: Error {
     var friendlyErrorString: String { get }
 }

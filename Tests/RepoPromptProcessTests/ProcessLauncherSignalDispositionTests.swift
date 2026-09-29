@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-@testable import RepoPromptApp
+@testable import RepoPromptProcess
 import XCTest
 
 final class ProcessLauncherSignalDispositionTests: XCTestCase {
@@ -43,7 +43,7 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
         process.arguments = [
             "xctest",
             "-XCTest",
-            "RepoPromptTests.ProcessLauncherSignalDispositionTests",
+            "RepoPromptProcessTests.ProcessLauncherSignalDispositionTests",
             Bundle(for: ProcessLauncherSignalDispositionTests.self).bundleURL.path
         ]
 

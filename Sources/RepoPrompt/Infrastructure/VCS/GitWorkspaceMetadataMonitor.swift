@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import CoreFoundation
 import CoreServices
 import Dispatch

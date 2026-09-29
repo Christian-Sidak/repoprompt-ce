@@ -1,28 +1,28 @@
 import Foundation
 
-struct CLILaunchProfile: Equatable {
-    let commandName: String
-    let preferredBasenames: [String]
-    let supplementalSearchPaths: [String]
+package struct CLILaunchProfile: Equatable {
+    package let commandName: String
+    package let preferredBasenames: [String]
+    package let supplementalSearchPaths: [String]
 }
 
-enum CLILaunchProfiles {
-    static let claudeCodeProviderSpecificPaths: [String] = [
+package enum CLILaunchProfiles {
+    package static let claudeCodeProviderSpecificPaths: [String] = [
         "~/.claude/local"
     ]
 
-    static let openCodeProviderSpecificPaths: [String] = [
+    package static let openCodeProviderSpecificPaths: [String] = [
         "~/.opencode/bin"
     ]
-    static let cursorProviderSpecificPaths: [String] = []
+    package static let cursorProviderSpecificPaths: [String] = []
     /// Official Devin installer location.
-    static let devinProviderSpecificPaths: [String] = [
+    package static let devinProviderSpecificPaths: [String] = [
         "~/.local/bin"
     ]
 
     /// Official Grok Build installer location (`GROK_BIN_DIR` overrides it, but a custom
     /// value is honored through PATH or an explicitly configured absolute command only).
-    static let grokBuildProviderSpecificPaths: [String] = [
+    package static let grokBuildProviderSpecificPaths: [String] = [
         "~/.grok/bin"
     ]
 
@@ -30,7 +30,7 @@ enum CLILaunchProfiles {
     /// fallbacks first, then Codex.app resources. System bins are intentionally not
     /// added as supplemental hints because the resolver already searches the built
     /// child PATH, which comes from the user's shell/inherited environment.
-    static let codexSupplementalSearchPaths: [String] = orderedUnique(
+    package static let codexSupplementalSearchPaths: [String] = orderedUnique(
         CLINativePathDefaults.homebrewBins +
             CLINativePathDefaults.nodePackageManagerBins +
             [
@@ -46,47 +46,47 @@ enum CLILaunchProfiles {
             ]
     )
 
-    static let claudeCode = CLILaunchProfile(
+    package static let claudeCode = CLILaunchProfile(
         commandName: "claude",
         preferredBasenames: ["claude"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: claudeCodeProviderSpecificPaths)
     )
 
-    static let codex = CLILaunchProfile(
+    package static let codex = CLILaunchProfile(
         commandName: "codex",
         preferredBasenames: ["codex"],
         supplementalSearchPaths: codexSupplementalSearchPaths
     )
 
-    static let openCode = CLILaunchProfile(
+    package static let openCode = CLILaunchProfile(
         commandName: "opencode",
         preferredBasenames: ["opencode"],
         supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(openCodeProviderSpecificPaths)
     )
 
-    static let cursor = CLILaunchProfile(
+    package static let cursor = CLILaunchProfile(
         commandName: "cursor-agent",
         preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
     )
 
-    static let devin = CLILaunchProfile(
+    package static let devin = CLILaunchProfile(
         commandName: "devin",
         preferredBasenames: ["devin"],
         supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(devinProviderSpecificPaths)
     )
 
-    static let grokBuild = CLILaunchProfile(
+    package static let grokBuild = CLILaunchProfile(
         commandName: "grok",
         preferredBasenames: ["grok"],
         supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(grokBuildProviderSpecificPaths)
     )
 
-    static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {
+    package static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {
         orderedUnique(CLINativePathDefaults.defaultAdditionalPaths + providerSpecificPaths)
     }
 
-    static func providerSpecificPathsSupplementedWithNativeDefaults(_ providerSpecificPaths: [String]) -> [String] {
+    package static func providerSpecificPathsSupplementedWithNativeDefaults(_ providerSpecificPaths: [String]) -> [String] {
         orderedUnique(providerSpecificPaths + CLINativePathDefaults.defaultAdditionalPaths)
     }
 

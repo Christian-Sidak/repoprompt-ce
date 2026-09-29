@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 
 /// Root scopes shared by UI and headless workspace file lookup paths.

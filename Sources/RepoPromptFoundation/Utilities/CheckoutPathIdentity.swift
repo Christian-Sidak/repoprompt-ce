@@ -5,21 +5,21 @@ import Foundation
 /// This is intentionally narrower than general file-path display normalization: branch switching
 /// needs one answer to "do these paths refer to the same checkout?" across the UI, actor cache,
 /// and persisted session bindings.
-struct CheckoutPathIdentity: Hashable, CustomStringConvertible {
-    let path: String
+package struct CheckoutPathIdentity: Hashable, CustomStringConvertible {
+    package let path: String
 
-    init?(_ rawPath: String?) {
+    package init?(_ rawPath: String?) {
         guard let canonical = Self.canonicalPath(rawPath) else {
             return nil
         }
         path = canonical
     }
 
-    var description: String {
+    package var description: String {
         path
     }
 
-    static func canonicalPath(_ rawPath: String?) -> String? {
+    package static func canonicalPath(_ rawPath: String?) -> String? {
         guard let trimmed = rawPath?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty
         else { return nil }
@@ -33,11 +33,11 @@ struct CheckoutPathIdentity: Hashable, CustomStringConvertible {
         return standardized.precomposedStringWithCanonicalMapping
     }
 
-    static func canonicalPathOrOriginal(_ rawPath: String) -> String {
+    package static func canonicalPathOrOriginal(_ rawPath: String) -> String {
         canonicalPath(rawPath) ?? rawPath
     }
 
-    static func same(_ lhs: String?, _ rhs: String?) -> Bool {
+    package static func same(_ lhs: String?, _ rhs: String?) -> Bool {
         guard let lhs = CheckoutPathIdentity(lhs),
               let rhs = CheckoutPathIdentity(rhs)
         else { return false }

@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 
 /// Filesystem-only checks for an immutable bound Context Builder invocation.

@@ -10,7 +10,7 @@ import Foundation
 /// `copiedEntryCount` accumulates every entry copied or shifted by mutations on this value, so
 /// callers can account for the real work of an update (see `takeCopiedEntryCount()`). It is
 /// bookkeeping only and does not participate in equality or hashing.
-struct PersistentHashMap<Key: Hashable, Value> {
+package struct PersistentHashMap<Key: Hashable, Value> {
     fileprivate enum Entry {
         case pair(key: Key, value: Value, hash: Int)
         case child(Node)
@@ -41,16 +41,16 @@ struct PersistentHashMap<Key: Hashable, Value> {
     }
 
     private var root: Node?
-    private(set) var count = 0
-    private(set) var copiedEntryCount = 0
+    package private(set) var count = 0
+    package private(set) var copiedEntryCount = 0
 
-    init() {}
+    package init() {}
 
-    var isEmpty: Bool {
+    package var isEmpty: Bool {
         count == 0
     }
 
-    subscript(key: Key) -> Value? {
+    package subscript(key: Key) -> Value? {
         get { lookup(key, hash: key.hashValue) }
         set {
             if let newValue {
@@ -61,19 +61,19 @@ struct PersistentHashMap<Key: Hashable, Value> {
         }
     }
 
-    subscript(key: Key, default defaultValue: @autoclosure () -> Value) -> Value {
+    package subscript(key: Key, default defaultValue: @autoclosure () -> Value) -> Value {
         get { self[key] ?? defaultValue() }
         set { updateValue(newValue, forKey: key) }
     }
 
     /// Returns and resets the copied/shifted entry count accumulated by mutations.
-    mutating func takeCopiedEntryCount() -> Int {
+    package mutating func takeCopiedEntryCount() -> Int {
         defer { copiedEntryCount = 0 }
         return copiedEntryCount
     }
 
     @discardableResult
-    mutating func updateValue(_ value: Value, forKey key: Key) -> Value? {
+    package mutating func updateValue(_ value: Value, forKey key: Key) -> Value? {
         let hash = key.hashValue
         var copies = 0
         let previous: Value?
@@ -87,7 +87,7 @@ struct PersistentHashMap<Key: Hashable, Value> {
     }
 
     @discardableResult
-    mutating func removeValue(forKey key: Key) -> Value? {
+    package mutating func removeValue(forKey key: Key) -> Value? {
         let hash = key.hashValue
         // Look up first so removing an absent key never copies a shared path.
         guard let previous = lookup(key, hash: hash), root != nil else { return nil }
@@ -263,10 +263,10 @@ struct PersistentHashMap<Key: Hashable, Value> {
 }
 
 extension PersistentHashMap: Sequence {
-    struct Iterator: IteratorProtocol {
+    package struct Iterator: IteratorProtocol {
         fileprivate var stack: [(node: Node, index: Int)]
 
-        mutating func next() -> (key: Key, value: Value)? {
+        package mutating func next() -> (key: Key, value: Value)? {
             while let top = stack.last {
                 guard top.index < top.node.entries.count else {
                     stack.removeLast()
@@ -286,25 +286,25 @@ extension PersistentHashMap: Sequence {
         }
     }
 
-    func makeIterator() -> Iterator {
+    package func makeIterator() -> Iterator {
         Iterator(stack: root.map { [(node: $0, index: 0)] } ?? [])
     }
 
-    var underestimatedCount: Int {
+    package var underestimatedCount: Int {
         count
     }
 
-    var keys: LazyMapSequence<Self, Key> {
+    package var keys: LazyMapSequence<Self, Key> {
         lazy.map(\.key)
     }
 
-    var values: LazyMapSequence<Self, Value> {
+    package var values: LazyMapSequence<Self, Value> {
         lazy.map(\.value)
     }
 }
 
 extension PersistentHashMap: ExpressibleByDictionaryLiteral {
-    init(dictionaryLiteral elements: (Key, Value)...) {
+    package init(dictionaryLiteral elements: (Key, Value)...) {
         self.init()
         for (key, value) in elements {
             updateValue(value, forKey: key)
@@ -314,7 +314,7 @@ extension PersistentHashMap: ExpressibleByDictionaryLiteral {
 }
 
 extension PersistentHashMap: Equatable where Value: Equatable {
-    static func == (lhs: Self, rhs: Self) -> Bool {
+    package static func == (lhs: Self, rhs: Self) -> Bool {
         guard lhs.count == rhs.count else { return false }
         if lhs.root === rhs.root { return true }
         return lhs.allSatisfy { rhs[$0.key] == $0.value }
@@ -322,7 +322,7 @@ extension PersistentHashMap: Equatable where Value: Equatable {
 }
 
 extension PersistentHashMap: Hashable where Value: Hashable {
-    func hash(into hasher: inout Hasher) {
+    package func hash(into hasher: inout Hasher) {
         // Order-independent: iteration order depends on the trie layout, not on contents.
         var combined = 0
         for (key, value) in self {
@@ -341,50 +341,50 @@ extension PersistentHashMap: Hashable where Value: Hashable {
 extension PersistentHashMap: @unchecked Sendable where Key: Sendable, Value: Sendable {}
 
 /// A persistent hash set with structural sharing; see `PersistentHashMap`.
-struct PersistentHashSet<Element: Hashable> {
+package struct PersistentHashSet<Element: Hashable> {
     private var storage = PersistentHashMap<Element, Bool>()
 
-    init() {}
+    package init() {}
 
-    var count: Int {
+    package var count: Int {
         storage.count
     }
 
-    var isEmpty: Bool {
+    package var isEmpty: Bool {
         storage.isEmpty
     }
 
-    func contains(_ element: Element) -> Bool {
+    package func contains(_ element: Element) -> Bool {
         storage[element] != nil
     }
 
     @discardableResult
-    mutating func insert(_ element: Element) -> Bool {
+    package mutating func insert(_ element: Element) -> Bool {
         storage.updateValue(true, forKey: element) == nil
     }
 
     @discardableResult
-    mutating func remove(_ element: Element) -> Element? {
+    package mutating func remove(_ element: Element) -> Element? {
         storage.removeValue(forKey: element) == nil ? nil : element
     }
 
-    mutating func takeCopiedEntryCount() -> Int {
+    package mutating func takeCopiedEntryCount() -> Int {
         storage.takeCopiedEntryCount()
     }
 }
 
 extension PersistentHashSet: Sequence {
-    func makeIterator() -> LazyMapSequence<PersistentHashMap<Element, Bool>, Element>.Iterator {
+    package func makeIterator() -> LazyMapSequence<PersistentHashMap<Element, Bool>, Element>.Iterator {
         storage.keys.makeIterator()
     }
 
-    var underestimatedCount: Int {
+    package var underestimatedCount: Int {
         count
     }
 }
 
 extension PersistentHashSet: ExpressibleByArrayLiteral {
-    init(arrayLiteral elements: Element...) {
+    package init(arrayLiteral elements: Element...) {
         self.init()
         for element in elements {
             insert(element)

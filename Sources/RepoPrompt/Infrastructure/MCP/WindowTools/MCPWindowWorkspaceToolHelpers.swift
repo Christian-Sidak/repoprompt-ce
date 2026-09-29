@@ -1,3 +1,4 @@
+import RepoPromptRegexCore
 import Foundation
 import MCP
 

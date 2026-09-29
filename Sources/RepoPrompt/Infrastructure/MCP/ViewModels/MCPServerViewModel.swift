@@ -5,6 +5,8 @@
 //  Created by Repo Prompt – MCP integration
 //
 
+import RepoPromptFoundation
+import RepoPromptRegexCore
 import AppKit
 import Combine
 import Foundation

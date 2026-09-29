@@ -3,14 +3,16 @@ import Foundation
 /// A narrow `NSLock` wrapper for lock owners whose caller closures have been
 /// explicitly reviewed. DEBUG builds trap before trying to acquire the same lock
 /// recursively on one thread; release builds retain `NSLock` behavior.
-final class SameThreadReentryCheckedLock: @unchecked Sendable {
+package final class SameThreadReentryCheckedLock: @unchecked Sendable {
+    package init() {}
+
     private let underlyingLock = NSLock()
 
     #if DEBUG
         private let ownershipKey = "RepoPrompt.SameThreadReentryCheckedLock.\(UUID().uuidString)"
     #endif
 
-    func lock() {
+    package func lock() {
         #if DEBUG
             let threadDictionary = Thread.current.threadDictionary
             precondition(
@@ -24,7 +26,7 @@ final class SameThreadReentryCheckedLock: @unchecked Sendable {
         #endif
     }
 
-    func unlock() {
+    package func unlock() {
         #if DEBUG
             let threadDictionary = Thread.current.threadDictionary
             precondition(

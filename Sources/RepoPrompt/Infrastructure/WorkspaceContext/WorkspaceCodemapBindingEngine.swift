@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 import OSLog
 import RepoPromptCodeMapCore

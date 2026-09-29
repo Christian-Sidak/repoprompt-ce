@@ -1,3 +1,4 @@
+import RepoPromptProcess
 import Foundation
 
 /// Synchronous "is the Devin CLI installed" probe for availability/status surfaces.

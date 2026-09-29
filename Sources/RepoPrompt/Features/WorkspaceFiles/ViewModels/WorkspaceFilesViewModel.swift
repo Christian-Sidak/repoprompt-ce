@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import AppKit
 import Combine
 import Foundation

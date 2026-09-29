@@ -1,24 +1,24 @@
 import Foundation
 
-struct BundleIdentityDefaultsMigrationReport: Equatable {
-    enum Outcome: String {
+package struct BundleIdentityDefaultsMigrationReport: Equatable {
+    package enum Outcome: String {
         case skipped
         case alreadyCompleted = "already-completed"
         case migrated
         case verificationFailed = "verification-failed"
     }
 
-    let outcome: Outcome
-    let copiedKeyCount: Int
-    let preservedKeyCount: Int
+    package let outcome: Outcome
+    package let copiedKeyCount: Int
+    package let preservedKeyCount: Int
 }
 
 /// Moves the legacy application preference domain to the successor bundle ID once.
 /// Existing successor values always win, including Sparkle and window-state values.
-enum BundleIdentityDefaultsMigration {
-    static let completionMarker = "RepoPromptIdentityDefaultsMigrationV1Completed"
+package enum BundleIdentityDefaultsMigration {
+    package static let completionMarker = "RepoPromptIdentityDefaultsMigrationV1Completed"
 
-    static func migrateIfNeeded(
+    package static func migrateIfNeeded(
         bundleIdentifier: String? = Bundle.main.bundleIdentifier,
         defaults: UserDefaults = .standard,
         legacyDomainName: String = RuntimeCodeSigningPolicy.developerIDBundleIdentifier,

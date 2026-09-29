@@ -663,19 +663,19 @@ struct SecureStorageIdentityMigrationCommittedBridgeResolver {
     }
 }
 
-final class IdentityMigrationRuntimeState: @unchecked Sendable {
-    static let shared = IdentityMigrationRuntimeState()
+package final class IdentityMigrationRuntimeState: @unchecked Sendable {
+    package static let shared = IdentityMigrationRuntimeState()
 
     private let lock = NSLock()
     private var blockedMessage: String?
 
-    func setBlockedMessage(_ message: String?) {
+    package func setBlockedMessage(_ message: String?) {
         lock.lock()
         blockedMessage = message
         lock.unlock()
     }
 
-    func updatesBlockedMessage() -> String? {
+    package func updatesBlockedMessage() -> String? {
         lock.lock()
         defer { lock.unlock() }
         return blockedMessage
@@ -689,7 +689,7 @@ enum SecureStorageIdentityMigrationCommittedStartupOutcome {
     case blocked(Error)
 }
 
-enum SecureStorageIdentityMigrationBootstrap {
+package enum SecureStorageIdentityMigrationBootstrap {
     static let phaseInfoKey = "RepoPromptIdentityMigrationPhase"
     static let anchorRelativePathInfoKey = "RepoPromptIdentityMigrationAnchorRelativePath"
 
@@ -737,7 +737,7 @@ enum SecureStorageIdentityMigrationBootstrap {
         return Set(migrationIdentifiers).isSubset(of: Set(currentIdentifiers))
     }
 
-    static func prepareIfConfigured(bundle: Bundle = .main) {
+    package static func prepareIfConfigured(bundle: Bundle = .main) {
         IdentityMigrationRuntimeState.shared.setBlockedMessage(nil)
         let domain = SecureKeyValueStorageFactory.currentDecision().domain
         guard domain == .officialDeveloperID || domain == .successorOfficialDeveloperID else {

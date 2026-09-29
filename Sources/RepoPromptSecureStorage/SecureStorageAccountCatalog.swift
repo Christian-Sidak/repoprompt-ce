@@ -3,7 +3,7 @@ import Foundation
 /// Closed inventory of every account identifier persisted through secure storage.
 ///
 /// These identifiers are persistence keys. Changing one requires an explicit migration.
-enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
+package enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     // Provider and CLI accounts.
     case anthropicAPI
     case openAIAPI
@@ -39,7 +39,7 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     case agentPermissionAntigravityDocument
     case agentPermissionDevinDocument
 
-    var identifier: String {
+    package var identifier: String {
         switch self {
         case .anthropicAPI:
             "AnthropicAPI"
@@ -123,11 +123,11 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
         }
     }
 
-    var id: String {
+    package var id: String {
         identifier
     }
 
-    var displayName: String {
+    package var displayName: String {
         switch self {
         case .anthropicAPI: "Anthropic API key"
         case .openAIAPI: "OpenAI API key"

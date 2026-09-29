@@ -1,22 +1,30 @@
 import Darwin
 import Foundation
 
-struct ExecutableFileIdentity: Equatable {
-    let canonicalPath: String
-    let device: UInt64
-    let inode: UInt64
-    let size: Int64
-    let modificationSeconds: Int64
-    let modificationNanoseconds: Int64
-    let statusChangeSeconds: Int64
-    let statusChangeNanoseconds: Int64
+package struct ExecutableFileIdentity: Equatable {
+    package let canonicalPath: String
+    package let device: UInt64
+    package let inode: UInt64
+    package let size: Int64
+    package let modificationSeconds: Int64
+    package let modificationNanoseconds: Int64
+    package let statusChangeSeconds: Int64
+    package let statusChangeNanoseconds: Int64
 
-    static func capture(atPath rawPath: String) throws -> ExecutableFileIdentity {
+    private static func realpathString(_ path: String) -> String? {
+        path.withCString { cPath in
+            guard let resolved = realpath(cPath, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+    }
+
+    package static func capture(atPath rawPath: String) throws -> ExecutableFileIdentity {
         guard rawPath.hasPrefix("/") else {
             throw ExecutableFileIdentityError.pathMustBeAbsolute(rawPath)
         }
 
-        guard let canonicalPath = FileSystemService.realpathString(rawPath) else {
+        guard let canonicalPath = realpathString(rawPath) else {
             throw ExecutableFileIdentityError.unavailable((rawPath as NSString).standardizingPath)
         }
         var info = stat()
@@ -32,7 +40,7 @@ struct ExecutableFileIdentity: Equatable {
 
         return ExecutableFileIdentity(
             canonicalPath: canonicalPath,
-            device: safeDeviceID(info.st_dev),
+            device: UInt64(bitPattern: Int64(info.st_dev)),
             inode: UInt64(info.st_ino),
             size: Int64(info.st_size),
             modificationSeconds: Int64(info.st_mtimespec.tv_sec),
@@ -42,13 +50,13 @@ struct ExecutableFileIdentity: Equatable {
         )
     }
 
-    static func captureForTrustedPathLaunch(atPath path: String) throws -> ExecutableFileIdentity {
+    package static func captureForTrustedPathLaunch(atPath path: String) throws -> ExecutableFileIdentity {
         let identity = try capture(atPath: path)
         try validateTrustedOwnershipAndPermissions(atCanonicalPath: identity.canonicalPath)
         return identity
     }
 
-    func validate(atPath path: String) throws {
+    package func validate(atPath path: String) throws {
         let current = try Self.capture(atPath: path)
         guard current == self else {
             throw ExecutableFileIdentityError.identityChanged(
@@ -61,12 +69,12 @@ struct ExecutableFileIdentity: Equatable {
     /// Revalidates identity and rejects launch paths that an untrusted local user can replace.
     /// Root and the current user are trusted globally; admin-group writes are trusted only for ACL-free
     /// canonical Homebrew Cellar paths.
-    func validateForTrustedPathLaunch(atPath path: String) throws {
+    package func validateForTrustedPathLaunch(atPath path: String) throws {
         try validate(atPath: path)
         try Self.validateTrustedOwnershipAndPermissions(atCanonicalPath: canonicalPath)
     }
 
-    static func permitsHomebrewAdminGroupWritableDirectory(
+    package static func permitsHomebrewAdminGroupWritableDirectory(
         canonicalPath: String,
         directoryPath: String,
         mode: mode_t,
@@ -97,7 +105,7 @@ struct ExecutableFileIdentity: Equatable {
         }
     }
 
-    static func directoryHasNoExtendedACL(atPath directoryPath: String) -> Bool {
+    package static func directoryHasNoExtendedACL(atPath directoryPath: String) -> Bool {
         let descriptor = open(directoryPath, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)
         guard descriptor >= 0 else { return false }
         defer { close(descriptor) }
@@ -168,7 +176,7 @@ struct ExecutableFileIdentity: Equatable {
     }
 }
 
-enum ExecutableFileIdentityError: Error, Equatable, LocalizedError {
+package enum ExecutableFileIdentityError: Error, Equatable, LocalizedError {
     case pathMustBeAbsolute(String)
     case unavailable(String)
     case notRegularFile(String)
@@ -178,7 +186,7 @@ enum ExecutableFileIdentityError: Error, Equatable, LocalizedError {
     case untrustedWritableFile(String, mode_t)
     case untrustedWritableDirectory(String, mode_t)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case let .pathMustBeAbsolute(path):
             "Executable path must be absolute: \(path)"

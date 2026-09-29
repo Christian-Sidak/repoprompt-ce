@@ -438,8 +438,8 @@ public enum RegexToolkit {
     }
 }
 
-enum SearchPatternErrorFormatter {
-    static func parts(for pattern: String, isRegex: Bool, error: SearchPatternError) -> (issue: String, suggestion: String?) {
+package enum SearchPatternErrorFormatter {
+    package static func parts(for pattern: String, isRegex: Bool, error: SearchPatternError) -> (issue: String, suggestion: String?) {
         let base = error.localizedDescription
         switch error {
         case .unmatchedParentheses:

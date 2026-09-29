@@ -1,3 +1,4 @@
+import RepoPromptProcess
 import Foundation
 
 final class CodexCLIProvider: AIProvider {

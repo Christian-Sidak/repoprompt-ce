@@ -1,11 +1,12 @@
 import Foundation
 
-enum CLIProcessLogCollectorError: Error {
+package enum CLIProcessLogCollectorError: Error {
     case noEntries
     case downloadsDirectoryUnavailable
 }
 
-final class CLIProcessLogCollector {
+package final class CLIProcessLogCollector {
+    package init() {}
     private struct Entry {
         let timestamp: Date
         let message: String
@@ -28,7 +29,7 @@ final class CLIProcessLogCollector {
     private let queue = DispatchQueue(label: "com.repoprompt.cli-log-collector", attributes: .concurrent)
     private var entries: [Entry] = []
 
-    var isEmpty: Bool {
+    package var isEmpty: Bool {
         queue.sync { entries.isEmpty }
     }
 
@@ -38,7 +39,7 @@ final class CLIProcessLogCollector {
         }
     }
 
-    func append(_ message: String) {
+    package func append(_ message: String) {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let entry = Entry(timestamp: Date(), message: trimmed)
@@ -75,7 +76,7 @@ final class CLIProcessLogCollector {
         return output
     }
 
-    func writeMarkdownToDownloads(baseFilename: String, title: String, timestamp: Date = Date()) throws -> URL {
+    package func writeMarkdownToDownloads(baseFilename: String, title: String, timestamp: Date = Date()) throws -> URL {
         let markdown = try makeMarkdown(title: title)
         guard let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
             throw CLIProcessLogCollectorError.downloadsDirectoryUnavailable

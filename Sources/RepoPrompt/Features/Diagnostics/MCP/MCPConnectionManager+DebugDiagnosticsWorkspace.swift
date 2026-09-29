@@ -1,5 +1,6 @@
 // MARK: - DEBUG Workspace Diagnostics
 
+import RepoPromptFoundation
 import Foundation
 import MCP
 

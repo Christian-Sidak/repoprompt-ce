@@ -1,8 +1,7 @@
 import Foundation
-import RepoPromptRegexCore
 
-enum RepoPromptSearchRegexRuntime {
-    static var pcre2SearchMatchLimitsEnabled: Bool {
+package enum RepoPromptSearchRegexRuntime {
+    package static var pcre2SearchMatchLimitsEnabled: Bool {
         let rawValue = ProcessInfo.processInfo.environment["REPOPROMPT_PCRE2_MATCH_LIMITS"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -16,36 +15,36 @@ enum RepoPromptSearchRegexRuntime {
     }
 }
 
-enum RepoPromptPCRE2MatchPolicy {
-    static var fileSearchFullBuffer: PCRE2MatchLimits? {
+package enum RepoPromptPCRE2MatchPolicy {
+    package static var fileSearchFullBuffer: PCRE2MatchLimits? {
         guard RepoPromptSearchRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
         return PCRE2MatchLimits(matchLimit: 10_000_000, depthLimit: 100_000, heapLimitKiB: 64 * 1024)
     }
 
-    static var fileSearchLine: PCRE2MatchLimits? {
+    package static var fileSearchLine: PCRE2MatchLimits? {
         guard RepoPromptSearchRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
         return PCRE2MatchLimits(matchLimit: 1_000_000, depthLimit: 10000, heapLimitKiB: 16 * 1024)
     }
 
-    static var pathSearchShortSubject: PCRE2MatchLimits? {
+    package static var pathSearchShortSubject: PCRE2MatchLimits? {
         guard RepoPromptSearchRegexRuntime.pcre2SearchMatchLimitsEnabled else { return nil }
         return PCRE2MatchLimits(matchLimit: 100_000, depthLimit: 1000, heapLimitKiB: 4 * 1024)
     }
 }
 
-struct RepoPromptPCRE2CompileResult {
-    let regex: PCRE2Regex
-    let compiledPattern: String
-    let wasRepaired: Bool
+package struct RepoPromptPCRE2CompileResult {
+    package let regex: PCRE2Regex
+    package let compiledPattern: String
+    package let wasRepaired: Bool
 }
 
-struct RepoPromptPCRE2CompileRequest {
-    let pattern: String
-    let caseInsensitive: Bool
-    let multilineAnchors: Bool
-    let jitMode: PCRE2JITMode
+package struct RepoPromptPCRE2CompileRequest {
+    package let pattern: String
+    package let caseInsensitive: Bool
+    package let multilineAnchors: Bool
+    package let jitMode: PCRE2JITMode
 
-    init(
+    package init(
         pattern: String,
         caseInsensitive: Bool,
         multilineAnchors: Bool,
@@ -58,8 +57,8 @@ struct RepoPromptPCRE2CompileRequest {
     }
 }
 
-enum RepoPromptPCRE2Adapter {
-    static func compile(_ request: RepoPromptPCRE2CompileRequest) throws -> PCRE2Regex {
+package enum RepoPromptPCRE2Adapter {
+    package static func compile(_ request: RepoPromptPCRE2CompileRequest) throws -> PCRE2Regex {
         var options = PCRE2CompileOptions.defaultRegex
         if request.caseInsensitive {
             options.insert(.caseless)
@@ -70,7 +69,7 @@ enum RepoPromptPCRE2Adapter {
         return try PCRE2Regex(request.pattern, options: options, jit: request.jitMode)
     }
 
-    static func searchPatternError(from error: Error, pattern: String) -> RegexPatternFailure {
+    package static func searchPatternError(from error: Error, pattern: String) -> RegexPatternFailure {
         if let failure = error as? RegexPatternFailure {
             return failure
         }
@@ -94,7 +93,7 @@ enum RepoPromptPCRE2Adapter {
         return SearchPatternError.invalidRegex(pattern, error.localizedDescription)
     }
 
-    static func isVariableLengthLookbehindError(pattern: String, details: String) -> Bool {
+    package static func isVariableLengthLookbehindError(pattern: String, details: String) -> Bool {
         guard pattern.contains("(?<=") || pattern.contains("(?<!") else { return false }
         let normalized = details.lowercased()
         return normalized.contains("lookbehind") && (
@@ -107,7 +106,7 @@ enum RepoPromptPCRE2Adapter {
         )
     }
 
-    static func variableLengthLookbehindSuggestion(pattern: String) -> String? {
+    package static func variableLengthLookbehindSuggestion(pattern: String) -> String? {
         guard pattern.contains("(?<=") || pattern.contains("(?<!") else { return nil }
         return "Use a fixed-width lookbehind, or rewrite the search as a line-level lookahead. For example, to find GetComponent only on lines that do not contain //, use `(?m)^(?!.*\\/\\/).*GetComponent`."
     }
@@ -135,11 +134,11 @@ enum RepoPromptPCRE2Adapter {
         return "Check the regex syntax, remove unsupported constructs, or simplify the pattern."
     }
 
-    static func escapedLiteral(_ literal: String) -> String {
+    package static func escapedLiteral(_ literal: String) -> String {
         PCRE2Literal.escapedPattern(for: literal)
     }
 
-    static func compressDoubleEscapesBeforeMeta(_ pattern: String) -> String {
+    package static func compressDoubleEscapesBeforeMeta(_ pattern: String) -> String {
         let regexMeta: Set<Character> = ["(", ")", "[", "]", "{", "}", ".", "*", "+", "?", "|", "^", "$"]
         let chars = Array(pattern)
         var out: [Character] = []
@@ -162,7 +161,7 @@ enum RepoPromptPCRE2Adapter {
         return String(out)
     }
 
-    static func anchoredDeclarationLinePlan(
+    package static func anchoredDeclarationLinePlan(
         for pattern: String,
         caseInsensitive: Bool
     ) -> PCRE2AnchoredDeclarationLinePattern? {
@@ -172,7 +171,7 @@ enum RepoPromptPCRE2Adapter {
         return PCRE2AnchoredDeclarationLinePattern(caseInsensitive: caseInsensitive)
     }
 
-    static func linePrefilterForAnchoredPattern(
+    package static func linePrefilterForAnchoredPattern(
         _ pattern: String,
         caseInsensitive: Bool
     ) -> PCRE2LinePrefilter? {
@@ -191,7 +190,7 @@ enum RepoPromptPCRE2Adapter {
         return PCRE2LinePrefilter(asciiRequiredAlternatives: requiredAlternatives, caseInsensitive: caseInsensitive)
     }
 
-    static func asciiMarkerLinePatternPlan(
+    package static func asciiMarkerLinePatternPlan(
         forRegex pattern: String,
         caseInsensitive: Bool
     ) -> PCRE2ASCIIMarkerLinePattern? {
@@ -199,7 +198,7 @@ enum RepoPromptPCRE2Adapter {
         return PCRE2ASCIIMarkerLinePattern(marker: "TODO", digitCount: 3, requiredPrefix: "Search", caseInsensitive: caseInsensitive)
     }
 
-    static func asciiWholeWordLiteralPlan(
+    package static func asciiWholeWordLiteralPlan(
         pattern: String,
         isRegex: Bool,
         wholeWord: Bool,
@@ -215,7 +214,7 @@ enum RepoPromptPCRE2Adapter {
         return PCRE2ASCIIWholeWordLiteral(needle: pattern, caseInsensitive: caseInsensitive)
     }
 
-    static func pathSuffixPattern(forRegex pattern: String) -> PCRE2PathSuffixPattern? {
+    package static func pathSuffixPattern(forRegex pattern: String) -> PCRE2PathSuffixPattern? {
         if pattern.hasPrefix(#".*\."#), pattern.hasSuffix("$") {
             let inner = String(pattern.dropFirst(4).dropLast())
             if inner.hasPrefix("("), inner.hasSuffix(")") {
@@ -291,7 +290,7 @@ enum RepoPromptPCRE2Adapter {
         }
     }
 
-    static func compileSearchRegexWithRepairsResult(
+    package static func compileSearchRegexWithRepairsResult(
         pattern: String,
         caseInsensitive: Bool,
         wholeWord: Bool,
@@ -348,7 +347,7 @@ enum RepoPromptPCRE2Adapter {
         )
     }
 
-    static func compileSearchRegexWithRepairs(
+    package static func compileSearchRegexWithRepairs(
         pattern: String,
         caseInsensitive: Bool,
         wholeWord: Bool,

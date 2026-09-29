@@ -1,3 +1,4 @@
+import RepoPromptSecureStorage
 import Foundation
 
 actor JevRouterCredentialService: AgentTaskRouterBackendSettingsController {

@@ -1,6 +1,6 @@
 import Darwin
 import Foundation
-@testable import RepoPromptApp
+@testable import RepoPromptProcess
 import XCTest
 
 final class ExecutableFileIdentityTests: XCTestCase {
@@ -69,7 +69,7 @@ final class ExecutableFileIdentityTests: XCTestCase {
         try "#!/bin/sh\nexit 0\n".write(to: escapedExecutable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: escapedExecutable.path)
         try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: escapedDirectory.path)
-        let canonicalEscapedDirectory = try XCTUnwrap(FileSystemService.realpathString(escapedDirectory.path))
+        let canonicalEscapedDirectory = try XCTUnwrap(self.realpathString(escapedDirectory.path))
 
         let alias = trustedDirectory.appendingPathComponent("opencode")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: escapedExecutable)
@@ -121,6 +121,14 @@ final class ExecutableFileIdentityTests: XCTestCase {
         XCTAssertFalse(ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: root.appendingPathComponent("missing").path))
         XCTAssertFalse(ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: regularFile.path))
         XCTAssertFalse(ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: symlink.path))
+    }
+
+    private func realpathString(_ path: String) -> String? {
+        path.withCString { cPath in
+            guard let resolved = realpath(cPath, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
     }
 
     private func addExtendedACL(_ entry: String, to directory: URL) throws {

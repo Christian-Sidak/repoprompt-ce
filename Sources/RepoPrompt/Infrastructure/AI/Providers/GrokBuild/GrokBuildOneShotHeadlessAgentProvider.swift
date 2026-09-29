@@ -1,3 +1,4 @@
+import RepoPromptProcess
 import Foundation
 
 /// Prompt-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.

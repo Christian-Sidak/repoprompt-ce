@@ -5,6 +5,7 @@
 //  Created by Eric Provencher on 2025-04-10.
 //
 import Foundation
+import RepoPromptFoundation
 import SwiftAnthropic
 import SwiftOpenAI
 

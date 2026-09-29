@@ -1,16 +1,16 @@
 import Foundation
 @_exported import RepoPromptWorkspaceCore
 
-enum StoredSelectionPathNormalization {
+package enum StoredSelectionPathNormalization {
     /// Canonicalizes stored selection path state.
     /// Policy: canonical absolute keys win over legacy/raw variants for the same file.
-    static func standardizedPath(_ rawPath: String) -> String? {
+    package static func standardizedPath(_ rawPath: String) -> String? {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         return StandardizedPath.absolute(trimmed)
     }
 
-    static func standardizedPaths(_ paths: [String]) -> [String] {
+    package static func standardizedPaths(_ paths: [String]) -> [String] {
         var seen = Set<String>()
         var result: [String] = []
         result.reserveCapacity(paths.count)
@@ -21,7 +21,7 @@ enum StoredSelectionPathNormalization {
         return result
     }
 
-    static func orderedSlicePaths(_ slices: [String: [LineRange]]) -> [String] {
+    package static func orderedSlicePaths(_ slices: [String: [LineRange]]) -> [String] {
         slices.keys.sorted {
             let lhs = standardizedPath($0) ?? $0
             let rhs = standardizedPath($1) ?? $1
@@ -30,7 +30,7 @@ enum StoredSelectionPathNormalization {
         }
     }
 
-    static func mergeSliceRanges(
+    package static func mergeSliceRanges(
         _ ranges: [LineRange],
         for fileID: UUID,
         into rangesByFileID: inout [UUID: [LineRange]]
@@ -47,7 +47,7 @@ enum StoredSelectionPathNormalization {
         rangesByFileID[fileID] = normalizedRanges
     }
 
-    static func standardizedSlices(_ slices: [String: [LineRange]]) -> [String: [LineRange]] {
+    package static func standardizedSlices(_ slices: [String: [LineRange]]) -> [String: [LineRange]] {
         guard !slices.isEmpty else { return [:] }
 
         var canonical: [String: [LineRange]] = [:]
@@ -75,13 +75,13 @@ enum StoredSelectionPathNormalization {
     }
 }
 
-enum GitDiffPathNormalization {
+package enum GitDiffPathNormalization {
     @inline(__always)
-    static func normalizedAbsolutePath(_ path: String) -> String {
+    package static func normalizedAbsolutePath(_ path: String) -> String {
         StandardizedPath.absolute(path).precomposedStringWithCanonicalMapping
     }
 
-    static func normalizedAbsolutePaths(_ paths: [String]) -> [String] {
+    package static func normalizedAbsolutePaths(_ paths: [String]) -> [String] {
         paths.map(normalizedAbsolutePath)
     }
 
@@ -90,7 +90,7 @@ enum GitDiffPathNormalization {
         let requiresLiteralMagic: Bool
     }
 
-    static func gitPathspecs(from paths: [String], repoRootPath: String) -> [String] {
+    package static func gitPathspecs(from paths: [String], repoRootPath: String) -> [String] {
         var seen = Set<String>()
         return normalizedGitPathspecs(from: paths, repoRootPath: repoRootPath).compactMap { normalized in
             seen.insert(normalized.plain).inserted ? normalized.plain : nil
@@ -99,7 +99,7 @@ enum GitDiffPathNormalization {
 
     /// Produces command pathspecs while preserving user-authored relative Git pathspec semantics.
     /// Absolute inputs are app/worktree-derived paths and must be literalized before invoking Git.
-    static func gitDiscoveryPathspecs(from paths: [String], repoRootPath: String) -> [String] {
+    package static func gitDiscoveryPathspecs(from paths: [String], repoRootPath: String) -> [String] {
         var seen = Set<String>()
         return normalizedGitPathspecs(from: paths, repoRootPath: repoRootPath).compactMap { normalized in
             let pathspec = normalized.requiresLiteralMagic
@@ -109,7 +109,7 @@ enum GitDiffPathNormalization {
         }
     }
 
-    static func literalGitPathspecs(_ paths: [String]) -> [String] {
+    package static func literalGitPathspecs(_ paths: [String]) -> [String] {
         paths.map(literalGitPathspec)
     }
 
@@ -156,7 +156,7 @@ enum GitDiffPathNormalization {
         return results
     }
 
-    static func gitRelativePaths(from absolutePaths: [String], repoRootPath: String) -> [String] {
+    package static func gitRelativePaths(from absolutePaths: [String], repoRootPath: String) -> [String] {
         let standardizedRoot = normalizedAbsolutePath(repoRootPath)
         var results: [String] = []
         results.reserveCapacity(absolutePaths.count)

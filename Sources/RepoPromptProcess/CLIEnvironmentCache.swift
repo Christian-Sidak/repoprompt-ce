@@ -1,15 +1,15 @@
 import Darwin
 import Foundation
 
-actor CLIEnvironmentCache {
-    static let shared = CLIEnvironmentCache()
+package actor CLIEnvironmentCache {
+    package static let shared = CLIEnvironmentCache()
 
     private var cachedSnapshots: [ShellEnvironmentCaptureMode: CLIEnvironmentSnapshot] = [:]
     private var fallbackEnvironments: [ShellEnvironmentCaptureMode: [String: String]] = [:]
     private var loadTasks: [ShellEnvironmentCaptureMode: Task<CLIEnvironmentSnapshot, Never>] = [:]
     private var loadGenerations: [ShellEnvironmentCaptureMode: UInt64] = [:]
 
-    func invalidate() {
+    package func invalidate() {
         for mode in ShellEnvironmentCaptureMode.allCases {
             loadGenerations[mode, default: 0] &+= 1
             loadTasks[mode]?.cancel()
@@ -21,11 +21,11 @@ actor CLIEnvironmentCache {
         }
     }
 
-    func environment(enableLogging: Bool) async -> [String: String] {
+    package func environment(enableLogging: Bool) async -> [String: String] {
         await environmentSnapshot(enableLogging: enableLogging).environment
     }
 
-    func environmentSnapshot(
+    package func environmentSnapshot(
         enableLogging: Bool,
         forceRefresh: Bool = false,
         captureMode: ShellEnvironmentCaptureMode = .interactiveLoginShell

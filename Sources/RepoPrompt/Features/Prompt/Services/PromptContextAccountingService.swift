@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 
 /// Dormant value-based orchestration for resolving persisted workspace selections into prompt-entry

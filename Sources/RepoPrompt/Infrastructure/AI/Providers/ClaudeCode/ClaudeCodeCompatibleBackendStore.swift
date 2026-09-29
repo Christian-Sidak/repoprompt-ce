@@ -1,3 +1,4 @@
+import RepoPromptSecureStorage
 import Foundation
 
 final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {

@@ -1,7 +1,8 @@
 import Foundation
+import RepoPromptProcess
 
-extension SentryTelemetryBootstrap {
-    enum Category: String, CaseIterable {
+package enum SentryTelemetryModel {
+    package enum Category: String, CaseIterable {
         case agentMessage = "agent.message"
         case agentRun = "agent.run"
         case agentTool = "agent.tool"
@@ -16,7 +17,7 @@ extension SentryTelemetryBootstrap {
         case workspaceTool = "workspace.tool"
     }
 
-    enum Action: String, CaseIterable {
+    package enum Action: String, CaseIterable {
         case agentMessageObserved = "agent.message.observed"
         case agentRunCancelled = "agent.run.cancelled"
         case agentRunCompleted = "agent.run.completed"
@@ -54,7 +55,7 @@ extension SentryTelemetryBootstrap {
         case workspaceActionStarted = "workspace.action.started"
     }
 
-    enum Transaction: CaseIterable {
+    package enum Transaction: CaseIterable {
         case agentRun
         case appLaunch
         case contextBuilderRun
@@ -91,7 +92,7 @@ extension SentryTelemetryBootstrap {
         }
     }
 
-    enum Metric: String, CaseIterable {
+    package enum Metric: String, CaseIterable {
         case agentProviderErrors = "agent.provider.errors"
         case agentRunActive = "agent.run.active"
         case agentRunDuration = "agent.run.duration"
@@ -101,7 +102,7 @@ extension SentryTelemetryBootstrap {
         case mcpExternalSessionStarts = "mcp.external.session.starts"
     }
 
-    enum SpanOperation: String, CaseIterable {
+    package enum SpanOperation: String, CaseIterable {
         case agentProviderFirstEvent = "agent.provider.first_event"
         case agentSessionPersist = "agent.session.persist"
         case agentSessionPrepare = "agent.session.prepare"
@@ -123,7 +124,7 @@ extension SentryTelemetryBootstrap {
         case workspaceSearch = "workspace.search"
     }
 
-    enum ApprovalKind: String {
+    package enum ApprovalKind: String {
         case applyEdits = "apply_edits"
         case commandExecution = "command_execution"
         case fileChange = "file_change"
@@ -131,14 +132,14 @@ extension SentryTelemetryBootstrap {
         case worktreeMerge = "worktree_merge"
     }
 
-    enum ApprovalOutcome: String { case approved, denied }
-    enum CancellationReason: String { case superseded, timeout, user }
-    enum ClientClass: String { case externalAgent = "external_agent", inApp = "in_app", unknown }
-    enum Entrypoint: String { case agent, app, cli, mcp, user }
-    enum ErrorKind: String { case cancelled, error, timeout }
-    enum MessageRole: String { case assistant, system, tool, user }
+    package enum ApprovalOutcome: String { case approved, denied }
+    package enum CancellationReason: String { case superseded, timeout, user }
+    package enum ClientClass: String { case externalAgent = "external_agent", inApp = "in_app", unknown }
+    package enum Entrypoint: String { case agent, app, cli, mcp, user }
+    package enum ErrorKind: String { case cancelled, error, timeout }
+    package enum MessageRole: String { case assistant, system, tool, user }
 
-    enum ProviderErrorKind: String {
+    package enum ProviderErrorKind: String {
         case apiError = "api_error"
         case authRequired = "auth_required"
         case cancelled
@@ -154,7 +155,7 @@ extension SentryTelemetryBootstrap {
         case unknown
     }
 
-    enum RuntimeEvent: String {
+    package enum RuntimeEvent: String {
         case codexRecoveryFailed = "codex_recovery_failed"
         case codexRecoveryRecovered = "codex_recovery_recovered"
         case codexRecoverySkipped = "codex_recovery_skipped"
@@ -164,10 +165,10 @@ extension SentryTelemetryBootstrap {
         case codexTransportClosed = "codex_transport_closed"
     }
 
-    enum ToolDomain: String { case agent, app, context, file, git, mcp, prompt, search, selection, workspace }
-    enum WorkspaceAction: String { case create, delete, folder, hide, switchWorkspace = "switch", tab }
+    package enum ToolDomain: String { case agent, app, context, file, git, mcp, prompt, search, selection, workspace }
+    package enum WorkspaceAction: String { case create, delete, folder, hide, switchWorkspace = "switch", tab }
 
-    enum ModelFamily: String {
+    package enum ModelFamily: String {
         case claude
         case codex
         case cursor
@@ -189,7 +190,7 @@ extension SentryTelemetryBootstrap {
         case sonnet
     }
 
-    enum ProviderKind: String {
+    package enum ProviderKind: String {
         case claudeCode = "claude_code"
         case claudeCodeGLM = "claude_code_glm"
         case codexExec = "codex_exec"
@@ -201,38 +202,10 @@ extension SentryTelemetryBootstrap {
         case antigravity
         case devin
 
-        init(agentKind: AgentProviderKind) {
-            switch agentKind {
-            case .claudeCode:
-                self = .claudeCode
-            case .codexExec:
-                self = .codexExec
-            case .openCode:
-                self = .openCode
-            case .cursor:
-                self = .cursor
-            case .grokBuild:
-                self = .grokBuild
-            case .antigravity:
-                self = .antigravity
-            case .devin:
-                self = .devin
-            case .claudeCodeGLM:
-                self = .claudeCodeGLM
-            case .kimiCode:
-                self = .kimiCode
-            case .customClaudeCompatible:
-                self = .customClaudeCompatible
-            }
-        }
 
-        init?(agentKindRaw: String) {
-            guard let agentKind = AgentProviderKind(rawValue: agentKindRaw) else { return nil }
-            self.init(agentKind: agentKind)
-        }
     }
 
-    enum ToolName: String {
+    package enum ToolName: String {
         case agentManage = "agent_manage"
         case agentRun = "agent_run"
         case appSettings = "app_settings"
@@ -289,14 +262,14 @@ extension SentryTelemetryBootstrap {
         }
     }
 
-    enum ContextBuilderPhase: String {
+    package enum ContextBuilderPhase: String {
         case discovery
         case export
         case oracleResponse = "oracle_response"
         case selectionCommit = "selection_commit"
     }
 
-    enum Outcome: String {
+    package enum Outcome: String {
         case accepted
         case cancelled
         case completed
@@ -306,7 +279,7 @@ extension SentryTelemetryBootstrap {
         case timedOut = "timed_out"
     }
 
-    enum TokenBudgetBucket: String {
+    package enum TokenBudgetBucket: String {
         case under25K = "under_25k"
         case k25To75 = "25k_75k"
         case k75To150 = "75k_150k"
@@ -314,7 +287,7 @@ extension SentryTelemetryBootstrap {
         case unknown
     }
 
-    enum Attribute {
+    package enum Attribute {
         case action(Action)
         case activeHandshakes(Int)
         case attachmentCount(Int)
@@ -431,7 +404,7 @@ extension SentryTelemetryBootstrap {
         }
     }
 
-    static func telemetryData(from attributes: [Attribute]) -> [String: String] {
+    package static func telemetryData(from attributes: [Attribute]) -> [String: String] {
         var data: [String: String] = [:]
         for attribute in attributes {
             guard let value = attribute.value else { continue }
@@ -441,19 +414,19 @@ extension SentryTelemetryBootstrap {
     }
 }
 
-enum SentryTelemetryValue {
+package enum SentryTelemetryValue {
     private static let maxCount = 999_999
 
-    static func formatBool(_ value: Bool) -> String {
+    package static func formatBool(_ value: Bool) -> String {
         value ? "true" : "false"
     }
 
-    static func formatCount(_ value: Int) -> String? {
+    package static func formatCount(_ value: Int) -> String? {
         guard value >= 0 else { return nil }
         return String(min(value, maxCount))
     }
 
-    static func formatShellEnvironmentSource(_ source: ShellEnvironmentSource?) -> String? {
+    package static func formatShellEnvironmentSource(_ source: ShellEnvironmentSource?) -> String? {
         guard let source else { return nil }
         switch source {
         case .capturedLoginShell:

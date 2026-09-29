@@ -1,13 +1,13 @@
 import Foundation
 
-struct IdentityTransitionDiagnosticEvent: Codable, Equatable {
-    enum Subsystem: String, Codable {
+package struct IdentityTransitionDiagnosticEvent: Codable, Equatable {
+    package enum Subsystem: String, Codable {
         case defaultsMigration = "defaults-migration"
         case secureStorage = "secure-storage"
         case sparkle
     }
 
-    enum Outcome: String, Codable {
+    package enum Outcome: String, Codable {
         case started
         case succeeded
         case skipped
@@ -18,25 +18,25 @@ struct IdentityTransitionDiagnosticEvent: Codable, Equatable {
         case selected
     }
 
-    let timestamp: Date
-    let subsystem: Subsystem
-    let stage: String
-    let outcome: Outcome
-    let bundleIdentifier: String?
-    let displayVersion: String?
-    let buildVersion: String?
-    let migrationPhase: String?
-    let secureStorageDomain: String?
-    let updateChannel: String?
-    let targetDisplayVersion: String?
-    let targetBuildVersion: String?
-    let recordStateCounts: [String: Int]?
-    let errorClass: String?
+    package let timestamp: Date
+    package let subsystem: Subsystem
+    package let stage: String
+    package let outcome: Outcome
+    package let bundleIdentifier: String?
+    package let displayVersion: String?
+    package let buildVersion: String?
+    package let migrationPhase: String?
+    package let secureStorageDomain: String?
+    package let updateChannel: String?
+    package let targetDisplayVersion: String?
+    package let targetBuildVersion: String?
+    package let recordStateCounts: [String: Int]?
+    package let errorClass: String?
 }
 
 /// A small, local source of truth for the identity rollover. Events deliberately omit
 /// credential identifiers, values, attempt IDs, paths, URLs, and raw error text.
-final class IdentityTransitionDiagnostics: @unchecked Sendable {
+package final class IdentityTransitionDiagnostics: @unchecked Sendable {
     private struct Ledger: Codable, Equatable {
         static let currentVersion = 1
 
@@ -44,8 +44,16 @@ final class IdentityTransitionDiagnostics: @unchecked Sendable {
         var events: [IdentityTransitionDiagnosticEvent]
     }
 
-    static let shared = IdentityTransitionDiagnostics()
-    static let maximumEventCount = 64
+    /// Shared persisted key with the app's UpdateChannel UI.
+    package static let updateChannelUserDefaultsKey = "RepoPromptUpdateChannel"
+
+    private static func currentUpdateChannelRawValue(defaults: UserDefaults = .standard) -> String {
+        let value = defaults.string(forKey: updateChannelUserDefaultsKey)
+        return value == "tip" ? "tip" : "stable"
+    }
+
+    package static let shared = IdentityTransitionDiagnostics()
+    package static let maximumEventCount = 64
 
     private let fileManager: FileManager
     private let fileURL: URL?
@@ -65,7 +73,7 @@ final class IdentityTransitionDiagnostics: @unchecked Sendable {
         self.now = now
     }
 
-    func record(
+    package func record(
         subsystem: IdentityTransitionDiagnosticEvent.Subsystem,
         stage: String,
         outcome: IdentityTransitionDiagnosticEvent.Outcome,
@@ -88,7 +96,7 @@ final class IdentityTransitionDiagnostics: @unchecked Sendable {
                 forInfoDictionaryKey: SecureStorageIdentityMigrationBootstrap.phaseInfoKey
             ) as? String,
             secureStorageDomain: secureStorageDomain?.diagnosticName,
-            updateChannel: UpdateChannel.load().rawValue,
+            updateChannel: Self.currentUpdateChannelRawValue(),
             targetDisplayVersion: targetDisplayVersion,
             targetBuildVersion: targetBuildVersion,
             recordStateCounts: recordStateCounts,
@@ -97,7 +105,7 @@ final class IdentityTransitionDiagnostics: @unchecked Sendable {
         record(event)
     }
 
-    func record(_ event: IdentityTransitionDiagnosticEvent) {
+    package func record(_ event: IdentityTransitionDiagnosticEvent) {
         let line = "[IdentityTransition] subsystem=\(event.subsystem.rawValue) stage=\(event.stage) outcome=\(event.outcome.rawValue)\n"
         FileHandle.standardError.write(Data(line.utf8))
         guard let fileURL else { return }
@@ -140,7 +148,7 @@ final class IdentityTransitionDiagnostics: @unchecked Sendable {
         }
     }
 
-    func readEvents() -> [IdentityTransitionDiagnosticEvent] {
+    package func readEvents() -> [IdentityTransitionDiagnosticEvent] {
         guard let fileURL else { return [] }
         lock.lock()
         defer { lock.unlock() }

@@ -52,7 +52,7 @@ struct RuntimeCodeSigningInfo: Equatable {
     }
 }
 
-enum RuntimeSecureStorageDomain: Equatable {
+package enum RuntimeSecureStorageDomain: Equatable {
     case officialDeveloperID
     case successorOfficialDeveloperID
     case localSelfSigned
@@ -107,11 +107,11 @@ struct RuntimeSecureStorageDecision: Equatable {
     }
 }
 
-enum RuntimeCodeSigningPolicy {
+package enum RuntimeCodeSigningPolicy {
     static let developerIDBundleIdentifier = "com.pvncher.repoprompt.ce"
     static let appleDevelopmentDebugBundleIdentifier = "com.repoprompt.ce.debug"
     static let signingTeamIdentifier = "648A27MST5"
-    static let successorDeveloperIDBundleIdentifier = "com.repoprompt.ce"
+    package static let successorDeveloperIDBundleIdentifier = "com.repoprompt.ce"
     static let successorSigningTeamIdentifier = "69N6K965SF"
     static let localSelfSignedCertificateName = "RepoPrompt CE Local Self-Signed Code Signing"
 

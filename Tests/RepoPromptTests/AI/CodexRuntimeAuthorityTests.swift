@@ -1,5 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProcess
+import RepoPromptSecureStorage
 import XCTest
 
 final class CodexRuntimeAuthorityTests: XCTestCase {

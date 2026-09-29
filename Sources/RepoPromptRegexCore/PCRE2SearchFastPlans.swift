@@ -1,19 +1,18 @@
 import CSwiftPCRE2
-import RepoPromptRegexCore
 
-struct PCRE2LinePrefilter: Equatable {
-    let asciiRequiredAlternatives: [String]
-    let caseInsensitive: Bool
+package struct PCRE2LinePrefilter: Equatable {
+    package let asciiRequiredAlternatives: [String]
+    package let caseInsensitive: Bool
 }
 
-struct PCRE2LineScanOptions: Equatable {
-    let maxLineUTF8Length: Int?
-    let collectMatches: Bool
-    let maxCollectedMatches: Int?
-    let cancellationCheckStride: Int
-    let prefilter: PCRE2LinePrefilter?
+package struct PCRE2LineScanOptions: Equatable {
+    package let maxLineUTF8Length: Int?
+    package let collectMatches: Bool
+    package let maxCollectedMatches: Int?
+    package let cancellationCheckStride: Int
+    package let prefilter: PCRE2LinePrefilter?
 
-    init(
+    package init(
         maxLineUTF8Length: Int? = nil,
         collectMatches: Bool = true,
         maxCollectedMatches: Int? = nil,
@@ -28,37 +27,37 @@ struct PCRE2LineScanOptions: Equatable {
     }
 }
 
-struct PCRE2LineScanResult: Equatable {
-    let matchingLineNumbers: [Int]
-    let lineMatchCount: Int
+package struct PCRE2LineScanResult: Equatable {
+    package let matchingLineNumbers: [Int]
+    package let lineMatchCount: Int
 }
 
-struct PCRE2LineRangeHit: Equatable {
-    let lineNumber: Int
-    let byteRange: Range<Int>
+package struct PCRE2LineRangeHit: Equatable {
+    package let lineNumber: Int
+    package let byteRange: Range<Int>
 }
 
-struct PCRE2LineRangeScanResult: Equatable {
-    let hits: [PCRE2LineRangeHit]
-    let lineMatchCount: Int
+package struct PCRE2LineRangeScanResult: Equatable {
+    package let hits: [PCRE2LineRangeHit]
+    package let lineMatchCount: Int
 }
 
-enum PCRE2LineMode: Equatable {
+package enum PCRE2LineMode: Equatable {
     case crlf
 }
 
-struct PCRE2ASCIIMarkerLinePattern: Equatable {
+package struct PCRE2ASCIIMarkerLinePattern: Equatable {
     private static let speculativeCollectCapacity = 64
     private static let maximumRequestedCollectCapacity = 16384
 
-    let marker: String
-    let digitCount: UInt32
-    let requiredPrefix: String
-    let caseInsensitive: Bool
+    package let marker: String
+    package let digitCount: UInt32
+    package let requiredPrefix: String
+    package let caseInsensitive: Bool
     private let markerBytes: [UInt8]
     private let requiredPrefixBytes: [UInt8]
 
-    init?(marker: String, digitCount: UInt32, requiredPrefix: String, caseInsensitive: Bool) {
+    package init?(marker: String, digitCount: UInt32, requiredPrefix: String, caseInsensitive: Bool) {
         guard digitCount > 0,
               !marker.isEmpty,
               !requiredPrefix.isEmpty,
@@ -75,11 +74,11 @@ struct PCRE2ASCIIMarkerLinePattern: Equatable {
         requiredPrefixBytes = requiredPrefix.utf8.map { caseInsensitive ? PCRE2ASCIIWholeWordLiteral.asciiLowercase($0) : $0 }
     }
 
-    func countMatchingLines(in subject: String) -> Int? {
+    package func countMatchingLines(in subject: String) -> Int? {
         scanMatchingLines(in: subject, collectMatches: false)?.lineMatchCount
     }
 
-    func scanMatchingLineRanges(
+    package func scanMatchingLineRanges(
         in subject: String,
         maxCollectedMatches: Int,
         shouldCancel: () -> Bool = { false }
@@ -154,7 +153,7 @@ struct PCRE2ASCIIMarkerLinePattern: Equatable {
         return bytes.withUnsafeBufferPointer { scan($0) }
     }
 
-    func scanMatchingLines(
+    package func scanMatchingLines(
         in subject: String,
         collectMatches: Bool,
         maxCollectedMatches: Int? = nil,
@@ -246,11 +245,11 @@ struct PCRE2ASCIIMarkerLinePattern: Equatable {
     }
 }
 
-struct PCRE2ASCIIWholeWordLiteral: Equatable {
-    let needle: String
-    let caseInsensitive: Bool
+package struct PCRE2ASCIIWholeWordLiteral: Equatable {
+    package let needle: String
+    package let caseInsensitive: Bool
 
-    init?(needle: String, caseInsensitive: Bool) {
+    package init?(needle: String, caseInsensitive: Bool) {
         guard !needle.isEmpty,
               needle.utf8.allSatisfy({ PCRE2ASCIIWholeWordLiteral.isASCIIWordByte($0) })
         else {
@@ -260,11 +259,11 @@ struct PCRE2ASCIIWholeWordLiteral: Equatable {
         self.caseInsensitive = caseInsensitive
     }
 
-    func countMatchingLines(in subject: String) -> Int? {
+    package func countMatchingLines(in subject: String) -> Int? {
         scanMatchingLines(in: subject, collectMatches: false)?.lineMatchCount
     }
 
-    func scanMatchingLines(
+    package func scanMatchingLines(
         in subject: String,
         lineMode: PCRE2LineMode = .crlf,
         collectMatches: Bool,
@@ -412,10 +411,10 @@ struct PCRE2ASCIIWholeWordLiteral: Equatable {
     }
 }
 
-struct PCRE2AnchoredDeclarationLinePattern: Equatable {
-    let caseInsensitive: Bool
+package struct PCRE2AnchoredDeclarationLinePattern: Equatable {
+    package let caseInsensitive: Bool
 
-    func scanMatchingLines(
+    package func scanMatchingLines(
         in subject: String,
         collectMatches: Bool,
         maxCollectedMatches: Int? = nil,
@@ -601,18 +600,18 @@ struct PCRE2AnchoredDeclarationLinePattern: Equatable {
     }
 }
 
-struct PCRE2PathSuffixPattern: Equatable {
-    let suffixes: [String]
-    let basenamePrefix: String?
-    let singleDigitRange: ClosedRange<UInt8>?
+package struct PCRE2PathSuffixPattern: Equatable {
+    package let suffixes: [String]
+    package let basenamePrefix: String?
+    package let singleDigitRange: ClosedRange<UInt8>?
 
-    init(suffixes: [String], basenamePrefix: String? = nil, singleDigitRange: ClosedRange<UInt8>? = nil) {
+    package init(suffixes: [String], basenamePrefix: String? = nil, singleDigitRange: ClosedRange<UInt8>? = nil) {
         self.suffixes = suffixes
         self.basenamePrefix = basenamePrefix
         self.singleDigitRange = singleDigitRange
     }
 
-    func matches(_ candidate: String, caseInsensitive: Bool) -> Bool {
+    package func matches(_ candidate: String, caseInsensitive: Bool) -> Bool {
         let haystack = caseInsensitive ? candidate.lowercased() : candidate
         let basenameStart = haystack.lastIndex(of: "/").map { haystack.index(after: $0) } ?? haystack.startIndex
         let basename = haystack[basenameStart...]
@@ -643,7 +642,7 @@ struct PCRE2PathSuffixPattern: Equatable {
 }
 
 extension PCRE2Regex.MatchSession {
-    func scanMatchingLines(
+    package func scanMatchingLines(
         in subject: String,
         options: PCRE2LineScanOptions,
         shouldCancel: () -> Bool = { false }
@@ -687,7 +686,7 @@ extension PCRE2Regex.MatchSession {
     }
 }
 
-struct PCRE2LinePrefilterMatcher {
+package struct PCRE2LinePrefilterMatcher {
     private struct Node {
         var transitions: [UInt8: Int] = [:]
         var failure = 0
@@ -697,7 +696,7 @@ struct PCRE2LinePrefilterMatcher {
     private let nodes: [Node]
     private let caseInsensitive: Bool
 
-    init?(prefilter: PCRE2LinePrefilter) {
+    package init?(prefilter: PCRE2LinePrefilter) {
         var needles: [[UInt8]] = []
         needles.reserveCapacity(prefilter.asciiRequiredAlternatives.count)
         for alternative in prefilter.asciiRequiredAlternatives {
@@ -748,7 +747,7 @@ struct PCRE2LinePrefilterMatcher {
         caseInsensitive = prefilter.caseInsensitive
     }
 
-    func contains(
+    package func contains(
         in buffer: UnsafeBufferPointer<UInt8>,
         range: Range<Int>
     ) -> Bool {

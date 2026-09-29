@@ -1,3 +1,5 @@
+import RepoPromptFoundation
+
 extension CustomOpenAIProviderError: FriendlyErrorRepresentable {
     var friendlyErrorString: String {
         switch self {

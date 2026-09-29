@@ -14,12 +14,12 @@ import Foundation
 /// - Producer:  ClaudeNativeProcessSessionController.startStdoutReader / startStderrReader
 /// - Consumer:  ClaudeNativeProcessSessionController.handleStdoutChunk / handleStderrChunk
 /// - Tests:     RepoPromptTests/Process/ProcessCoreTests.swift
-final class FileHandleChunkChannel: @unchecked Sendable {
-    let stream: AsyncStream<Data>
+package final class FileHandleChunkChannel: @unchecked Sendable {
+    package let stream: AsyncStream<Data>
     private let continuation: AsyncStream<Data>.Continuation
     private var lock = os_unfair_lock()
 
-    init(bufferingPolicy: AsyncStream<Data>.Continuation.BufferingPolicy = .unbounded) {
+    package init(bufferingPolicy: AsyncStream<Data>.Continuation.BufferingPolicy = .unbounded) {
         var captured: AsyncStream<Data>.Continuation?
         stream = AsyncStream<Data>(bufferingPolicy: bufferingPolicy) { continuation in
             captured = continuation
@@ -31,14 +31,14 @@ final class FileHandleChunkChannel: @unchecked Sendable {
     }
 
     /// Enqueue a data chunk. Safe to call from any thread (including `readabilityHandler` dispatch queues).
-    func yield(_ data: Data) {
+    package func yield(_ data: Data) {
         os_unfair_lock_lock(&lock)
         _ = continuation.yield(data)
         os_unfair_lock_unlock(&lock)
     }
 
     /// Signal that no more chunks will be produced (e.g. EOF or shutdown).
-    func finish() {
+    package func finish() {
         os_unfair_lock_lock(&lock)
         continuation.finish()
         os_unfair_lock_unlock(&lock)

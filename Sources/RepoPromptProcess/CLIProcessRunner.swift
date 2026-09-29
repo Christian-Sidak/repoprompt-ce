@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptFoundation
 
 /// Separate diagnostic logger for deadlock debugging (independent of config.enableDebugLogging)
 enum ProcessDiagnostics {
@@ -133,7 +134,7 @@ private actor ResolvedCommandCache {
 
 /// Diagnostics logger for lifecycle gate operations
 enum LifecycleGateDiagnostics {
-    static var enableLogging = false
+    static let enableLogging = false
 
     static func log(_ message: String) {
         guard enableLogging else { return }
@@ -141,14 +142,14 @@ enum LifecycleGateDiagnostics {
     }
 }
 
-enum CLIProcessRunnerError: Error, LocalizedError {
+package enum CLIProcessRunnerError: Error, LocalizedError {
     case commandNotFound(String)
     case spawnFailed(String)
     case inputEncodingFailed
     case inputWriteFailed(String)
     case waitFailed(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case let .commandNotFound(command):
             "Command not found: \(command)"
@@ -164,21 +165,21 @@ enum CLIProcessRunnerError: Error, LocalizedError {
     }
 }
 
-final class CLIProcessRunner {
-    struct Result {
-        let stdout: Data
-        let stderr: Data
-        let status: Int32
-        let timedOut: Bool
+package final class CLIProcessRunner {
+    package struct Result {
+        package let stdout: Data
+        package let stderr: Data
+        package let status: Int32
+        package let timedOut: Bool
     }
 
-    enum OutputFlagMode {
+    package enum OutputFlagMode {
         case auto(CLIOutputFormat)
         case none
         case custom([String])
     }
 
-    enum StreamEvent {
+    package enum StreamEvent {
         case stdout(Data)
         case stderr(Data)
         case terminated(status: Int32, timedOut: Bool)
@@ -192,7 +193,7 @@ final class CLIProcessRunner {
     private let beforeStreamingDrain: (@Sendable () -> Void)?
     private let streamingDrainTimeout: TimeInterval
 
-    init(
+    package init(
         config: CLIProcessConfiguration,
         concurrencyLimit: Int = 1,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = { pid in
@@ -242,7 +243,7 @@ final class CLIProcessRunner {
         return access(path, X_OK) == 0
     }
 
-    func run(
+    package func run(
         args: [String],
         stdin: String?,
         outputMode: OutputFlagMode = .auto(.json),
@@ -465,7 +466,7 @@ final class CLIProcessRunner {
         }
     }
 
-    func runStreaming(
+    package func runStreaming(
         args: [String],
         stdin: String?,
         outputMode: OutputFlagMode = .auto(.streamJson),
@@ -815,7 +816,7 @@ final class CLIProcessRunner {
         }
     }
 
-    func cancelAll() async {
+    package func cancelAll() async {
         // Do not steal cleanup ownership from runStreaming; just request termination.
         let processes = await registry.current()
         for process in processes {

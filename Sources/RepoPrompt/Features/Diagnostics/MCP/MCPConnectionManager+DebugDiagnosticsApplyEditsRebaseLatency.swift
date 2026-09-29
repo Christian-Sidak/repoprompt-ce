@@ -1,5 +1,6 @@
 // MARK: - DEBUG MCP Apply-Edits Stable-Rebase Diagnostics
 
+import RepoPromptFoundation
 import CryptoKit
 import Foundation
 import MCP

@@ -1,6 +1,6 @@
 import Foundation
 
-enum SecureStorageRepairFailure: Equatable {
+package enum SecureStorageRepairFailure: Equatable {
     case authenticationFailed
     case invalidData
     case keychainFailure
@@ -8,7 +8,7 @@ enum SecureStorageRepairFailure: Equatable {
     case confirmationRequired
 }
 
-enum SecureStorageRepairState: Equatable {
+package enum SecureStorageRepairState: Equatable {
     case absent
     case importable
     case interactionRequired
@@ -18,31 +18,31 @@ enum SecureStorageRepairState: Equatable {
     case failed(SecureStorageRepairFailure)
 }
 
-struct SecureStorageRepairRecord: Equatable, Identifiable {
-    let account: SecureStorageAccount
-    let state: SecureStorageRepairState
-    let targetVerified: Bool
+package struct SecureStorageRepairRecord: Equatable, Identifiable {
+    package let account: SecureStorageAccount
+    package let state: SecureStorageRepairState
+    package let targetVerified: Bool
 
-    var id: String {
+    package var id: String {
         account.identifier
     }
 
-    var legacyDeletionAvailable: Bool {
+    package var legacyDeletionAvailable: Bool {
         state == .imported && targetVerified
     }
 }
 
-enum SecureStorageConflictResolution {
+package enum SecureStorageConflictResolution {
     case preserveTarget
     case replaceTarget
 }
 
-actor SecureStorageRepairService {
+package actor SecureStorageRepairService {
     private let accounts: [SecureStorageAccount]
     private let legacyStore: SecureKeyValueStorageBackend
     private let targetStore: SecureKeyValueStorageBackend
 
-    init(
+    package init(
         accounts: [SecureStorageAccount] = SecureStorageAccountCatalog.allAccounts,
         legacyStore: SecureKeyValueStorageBackend,
         targetStore: SecureKeyValueStorageBackend
@@ -52,7 +52,7 @@ actor SecureStorageRepairService {
         self.targetStore = targetStore
     }
 
-    static func makeForCurrentRuntime() -> SecureStorageRepairService? {
+    package static func makeForCurrentRuntime() -> SecureStorageRepairService? {
         makeForRuntime(
             decision: SecureKeyValueStorageFactory.currentDecision(),
             legacyStore: KeychainService.legacyRepairSource(),
@@ -69,11 +69,11 @@ actor SecureStorageRepairService {
         return SecureStorageRepairService(legacyStore: legacyStore, targetStore: targetStore)
     }
 
-    func scan() -> [SecureStorageRepairRecord] {
+    package func scan() -> [SecureStorageRepairRecord] {
         accounts.map(scanAccount)
     }
 
-    func importAccount(
+    package func importAccount(
         _ account: SecureStorageAccount,
         resolution: SecureStorageConflictResolution = .preserveTarget
     ) -> SecureStorageRepairRecord {
@@ -110,7 +110,7 @@ actor SecureStorageRepairService {
         }
     }
 
-    func deleteLegacy(
+    package func deleteLegacy(
         _ account: SecureStorageAccount,
         confirmed: Bool
     ) -> SecureStorageRepairRecord {

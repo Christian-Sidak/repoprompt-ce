@@ -1,6 +1,6 @@
 import Foundation
 
-protocol SecureKeyValueStorageBackend: AnyObject, Sendable {
+package protocol SecureKeyValueStorageBackend: AnyObject, Sendable {
     var persistsValuesAcrossLaunches: Bool { get }
 
     func save(
@@ -93,7 +93,7 @@ struct SecureKeyValueStorageSelection {
     let backend: SecureKeyValueStorageBackend
 }
 
-enum SecureKeyValueStorageFactory {
+package enum SecureKeyValueStorageFactory {
     private final class State: @unchecked Sendable {
         static let shared = State()
 
@@ -126,7 +126,7 @@ enum SecureKeyValueStorageFactory {
         )
     }()
 
-    static func defaultBackend() -> SecureKeyValueStorageBackend {
+    package static func defaultBackend() -> SecureKeyValueStorageBackend {
         guard officialOverrideApplies(to: cachedSelection.decision.domain) else {
             return cachedSelection.backend
         }

@@ -1,5 +1,5 @@
 import Darwin
-@testable import RepoPromptApp
+@testable import RepoPromptSecureStorage
 import XCTest
 
 final class LocalSigningIdentityRegistryTests: XCTestCase {

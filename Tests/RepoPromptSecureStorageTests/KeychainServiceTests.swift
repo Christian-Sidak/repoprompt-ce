@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptApp
+@testable import RepoPromptSecureStorage
 import Security
 import XCTest
 

@@ -1,16 +1,16 @@
 import Foundation
 
 /// Pure string-based relative path computation (no filesystem I/O).
-enum RelativePath {
+package enum RelativePath {
     @inline(__always)
-    static func from(absolutePath: String, rootPath: String) -> String {
+    package static func from(absolutePath: String, rootPath: String) -> String {
         let abs = (absolutePath as NSString).standardizingPath
         let root = (rootPath as NSString).standardizingPath
         return fromStandardized(standardizedAbsolutePath: abs, standardizedRootPath: root)
     }
 
     @inline(__always)
-    static func fromStandardized(
+    package static func fromStandardized(
         standardizedAbsolutePath abs: String,
         standardizedRootPath root: String
     ) -> String {

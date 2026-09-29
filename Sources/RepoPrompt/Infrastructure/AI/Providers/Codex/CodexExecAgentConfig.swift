@@ -1,3 +1,4 @@
+import RepoPromptProcess
 import Foundation
 
 /// Configuration for Codex Exec agent provider.

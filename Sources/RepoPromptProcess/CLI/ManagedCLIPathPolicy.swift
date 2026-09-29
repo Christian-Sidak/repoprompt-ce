@@ -5,28 +5,28 @@ import RepoPromptShared
 /// Shared ownership classifier for CE-managed CLI links and wrapper scripts.
 /// Missing and dangling symlinks are inspected with lstat/readlink rather than
 /// FileManager.fileExists, which follows the target.
-enum ManagedCLIPathPolicy {
-    enum SymlinkClassification: Equatable {
+package enum ManagedCLIPathPolicy {
+    package enum SymlinkClassification: Equatable {
         case missing
         case managedCurrent(destination: String)
         case managedStale(destination: String)
         case unmanaged
     }
 
-    enum WrapperClassification: Equatable {
+    package enum WrapperClassification: Equatable {
         case missing
         case managedCurrent
         case managedOutdated
         case unmanaged
     }
 
-    static let currentClaudeWrapperMarker = "# claude-rpce: Claude Code wrapper configured for RepoPrompt CE"
-    static let legacyClaudeWrapperMarkers = [
+    package static let currentClaudeWrapperMarker = "# claude-rpce: Claude Code wrapper configured for RepoPrompt CE"
+    package static let legacyClaudeWrapperMarkers = [
         "# claude-rp-ce: Claude Code wrapper configured for RepoPrompt CE",
         "# claude-rp: Claude Code wrapper configured for RepoPrompt"
     ]
 
-    static func classifySymlink(
+    package static func classifySymlink(
         at path: String,
         desiredDestination: String,
         managedDestinations: Set<String>,
@@ -52,7 +52,7 @@ enum ManagedCLIPathPolicy {
         return .managedStale(destination: rawDestination)
     }
 
-    static func classifyWrapper(
+    package static func classifyWrapper(
         at path: String,
         expectedContent: String,
         fileManager: FileManager = .default
@@ -68,13 +68,13 @@ enum ManagedCLIPathPolicy {
             : .managedOutdated
     }
 
-    static func isManagedWrapper(_ content: String) -> Bool {
+    package static func isManagedWrapper(_ content: String) -> Bool {
         let lines = content.split(whereSeparator: \.isNewline).prefix(8).map(String.init)
         let markers = [currentClaudeWrapperMarker] + legacyClaudeWrapperMarkers
         return markers.contains { marker in lines.contains(marker) }
     }
 
-    static func managedDestinations(
+    package static func managedDestinations(
         currentBundledCLIPath: String?,
         fileManager: FileManager = .default
     ) -> Set<String> {
@@ -98,7 +98,7 @@ enum ManagedCLIPathPolicy {
         return Set(paths.map(standardized))
     }
 
-    static func isRecognizedCECommand(
+    package static func isRecognizedCECommand(
         _ command: String,
         currentBundledCLIPath: String?,
         fileManager: FileManager = .default
@@ -107,11 +107,11 @@ enum ManagedCLIPathPolicy {
             .contains(standardized(command))
     }
 
-    static var exactLegacyPathCommandNames: [String] {
+    package static var exactLegacyPathCommandNames: [String] {
         ["rp-cli-ce-debug", "rp-ce-cli", "rp-ce-cli-debug"]
     }
 
-    static var exactLegacyWrapperCommandNames: [String] {
+    package static var exactLegacyWrapperCommandNames: [String] {
         ["claude-rp-ce", "claude-rp-ce-debug"]
     }
 

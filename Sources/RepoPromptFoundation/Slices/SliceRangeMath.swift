@@ -1,7 +1,7 @@
 import Foundation
 
-enum SliceRangeMath {
-    static func normalize(_ ranges: [LineRange]) -> [LineRange] {
+package enum SliceRangeMath {
+    package static func normalize(_ ranges: [LineRange]) -> [LineRange] {
         let filtered = ranges.filter { $0.start <= $0.end }
         guard !filtered.isEmpty else { return [] }
         func mergedDescription(_ lhs: LineRange, _ rhs: LineRange) -> String? {
@@ -34,11 +34,11 @@ enum SliceRangeMath {
         return merged
     }
 
-    static func coalesce(_ lhs: [LineRange], _ rhs: [LineRange]) -> [LineRange] {
+    package static func coalesce(_ lhs: [LineRange], _ rhs: [LineRange]) -> [LineRange] {
         normalize(lhs + rhs)
     }
 
-    static func subtract(_ base: [LineRange], removing: [LineRange]) -> [LineRange] {
+    package static func subtract(_ base: [LineRange], removing: [LineRange]) -> [LineRange] {
         let baseNormalized = normalize(base)
         let removingNormalized = normalize(removing)
         guard !baseNormalized.isEmpty, !removingNormalized.isEmpty else {

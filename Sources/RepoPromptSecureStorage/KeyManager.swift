@@ -1,25 +1,30 @@
 import Foundation
 
-actor KeyManager {
+package actor SecureStorageKeyManager<Provider: Hashable & Sendable> {
     private let secureService: SecureKeysService
+    private let accountForProvider: @Sendable (Provider) -> SecureStorageAccount?
 
     /// Simple in-memory store of keys
-    private var cache = [AIProviderType: String]()
+    private var cache = [Provider: String]()
 
-    init(secureService: SecureKeysService = SecureKeysService()) {
+    package init(
+        secureService: SecureKeysService = SecureKeysService(),
+        accountForProvider: @escaping @Sendable (Provider) -> SecureStorageAccount?
+    ) {
         self.secureService = secureService
+        self.accountForProvider = accountForProvider
     }
 
     /// Lazily loads the key from disk only if not already in the `cache`.
-    func getAPIKey(
-        for provider: AIProviderType,
+    package func getAPIKey(
+        for provider: Provider,
         accessMode: KeychainAccessMode = .interactive
     ) async throws -> String? {
         if let cached = cache[provider] {
             return cached
         }
 
-        guard let account = provider.secureStorageAccount else { return nil }
+        guard let account = accountForProvider(provider) else { return nil }
         let keyFromDisk = try await secureService.getAPIKey(for: account, accessMode: accessMode)
 
         if let k = keyFromDisk {
@@ -30,49 +35,23 @@ actor KeyManager {
     }
 
     /// Saves to both in-memory cache and disk.
-    func saveAPIKey(
+    package func saveAPIKey(
         _ key: String,
-        for provider: AIProviderType,
+        for provider: Provider,
         accessMode: KeychainAccessMode = .interactive
     ) throws {
-        guard let account = provider.secureStorageAccount else { return }
+        guard let account = accountForProvider(provider) else { return }
         cache[provider] = key
         try secureService.saveAPIKey(key, for: account, accessMode: accessMode)
     }
 
     /// Deletes from both in-memory cache and disk.
-    func deleteAPIKey(
-        for provider: AIProviderType,
+    package func deleteAPIKey(
+        for provider: Provider,
         accessMode: KeychainAccessMode = .interactive
     ) throws {
         cache.removeValue(forKey: provider)
-        guard let account = provider.secureStorageAccount else { return }
+        guard let account = accountForProvider(provider) else { return }
         try secureService.deleteAPIKey(for: account, accessMode: accessMode)
-    }
-}
-
-extension AIProviderType {
-    /// Maps each provider to its frozen secure-storage account.
-    var secureStorageAccount: SecureStorageAccount? {
-        switch self {
-        case .anthropic: .anthropicAPI
-        case .openAI: .openAIAPI
-        case .gemini: .geminiAPI
-        case .openRouter: .openRouterAPI
-        case .ollama: .ollamaURL
-        case .azure: .azureAPI
-        case .deepseek: .deepSeekAPI
-        case .customProvider: .customProviderAPI
-        case .fireworks: .fireworksAPI
-        case .grok: .grokAPI
-        case .groq: .groqAPI
-        case .claudeCode: .claudeCodeAPI
-        case .codex: .codexCLIAPI
-        case .openCode: .openCodeCLIAPI
-        case .cursor: .cursorCLIAPI
-        case .grokBuild: .grokAPI
-        case .zAI: .zAIAPI
-        case .devin: nil
-        }
     }
 }

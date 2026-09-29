@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptApp
+@testable import RepoPromptSecureStorage
 import RepoPromptTestSupport
 import XCTest
 
@@ -72,54 +72,16 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
         )
     }
 
-    func testProviderMappingsUseCatalogAccounts() {
-        let mappings: [(AIProviderType, SecureStorageAccount)] = [
-            (.anthropic, .anthropicAPI),
-            (.openAI, .openAIAPI),
-            (.gemini, .geminiAPI),
-            (.openRouter, .openRouterAPI),
-            (.ollama, .ollamaURL),
-            (.azure, .azureAPI),
-            (.deepseek, .deepSeekAPI),
-            (.customProvider, .customProviderAPI),
-            (.fireworks, .fireworksAPI),
-            (.grok, .grokAPI),
-            (.groq, .groqAPI),
-            (.claudeCode, .claudeCodeAPI),
-            (.codex, .codexCLIAPI),
-            (.openCode, .openCodeCLIAPI),
-            (.cursor, .cursorCLIAPI),
-            (.zAI, .zAIAPI)
-        ]
-
-        XCTAssertEqual(mappings.map(\.0.secureStorageAccount), mappings.map(\.1))
-        XCTAssertEqual(mappings.map(\.1), SecureStorageAccountCatalog.providerAndCLIAccounts)
-    }
-
-    func testClaudeCompatibleMappingsUseCatalogAccounts() {
-        XCTAssertEqual(
-            ClaudeCodeCompatibleBackendID.allCases.map(\.secureStorageAccount),
-            SecureStorageAccountCatalog.claudeCompatibleAccounts
-        )
-    }
-
-    func testAgentPermissionMappingsUseCatalogAccounts() {
-        XCTAssertEqual(
-            AgentPermissionSecureDomain.allCases.map(\.secureStorageAccount),
-            SecureStorageAccountCatalog.agentPermissionAccounts
-        )
-    }
-
     func testSecureStorageBackendBoundaryRemainsCentralized() throws {
         let root = try RepoRoot.url()
-        let sourceRoot = root.appendingPathComponent("Sources/RepoPrompt", isDirectory: true)
+        let sourceRoot = root.appendingPathComponent("Sources/RepoPromptSecureStorage", isDirectory: true)
         let allowedFiles: Set = [
-            "Sources/RepoPrompt/Infrastructure/Security/EphemeralSecureKeyValueStore.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/KeychainService.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/SecureKeyService.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/SecureKeyValueStorageBackend.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/SecureStorageIdentityMigration.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/SecureStorageRepairService.swift"
+            "Sources/RepoPromptSecureStorage/EphemeralSecureKeyValueStore.swift",
+            "Sources/RepoPromptSecureStorage/KeychainService.swift",
+            "Sources/RepoPromptSecureStorage/SecureKeyService.swift",
+            "Sources/RepoPromptSecureStorage/SecureKeyValueStorageBackend.swift",
+            "Sources/RepoPromptSecureStorage/SecureStorageIdentityMigration.swift",
+            "Sources/RepoPromptSecureStorage/SecureStorageRepairService.swift"
         ]
 
         var filesUsingBackend: Set<String> = []

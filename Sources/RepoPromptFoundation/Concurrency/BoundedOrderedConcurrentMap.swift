@@ -5,8 +5,8 @@ private struct BoundedOrderedMapOutcome<Value: Sendable> {
     let value: Value
 }
 
-enum BoundedOrderedConcurrentMap {
-    static func map<Input: Sendable, Output: Sendable>(
+package enum BoundedOrderedConcurrentMap {
+    package static func map<Input: Sendable, Output: Sendable>(
         _ inputs: [Input],
         maxConcurrent: Int,
         operation: @escaping @Sendable (Input) async -> Output

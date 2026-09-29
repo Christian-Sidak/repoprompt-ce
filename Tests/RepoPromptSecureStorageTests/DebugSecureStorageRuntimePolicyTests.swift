@@ -1,4 +1,4 @@
-@testable import RepoPromptApp
+@testable import RepoPromptSecureStorage
 import XCTest
 
 final class RuntimeCodeSigningPolicyTests: XCTestCase {

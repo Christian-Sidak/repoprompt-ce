@@ -1,3 +1,4 @@
+import RepoPromptFoundation
 import Foundation
 
 /// Background actor that handles all VCS (git/jj) operations off the main thread.

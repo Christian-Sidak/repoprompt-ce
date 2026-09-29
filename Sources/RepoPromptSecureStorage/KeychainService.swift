@@ -9,7 +9,7 @@ import Foundation
 import Security
 
 /// Controls whether a Keychain operation may display macOS authentication/approval UI.
-enum KeychainAccessMode: Equatable {
+package enum KeychainAccessMode: Equatable {
     case interactive
     case nonInteractive(reason: KeychainAccessReason)
 
@@ -22,7 +22,7 @@ enum KeychainAccessMode: Equatable {
 }
 
 /// Sanitized reason metadata for noninteractive Keychain access.
-enum KeychainAccessReason: Equatable {
+package enum KeychainAccessReason: Equatable {
     case launch
     case bulkSettingsLoad
     case permissionDecision
@@ -621,7 +621,7 @@ struct ExistingKeychainItemAccessAttributeProvider: KeychainItemCreationAttribut
 }
 
 /// Secure storage service for one explicitly selected CE macOS Keychain domain.
-final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
+package final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     static let legacyCanonicalServiceName = "com.pvncher.repoprompt.ce.keychain"
     static let officialV2ServiceName = "com.pvncher.repoprompt.ce.developer-id.keychain.v2"
     static let identityMigrationBridgeServiceNamePrefix = "com.repoprompt.ce.identity-migration.keychain.v1."
@@ -679,7 +679,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     private let itemAccessProvider: SecKeychainItemAccessProvider
     private let operationLock = NSRecursiveLock()
 
-    let persistsValuesAcrossLaunches = true
+    package let persistsValuesAcrossLaunches = true
 
     init(
         serviceName: String = KeychainService.officialV2ServiceName,
@@ -753,7 +753,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
         }
     }
 
-    enum KeychainError: Error, LocalizedError, Equatable {
+    package enum KeychainError: Error, LocalizedError, Equatable {
         case itemNotFound
         case duplicateItem
         case invalidData
@@ -762,7 +762,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
         case authenticationFailed
         case unexpectedStatus(OSStatus)
 
-        var errorDescription: String? {
+        package var errorDescription: String? {
             switch self {
             case .itemNotFound:
                 "Item not found in keychain"
@@ -785,7 +785,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     // MARK: - Save to Keychain
 
     /// Save a UTF-8 string to this service only.
-    func save(
+    package func save(
         _ value: String,
         for key: String,
         accessMode: KeychainAccessMode = .interactive
@@ -832,7 +832,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
 
     /// Atomically creates a UTF-8 value without falling back to an update. The
     /// migration bridge uses this to avoid retaining an unproven existing ACL.
-    func create(
+    package func create(
         _ value: String,
         for key: String,
         accessMode: KeychainAccessMode = .interactive
@@ -879,7 +879,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     // MARK: - Retrieve from Keychain
 
     /// Retrieve a UTF-8 string from this service only.
-    func get(
+    package func get(
         for key: String,
         accessMode: KeychainAccessMode = .interactive
     ) throws -> String {
@@ -914,7 +914,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     // MARK: - Delete from Keychain
 
     /// Delete an item from this service only.
-    func delete(for key: String, accessMode: KeychainAccessMode = .interactive) throws {
+    package func delete(for key: String, accessMode: KeychainAccessMode = .interactive) throws {
         try withLock {
             if itemAccessValidator != nil {
                 do {

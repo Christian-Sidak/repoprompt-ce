@@ -1,7 +1,7 @@
 import Foundation
 
-enum JSONDictionaryHelpers {
-    static func prettyJSONString(from object: Any, sortedKeys: Bool = true) -> String? {
+package enum JSONDictionaryHelpers {
+    package static func prettyJSONString(from object: Any, sortedKeys: Bool = true) -> String? {
         guard JSONSerialization.isValidJSONObject(object) else { return nil }
         var options: JSONSerialization.WritingOptions = [.prettyPrinted]
         if sortedKeys {
@@ -15,7 +15,7 @@ enum JSONDictionaryHelpers {
         return json
     }
 
-    static func object(from raw: String?) -> [String: Any]? {
+    package static func object(from raw: String?) -> [String: Any]? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let data = raw.data(using: .utf8),
@@ -27,7 +27,7 @@ enum JSONDictionaryHelpers {
         return object
     }
 
-    static func string(_ object: [String: Any], key: String) -> String? {
+    package static func string(_ object: [String: Any], key: String) -> String? {
         if let value = object[key] as? String {
             return value
         }
@@ -37,7 +37,7 @@ enum JSONDictionaryHelpers {
         return nil
     }
 
-    static func bool(_ object: [String: Any], key: String) -> Bool? {
+    package static func bool(_ object: [String: Any], key: String) -> Bool? {
         if let value = object[key] as? Bool {
             return value
         }
@@ -47,7 +47,7 @@ enum JSONDictionaryHelpers {
         return nil
     }
 
-    static func int(_ object: [String: Any], key: String) -> Int? {
+    package static func int(_ object: [String: Any], key: String) -> Int? {
         if let value = object[key] as? Int {
             return value
         }

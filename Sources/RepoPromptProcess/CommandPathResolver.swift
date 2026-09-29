@@ -15,7 +15,7 @@ private func commandPathResolverLog(_ message: @autoclosure () -> String) {
     #endif
 }
 
-enum CLIExecutableLaunchability: Equatable {
+package enum CLIExecutableLaunchability: Equatable {
     case launchable
     case bareCommandFallback
     case missingPath
@@ -23,8 +23,8 @@ enum CLIExecutableLaunchability: Equatable {
     case notExecutable
 }
 
-enum CommandPathResolver {
-    enum ShellLookupMode: Equatable {
+package enum CommandPathResolver {
+    package enum ShellLookupMode: Equatable {
         /// Query the user's shell before PATH search. Preserves legacy alias/function-first behavior.
         case preferShell
         /// Search the captured environment PATH first; query the shell only if PATH search misses.
@@ -49,7 +49,7 @@ enum CommandPathResolver {
     /// IMPORTANT: The environment passed here should NOT have additionalPaths merged into PATH.
     /// This ensures the interactive shell uses the user's actual PATH configuration,
     /// allowing version managers like nvm to work correctly.
-    static func resolve(
+    package static func resolve(
         _ command: String,
         environment: [String: String],
         additionalPaths: [String],
@@ -97,7 +97,7 @@ enum CommandPathResolver {
         return expanded
     }
 
-    static func expandPath(_ path: String, environment: [String: String]) -> String {
+    package static func expandPath(_ path: String, environment: [String: String]) -> String {
         let tildeExpanded: String = if let home = environment["HOME"], !home.isEmpty, path == "~" {
             home
         } else if let home = environment["HOME"], !home.isEmpty, path.hasPrefix("~/") {
@@ -109,7 +109,7 @@ enum CommandPathResolver {
         return expandEnvironmentVariables(in: tildeExpanded, environment: environment)
     }
 
-    static func launchability(of resolvedCommand: String) -> CLIExecutableLaunchability {
+    package static func launchability(of resolvedCommand: String) -> CLIExecutableLaunchability {
         guard resolvedCommand.contains("/") else {
             return .bareCommandFallback
         }
@@ -127,7 +127,7 @@ enum CommandPathResolver {
         return .launchable
     }
 
-    static func mergedPathComponents(environment: [String: String], additionalPaths: [String]) -> [String] {
+    package static func mergedPathComponents(environment: [String: String], additionalPaths: [String]) -> [String] {
         var components: [String] = []
         var seen = Set<String>()
         func append(path: String) {
@@ -395,7 +395,7 @@ enum CommandPathResolver {
         return (process.terminationStatus, stdoutAccum, stderrAccum)
     }
 
-    static func sanitizedExecutableOutput(_ rawLine: String, originalCommand: String, preferredBasenames: [String]? = nil) -> (path: String, isAliasTarget: Bool)? {
+    package static func sanitizedExecutableOutput(_ rawLine: String, originalCommand: String, preferredBasenames: [String]? = nil) -> (path: String, isAliasTarget: Bool)? {
         var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !line.isEmpty else { return nil }
 

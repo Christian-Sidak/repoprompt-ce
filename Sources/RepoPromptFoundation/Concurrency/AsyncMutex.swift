@@ -1,10 +1,11 @@
 import Foundation
 
-actor AsyncMutex {
+package actor AsyncMutex {
+    package init() {}
     private var isLocked = false
     private var waiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
 
-    func withLock<T: Sendable>(
+    package func withLock<T: Sendable>(
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
         let acquired = await lock()
@@ -22,7 +23,7 @@ actor AsyncMutex {
     ///
     /// Use this only for state restoration that must finish before a cancelled
     /// operation can return.
-    func withLockIgnoringCancellation<T: Sendable>(
+    package func withLockIgnoringCancellation<T: Sendable>(
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
         await lockIgnoringCancellation()

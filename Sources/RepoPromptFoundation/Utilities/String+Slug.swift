@@ -6,7 +6,7 @@ extension String {
     ///   - maxLength: Maximum length of the slug (default: 24)
     ///   - separator: Character to use for separating words (default: "-")
     /// - Returns: A slugified version of the string
-    func slugify(maxLength: Int = 24, separator: String = "-") -> String {
+    package func slugify(maxLength: Int = 24, separator: String = "-") -> String {
         // Convert to lowercase
         let lowercased = lowercased()
 

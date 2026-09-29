@@ -5,14 +5,18 @@ import Foundation
 /// One cancellation-independent owner for a direct child's destructive reap.
 /// Callers may wait repeatedly, but only the callback-based observation invokes
 /// `waitpid` through `ProcessTermination.observeChildStatus`.
-final class ChildProcessExitObserver: @unchecked Sendable {
+package final class ChildProcessExitObserver: @unchecked Sendable {
+    package static func observe(pid: pid_t) -> ChildProcessExitObserver {
+        ChildProcessExitObserver(pid: pid)
+    }
+
     typealias StatusObserver = @Sendable (
         _ pid: pid_t,
         _ beforeReap: @escaping @Sendable () -> Void,
         _ completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
     ) -> Void
 
-    enum Outcome: Equatable {
+    package enum Outcome: Equatable {
         case exited(ProcessExitStatus)
         case failed(ProcessTerminationError)
     }
@@ -56,7 +60,7 @@ final class ChildProcessExitObserver: @unchecked Sendable {
             }
         }
 
-        func wait(timeout: TimeInterval?) async -> Outcome? {
+        package func wait(timeout: TimeInterval?) async -> Outcome? {
             let waiterID = UUID()
             return await withCheckedContinuation { continuation in
                 lock.lock()
@@ -86,7 +90,7 @@ final class ChildProcessExitObserver: @unchecked Sendable {
             return operation()
         }
 
-        var isRootSignalingClosed: Bool {
+        package var isRootSignalingClosed: Bool {
             lock.lock()
             defer { lock.unlock() }
             return rootSignalingClosed
@@ -100,7 +104,7 @@ final class ChildProcessExitObserver: @unchecked Sendable {
         }
     }
 
-    let pid: pid_t
+    package let pid: pid_t
     private let state: State
     private static let outcomePublicationQueue = DispatchQueue(
         label: "com.repoprompt.child-process-exit-observer.outcome-publication",
@@ -137,18 +141,18 @@ final class ChildProcessExitObserver: @unchecked Sendable {
         )
     }
 
-    func wait(timeout: TimeInterval? = nil) async -> Outcome? {
+    package func wait(timeout: TimeInterval? = nil) async -> Outcome? {
         await state.wait(timeout: timeout)
     }
 
-    var isRootSignalingClosed: Bool {
+    package var isRootSignalingClosed: Bool {
         state.isRootSignalingClosed
     }
 
     /// Signals only while this observer still owns an unreaped root PID. The
     /// registry closes this lock-protected window before its destructive wait,
     /// before diagnostic outcome publication can block or change executors.
-    func signalRootProcessFamilyIfUnreaped(
+    package func signalRootProcessFamilyIfUnreaped(
         processGroupID: pid_t?,
         signal: Int32,
         logger: (String) -> Void = { _ in }
