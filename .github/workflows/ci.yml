@@ -55,14 +55,17 @@ jobs:
           fetch-depth: 0
 
       - name: Restore SwiftPM build cache
-        uses: actions/cache@v6
+        id: rootbundles-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             .build
             Packages/RepoPromptAgentProviders/.build
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          # Own prefix: must never prefix-match the Sentry or sources caches.
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}-
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-
 
       - name: Run repository guardrails
         run: make guardrails
@@ -135,6 +138,17 @@ jobs:
           name: root-build-${{ github.run_id }}
           path: root-build.tar.gz
           retention-days: 1
+
+      # Save the compiled cache only from main, so PR runs restore a warm, main-built cache
+      # (PR-scoped caches would evict it). One key per main commit keeps it current.
+      - name: Save SwiftPM build cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rootbundles-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            .build
+            Packages/RepoPromptAgentProviders/.build
+          key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
           compression-level: 0
           if-no-files-found: error
 
@@ -209,7 +223,7 @@ jobs:
             Packages/RepoPromptAgentProviders/.build
           key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-sentry-
 
       - name: Build app product with Sentry SDK linked
         env:
