@@ -194,8 +194,25 @@ class CatalogTests(unittest.TestCase):
 
     def test_ci_typecheck_warning_classification(self) -> None:
         warning = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'
-        self.assertEqual(ci_build.classify_warning(warning), ('expression', 502))
+        self.assertEqual(ci_build.classify_warning(warning), (
+            'expression', 502,
+            ('Sources/RepoPrompt/App/X.swift', '3', '4', 'expression took 502ms to type-check'),
+        ))
         self.assertIsNone(ci_build.classify_warning(warning.replace('Sources/RepoPrompt/', 'Sources/Core/')))
+
+    def test_ci_typecheck_ratchet_deduplicates_reemitted_diagnostics(self) -> None:
+        expression = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'
+        function = '/checkout/Sources/RepoPrompt/App/X.swift:1:1: warning: getter took 1200ms to type-check'
+        counts = {'function_body': 0, 'expression': 0}
+        seen: set[tuple[str, str, str, str]] = set()
+        for _ in range(25):
+            ci_build.record_warning(expression, counts, seen)
+            ci_build.record_warning(function, counts, seen)
+        self.assertEqual(counts, {'function_body': 1, 'expression': 1})
+        ci_build.record_warning(expression.replace('502ms', '505ms'), counts, seen)
+        ci_build.record_warning(expression.replace('502ms', '499ms'), counts, seen)
+        ci_build.record_warning(expression.replace('Sources/RepoPrompt/', 'Sources/Core/'), counts, seen)
+        self.assertEqual(counts, {'function_body': 1, 'expression': 2})
 
 
 if __name__ == '__main__':
