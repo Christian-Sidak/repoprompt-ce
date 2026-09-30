@@ -101,8 +101,10 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          set +e
           ./conductor ci-build-tests 2>&1 | tee "$RUNNER_TEMP/ci-build-tests-conductor.txt"
           build_status=${PIPESTATUS[0]}
+          set -e
           if (( build_status != 0 )); then
             log_path="$(sed -n 's/^Log:[[:space:]]*//p' "$RUNNER_TEMP/ci-build-tests-conductor.txt" | tail -n 1)"
             if [[ -n "$log_path" && -f "$log_path" ]]; then
