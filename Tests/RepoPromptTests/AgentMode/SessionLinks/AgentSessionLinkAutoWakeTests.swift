@@ -176,10 +176,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     // MARK: - Guidance revision
 
-    /// A provider context that physically accepted an earlier revision is re-owed revision 10 in full.
-    /// Merely rendering or abandoning revision 10 does not advance the acknowledgement; only physical
+    /// A context that accepted either parallel revision-11 branch is re-owed revision 12 in full.
+    /// Merely rendering or abandoning revision 12 does not advance the acknowledgement; only physical
     /// acceptance earns the reminder, and a rebuilt context owes the full block again.
-    func testRevisionElevenReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
+    func testRevisionTwelveReOwesCombinedGuidanceAndReminderIsAcceptanceGated() throws {
         let observerSessionID = UUID()
         let epoch = Self.epoch(observerSessionID: observerSessionID)
         let inventory = Self.inventory(observerSessionID: observerSessionID, revision: 1)
@@ -208,17 +208,17 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 observerEndpoint: passive.observerEndpoint,
                 receipt: passive.receipt,
                 includesUnattributedOverflow: passive.includesUnattributedOverflow,
-                guidanceRevision: 6,
+                guidanceRevision: 11,
                 displayAttribution: passive.displayAttribution
             ),
             laneGuidanceMode: first.laneGuidanceMode,
-            inventoryGuidanceRevision: first.inventoryGuidanceRevision,
+            inventoryGuidanceRevision: 6,
             fragment: first.fragment
         )
         store.accept(priorRevisionClaim)
         XCTAssertEqual(
             store.test_lastAcceptedLaneGuidanceRevision(observerSessionID: observerSessionID),
-            6
+            11
         )
 
         let reOwed = try XCTUnwrap(store.claim(
@@ -229,7 +229,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 11 supersedes"))
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 13 supersedes"))
+        XCTAssertEqual(reOwed.inventoryGuidanceRevision, 8)
+        XCTAssertTrue(reOwed.fragment.contains("`compact`"))
+        XCTAssertTrue(reOwed.fragment.contains("`stop`"))
+        XCTAssertTrue(reOwed.fragment.contains("`create_lane`"))
+        XCTAssertTrue(reOwed.fragment.contains("`retire_lane`"))
         // The rule revision 10 restates: a context taught it may only observe — and that may have
         // refused its own user on that basis — is told outright what replaced it.
         XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))
@@ -4622,7 +4627,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                         connectionLifecycleGeneration: 1
                     ),
                     projectionRevision: 1,
-                    hasAgentSessionLink: true
+                    hasAgentSessionLink: true,
+                    hasAnyActiveLink: true
                 ),
                 to: endpoint
             )
@@ -4669,7 +4675,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 connectionLifecycleGeneration: 1
             ),
             projectionRevision: revision,
-            hasAgentSessionLink: hasAgentSessionLink
+            hasAgentSessionLink: hasAgentSessionLink,
+            hasAnyActiveLink: true
         )
         fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
         return projection

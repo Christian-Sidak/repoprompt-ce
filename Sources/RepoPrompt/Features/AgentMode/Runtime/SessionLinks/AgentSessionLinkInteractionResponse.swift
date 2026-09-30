@@ -24,7 +24,9 @@ enum AgentSessionLinkInteractionManualOnlyReason: String, Equatable {
     case instructionPrompt = "instruction_prompt"
     /// Session-wide or policy-amending approvals widen authority beyond this one request.
     case persistentDecision = "persistent_decision"
-    /// An ACP provider offered no genuine one-time allow option for this request.
+    /// An ACP provider offered no genuine one-time allow option for this request. Reported only
+    /// when an observer tries to accept; decline and cancel stay available because both remain
+    /// scoped to this one request.
     case noOneTimeAllowOption = "no_one_time_allow_option"
     /// The redacted prompt exceeds the hard single-target disclosure limit.
     case tooLarge = "too_large"

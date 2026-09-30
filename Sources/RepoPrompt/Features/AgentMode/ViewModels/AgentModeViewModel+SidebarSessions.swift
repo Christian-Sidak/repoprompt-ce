@@ -1014,6 +1014,7 @@ extension AgentModeViewModel {
             sessionID: row.sessionID,
             canStash: row.canStash,
             parentSessionID: row.parentSessionID,
+            createdByOverseerSessionID: row.createdByOverseerSessionID,
             depth: row.depth,
             isMCPControlled: row.isMCPControlled,
             worktree: row.worktree,

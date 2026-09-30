@@ -363,7 +363,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
         guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointHost)
         }
         return await window.agentModeViewModel.agentSessionLinkPerformSend(
             to: candidate,
@@ -385,7 +385,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
         guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointHost)
         }
         return await window.agentModeViewModel.agentSessionLinkPerformSteer(
             to: candidate,
@@ -406,7 +406,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) async -> AgentSessionLinkStopTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
         guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointHost)
         }
         return await window.agentModeViewModel.agentSessionLinkPerformStop(
             to: candidate,
@@ -443,6 +443,26 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
             for: candidate,
             request: request,
             authorize: authorize
+        )
+    }
+
+    /// Routes the compaction transaction to the exact owning window, with the same terminating and
+    /// closing refusals as a send. Nothing here focuses or activates the window.
+    func agentSessionLinkPerformCompact(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkCompactRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+            return .blocked(.endpointHost)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformCompact(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            commitAuthorization: commitAuthorization
         )
     }
 

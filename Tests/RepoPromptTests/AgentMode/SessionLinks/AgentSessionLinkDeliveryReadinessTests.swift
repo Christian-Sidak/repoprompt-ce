@@ -39,6 +39,7 @@ final class AgentSessionLinkDeliveryReadinessTests: XCTestCase {
             ("terminalCommitInProgress", \.terminalCommitInProgress),
             ("stopInProgress", \.stopInProgress),
             ("mcpFollowUpRunPending", \.mcpFollowUpRunPending),
+            ("pendingSelfCompact", \.pendingSelfCompact),
             ("isComposerSubmissionInFlight", \.isComposerSubmissionInFlight),
             ("isPreparingInitialWorktree", \.isPreparingInitialWorktree),
             ("isChangingExecutionLocation", \.isChangingExecutionLocation),

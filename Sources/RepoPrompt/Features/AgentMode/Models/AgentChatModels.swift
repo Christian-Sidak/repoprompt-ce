@@ -361,6 +361,86 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
+    /// Fixed provider-replay text of an overseer compaction request row. It names no session and
+    /// carries no observer-derived bytes, because system rows are replayed verbatim to providers.
+    public static let overseerCompactionRequestText =
+        "Context compaction was requested by an overseeing session."
+
+    /// Fixed text of the note appended when an ACP provider accepts `/compact` and ends the command
+    /// turn instantly with no output — the signature of a fire-and-forget slash command whose
+    /// compaction keeps running in the provider's background, where the session's next prompt
+    /// cancels it.
+    public static let acpBackgroundCompactionNoteText =
+        "The provider accepted the compaction; it may still be running in the background — sending "
+            + "a message to this session in the next ~60–90 s can cancel it. Overseer messages and "
+            + "automatic wakes are held until then."
+
+    /// The visible provenance row for one overseer-requested context compaction.
+    ///
+    /// `.system`, never `.user`: RepoPrompt issued the provider command, not the target's user, and no
+    /// `/compact` user message is fabricated. The observer's identity travels only in the typed
+    /// `crossSessionAttribution`, which is local display metadata and never enters provider replay or
+    /// the cross-session `read` projection (that classifies `.user` rows only). The row records the
+    /// *request*; whether the compaction started or finished is told by the run's own rows.
+    public static func overseerCompactionRequest(
+        attribution: AgentCrossSessionAttribution,
+        sequenceIndex: Int
+    ) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: overseerCompactionRequestText,
+            sequenceIndex: sequenceIndex,
+            crossSessionAttribution: attribution
+        )
+    }
+
+    /// Fixed replay-safe provenance. The continuation note remains only in the attempt record.
+    public static func selfCompactionRequest(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Context compaction was requested by this session.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe cancellation text. The retained recovery note is not interpolated here.
+    public static func selfCompactionCancelled(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Scheduled self-compaction was cancelled before it reached the provider.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe failure text; no note bytes or provider error are interpolated.
+    public static func selfCompactionCouldNotStart(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Self-compaction could not start. The continuation note was retained for recovery.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe text for unverified completion: an ACP settle that never saw a vouched
+    /// context drop, or a native command that outlived its deadline.
+    /// The continuation note is not interpolated here; it stays parked for the next ordinary send.
+    public static func selfCompactionCompletionUnverified(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "The provider did not confirm that compaction finished. The continuation note will be attached to the next message in this session.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe provenance; the provider input, not this row, contains the note.
+    public static func selfCompactionNoteRestored(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "A continuation note from before compaction was restored to this session.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
     /// Provider-replay-safe fact row: the overseer's name remains typed display metadata only.
     public static let overseerRunStoppedText = "Run stopped by an overseeing session."
 

@@ -11,7 +11,7 @@ package enum AgentSessionLinkCatalogOutcome: String, Equatable, Sendable {
     case coalescedDuplicate = "coalesced-duplicate"
     case opened
     case closedCatalogPresent = "closed-catalog-present"
-    case closedOutboundLost = "closed-outbound-lost"
+    case closedLinksLost = "closed-links-lost"
     case closedProviderChanged = "closed-provider-changed"
     case closedToolDisabled = "closed-tool-disabled"
     case spentReplaced = "spent-replaced"

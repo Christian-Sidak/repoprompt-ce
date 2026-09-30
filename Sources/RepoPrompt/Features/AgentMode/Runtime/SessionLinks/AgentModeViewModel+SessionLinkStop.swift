@@ -50,7 +50,7 @@ extension AgentModeViewModel {
         guard let binding = session.persistentSessionBindingIdentity else { return .blocked(.targetBusy) }
 
         if selection == .notRunning {
-            prepareAgentRunCancellation(session: session, intent: .userStop)
+            prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
                 result: .notRunning, stopRequested: false, audit: .notRequired,
@@ -109,7 +109,7 @@ extension AgentModeViewModel {
             return .blocked(.targetBusy)
         }
         // Claim-time withdrawal is independent of whether the run still exists when cleanup starts.
-        prepareAgentRunCancellation(session: session, intent: .userStop)
+        prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
         withdrawQueuedWorkForManagedStop(session: session)
         let claimedAdmission = AgentRunCancellationAdmission(
             scope: .activeRun, session: session, binding: binding,
@@ -201,15 +201,17 @@ extension AgentModeViewModel {
                     runState: terminalState
                 ))
             }
+            // An accepted cancellation publication means the run was stopped; only local
+            // teardown is unconfirmed, which `teardownCompleted: false` reports as a warning.
             let failure: DomainAgentSessionLinkStopReceipt.FailureReason? = switch recorder.publicationResult {
-            case .accepted?: .teardownTimeout
+            case .accepted?: nil
             case .stale?: .terminalPublicationStale
             case .rejected?: .terminalPublicationRejected
             case nil: recorder.initiatedCancellation ? .cancellationUnconfirmed : .targetChanged
             }
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
-                result: .stopFailed, failure: failure,
+                result: accepted ? .stopped : .stopFailed, failure: failure,
                 stopRequested: recorder.initiatedCancellation,
                 teardownCompleted: recorder.teardownCompleted,
                 itemID: itemID, audit: itemID == nil ? .notRequired : .unknown,

@@ -220,6 +220,10 @@ fresh managed generation, not a resurrection of the old one.
 retain their watch-level operation grant but disclose prompt bodies only after a separate whole-batch
 management fence and live-endpoint check. A restricted link can still `poll` or `wait` for status
 with `managed: false` and no prompt body; `respond` and `steer` return `management_not_granted`.
+When that fence fails for a multi-target `wait` after a non-terminal wake, each target is re-fenced on
+its own (as terminal survivors already are): healthy siblings keep their rows, cursors, and prompts,
+and a sibling that failed its own fence releases nothing and is named in `unavailable_session_ids`.
+A single-target wait, or a batch with no survivor, is still denied.
 An unlinked UUID still receives the indistinguishable denial. A steer's ledger
 commit still uses `commitSendAuthorization(requiresManagement: true)`, and revocation before the final
 fence releases the uncommitted reservation without delivery.
@@ -238,7 +242,9 @@ submits without suspending. Approvals and permissions accept only `accept` (this
 `decline`, or `cancel`. Session-wide and exec-policy-amending approvals, Codex project-hook trust,
 app-owned worktree-merge reviews, and user-input requests containing a secret field are visible but
 `manual_only`. ACP permissions use only a genuine one-time allow option for accept and a one-time
-reject for decline. A wait for the session's next instruction is not a prompt `respond` answers;
+reject (otherwise `cancelled`) for decline. When the provider offers no genuine one-time allow
+option, `poll`/`wait` omit `accept` and `respond` refuses only accept (`manual_only`,
+`no_one_time_allow_option`); decline and cancel stay available. A wait for the session's next instruction is not a prompt `respond` answers;
 the managed pending-interaction note says to deliver that instruction with `steer`.
 
 ### Steering
@@ -387,8 +393,11 @@ manufacture it, global MCP disable remains absolute, and the disabled-tool setti
 catalog advertisement. Reachability never supplies outbound or inverse operation authority; the
 service authorizes each direction independently.
 
-An authorized request appends one immutable occurrence identity to separate, observer-local attention
-storage. A hard enqueue-time cap refuses excess attention rather than evicting an occurrence, and
+After inverse authorization, the bridge awaits the existing observer-scoped authoritative projection
+refresh before revalidating the proof and enqueuing. This repairs a missing or lagging observer-local
+baseline without fabricating a grant or a one-lane reducer; all exact endpoint, eligibility, membership
+revision, and generation fences remain after the refresh. An authorized request then appends one
+immutable occurrence identity to separate, observer-local attention storage. A hard enqueue-time cap refuses excess attention rather than evicting an occurrence, and
 attention neither evicts nor consumes the reducer's coalesced status intervals. Publication lets the
 occurrence ride a natural observer turn or, if every hard admission gate permits, start an Auto-wake
 through its exact lane. Exact purposeful attention may bypass master and per-lane routine selection and
@@ -423,6 +432,51 @@ through a separate state path. It is never a prerequisite for `request_attention
 auto-cleared by attention, and may be absent or may change before or after the attention claim is
 composed. Both the declaration and the attention signal remain attributed untrusted target data; they
 never become an observer instruction or authority.
+
+## Compaction is a send-gated native command, not a message
+
+`agent_session_link` `compact` asks one exact target to compact its provider context. The
+distinct `monitorCompact` identity requires `send_when_idle`, so every send-capable link can compact
+and no grant or UI changes. That delegation is the deliberate trade-off; a separate capability would
+either be decorative in the default set or leave existing links without it.
+
+It is a sibling of the send transaction, not a kind of send. It shares the readiness gate, composer
+claim, commit fence, durable-before-dispatch ordering, and idempotency ledger (under a
+domain-separated digest, so a key spent on a send conflicts rather than replays). It differs in two
+places. It records a `.system` request row with fixed text and typed `crossSessionAttribution`
+instead of a user row, and it dispatches a RepoPrompt-constructed command
+(`AgentProviderControlCommand.compact`) instead of an envelope: Codex compacts through
+`thread/compact/start`, and Claude Code receives exactly `/compact` through its ordinary run
+pipeline with every decoration (handoff, oversight supplement, instruction packaging, effort)
+skipped and no interrupt of an in-flight turn. No caller text ever reaches the provider. Every other
+unsupported runtime returns `not_supported` rather than a message asking the model to compact itself.
+
+ACP uses an undecorated `session/prompt` only for a live Devin, Grok Build, or Antigravity
+session that advertises `compact` for its exact conversation. Each `available_commands_update`
+replaces its controller snapshot; opening or retiring the session clears it. A missing live
+session or unobserved command list is retryable `no_provider_session`; an observed list that lacks
+`compact` is `not_supported`. OpenCode user commands and Cursor never qualify. A command never
+starts/replaces a controller or applies model/mode configuration. The controller rechecks idle state,
+conversation, advertisement, and the **current** request's compatibility immediately before the
+write, including Devin's launched permission mode. An unsent refusal retains a usable controller;
+a retired one is detached and shut down. Busy is not retired.
+
+ACP context count becomes unknown at dispatch: new occupancy may vouch for it again, but this
+command's billed prompt count cannot. A proven no-send restores the withdrawn vouch only if no
+newer occupancy replaced it. Instant silent completion may mean background work that the
+session's next prompt would cancel, so it adds a fixed transcript hint and starts a 90-second
+settle hold (`AgentTabSession.beginACPBackgroundCompactionSettle`). While it lasts, delivery
+readiness is `target_not_idle` — refusing `send`, `compact`, and parked `when_sendable` drains —
+Auto-wake and periodic wakes are not admitted, and `poll` reports `idle_for_send: false` with
+`send_blockers: ["background_compaction_settling"]`. Expiry publishes a readiness change, so parked
+work resumes without polling; any new run start (the session's own user is never held) ends the
+hold early. It is a cancellation guard, not completion proof. Duplicate receipts retain the
+background metadata.
+
+A failed last run is not a readiness blocker, so a target that died on context length is admissible;
+any interaction or `awaiting_user` is `target_not_idle`. `accepted` means started, not completed: completion is
+observed through `poll`/`wait`, where the `context` count reads unknown after the compaction signal
+until the provider reports a new one.
 
 ## Snooze suppresses routine admission, never delivery
 
@@ -659,13 +713,14 @@ absorbed into that record rather than duplicated.
 ### A returned catalog can get stuck saying the tool is gone
 
 One projection state cannot heal itself: the *returned* catalog says `agent_session_link` is absent
-while the link authority says that exact endpoint holds a live outbound grant. It is produced by
+while the link authority says that exact endpoint holds a live grant in either direction. It is produced by
 ordinary code. `notifyToolListChangedForAgentSession` republishes the observation with the returned
-presence **preserved** and outbound presence recomputed, so a grant restored against a live run whose
+presence **preserved** and any-link presence recomputed, so a grant restored against a live run whose
 client has not re-read `tools/list` lands on exactly `hasAgentSessionLink == false` plus
-`hasActiveOutboundLink == true`. For any established run `agentSessionLinkPromptContext` then fails
-closed, and the only admission exception — the `session.runID == nil` cold bootstrap — is unreachable
-while that run identity persists. Auto-wake is blocked behind a projection nothing else will fix.
+`hasAnyActiveLink == true`. For outbound observers, `agentSessionLinkPromptContext` then fails closed
+and the `session.runID == nil` cold-bootstrap exception is unreachable while that run identity persists.
+An inbound-only created lane instead loses access to inverse `request_attention`. The repair uses
+any-link membership, while prompt readiness and observer operations remain strictly outbound-only.
 
 The repair is Codex-only, bounded to **one controller replacement per repair cycle**, and made of
 parts that already existed:
@@ -717,7 +772,7 @@ A cycle is closed by exactly five paths, all of which mean it is *over* rather t
 | Close path | Where |
 | --- | --- |
 | Exact current positive catalog (`hasAgentSessionLink == true`) | projection reconciler |
-| Exact outbound loss (`hasActiveOutboundLink == false`) | projection reconciler |
+| Exact any-link loss (`hasAnyActiveLink == false`) | projection reconciler |
 | Provider switch away from `.codexExec` | `handleProviderSwitch` |
 | `agent_session_link` disabled when the cycle is spent | repair entrypoint |
 | Stranded consumed run (`codexController == nil`, `runID != nil`) after its retirement | repair entrypoint |

@@ -1208,6 +1208,25 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
+    private var agentSelfToolService: AgentSelfMCPToolService {
+        AgentSelfMCPToolService(
+            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            requireTargetWindow: { [self] in try requireTargetWindow() },
+            resolveObserverEndpoint: { [self] metadata, targetWindow in
+                await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
+            },
+            captureCallOrigin: { AgentSelfMCPCallOrigin.current },
+            readSelf: { window, endpoint, origin in
+                window.agentModeViewModel.agentSelfContextSnapshot(endpoint: endpoint, origin: origin)
+            },
+            scheduleCompact: { window, endpoint, origin, note, key in
+                await window.agentModeViewModel.agentSelfCompactMCPAdmission(
+                    endpoint: endpoint, origin: origin, note: note, idempotencyKey: key
+                )
+            }
+        )
+    }
+
     private var agentSessionLinkToolService: AgentSessionLinkMCPToolService {
         AgentSessionLinkMCPToolService(
             toolName: MCPWindowToolName.agentSessionLink,
@@ -1459,6 +1478,12 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.internalError("Window deallocated while executing agent_session_link")
             }
             return try await agentSessionLinkToolService.execute(args: args)
+        },
+        executeAgentSelf: { [weak self] args in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while executing agent_self")
+            }
+            return try await agentSelfToolService.execute(args: args)
         },
         requireTargetWindow: { [weak self] in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving target window") }
@@ -3769,6 +3794,22 @@ final class MCPServerViewModel: ObservableObject {
         let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
             ? executionRunID
             : nil
+        // Capture the exact self caller at registration, before the tool body can suspend. Neither
+        // request metadata nor a later live tab lookup may substitute a successor run attempt.
+        let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf,
+                                                         let context = resolvedContext?.snapshot,
+                                                         let runID = context.runID,
+                                                         indexedRunID == runID,
+                                                         let window = try? requireTargetWindow(),
+                                                         let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID),
+                                                         let session = window.agentModeViewModel.sessions[context.tabID],
+                                                         session.runID == runID,
+                                                         let ownership = session.activeRunOwnership
+        {
+            .init(endpoint: endpoint, runID: runID, runAttemptID: ownership.attemptID)
+        } else {
+            nil
+        }
 
         // Generate a unique token for this tool execution to prevent cleanup races
         let toolToken = UUID()
@@ -3835,7 +3876,9 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Stage.MCPToolCall.providerExecution,
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
-                        try await body()
+                        try await AgentSelfMCPCallOrigin.$current.withValue(selfCallOrigin) {
+                            try await body()
+                        }
                     }
                     EditFlowPerf.lifecycleEvent(
                         EditFlowPerf.Lifecycle.MCPRunTool.providerEnded,

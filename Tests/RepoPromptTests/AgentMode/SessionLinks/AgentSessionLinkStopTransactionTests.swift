@@ -72,7 +72,8 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         teardownDeadlineSeconds: TimeInterval = 1,
         auditDeadlineSeconds: TimeInterval = 1,
         deadlineSleep: (@MainActor (TimeInterval) async -> Void)? = nil,
-        beforeCleanupTask: @escaping @MainActor () -> Void = {}
+        beforeCleanupTask: @escaping @MainActor () -> Void = {},
+        commitAuthorization: @escaping @MainActor () async -> AgentSessionLinkSendCommitOutcome = { .committed }
     ) async -> AgentSessionLinkStopTransactionOutcome {
         let observer = DomainAgentSessionLinkEndpointIdentity(
             windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(),
@@ -90,7 +91,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             ) },
             queueHasCommittedDrain: { false },
             withdrawInbound: { true },
-            commitAuthorization: { .committed },
+            commitAuthorization: commitAuthorization,
             teardownDeadlineSeconds: teardownDeadlineSeconds,
             auditDeadlineSeconds: auditDeadlineSeconds,
             deadlineSleep: deadlineSleep ?? { seconds in
@@ -110,6 +111,90 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         XCTAssertNil(receipt.targetItemID)
         XCTAssertEqual(fixture.session.items.count, before)
         XCTAssertEqual(fixture.session.runState, .idle)
+    }
+
+    func testSelfCompactHoldRejectsStopBeforeAndAfterAuthorizationWithoutMutation() async throws {
+        for holdAtCommit in [false, true] {
+            let fixture = try makeFixture()
+            let hold = AgentSelfCompactState(active: AgentSelfCompactAttempt(
+                idempotencyKey: "stop-hold", note: "Continue the current task.", phase: .acpSettling
+            ))
+            if !holdAtCommit { fixture.session.selfCompactState = hold }
+            let generation = fixture.session.stopState.cancellationGeneration
+            let before = fixture.session.items
+            var authorizationCount = 0
+            let outcome = await stop(fixture, commitAuthorization: {
+                authorizationCount += 1
+                fixture.session.selfCompactState = hold
+                return .committed
+            })
+            XCTAssertEqual(outcome, .blocked(.targetBusy))
+            XCTAssertEqual(authorizationCount, holdAtCommit ? 1 : 0)
+            XCTAssertEqual(fixture.session.stopState.cancellationGeneration, generation)
+            XCTAssertEqual(fixture.session.selfCompactState, hold)
+            XCTAssertEqual(fixture.session.items, before)
+            XCTAssertEqual(fixture.session.runState, .idle)
+        }
+    }
+
+    func testParkedSelfCompactNoteDoesNotBlockIdleStopOrSpendTheNote() async throws {
+        let fixture = try makeFixture()
+        let parked = AgentSelfCompactState(active: AgentSelfCompactAttempt(
+            idempotencyKey: "stop-parked", note: "Continue the current task.", phase: .parked
+        ))
+        fixture.session.selfCompactState = parked
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .notRunning)
+        XCTAssertEqual(fixture.session.selfCompactState, parked)
+    }
+
+    func testManagedStopEndsTheOriginatingTurnThatScheduledSelfCompaction() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        let ownership = fixture.session.beginRunAttempt(source: "self-compact-stop-test")
+        let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+        let owner = AgentSelfCompactOwner(
+            windowID: 1, workspaceID: UUID(), tabID: fixture.tabID, sessionID: binding.sessionID,
+            persistentBindingGeneration: binding.generation,
+            bindingTransitionGeneration: fixture.session.bindingTransitionGeneration,
+            runID: runID, runAttemptID: ownership.attemptID
+        )
+        fixture.session.selfCompactState = AgentSelfCompactState(active: AgentSelfCompactAttempt(
+            idempotencyKey: "stop-origin", note: "Continue the current task.", owner: owner
+        ))
+        XCTAssertTrue(fixture.session.selfCompactState.blocksOverseerDelivery)
+
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("Stop was refused") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        // A non-completed originating terminal cancels the request instead of compacting.
+        try await AsyncTestWait.waitUntil("stopped origin cancels the scheduled request") {
+            fixture.session.selfCompactState.active == nil
+        }
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .cancelled)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.noteDelivery, .notSent)
+    }
+
+    func testManagedStopEndsAContinuationTurnWhoseNoteSendStarted() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "self-compact-note-stop-test")
+        var attempt = AgentSelfCompactAttempt(
+            idempotencyKey: "stop-note", note: "Continue the current task.", phase: .dispatchingNote
+        )
+        attempt.compactTurnSucceeded = true
+        attempt.noteDispatchStarted = true
+        let sent = AgentSelfCompactState(active: attempt)
+        fixture.session.selfCompactState = sent
+
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("Stop was refused") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        // Stop never spends or rewrites the one-shot note; its provider seam settles it.
+        XCTAssertEqual(fixture.session.selfCompactState, sent)
     }
 
     func testHeldWakeCannotDispatchAfterIdleStop() async throws {
@@ -305,7 +390,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         deadline.finish(())
     }
 
-    func testTeardownDeadlineRetainsStopFailedTimeoutAndKeepsExecutingCleanupClaimed() async throws {
+    func testTeardownDeadlineReportsStoppedAndKeepsExecutingCleanupClaimed() async throws {
         let fixture = try makeFixture()
         fixture.session.runState = .running
         fixture.session.installRunID(UUID())
@@ -336,26 +421,46 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         await entered.value()
         deadline.finish(())
         guard case let .settled(receipt) = await stopping.value else { return XCTFail("expected receipt") }
-        XCTAssertEqual(receipt.result, .stopFailed)
-        XCTAssertEqual(receipt.failureReason, .teardownTimeout)
+        // The cancellation was published, so the run is stopped; only local teardown is pending.
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertNil(receipt.failureReason)
         XCTAssertEqual(receipt.teardownCompleted, false)
         XCTAssertEqual(receipt.auditStatus, .unknown)
         let rendered = try AgentSessionLinkMCPToolService.stopOutcomeValue(
             .receipt(receipt), targetSessionID: fixture.candidate.sessionID
         )
+        XCTAssertEqual(rendered.objectValue?["result"]?.stringValue, "stopped")
         XCTAssertNotNil(rendered.objectValue?["warning"]?.stringValue)
-        XCTAssertEqual(rendered.objectValue?["reason"]?.stringValue, "teardown_timeout")
+        XCTAssertNil(rendered.objectValue?["reason"])
         XCTAssertEqual(fixture.session.runState, .cancelled)
         let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+        XCTAssertEqual(fixture.session.stopState.activeManagedStopID, receipt.requestID)
         XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
         XCTAssertFalse(
             fixture.session.stopState.forceRetireUnclaimedStop(binding: binding),
             "deadline must not mark already-started teardown unclaimed"
         )
+        XCTAssertFalse(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
+        let overlappingStop = await stop(fixture)
+        XCTAssertEqual(overlappingStop, .blocked(.targetBusy), "executing cleanup must retain its fence")
         release.finish(())
         try await AsyncTestWait.waitUntil("late teardown releases the stop gate") {
-            !fixture.session.stopState.isStopping(binding: binding)
+            fixture.session.stopState.activeManagedStopID == nil
         }
+        XCTAssertNil(fixture.session.stopState.activeManagedStopBinding)
+        XCTAssertTrue(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
+        XCTAssertTrue(AgentModeViewModel.sendBlockers(AgentModeViewModel.sendReadinessInputs(
+            session: fixture.session, candidate: fixture.candidate,
+            status: AgentModeViewModel.linkStatus(for: fixture.session, pendingInteraction: nil)
+        )).isEmpty)
+
+        fixture.session.mcpFollowUpRunPending = true
+        fixture.session.pendingInstructions = ["new work after timed-out Stop"]
+        guard case let .settled(nextReceipt) = await stop(fixture) else { return XCTFail("next Stop was wedged") }
+        XCTAssertEqual(nextReceipt.result, .stopped)
+        XCTAssertEqual(nextReceipt.resultingRunState, "pending_start_withdrawn")
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
     }
 
     func testSecondUserStopRetiresStartedTimedOutTeardownGate() async throws {
@@ -384,12 +489,71 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         await entered.value()
         deadline.finish(())
         guard case let .settled(receipt) = await stopping.value else { return XCTFail("expected receipt") }
-        XCTAssertEqual(receipt.failureReason, .teardownTimeout)
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.teardownCompleted, false)
         let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
         XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
         fixture.session.stopState.test_ageManagedStopClaim(by: 31)
         await fixture.viewModel.cancelAgentRun(tabID: fixture.tabID)
         XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding))
+        release.finish(())
+        XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding), "late cleanup cannot reclaim the gate")
+    }
+
+    /// The composer Stop button targets the run it rendered and is refused once that run
+    /// settled; it must still recover a wedged managed-Stop gate after the deadline, and never
+    /// before it while cleanup is executing.
+    func testComposerStopTargetRetiresTimedOutTeardownGateOnlyAfterDeadline() async throws {
+        let fixture = try makeFixture()
+        fixture.session.runState = .running
+        fixture.session.installRunID(UUID())
+        let ownership = fixture.session.beginRunAttempt(source: "composer-stop-wedged")
+        let renderedTarget = AgentRunCancelTarget(
+            tabID: fixture.tabID,
+            expectedRunID: fixture.session.runID,
+            expectedActiveAgentSessionID: fixture.session.activeAgentSessionID,
+            expectedRunAttemptID: ownership.attemptID,
+            expectedPendingUserInputRequestID: nil
+        )
+        let entered = AgentSessionLinkStopSignal<Void>()
+        let release = AgentSessionLinkStopSignal<Void>()
+        let deadline = AgentSessionLinkStopSignal<Void>()
+        fixture.session.installRunAttemptTerminalResources(ownership: ownership) { _ in
+            {
+                entered.finish(())
+                await release.value()
+            }
+        }
+        addTeardownBlock {
+            release.finish(())
+            deadline.finish(())
+        }
+        let stopping = Task {
+            await self.stop(fixture, teardownDeadlineSeconds: 30, deadlineSleep: { seconds in
+                if seconds == 30 { await deadline.value() }
+            })
+        }
+        await entered.value()
+        deadline.finish(())
+        guard case let .settled(receipt) = await stopping.value else { return XCTFail("expected receipt") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(fixture.session.runState, .cancelled)
+        let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+
+        let earlyRouted = await fixture.viewModel.cancelAgentRun(target: renderedTarget)
+        XCTAssertFalse(earlyRouted, "a settled run refuses the stale rendered target")
+        XCTAssertTrue(
+            fixture.session.stopState.isStopping(binding: binding),
+            "executing cleanup inside its deadline keeps the gate"
+        )
+
+        fixture.session.stopState.test_ageManagedStopClaim(by: 31)
+        let lateRouted = await fixture.viewModel.cancelAgentRun(target: renderedTarget)
+        XCTAssertFalse(lateRouted)
+        XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding))
+        XCTAssertNil(fixture.session.stopState.activeManagedStopID)
+        XCTAssertTrue(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
+
         release.finish(())
         XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding), "late cleanup cannot reclaim the gate")
     }
@@ -466,15 +630,26 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
         let wedgedID = UUID()
         XCTAssertTrue(fixture.session.stopState.claimManagedStop(id: wedgedID, binding: binding))
+        // Model the deadline winning before cleanup gets its first MainActor turn.
         fixture.session.stopState.markCleanupUnclaimedIfNeverStarted(id: wedgedID, binding: binding)
-        XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
+        XCTAssertEqual(fixture.session.stopState.activeManagedStopID, wedgedID)
+        XCTAssertFalse(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
         let foreignBinding = AgentPersistentSessionBindingIdentity(
             tabID: fixture.tabID, sessionID: UUID()
         )
         XCTAssertFalse(fixture.session.stopState.forceRetireUnclaimedStop(binding: foreignBinding))
         XCTAssertTrue(fixture.session.stopState.isStopping(binding: binding))
         await fixture.viewModel.cancelAgentRun(tabID: fixture.tabID)
-        XCTAssertFalse(fixture.session.stopState.isStopping(binding: binding))
+        XCTAssertNil(fixture.session.stopState.activeManagedStopID)
+        XCTAssertNil(fixture.session.stopState.activeManagedStopBinding)
+        XCTAssertTrue(AgentRunStartStopFence(session: fixture.session).permitsStart(of: fixture.session))
+        fixture.session.mcpFollowUpRunPending = true
+        fixture.session.pendingInstructions = ["new work after never-started cleanup recovery"]
+        guard case let .settled(receipt) = await stop(fixture) else { return XCTFail("next Stop was wedged") }
+        XCTAssertEqual(receipt.result, .stopped)
+        XCTAssertEqual(receipt.resultingRunState, "pending_start_withdrawn")
+        XCTAssertTrue(fixture.session.pendingInstructions.isEmpty)
+        XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
     }
 
     func testCleanupDeadlineNeverUnclaimsAnExecutingTeardown() throws {
@@ -697,6 +872,14 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
         snapshot.stopInProgress = true
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(.targetBusy))
         snapshot.stopInProgress = false
+        // Overseer delivery holds do not refuse Stop by themselves; only an unsent RepoPrompt-owned
+        // self-compaction dispatch does.
+        snapshot.pendingSelfCompact = true
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .activeRun)
+        snapshot.selfCompactBlocksManagedStop = true
+        XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(.targetBusy))
+        snapshot.pendingSelfCompact = false
+        snapshot.selfCompactBlocksManagedStop = false
         snapshot.hasLoadedPersistedState = false
         XCTAssertEqual(AgentSessionLinkStopAdmission.classify(snapshot), .blocked(.targetLoading))
         snapshot.endpointMatchesGrant = false

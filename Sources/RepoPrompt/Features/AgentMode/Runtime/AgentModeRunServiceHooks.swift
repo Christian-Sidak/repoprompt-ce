@@ -206,6 +206,12 @@ extension AgentModeRunService {
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult
+        var onSelfCompactTerminalSettled: @MainActor (
+            AgentTabSession,
+            AgentRunTerminalCommitRevision,
+            AgentRunTerminalPublicationResult,
+            @escaping @MainActor () -> Bool
+        ) -> Void = { _, _, _, _ in }
     }
 
     /// Continuation of a settled or steered run (follow-up starts, MCP wakes).
@@ -232,7 +238,9 @@ extension AgentModeRunService {
         let terminalSettlement: TerminalSettlementHooks
         let continuation: RunContinuationHooks
         /// Host-owned synchronous deferred-work cleanup, before the terminal shortcut.
-        var prepareForCancellation: (AgentTabSession, DomainAgentRunCancellationIntent) -> Void = { _, _ in }
+        var prepareForCancellation: (
+            AgentTabSession, DomainAgentRunCancellationIntent, AgentModeRunService.CancellationOrigin
+        ) -> Void = { _, _, _ in }
     }
 }
 
@@ -309,6 +317,11 @@ extension AgentModeRunService.Hooks {
                 },
                 startFollowUpRun: { instruction in
                     continuation.startFollowUpRun(session, instruction)
+                },
+                onSelfCompactTerminalSettled: { revision, result, teardownSettled in
+                    terminalSettlement.onSelfCompactTerminalSettled(
+                        session, revision, result, teardownSettled
+                    )
                 }
             ),
             validatesOwnership: { ownership, expectedRunID in

@@ -119,6 +119,9 @@ struct AgentSessionLinkMCPToolService {
         case "cancel_pending_send":
             try validateAllowedKeys(args, op: op, allowed: Self.cancelPendingSendKeys)
             return try await executeCancelPendingSend(args: args)
+        case "compact":
+            try validateAllowedKeys(args, op: op, allowed: Self.compactKeys)
+            return try await executeCompact(args: args)
         case "set_waiting_on":
             try validateAllowedKeys(args, op: op, allowed: Self.setWaitingOnKeys)
             return try await executeSetWaitingOn(args: args)
@@ -134,6 +137,12 @@ struct AgentSessionLinkMCPToolService {
         case "steer":
             try validateAllowedKeys(args, op: op, allowed: Self.steerKeys)
             return try await executeSteer(args: args)
+        case "create_lane":
+            try validateAllowedKeys(args, op: op, allowed: Self.createLaneKeys)
+            return try await executeCreateLane(args: args)
+        case "retire_lane":
+            try validateAllowedKeys(args, op: op, allowed: Self.retireLaneKeys)
+            return try await executeRetireLane(args: args)
         case "stop":
             try validateAllowedKeys(args, op: op, allowed: Self.stopKeys)
             return try await executeStop(args: args)
@@ -151,8 +160,8 @@ struct AgentSessionLinkMCPToolService {
     /// Single-sourced so the missing-op and unsupported-op errors can never drift apart, or from the
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
-        "Use list, poll, wait, read, send, cancel_pending_send, set_waiting_on, snooze_auto_wake, "
-            + "request_attention, respond, steer, or stop."
+        "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, snooze_auto_wake, "
+            + "request_attention, respond, steer, stop, create_lane, or retire_lane."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveCallerEndpointIdentity()
@@ -396,7 +405,11 @@ struct AgentSessionLinkMCPToolService {
             return .object(payload)
         case let .blocked(failure):
             switch failure {
-            case .endpointInvalidated, .linkRevoked, .managementRevoked:
+            case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
+                 .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
+                 .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
+                 .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
+                 .endpointPostWindow, .endpointPostReadiness, .linkRevoked, .managementRevoked:
                 throw Self.denialError(targetSessionID: targetSessionID)
             case .shuttingDown:
                 throw MCPError.internalError("RepoPrompt is shutting down.")
@@ -404,7 +417,7 @@ struct AgentSessionLinkMCPToolService {
                 return .object([
                     "result": .string("target_busy"),
                     "session_id": .string(targetSessionID.uuidString),
-                    "reason": .string(failure.rawValue)
+                    "reason": .string(failure.wireResult)
                 ])
             }
         case .indeterminate:
@@ -506,6 +519,92 @@ struct AgentSessionLinkMCPToolService {
 
     // MARK: - list
 
+    /// The bridge owns authority and sequencing; this surface owns only parsing and receipts.
+    private func executeCreateLane(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        if let refusal = await bridge.laneCreationCallerPreflight(observerEndpoint) {
+            if refusal == .denied { throw Self.unavailableError }
+            return AgentSessionLaneMCPToolService.refusal(refusal.rawValue)
+        }
+        let key = try Self.parseIdempotencyKey(args["idempotency_key"], op: "create_lane")
+        let role: String?
+        if let value = args["role"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane role must be a string.")
+            }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard AgentModelCatalog.TaskLabelKind(rawValue: normalized) != nil else {
+                let roles = AgentModelCatalog.TaskLabelKind.allCases.map(\.rawValue).joined(separator: ", ")
+                throw MCPError.invalidParams("agent_session_link create_lane role must be one of: \(roles).")
+            }
+            role = normalized
+        } else {
+            role = nil
+        }
+        let sessionName: String?
+        if let value = args["session_name"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane session_name must be a string.")
+            }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, normalized.utf8.count <= 120 else {
+                throw MCPError.invalidParams("agent_session_link create_lane session_name must be 1–120 UTF-8 bytes.")
+            }
+            sessionName = normalized
+        } else {
+            sessionName = nil
+        }
+        let message = try args["message"].map { try Self.parseMessage($0, op: "create_lane") }
+        let workflowReference = try AgentWorkflowReference.parse(args: args)
+        guard message != nil || workflowReference == nil else {
+            throw MCPError.invalidParams("agent_session_link create_lane workflow requires message.")
+        }
+        let workspaceSelector: String?
+        if let value = args["workspace"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane workspace must be a name or UUID string.")
+            }
+            workspaceSelector = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard workspaceSelector?.isEmpty == false else {
+                throw MCPError.invalidParams("agent_session_link create_lane workspace must not be empty.")
+            }
+        } else {
+            workspaceSelector = nil
+        }
+        let callerWindow = try requireTargetWindow()
+        let receipt = await bridge.createLane(
+            observerEndpoint: observerEndpoint,
+            request: AgentSessionLaneCreateRequest(
+                idempotencyKey: key,
+                role: role,
+                sessionName: sessionName,
+                workspaceSelector: workspaceSelector,
+                message: message,
+                workflowReference: workflowReference
+            ),
+            resolveDestination: {
+                AgentSessionLaneMCPToolService.resolveDestination(
+                    workspaceSelector: workspaceSelector, callerWindow: callerWindow
+                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID) }
+            }
+        )
+        if receipt.reason == .denied { throw Self.unavailableError }
+        return AgentSessionLaneMCPToolService.render(receipt)
+    }
+
+    private func executeRetireLane(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "retire_lane")
+        let outcome = await bridge.retireLane(
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        if case .notRetired(_, .denied) = outcome {
+            throw Self.denialError(targetSessionID: targetSessionID)
+        }
+        return AgentSessionLaneMCPToolService.render(outcome)
+    }
+
     private func executeList(args: [String: Value]) async throws -> Value {
         let observerEndpoint = try await resolveCallerEndpointIdentity()
         let inventory: DomainAgentSessionLinkInventory
@@ -542,6 +641,10 @@ struct AgentSessionLinkMCPToolService {
         }
 
         let page = inventory.items.dropFirst(offset).prefix(maxItems)
+        let createdByYou = Set(
+            bridge.laneAnnotatedPromptInventory(inventory).items
+                .filter(\.createdByYou).map(\.targetSessionID)
+        )
         let nextOffset = offset + page.count
         let hasMore = nextOffset < inventory.items.count
 
@@ -554,7 +657,8 @@ struct AgentSessionLinkMCPToolService {
                     "session_id": .string(item.targetSessionID.uuidString),
                     "name": AgentMCPToolHelpers.stringOrNull(item.displayName),
                     "capabilities": .array(item.capabilityNames.map { .string($0) }),
-                    "managed": .bool(item.capabilities.contains(.manage))
+                    "managed": .bool(item.capabilities.contains(.manage)),
+                    "created_by_you": .bool(createdByYou.contains(item.targetSessionID))
                 ])
             }),
             "has_more": .bool(hasMore),
@@ -588,16 +692,12 @@ struct AgentSessionLinkMCPToolService {
         var states: [DomainAgentSessionLinkTargetState] = []
         var pendingSends: [UUID: AgentSessionLinkPendingSendProjection] = [:]
         var snoozes: [UUID: AgentSessionLinkAutoWakeSnoozeProjection] = [:]
-        var managed: [UUID: Bool] = [:]
         states.reserveCapacity(targets.count)
         for target in targets {
             guard let state = await bridge.targetState(for: target.lease) else {
                 throw Self.error(for: .denied, targetSessionID: target.lease.target.sessionID)
             }
             states.append(state)
-            // Read from the exact grant this poll was authorized under, so a mid-session grant or
-            // withdrawal of management shows on the very next poll rather than the next turn.
-            managed[state.sessionID] = await bridge.managementIsGranted(for: target.lease)
             // Read through this caller's own lease, so the queue state one observer staged is
             // structurally unreachable from another observer of the same target.
             pendingSends[state.sessionID] = bridge.pendingSendProjection(for: target.lease)
@@ -627,9 +727,9 @@ struct AgentSessionLinkMCPToolService {
             if bridge.isFrozenForShutdown { throw MCPError.internalError("RepoPrompt is shutting down.") }
             throw Self.denialError(targetSessionID: request.isSingle ? request.sessionIDs.first : nil)
         }
-        for state in states {
-            managed[state.sessionID] = inspections[state.sessionID] != nil
-        }
+        // `managed` comes from the same final whole-batch fence that released the prompt bodies, so
+        // it always agrees with whether `pending_interaction` could appear for that target.
+        let managed = Set(inspections.keys)
 
         if request.isSingle, let state = states.first {
             var payload: [String: Value] = [
@@ -637,7 +737,7 @@ struct AgentSessionLinkMCPToolService {
                 "session_id": .string(state.sessionID.uuidString),
                 "snapshot": AgentSessionLinkResponseRenderer.snapshotValue(state),
                 "wait_cursor": .string(state.waitCursor),
-                "managed": .bool(managed[state.sessionID] ?? false),
+                "managed": .bool(managed.contains(state.sessionID)),
                 "auto_wake_snooze": AgentSessionLinkResponseRenderer
                     .autoWakeSnoozeValue(snoozes[state.sessionID])
             ]
@@ -656,7 +756,7 @@ struct AgentSessionLinkMCPToolService {
                     state,
                     pendingSend: pendingSends[state.sessionID] ?? .empty,
                     autoWakeSnooze: snoozes[state.sessionID],
-                    managed: managed[state.sessionID] ?? false
+                    managed: managed.contains(state.sessionID)
                 )
             })
         ]), inspections: inspections, isSingle: false)
@@ -725,20 +825,28 @@ struct AgentSessionLinkMCPToolService {
             // Read after the wait resumes, so a queued send that drained while parked reports
             // its terminal outcome rather than the entry it had on admission.
             let pendingSends = await bridge.pendingSendProjections(for: leases)
-            guard let inspections = await bridge.pendingInteractionsForObservation(leases: leases) else {
+            // A sibling that lost its lease or endpoint while parked is dropped on its own; the
+            // healthy siblings keep their fresh rows and cursors. Denial only when none survive.
+            guard let observation = await bridge.pendingInteractionsForWaitObservation(leases: leases) else {
                 if await bridge.isFrozenForShutdown { throw MCPError.internalError("RepoPrompt is shutting down.") }
                 throw Self.denialError(targetSessionID: isSingle ? leases.first?.target.sessionID : nil)
             }
-            return AgentSessionLinkResponseRenderer.addPendingInteractions(
+            let surviving = observation.survivingTargets
+            let unavailable = leases.map(\.target.sessionID).filter { !surviving.contains($0) }
+            let rendered = AgentSessionLinkResponseRenderer.addPendingInteractions(
                 to: AgentSessionLinkResponseRenderer.waitValue(
-                    waitResult,
+                    DomainAgentSessionLinkWaitResult(
+                        outcome: waitResult.outcome,
+                        targets: waitResult.targets.filter { surviving.contains($0.sessionID) }
+                    ),
                     pendingSends: pendingSends,
                     isSingle: isSingle,
-                    managedTargets: Set(inspections.keys)
+                    managedTargets: Set(observation.inspections.keys)
                 ),
-                inspections: inspections,
+                inspections: observation.inspections,
                 isSingle: isSingle
             )
+            return AgentSessionLinkResponseRenderer.addUnavailableWaitTargets(unavailable, to: rendered)
         }
     }
 
@@ -1025,6 +1133,71 @@ struct AgentSessionLinkMCPToolService {
                 ),
                 targetSessionID: targetSessionID
             )
+        }
+    }
+
+    // MARK: - compact
+
+    /// Requests provider-native context compaction of one exact, fully idle overseen session.
+    ///
+    /// Authorized exactly like `send` (the `send_when_idle` grant) under its own operation identity,
+    /// and admitted by the same readiness contract, so a target whose last turn failed on context
+    /// length is admissible while one holding any interaction is `target_not_idle`. The provider
+    /// command is RepoPrompt's own; nothing the caller writes reaches the provider. The result is
+    /// `accepted` when the request was recorded — never proof that compaction finished.
+    private func executeCompact(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        guard let rawSessionID = AgentMCPToolHelpers.normalizedString(args["session_id"]),
+              let targetSessionID = UUID(uuidString: rawSessionID)
+        else {
+            throw MCPError.invalidParams("agent_session_link compact requires a canonical session_id.")
+        }
+        guard let rawKey = AgentMCPToolHelpers.normalizedString(args["idempotency_key"]) else {
+            throw MCPError.invalidParams(
+                "agent_session_link compact requires idempotency_key. Use a new key for a new "
+                    + "compaction request and reuse a key only to retry the same request."
+            )
+        }
+        let idempotencyKey = try Self.boundedIdempotencyKey(rawKey)
+        let target = try await authorize(
+            operation: .monitorCompact,
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        return try await Self.compactOutcomeValue(
+            bridge.compact(target: target, idempotencyKey: idempotencyKey),
+            targetSessionID: targetSessionID
+        )
+    }
+
+    private static func compactOutcomeValue(
+        _ outcome: AgentSessionLinkRuntimeBridge.SendOutcome,
+        targetSessionID: UUID
+    ) throws -> Value {
+        switch outcome {
+        case let .receipt(receipt):
+            return AgentSessionLinkResponseRenderer.compactReceiptValue(receipt)
+        case let .blocked(failure):
+            return AgentSessionLinkResponseRenderer.compactBlockedValue(
+                failure,
+                targetSessionID: targetSessionID
+            )
+        case .workflowUnavailable:
+            // A compaction names no workflow, so the bridge can never produce this.
+            throw MCPError.internalError("agent_session_link compact produced an unexpected workflow outcome.")
+        case let .rejected(rejection):
+            switch rejection {
+            case .denied:
+                throw Self.denialError(targetSessionID: targetSessionID)
+            case .shuttingDown:
+                throw MCPError.internalError("RepoPrompt is shutting down.")
+            case .idempotencyConflict, .sendAlreadyInProgress, .deliveryLedgerFull,
+                 .deliveryLedgerExhausted:
+                return AgentSessionLinkResponseRenderer.compactRejectedValue(
+                    rejection,
+                    targetSessionID: targetSessionID
+                )
+            }
         }
     }
 
@@ -1411,6 +1584,9 @@ struct AgentSessionLinkMCPToolService {
         "delivery", "replace_pending"
     ]
     static let cancelPendingSendKeys: Set<String> = ["op", "session_id", "idempotency_key"]
+    /// Deliberately no text field: the provider command is fixed by RepoPrompt, so there is nothing
+    /// a caller could phrase, and no `session_ids`, queue, or workflow form either.
+    static let compactKeys: Set<String> = ["op", "session_id", "idempotency_key"]
     static let setWaitingOnKeys: Set<String> = ["op", "summary", "clear"]
     /// `clear` is shared with `set_waiting_on` and `duration_seconds` belongs to nothing else: the two
     /// are mutually exclusive, which this schema shape cannot express and the service enforces.
@@ -1424,6 +1600,11 @@ struct AgentSessionLinkMCPToolService {
     /// Deliberately no workflow, delivery mode, or queue flag: a steer is one instruction delivered
     /// now, into whatever the target is doing, under its own current settings.
     static let steerKeys: Set<String> = ["op", "session_id", "message", "idempotency_key"]
+    static let createLaneKeys: Set<String> = [
+        "op", "idempotency_key", "role", "session_name", "workspace", "message",
+        "workflow_id", "workflow_name"
+    ]
+    static let retireLaneKeys: Set<String> = ["op", "session_id"]
     static let stopKeys: Set<String> = ["op", "session_id", "idempotency_key"]
     // The caller still comes only from server-owned run routing. `observer_session_id` is a selector
     // over that caller's exact inbound grants, never a caller identity or an authority claim.
@@ -1899,18 +2080,124 @@ enum AgentSessionLinkResponseRenderer {
         ])
     }
 
+    /// Stable compaction receipt, identical for a duplicate retry except for `duplicate: true`.
+    ///
+    /// `accepted` only when the compaction run started (`delivery_state: run_started`); even then it
+    /// means started, never finished, and a provider refusal after that point surfaces as the run
+    /// failing. A request row recorded in the target whose
+    /// command was then withheld or failed to start reports `not_started`: nothing reached the
+    /// provider, and because the receipt is retained under the key, requesting again needs a new key.
+    static func compactReceiptValue(_ receipt: DomainAgentSessionLinkSendReceipt) -> Value {
+        let started = receipt.deliveryState == .runStarted
+        var detail = started
+            ? "The compaction run was started, not confirmed. Observe the session with poll and wait: "
+            + "a finished compaction leaves it idle, and its context count is unreliable until "
+            + "its next ordinary turn reports usage."
+            : "The request was recorded in the overseen session, but RepoPrompt did not confirm that "
+            + "a compaction started. Read the session before requesting again; a new request "
+            + "needs a new idempotency_key."
+        if started, receipt.compactionRunsInBackground {
+            detail += " This provider may keep compacting in the background after its turn ends, "
+                + "where a new prompt can get the compaction cancelled. If that turn ends with no output, "
+                + "RepoPrompt holds sends, compactions, and automatic wakes to the session for up to 90 s "
+                + "(poll lists send_blockers: background_compaction_settling); wait with "
+                + "until: \"sendable\" instead of retrying."
+        }
+        return .object([
+            "result": .string(started ? "accepted" : "not_started"),
+            "accepted": .bool(started),
+            "session_id": .string(receipt.targetSessionID.uuidString),
+            "target_item_id": .string(receipt.targetItemID),
+            "accepted_at": .string(AgentMCPToolHelpers.timestamp(receipt.acceptedAt)),
+            "delivery_state": .string(receipt.deliveryState.rawValue),
+            "resulting_run_state": .string(receipt.resultingRunState),
+            "duplicate": .bool(receipt.duplicate),
+            // A same-key retry can only replay this retained receipt, so it is never a retry signal.
+            "retryable": .bool(false),
+            "detail": .string(detail)
+        ])
+    }
+
+    /// The compaction transaction ran and refused before recording anything, or could not prove
+    /// what it recorded.
+    static func compactBlockedValue(
+        _ failure: AgentSessionLinkSendFailure,
+        targetSessionID: UUID
+    ) -> Value {
+        var payload: [String: Value] = [
+            "result": .string(failure.wireResult),
+            "session_id": .string(targetSessionID.uuidString),
+            "accepted": .bool(false),
+            "retryable": .bool(failure.isRetryable),
+            "detail": .string(compactFailureDetail(failure))
+        ]
+        if let subreason = failure.subreason { payload["subreason"] = .string(subreason) }
+        if failure.isDeliveryIndeterminate {
+            payload["accepted_unknown"] = .bool(true)
+        }
+        return .object(payload)
+    }
+
+    private static func compactFailureDetail(_ failure: AgentSessionLinkSendFailure) -> String {
+        switch failure {
+        case .linkRevoked:
+            "Oversight of this session ended before the compaction was authorized. Nothing was requested."
+        case .persistenceFailed:
+            "The compaction request could not be durably recorded in the overseen session, so nothing "
+                + "was started."
+        case .persistenceIndeterminate:
+            "The overseen session could not be saved and the rollback could not be confirmed, so it is "
+                + "unknown whether the request was recorded. No compaction was started and this "
+                + "idempotency_key is spent. Read the session before requesting again."
+        case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
+             .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
+             .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
+             .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
+             .endpointPostWindow, .endpointPostReadiness,
+             .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
+             .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy, .targetStopped,
+             .steerUnavailable, .steerNotAccepted, .steerUnconfirmed:
+            failure.message
+        }
+    }
+
+    /// The ledger refused a compaction before the target was touched.
+    static func compactRejectedValue(
+        _ rejection: AgentSessionLinkRuntimeBridge.SendRejection,
+        targetSessionID: UUID
+    ) -> Value {
+        let result = rejection == .sendAlreadyInProgress ? "compaction_in_progress" : rejection.rawValue
+        let detail = switch rejection {
+        case .idempotencyConflict:
+            "That idempotency_key was already used for a different request. Nothing was requested. "
+                + "Use a new key for a new compaction."
+        case .sendAlreadyInProgress:
+            "A compaction with that idempotency_key is still settling. Poll the target before retrying."
+        case .deliveryLedgerFull, .deliveryLedgerExhausted, .shuttingDown, .denied:
+            sendRejectionDetail(rejection)
+        }
+        return .object([
+            "result": .string(result),
+            "session_id": .string(targetSessionID.uuidString),
+            "accepted": .bool(false),
+            "retryable": .bool(isSendRejectionRetryable(rejection)),
+            "detail": .string(detail)
+        ])
+    }
+
     /// The transaction ran and refused. Nothing was appended, persisted, or dispatched.
     static func sendBlockedValue(
         _ failure: AgentSessionLinkSendFailure,
         targetSessionID: UUID
     ) -> Value {
         var payload: [String: Value] = [
-            "result": .string(failure.rawValue),
+            "result": .string(failure.wireResult),
             "session_id": .string(targetSessionID.uuidString),
             "delivered": .bool(false),
             "retryable": .bool(failure.isRetryable),
             "detail": .string(failure.message)
         ]
+        if let subreason = failure.subreason { payload["subreason"] = .string(subreason) }
         if failure.isDeliveryIndeterminate {
             // `delivered` stays the conservative `false` — no receipt exists — while this flag
             // carries the fact the observer must act on: the row may nonetheless be on disk, so it
@@ -2009,6 +2296,21 @@ enum AgentSessionLinkResponseRenderer {
                 }
                 return entry
             })
+        }
+        return .object(payload)
+    }
+
+    /// Names the requested targets a multi-target wait dropped because their own lease or endpoint
+    /// stopped holding while parked. Their rows, cursors, and prompts are withheld; every ID here
+    /// was supplied and authorized by this caller at admission.
+    static func addUnavailableWaitTargets(_ sessionIDs: [UUID], to value: Value) -> Value {
+        guard !sessionIDs.isEmpty, case var .object(payload) = value else { return value }
+        payload["unavailable_session_ids"] = .array(sessionIDs.map { .string($0.uuidString) })
+        if payload["detail"] == nil {
+            payload["detail"] = .string(
+                "Oversight of \(sessionIDs.map(\.uuidString).joined(separator: ", ")) is no longer available; "
+                    + "its row and cursor were withheld. Refresh `list` for any remaining grants and capabilities."
+            )
         }
         return .object(payload)
     }

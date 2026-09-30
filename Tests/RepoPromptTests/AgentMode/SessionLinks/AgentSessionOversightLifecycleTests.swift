@@ -102,6 +102,15 @@ final class AgentSessionOversightLifecycleTests: XCTestCase {
         ) async -> AgentSessionLinkSendTransactionOutcome {
             .blocked(.shuttingDown)
         }
+
+        func agentSessionLinkPerformCompact(
+            to _: AgentSessionLinkEndpointCandidate,
+            request _: AgentSessionLinkCompactRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkSendTransactionOutcome {
+            .blocked(.endpointInvalidated)
+        }
     }
 
     // MARK: - Fixture

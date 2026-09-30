@@ -517,6 +517,33 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
 
     // MARK: - Observer-scoped inventory
 
+    func testCreationDirectLinkRejectionNamesEitherDirectionRequirement() async throws {
+        let authority = makeAuthority()
+        let creator = makeEndpoint()
+        let inboundObserver = makeEndpoint(windowID: 2)
+        let newTarget = makeEndpoint(windowID: 3)
+        let noLink = await authority.reserveLink(
+            observer: creator, target: newTarget, requiresExistingDirectLink: true
+        )
+        XCTAssertEqual(noLink, .rejected(.observerHasNoActiveLink))
+        let inbound = try await activateLink(authority, observer: inboundObserver, target: creator)
+        let admitted = await authority.reserveLink(
+            observer: creator, target: newTarget, requiresExistingDirectLink: true
+        )
+        guard case let .reserved(pending, _) = admitted else {
+            return XCTFail("an inbound link should qualify: \(admitted)")
+        }
+        _ = await authority.revoke(
+            linkID: inbound.id, generation: inbound.generation, reason: .userRequested
+        )
+        let activation = await authority.activateLink(
+            reservation: pending,
+            initialSnapshot: makeSnapshot(sessionID: newTarget.sessionID),
+            sourcePublicationSequence: 1
+        )
+        XCTAssertEqual(activation, .rejected(.observerHasNoActiveLink))
+    }
+
     func testInventoryAuthorizationIsObserverScopedAndEndsWithTheLastLink() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()
@@ -529,6 +556,11 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         let inventory = try await authority.authorizeInventory(observerEndpoint: observer).get()
         XCTAssertEqual(inventory.items.map(\.targetSessionID), [target.sessionID])
         XCTAssertEqual(inventory.linkSetRevision, 1)
+        let createIsNotInventory = await authority.authorizeInventory(
+            operation: .monitorCreateLane,
+            observerEndpoint: observer
+        )
+        XCTAssertEqual(createIsNotInventory.failureError, .invalidRequest)
 
         // The target is not an observer, so it cannot list anything.
         let reversed = await authority.authorizeInventory(observerEndpoint: target)

@@ -702,6 +702,7 @@ final class AgentSessionLinkCodexCatalogRepairTests: XCTestCase {
             ),
             projectionRevision: revision,
             hasAgentSessionLink: hasAgentSessionLink,
+            hasAnyActiveLink: hasActiveOutboundLink,
             hasActiveOutboundLink: hasActiveOutboundLink
         )
         fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)

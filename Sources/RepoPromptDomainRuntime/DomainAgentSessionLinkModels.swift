@@ -219,7 +219,7 @@ package struct DomainAgentSessionContextLoad: Hashable, Sendable {
 }
 
 /// Derived target state for passive oversight. Blocker names are internal and opaque on the wire;
-/// only an empty versus non-empty list is contractual. Counts are zero until the census is wired.
+/// only an empty versus non-empty list is contractual. Counts come from the target view model's child census.
 package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
     package enum RunOutcome: String, Hashable, Sendable {
         case none
@@ -560,6 +560,8 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
     /// authority rechecks the predicate at activation, in the same actor turn that would insert the
     /// new grant, so revoking the previous final link cannot race this precondition.
     package let requiresExistingOutboundLink: Bool
+    /// Lane creation must still have an exact direct relationship when this grant activates.
+    package let requiresExistingDirectLink: Bool
     /// Advisory hint that this reservation is currently expected to install target observation.
     ///
     /// This is **not** authoritative. A reservation elected here can still be abandoned or
@@ -579,6 +581,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         target: DomainAgentSessionLinkEndpointIdentity,
         capabilities: Set<DomainAgentSessionLinkCapability>,
         requiresExistingOutboundLink: Bool,
+        requiresExistingDirectLink: Bool = false,
         provisionallyInstallsTargetObservation: Bool,
         reservedAtAuthorityRevision: UInt64
     ) {
@@ -588,6 +591,7 @@ package struct DomainAgentSessionLinkPendingReservation: Hashable, Sendable {
         self.target = target
         self.capabilities = capabilities
         self.requiresExistingOutboundLink = requiresExistingOutboundLink
+        self.requiresExistingDirectLink = requiresExistingDirectLink
         self.provisionallyInstallsTargetObservation = provisionallyInstallsTargetObservation
         self.reservedAtAuthorityRevision = reservedAtAuthorityRevision
     }
@@ -645,6 +649,7 @@ package enum DomainAgentSessionLinkReservationRejection: String, Equatable, Send
     case targetBindingUnresolved = "target_binding_unresolved"
     case reservationAlreadyPending = "reservation_already_pending"
     case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
+    case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
 package enum DomainAgentSessionLinkActivationDisposition: Equatable, Sendable {
@@ -668,6 +673,7 @@ package enum DomainAgentSessionLinkActivationRejection: String, Equatable, Senda
     case endpointDrift = "endpoint_drift"
     case snapshotSessionMismatch = "snapshot_session_mismatch"
     case observerHasNoActiveOutboundLink = "observer_has_no_active_outbound_link"
+    case observerHasNoActiveLink = "observer_has_no_active_link"
 }
 
 package enum DomainAgentSessionLinkRevocationDisposition: Equatable, Sendable {
@@ -903,6 +909,9 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
     package let resultingRunState: String
     /// Set by the authority when an identical key/digest pair replays a stored outcome.
     package let duplicate: Bool
+    /// Compaction only: the command went out on a provider path that may keep compacting in the
+    /// background after its prompt turn completes, so an early next turn can cancel it.
+    package let compactionRunsInBackground: Bool
 
     package init(
         targetSessionID: UUID,
@@ -910,7 +919,8 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
         acceptedAt: Date,
         deliveryState: DomainAgentSessionLinkDeliveryState,
         resultingRunState: String,
-        duplicate: Bool = false
+        duplicate: Bool = false,
+        compactionRunsInBackground: Bool = false
     ) {
         self.targetSessionID = targetSessionID
         self.targetItemID = targetItemID
@@ -918,6 +928,7 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
         self.deliveryState = deliveryState
         self.resultingRunState = resultingRunState
         self.duplicate = duplicate
+        self.compactionRunsInBackground = compactionRunsInBackground
     }
 
     package func markedDuplicate() -> DomainAgentSessionLinkSendReceipt {
@@ -927,7 +938,8 @@ package struct DomainAgentSessionLinkSendReceipt: Hashable, Sendable {
             acceptedAt: acceptedAt,
             deliveryState: deliveryState,
             resultingRunState: resultingRunState,
-            duplicate: true
+            duplicate: true,
+            compactionRunsInBackground: compactionRunsInBackground
         )
     }
 }

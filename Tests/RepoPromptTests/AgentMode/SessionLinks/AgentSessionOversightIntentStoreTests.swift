@@ -136,6 +136,20 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
 
     // MARK: - Load
 
+    func testVersionOneDocumentLoadsWithoutMigrationOrRewriting() async throws {
+        let existing = pair()
+        let encoded = try JSONEncoder().encode(AgentSessionOversightIntentDocument(version: 1, links: [existing]))
+        try encoded.write(to: fileURL, options: .atomic)
+
+        guard case let .ready(load) = await makeStore().loadForLaunch() else {
+            return XCTFail("Expected a v1 document to load")
+        }
+        XCTAssertEqual(AgentSessionOversightIntentDocument.currentVersion, 1)
+        XCTAssertEqual(load.source, .loaded)
+        XCTAssertEqual(load.pairs, [existing])
+        XCTAssertEqual(try Data(contentsOf: fileURL), encoded, "Loading v1 must not migrate or rewrite it")
+    }
+
     func testLoadDeduplicatesAndDropsSelfPairsWithoutRewritingTheFile() async throws {
         let observer = UUID()
         let target = UUID()

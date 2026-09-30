@@ -4,6 +4,10 @@ import Foundation
 struct AgentRunStopState {
     private(set) var cancellationGeneration = UUID()
     private(set) var cancellationCount: UInt64 = 0
+    /// Advanced only by an explicit user or managed Stop. Queued cross-session deliveries key
+    /// on this, so internal lifecycle cancellations (location change, instruction timeout,
+    /// runtime shutdown) never withdraw an overseer's queued message as stopped.
+    private(set) var explicitStopGeneration = UUID()
     private(set) var activeManagedStopID: UUID?
     private(set) var activeManagedStopBinding: AgentPersistentSessionBindingIdentity?
     private(set) var managedStopCleanupClaimed = false
@@ -13,6 +17,10 @@ struct AgentRunStopState {
     mutating func invalidateScheduledStarts() {
         cancellationGeneration = UUID()
         cancellationCount &+= 1
+    }
+
+    mutating func invalidateQueuedDeliveries() {
+        explicitStopGeneration = UUID()
     }
 
     mutating func claimManagedStop(id: UUID, binding: AgentPersistentSessionBindingIdentity) -> Bool {
@@ -86,24 +94,29 @@ struct AgentRunStartStopFence: Equatable {
     let binding: AgentPersistentSessionBindingIdentity?
     let cancellationGeneration: UUID
     let cancellationCount: UInt64
+    let explicitStopGeneration: UUID
 
     @MainActor
     init(session: AgentTabSession) {
         binding = session.persistentSessionBindingIdentity
         cancellationGeneration = session.stopState.cancellationGeneration
         cancellationCount = session.stopState.cancellationCount
-    }
-
-    private init(binding: AgentPersistentSessionBindingIdentity?, cancellationGeneration: UUID, cancellationCount: UInt64) {
-        self.binding = binding
-        self.cancellationGeneration = cancellationGeneration
-        self.cancellationCount = cancellationCount
+        explicitStopGeneration = session.stopState.explicitStopGeneration
     }
 
     @MainActor
     func permitsStart(of session: AgentTabSession) -> Bool {
         binding == session.persistentSessionBindingIdentity
             && cancellationGeneration == session.stopState.cancellationGeneration
+            && !session.stopState.isStopping(binding: binding)
+    }
+
+    /// A queued inbound send survives internal lifecycle cancellations; only an explicit
+    /// Stop (or a rebind or in-flight managed Stop) withdraws it.
+    @MainActor
+    func permitsQueuedDelivery(to session: AgentTabSession) -> Bool {
+        binding == session.persistentSessionBindingIdentity
+            && explicitStopGeneration == session.stopState.explicitStopGeneration
             && !session.stopState.isStopping(binding: binding)
     }
 }

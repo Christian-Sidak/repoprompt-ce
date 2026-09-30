@@ -13,6 +13,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
     func testEachOperationDeclaresExactlyItsDocumentedFields() {
         XCTAssertEqual(AgentSessionLinkMCPToolService.listKeys, ["op", "cursor", "max_items"])
+        XCTAssertEqual(AgentSessionLinkMCPToolService.createLaneKeys, [
+            "op", "idempotency_key", "role", "session_name", "workspace", "message",
+            "workflow_id", "workflow_name"
+        ])
+        XCTAssertEqual(AgentSessionLinkMCPToolService.retireLaneKeys, ["op", "session_id"])
         XCTAssertEqual(AgentSessionLinkMCPToolService.pollKeys, ["op", "session_id", "session_ids"])
         XCTAssertEqual(
             AgentSessionLinkMCPToolService.waitKeys,
@@ -436,6 +441,140 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(multiRow["snapshot"]?.objectValue?["context"], expected)
     }
 
+    // MARK: - compact
+
+    func testCompactAcceptsNoTextQueueOrMultiTargetFields() {
+        XCTAssertEqual(AgentSessionLinkMCPToolService.compactKeys, ["op", "session_id", "idempotency_key"])
+        for forbidden in ["message", "instructions", "session_ids", "delivery", "workflow_name"] {
+            XCTAssertFalse(AgentSessionLinkMCPToolService.compactKeys.contains(forbidden), forbidden)
+        }
+    }
+
+    func testCompactReceiptSaysAcceptedNeverCompleted() throws {
+        let receipt = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        )
+        let object = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(receipt).objectValue)
+        XCTAssertEqual(object["result"]?.stringValue, "accepted")
+        XCTAssertEqual(object["delivery_state"]?.stringValue, "run_started")
+        XCTAssertEqual(object["target_item_id"]?.stringValue, receipt.targetItemID)
+        XCTAssertEqual(object["duplicate"]?.boolValue, false)
+        XCTAssertNil(object["delivered"], "A compaction is not a delivered message")
+        XCTAssertEqual(object["accepted"]?.boolValue, true)
+        XCTAssertTrue(try XCTUnwrap(object["detail"]?.stringValue).contains("not confirmed"))
+
+        // A recorded request whose command never started must not read as accepted.
+        for state in [DomainAgentSessionLinkDeliveryState.persisted, .runStartFailed] {
+            let notStarted = DomainAgentSessionLinkSendReceipt(
+                targetSessionID: UUID(),
+                targetItemID: UUID().uuidString,
+                acceptedAt: Date(timeIntervalSince1970: 100),
+                deliveryState: state,
+                resultingRunState: "idle"
+            )
+            let rendered = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(notStarted).objectValue)
+            XCTAssertEqual(rendered["result"]?.stringValue, "not_started", "\(state)")
+            XCTAssertEqual(rendered["accepted"]?.boolValue, false, "\(state)")
+            XCTAssertTrue(try XCTUnwrap(rendered["detail"]?.stringValue).contains("new idempotency_key"))
+            XCTAssertEqual(rendered["retryable"]?.boolValue, false, "A same-key retry only replays this receipt")
+        }
+    }
+
+    /// ACP providers can treat `/compact` as fire-and-forget (Devin does): the prompt turn ends
+    /// instantly while the compaction keeps running in the background, where the session's next
+    /// prompt cancels it. A started ACP compaction must warn the overseer; other paths and
+    /// non-started receipts must not.
+    func testAStartedBackgroundCompactionReceiptWarnsAgainstAnEarlyNextSend() throws {
+        let background = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running",
+            compactionRunsInBackground: true
+        )
+        let warned = try XCTUnwrap(AgentSessionLinkResponseRenderer.compactReceiptValue(background).objectValue)
+        let detail = try XCTUnwrap(warned["detail"]?.stringValue)
+        XCTAssertTrue(detail.contains("background"))
+        XCTAssertTrue(detail.contains("cancelled"), "The warning names the consequence")
+        XCTAssertTrue(
+            detail.contains("background_compaction_settling"),
+            "The receipt names the enforced hold poll reports, not just a caution"
+        )
+
+        let inTurn = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .runStarted,
+            resultingRunState: "running"
+        )
+        let inTurnObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactReceiptValue(inTurn).objectValue
+        )
+        let inTurnDetail = try XCTUnwrap(inTurnObject["detail"]?.stringValue)
+        XCTAssertFalse(
+            inTurnDetail.contains("background"),
+            "Codex/Claude compactions run in the turn; the warning would be wrong there"
+        )
+
+        let withheld = DomainAgentSessionLinkSendReceipt(
+            targetSessionID: UUID(),
+            targetItemID: UUID().uuidString,
+            acceptedAt: Date(timeIntervalSince1970: 100),
+            deliveryState: .persisted,
+            resultingRunState: "idle",
+            compactionRunsInBackground: true
+        )
+        let withheldObject = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactReceiptValue(withheld).objectValue
+        )
+        let withheldDetail = try XCTUnwrap(withheldObject["detail"]?.stringValue)
+        XCTAssertFalse(
+            withheldDetail.contains("background"),
+            "Nothing started, so nothing can still be running"
+        )
+    }
+
+    func testCompactRefusalsUseTheSharedReadinessVocabularyAndHonestSupportResults() throws {
+        let sessionID = UUID()
+        for (failure, retryable) in [
+            (AgentSessionLinkSendFailure.targetNotIdle, true),
+            (.notSupported, false),
+            (.noProviderSession, true),
+            (.persistenceIndeterminate, false)
+        ] {
+            let object = try XCTUnwrap(
+                AgentSessionLinkResponseRenderer.compactBlockedValue(failure, targetSessionID: sessionID).objectValue
+            )
+            XCTAssertEqual(object["result"]?.stringValue, failure.rawValue)
+            XCTAssertEqual(object["accepted"]?.boolValue, false)
+            XCTAssertEqual(object["retryable"]?.boolValue, retryable, failure.rawValue)
+        }
+        XCTAssertEqual(AgentSessionLinkSendFailure.notSupported.rawValue, "not_supported")
+        XCTAssertEqual(AgentSessionLinkSendFailure.noProviderSession.rawValue, "no_provider_session")
+        let noSession = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactBlockedValue(.noProviderSession, targetSessionID: sessionID)
+                .objectValue
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(noSession["detail"]?.stringValue)
+                .contains("run one turn"),
+            "A retryable no_provider_session tells the overseer how to make the session live"
+        )
+
+        let inProgress = try XCTUnwrap(
+            AgentSessionLinkResponseRenderer.compactRejectedValue(.sendAlreadyInProgress, targetSessionID: sessionID)
+                .objectValue
+        )
+        XCTAssertEqual(inProgress["result"]?.stringValue, "compaction_in_progress")
+        XCTAssertEqual(inProgress["retryable"]?.boolValue, true)
+    }
+
     // MARK: - stop
 
     func testStopRoutedServiceRequiresOneKeyAndRejectsEveryExtra() async throws {
@@ -595,6 +734,217 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertTrue("\(a)".contains("No active session link"))
         XCTAssertTrue("\(a)".contains("refresh `list` once"))
         XCTAssertTrue("\(AgentSessionLinkMCPToolService.unavailableError)".contains("not available for this session"))
+    }
+
+    func testLaneOperationsRejectUnknownKeysAndWorkflowWithoutMessage() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-1"),
+                "session_id": .string(fixture.target.sessionID.uuidString)
+            ])
+            XCTFail("Expected create_lane to reject a target override")
+        } catch {
+            XCTAssertTrue("\(error)".contains("does not support 'session_id'"))
+        }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("retire_lane"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "message": .string("override")
+            ])
+            XCTFail("Expected retire_lane to reject a message")
+        } catch {
+            XCTAssertTrue("\(error)".contains("does not support 'message'"))
+        }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-2"),
+                "workflow_name": .string("Review")
+            ])
+            XCTFail("Expected workflow without message to fail")
+        } catch {
+            XCTAssertTrue("\(error)".contains("workflow requires message"))
+        }
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-bad-role"),
+                "role": .string("unsupported")
+            ])
+            XCTFail("Expected an unknown role to fail")
+        } catch {
+            let message = "\(error)"
+            XCTAssertTrue(message.contains("role must be one of"))
+            for role in AgentModelCatalog.TaskLabelKind.allCases {
+                XCTAssertTrue(message.contains(role.rawValue))
+            }
+        }
+        let list = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
+        XCTAssertEqual(list["items"]?.arrayValue?.first?.objectValue?["created_by_you"], .bool(false))
+        fixture.host.laneCreatorByEndpoint[fixture.target.domainEndpoint] = fixture.observer.sessionID
+        let creatorList = try await Self.executeObject(fixture.service, args: ["op": .string("list")])
+        XCTAssertEqual(creatorList["items"]?.arrayValue?.first?.objectValue?["created_by_you"], .bool(true))
+        let maybeReference = await fixture.linkReference()
+        let reference = try XCTUnwrap(maybeReference)
+        await fixture.bridge.revokeLink(linkID: reference.linkID, generation: reference.generation)
+        do {
+            _ = try await fixture.service.execute(args: [
+                "op": .string("create_lane"),
+                "idempotency_key": .string("lane-3"),
+                "workspace": .string("not-a-workspace")
+            ])
+            XCTFail("Expected an unlinked caller to be denied before workspace resolution")
+        } catch {
+            XCTAssertTrue("\(error)".contains("not available for this session"))
+        }
+    }
+
+    func testCreateLaneServiceReplaysReceiptAndRejectsConflictingDigest() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lane-service-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        fixture.bridge.installIntentStore(AgentSessionOversightIntentStore(
+            fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
+            backupsDirectoryURL: directory.appendingPathComponent("Backups", isDirectory: true),
+            mode: .enabled
+        ))
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let args: [String: Value] = [
+            "op": .string("create_lane"),
+            "idempotency_key": .string("service-replay-1"),
+            "session_name": .string("Service lane"),
+            "workspace": .string(workspace.name)
+        ]
+
+        let first = try await Self.executeObject(fixture.service, args: args)
+        let workspaceIndex = try XCTUnwrap(fixture.window.workspaceManager.workspaces.firstIndex {
+            $0.id == workspace.id
+        })
+        fixture.window.workspaceManager.workspaces[workspaceIndex].name = "Renamed after creation"
+        let replay = try await Self.executeObject(fixture.service, args: args)
+        XCTAssertEqual(first["result"], .string("created"))
+        XCTAssertEqual(replay["session_id"], first["session_id"])
+        XCTAssertEqual(replay["duplicate"], .bool(true))
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+
+        var conflictArgs = args
+        conflictArgs["session_name"] = .string("Different lane")
+        let conflict = try await Self.executeObject(fixture.service, args: conflictArgs)
+        XCTAssertEqual(conflict["result"], .string("idempotency_conflict"))
+        XCTAssertEqual(fixture.host.laneCreationCount, 1)
+    }
+
+    func testLaneDestinationResolvesNameAndIDAndPrefersCallerOnMultiMatch() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let byName = AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: workspace.name.uppercased(), callerWindow: fixture.window
+        )
+        let byID = AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: workspace.id.uuidString, callerWindow: fixture.window
+        )
+        XCTAssertEqual(byName?.windowID, fixture.window.windowID)
+        XCTAssertEqual(byName?.workspaceID, workspace.id)
+        XCTAssertEqual(byID?.windowID, fixture.window.windowID)
+        XCTAssertNil(AgentSessionLaneMCPToolService.resolveDestination(
+            workspaceSelector: UUID().uuidString, callerWindow: fixture.window
+        ))
+        let candidates = [
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 4, workspaceID: workspace.id, workspaceName: workspace.name
+            ),
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 2, workspaceID: workspace.id, workspaceName: workspace.name
+            ),
+            AgentSessionLaneMCPToolService.Destination(
+                windowID: 8, workspaceID: UUID(), workspaceName: "Other"
+            )
+        ]
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: workspace.id.uuidString, callerWindowID: 4
+        )?.windowID, 4)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: workspace.name, callerWindowID: 8
+        )?.windowID, 2)
+        let ambiguousName = candidates + [AgentSessionLaneMCPToolService.Destination(
+            windowID: 9, workspaceID: UUID(), workspaceName: workspace.name
+        )]
+        XCTAssertNil(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: ambiguousName, workspaceSelector: workspace.name, callerWindowID: 4
+        ))
+        let uuidShapedName = UUID()
+        XCTAssertNil(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: [AgentSessionLaneMCPToolService.Destination(
+                windowID: 10, workspaceID: UUID(), workspaceName: uuidShapedName.uuidString
+            )], workspaceSelector: uuidShapedName.uuidString, callerWindowID: 10
+        ))
+    }
+
+    func testLaneWorkspaceDigestUsesExactlyDestinationNameEquivalence() {
+        let plain = AgentSessionLaneMCPToolService.Destination(
+            windowID: 1, workspaceID: UUID(), workspaceName: "Cafe"
+        )
+        let accented = AgentSessionLaneMCPToolService.Destination(
+            windowID: 2, workspaceID: UUID(), workspaceName: "Café"
+        )
+        let candidates = [plain, accented]
+        func request(_ selector: String) -> AgentSessionLaneCreateRequest {
+            AgentSessionLaneCreateRequest(
+                idempotencyKey: "same-key", role: "pair", sessionName: nil,
+                workspaceSelector: selector, message: nil, workflowReference: nil
+            )
+        }
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: "CAFE", callerWindowID: 2
+        )?.workspaceID, plain.workspaceID)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: "Café", callerWindowID: 1
+        )?.workspaceID, accented.workspaceID)
+        XCTAssertEqual(request("Cafe").digest, request("CAFE").digest)
+        let decomposed = "Cafe\u{301}"
+        XCTAssertEqual(request("Café").digest, request(decomposed).digest)
+        XCTAssertEqual(AgentSessionLaneMCPToolService.selectDestination(
+            candidates: candidates, workspaceSelector: decomposed, callerWindowID: 1
+        )?.workspaceID, accented.workspaceID)
+        XCTAssertNotEqual(request("Cafe").digest, request("Café").digest)
+    }
+
+    func testIncompleteLaneReceiptPointsToOrdinaryAddWithoutReallocating() {
+        let sessionID = UUID()
+        let receipt = AgentSessionLaneCreateReceipt(
+            result: .creationIncomplete, sessionID: sessionID, sessionName: "Retained lane",
+            linked: false, reason: .addFailed, firstTask: .none, laneCount: 1
+        )
+        let rendered = AgentSessionLaneMCPToolService.render(receipt).objectValue
+        XCTAssertEqual(rendered?["session_id"]?.stringValue, sessionID.uuidString)
+        XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains("ordinary add") == true)
+        XCTAssertTrue(rendered?["recovery_hint"]?.stringValue?.contains(sessionID.uuidString) == true)
+    }
+
+    func testLaneRefusalsExposeOnlyShortFailureSubreasons() {
+        let sessionID = UUID()
+        var receipt = AgentSessionLaneCreateReceipt(
+            result: .created, sessionID: sessionID, sessionName: "Lane",
+            linked: true, reason: nil, firstTask: .failed, laneCount: 1
+        )
+        receipt.firstTaskReason = "claim"
+        let created = AgentSessionLaneMCPToolService.render(receipt).objectValue
+        XCTAssertEqual(created?["first_task"], .string("failed"))
+        XCTAssertEqual(created?["first_task_subreason"], .string("claim"))
+
+        let retired = AgentSessionLaneMCPToolService.render(
+            .notRetired(sessionID: sessionID, reason: .laneInUsePending)
+        ).objectValue
+        XCTAssertEqual(retired?["reason"], .string("lane_in_use"))
+        XCTAssertEqual(retired?["subreason"], .string("pending"))
     }
 
     /// The missing-op and unsupported-op errors teach the same operation list the schema advertises.
@@ -802,7 +1152,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         )
     }
 
-    func testRequestAttentionFailsClosedWithoutAnObserverReducerAndListDenialIsOutboundSpecific() async throws {
+    func testRequestAttentionReconcilesMissingObserverBaselineWithoutGrantingOutboundAuthority() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         let targetService = fixture.routedService(from: fixture.target.domainEndpoint)
@@ -817,12 +1167,17 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             )
         }
 
+        let inverse = await fixture.authority.authorizeRequestAttention(
+            requesterEndpoint: fixture.target.domainEndpoint,
+            liveEndpoints: [fixture.observer.domainEndpoint, fixture.target.domainEndpoint]
+        )
+        let expectedReference = try inverse.get().reference
         let bridgeWithoutReducer = AgentSessionLinkRuntimeBridge(
             authority: fixture.authority,
             host: fixture.host,
             toolAdvertisementInvalidator: { _ in }
         )
-        let failClosedService = AgentSessionLinkMCPToolService(
+        let recoveringService = AgentSessionLinkMCPToolService(
             toolName: MCPWindowToolName.agentSessionLink,
             captureRequestMetadata: {
                 MCPServerViewModel.RequestMetadata(
@@ -836,14 +1191,20 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             withHeartbeat: { _, _, _, _, operation in try await operation() },
             bridge: bridgeWithoutReducer
         )
+        let recovered: Value
         do {
-            _ = try await failClosedService.execute(args: [
+            recovered = try await recoveringService.execute(args: [
                 "op": .string("request_attention")
             ])
-            XCTFail("a live inverse grant without a baselined observer reducer must fail closed")
-        } catch let error as MCPError {
-            XCTAssertEqual("\(error)", "\(AgentSessionLinkMCPToolService.requestAttentionDeniedError)")
+        } catch {
+            return XCTFail("an exact live inverse grant should reconcile its baseline: \(error)")
         }
+        XCTAssertEqual(recovered.objectValue?["result"], .string("accepted"))
+        let attention = try XCTUnwrap(fixture.host.publishedPassiveNotices[fixture.observer.domainEndpoint])
+        XCTAssertEqual(attention.attentionRequests.map(\.targetSessionID), [fixture.target.sessionID])
+        XCTAssertEqual(attention.attentionRequests.first?.reference, expectedReference)
+        let reverseGrant = await fixture.authority.hasActiveOutboundLink(observerEndpoint: fixture.target.domainEndpoint)
+        XCTAssertFalse(reverseGrant, "reconciliation must not manufacture reverse authority")
 
         do {
             _ = try await targetService.execute(args: [
@@ -1182,6 +1543,33 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertTrue(AgentSessionLinkMCPToolService.steerKeys.isDisjoint(with: [
             "workflow_id", "workflow_name", "delivery", "replace_pending", "session_ids", "model_id"
         ]))
+    }
+
+    func testIdleManagedPollReportsTheGrantWithoutAPendingInteraction() async throws {
+        let managed = try await makeReadReleaseFixture()
+        defer { managed.tearDown() }
+        managed.host.pendingInteractionInspection = .none
+        let managedPoll = try await Self.executeObject(managed.service, args: [
+            "op": .string("poll"), "session_id": .string(managed.target.sessionID.uuidString)
+        ])
+        let snapshot = try XCTUnwrap(managedPoll["snapshot"]?.objectValue)
+        XCTAssertEqual(snapshot["status"], .string("idle"))
+        XCTAssertEqual(snapshot["idle_for_send"], .bool(true))
+        XCTAssertEqual(snapshot["has_pending_interaction"], .bool(false))
+        // Management follows the grant, not whether its inspection contains a prompt.
+        XCTAssertEqual(managedPoll["managed"], .bool(true))
+        XCTAssertNil(managedPoll["pending_interaction"])
+        XCTAssertNil(managedPoll["respond_hint"])
+
+        let watchOnly = try await makeReadReleaseFixture(restricted: true)
+        defer { watchOnly.tearDown() }
+        watchOnly.host.pendingInteractionInspection = .none
+        let watchOnlyPoll = try await Self.executeObject(watchOnly.service, args: [
+            "op": .string("poll"), "session_id": .string(watchOnly.target.sessionID.uuidString)
+        ])
+        XCTAssertEqual(watchOnlyPoll["managed"], .bool(false))
+        XCTAssertNil(watchOnlyPoll["pending_interaction"])
+        XCTAssertNil(watchOnlyPoll["respond_hint"])
     }
 
     func testManagedLinkInspectsAnswersAndSteersAndReportsTheGrant() async throws {
@@ -1687,6 +2075,77 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(terminal["targets"]?.arrayValue?.count, 0)
     }
 
+    /// A sibling that stops holding after a non-terminal wake is dropped on its own: the healthy
+    /// sibling keeps its fresh row, cursor, and prompt instead of the whole wait being denied.
+    func testMultiTargetWaitDropsOnlyTheSiblingThatFailsTheObservationFence() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        let second = makeCandidate(windowID: 3, displayName: "Second")
+        fixture.host.candidates.append(second)
+        guard case .added = await fixture.bridge.addMonitorLink(
+            observerSessionID: fixture.observer.sessionID,
+            rawTargetSessionID: second.sessionID.uuidString
+        ) else { return XCTFail("expected second link") }
+        fixture.host.pendingInteractionInspection = Self.sampleInspection(manualOnly: nil)
+        let firstID = Value.string(fixture.target.sessionID.uuidString)
+        let secondID = Value.string(second.sessionID.uuidString)
+        // Deletion of the second target lands after the whole-batch authority hop, so the batch
+        // fence fails. Each target is then re-fenced on its own.
+        var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
+        fixture.bridge.test_afterManagedObservationAuthorityValidation = {
+            guard deletionAttempt == nil else { return }
+            deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(sessionID: second.sessionID)
+        }
+        defer {
+            fixture.bridge.test_afterManagedObservationAuthorityValidation = nil
+            if let deletionAttempt {
+                AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletionAttempt)
+            }
+        }
+
+        let result = try await Self.executeObject(fixture.service, args: [
+            "op": .string("wait"), "session_ids": .array([firstID, secondID]), "timeout_seconds": .int(0)
+        ])
+        XCTAssertNotNil(deletionAttempt, "the authority-hop test seam must run")
+        let rows = try XCTUnwrap(result["targets"]?.arrayValue)
+        XCTAssertEqual(rows.count, 1, "the failing sibling's row and cursor are withheld")
+        let survivor = try XCTUnwrap(rows.first?.objectValue)
+        XCTAssertEqual(survivor["session_id"], firstID)
+        XCTAssertNotNil(survivor["wait_cursor"]?.stringValue)
+        XCTAssertEqual(survivor["managed"], .bool(true))
+        XCTAssertNotNil(survivor["pending_interaction"], "the healthy sibling still sees its prompt")
+        XCTAssertEqual(result["unavailable_session_ids"], .array([secondID]))
+        XCTAssertTrue(result["detail"]?.stringValue?.contains("Refresh `list`") == true)
+    }
+
+    func testSingleTargetWaitStillDeniesWhenItsObservationFenceFails() async throws {
+        let fixture = try await makeReadReleaseFixture()
+        defer { fixture.tearDown() }
+        var deletionAttempt: AgentSessionDeletionRegistry.AttemptToken?
+        fixture.bridge.test_afterManagedObservationAuthorityValidation = {
+            guard deletionAttempt == nil else { return }
+            deletionAttempt = AgentSessionDeletionRegistry.shared.beginDurableDeletion(
+                sessionID: fixture.target.sessionID
+            )
+        }
+        defer {
+            fixture.bridge.test_afterManagedObservationAuthorityValidation = nil
+            if let deletionAttempt {
+                AgentSessionDeletionRegistry.shared.didFailDurableDeletion(deletionAttempt)
+            }
+        }
+        do {
+            _ = try await Self.executeObject(fixture.service, args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.target.sessionID.uuidString),
+                "timeout_seconds": .int(0)
+            ])
+            XCTFail("a single target that fails its fence must still deny")
+        } catch let error as MCPError {
+            XCTAssertTrue("\(error)".contains("No active session link"))
+        }
+    }
+
     func testManagedWaitCarriesPendingInteractionOutsideSnapshot() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
@@ -1709,8 +2168,8 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         for op in [
-            "list", "poll", "wait", "read", "send", "cancel_pending_send", "set_waiting_on",
-            "snooze_auto_wake", "request_attention", "respond"
+            "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact", "set_waiting_on",
+            "snooze_auto_wake", "request_attention", "respond", "steer", "stop", "create_lane", "retire_lane"
         ] {
             XCTAssertTrue(
                 AgentSessionLinkMCPToolService.supportedOperationsSentence.contains(op),
@@ -2142,6 +2601,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         XCTAssertEqual(busy["result"], .string("target_not_idle"))
         XCTAssertEqual(busy["delivered"], .bool(false))
         XCTAssertEqual(busy["retryable"], .bool(true))
+        XCTAssertNil(busy["subreason"])
+
+        let endpoint = AgentSessionLinkResponseRenderer.sendBlockedValue(
+            .endpointClaim, targetSessionID: sessionID
+        ).objectValue
+        XCTAssertEqual(endpoint?["result"], .string("endpoint_invalidated"))
+        XCTAssertEqual(endpoint?["subreason"], .string("claim"))
+        XCTAssertEqual(endpoint?["retryable"], .bool(false))
 
         guard case let .object(revoked) = AgentSessionLinkResponseRenderer.sendBlockedValue(
             .linkRevoked,
@@ -2206,6 +2673,48 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
 
         var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var laneCreatorByEndpoint: [DomainAgentSessionLinkEndpointIdentity: UUID] = [:]
+        private(set) var laneCreationCount = 0
+
+        func agentSessionLinkCreateLane(
+            destinationWindowID: Int,
+            workspaceID: UUID,
+            creatorSessionID: UUID,
+            sessionName: String?,
+            selection _: AgentSessionLanePolicy.RoleSelection
+        ) async throws -> AgentSessionLaneHostCreationOutcome {
+            laneCreationCount += 1
+            var lane = AgentSessionLinkEndpointCandidate(
+                windowID: destinationWindowID,
+                workspaceID: workspaceID,
+                tabID: UUID(),
+                sessionID: UUID(),
+                persistentBindingGeneration: UUID(),
+                bindingTransitionGeneration: 1,
+                isTopLevel: true,
+                hasLoadedPersistedState: true,
+                bindingTransitionInProgress: false,
+                isClosing: false,
+                isMCPControlled: false,
+                isMCPOriginated: false,
+                roleAllowsOutboundMonitoring: true,
+                displayName: sessionName ?? "Lane",
+                providerDisplayName: "Codex CLI",
+                locationLabel: "worktree/main"
+            )
+            let token = AgentSessionRestorationBindingToken(
+                bindingIdentity: AgentPersistentSessionBindingIdentity(
+                    tabID: lane.tabID, sessionID: lane.sessionID,
+                    generation: lane.persistentBindingGeneration!
+                ),
+                bindingTransitionGeneration: lane.bindingTransitionGeneration
+            )
+            lane.restorationReadiness = .authoritative(token, .freshBindingDurablyCreated)
+            candidates.append(lane)
+            laneCreatorByEndpoint[lane.domainEndpoint] = creatorSessionID
+            return .created(sessionID: lane.sessionID, tabID: lane.tabID, bindingToken: token)
+        }
+
         var transcriptPages: [UUID: AgentSessionLinkTranscriptPage] = [:]
         var waitingOn: DomainAgentSessionWaitingOn?
         var publishedPromptInventories:
@@ -2220,6 +2729,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 
         func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
             candidates
+        }
+
+        func agentSessionLinkLaneProvenance(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity
+        ) -> UUID? {
+            laneCreatorByEndpoint[endpoint]
         }
 
         func agentSessionLinkObservationSnapshot(

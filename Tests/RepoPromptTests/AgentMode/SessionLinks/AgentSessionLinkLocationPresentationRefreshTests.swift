@@ -128,6 +128,15 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
         ) async -> AgentSessionLinkSendTransactionOutcome {
             .blocked(.targetNotIdle)
         }
+
+        func agentSessionLinkPerformCompact(
+            to _: AgentSessionLinkEndpointCandidate,
+            request _: AgentSessionLinkCompactRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkSendTransactionOutcome {
+            .blocked(.endpointInvalidated)
+        }
     }
 
     /// Records the sessions the bridge asks to re-advertise `agent_session_link` for.

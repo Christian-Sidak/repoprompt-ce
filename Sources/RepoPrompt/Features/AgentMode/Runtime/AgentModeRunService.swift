@@ -35,6 +35,14 @@ final class AgentModeRunService {
     typealias CancellationIntent = DomainAgentRunCancellationIntent
     typealias CancellationCompletion = DomainAgentRunCancellationCompletion
 
+    /// Who asked for a cancellation. Only an explicit user or managed Stop withdraws queued
+    /// cross-session work, retracts auto-wake, or invalidates queued inbound sends; internal
+    /// lifecycle cancellations (instruction timeout, attachment restart, teardown) do not.
+    enum CancellationOrigin: Equatable {
+        case explicitStop
+        case internalLifecycle
+    }
+
     /// Strategy for restoring draft text back to the composer.
     enum DraftRestorationStrategy: Equatable {
         /// Only restore if the composer is currently empty.
@@ -128,6 +136,35 @@ final class AgentModeRunService {
         )
     }
 
+    /// Whether this session's run pipeline sends `command` as its exact native text.
+    ///
+    /// Claude Code always does. An ACP session does only while its live controller advertises the
+    /// command in the admitted provider session (see `AgentProviderControlCommand.acpSession`). The
+    /// Claude-compatible variants share the CLI but their backends are not verified to honor the
+    /// native command, and headless runtimes have no undecorated path.
+    static func dispatchesProviderControlCommand(
+        _ command: AgentProviderControlCommand,
+        for session: AgentTabSession
+    ) -> Bool {
+        if session.selectedAgent == .claudeCode { return true }
+        return AgentProviderControlCommand.acpSession(
+            session,
+            advertises: command.kind,
+            inProviderConversation: command.expectedProviderConversation
+        )
+    }
+
+    /// Claude and Codex use correlated completion. ACP self-compaction is admitted only for
+    /// runtimes whose advertised `compact` is a native command, and only after that support was
+    /// recorded on the attempt.
+    private static func allowsSelfCompactDispatch(_ session: AgentTabSession) -> Bool {
+        if session.selectedAgent == .codexExec || session.selectedAgent == .claudeCode {
+            return true
+        }
+        return AgentProviderControlCommand.acpRuntimeAdvertisesNativeCommands(session.selectedAgent)
+            && session.selfCompactState.active?.admittedSupport == .acpAdvertisedCommand
+    }
+
     @discardableResult
     func startRun(
         tabID: UUID,
@@ -137,6 +174,8 @@ final class AgentModeRunService {
         attachments: [AgentImageAttachment],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
+        providerControlCommand: AgentProviderControlCommand? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         stopFence: AgentRunStartStopFence? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
@@ -146,6 +185,27 @@ final class AgentModeRunService {
         }
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
         let selectedAgent = session.selectedAgent
+        if let selfCompactDispatchID {
+            guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
+                  selfCompactDispatchID.stage == .note
+                  ? session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID)
+                  : session.selfCompactDispatchIsCurrent?() != false,
+                  Self.allowsSelfCompactDispatch(session),
+                  (selfCompactDispatchID.stage == .compact) == (providerControlCommand != nil)
+            else {
+                startOutcome?.recordStartFailure(message: nil)
+                return nil
+            }
+        }
+        // A control command is only ever routed to a runtime that dispatches it natively and
+        // undecorated. Any other runtime would send it as ordinary prose, so it never starts at all.
+        if let providerControlCommand,
+           !Self.dispatchesProviderControlCommand(providerControlCommand, for: session)
+        {
+            let message = "\(selectedAgent.displayName) does not support this provider command."
+            startOutcome?.recordStartFailure(message: message)
+            return nil
+        }
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
         do {
@@ -159,6 +219,12 @@ final class AgentModeRunService {
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
 
+        // Every path that reaches a provider from here is a new turn, and a new turn is exactly what
+        // cancels a background ACP compaction. Held deliveries never get here, so this is the
+        // session's own user (or its own queued work) choosing to proceed: the hold protects nothing
+        // any more.
+        session.endACPBackgroundCompactionSettle()
+
         if selectedAgent == .codexExec {
             let outcome = await codexRunner.startRun(
                 tabID: tabID,
@@ -167,6 +233,7 @@ final class AgentModeRunService {
                 attachments: attachments,
                 fallbackContext: codexFallbackContext,
                 autoEffortSelection: autoEffortSelection,
+                selfCompactDispatchID: selfCompactDispatchID,
                 stopFence: stopFence
             )
             startOutcome?.record(codexOutcome: outcome)
@@ -214,6 +281,8 @@ final class AgentModeRunService {
                 attachments: attachments,
                 makeLease: makeLease,
                 autoEffortSelection: autoEffortSelection,
+                providerControlCommand: providerControlCommand,
+                selfCompactDispatchID: selfCompactDispatchID,
                 stopFence: stopFence
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
@@ -227,6 +296,7 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 runRequest: acpRunRequest,
+                providerControlCommand: providerControlCommand,
                 makeLease: makeLease,
                 stopFence: stopFence
             )
@@ -1231,7 +1301,7 @@ final class AgentModeRunService {
         admission: AgentRunCancellationAdmission
     ) -> Bool {
         guard admission.scope == .pendingStart, admission.claim(for: session) else { return false }
-        hooks.prepareForCancellation(session, .userStop)
+        hooks.prepareForCancellation(session, .userStop, .explicitStop)
         withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
         return true
     }
@@ -1241,6 +1311,7 @@ final class AgentModeRunService {
         session: AgentTabSession,
         intent: CancellationIntent = .userStop,
         completion: CancellationCompletion = .terminalPublished,
+        origin: CancellationOrigin = .internalLifecycle,
         admission: AgentRunCancellationAdmission? = nil,
         outcomeRecorder: AgentRunCancellationOutcomeRecorder? = nil
     ) async {
@@ -1249,13 +1320,13 @@ final class AgentModeRunService {
             guard admission.scope == .activeRun, admission.claim(for: session) else { return }
             outcomeRecorder?.recordCancellationInitiated()
         }
-        hooks.prepareForCancellation(session, intent)
+        hooks.prepareForCancellation(session, intent, origin)
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
             // A settled run can still carry deferred instructions. Local Stop must withdraw
             // them without manufacturing another terminal attempt.
-            if intent == .userStop {
+            if intent == .userStop, origin == .explicitStop {
                 withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
             }
             await terminalCommitBarrier.awaitTerminalPublication(

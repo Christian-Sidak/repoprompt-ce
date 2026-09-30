@@ -1821,12 +1821,14 @@ extension AgentModeViewModel {
             && !session.bindingTransitionInProgress
             && !session.terminalCommitInProgress
             && !session.mcpFollowUpRunPending
+            && !session.selfCompactState.blocksAutomaticWake
             && !session.isComposerSubmissionInFlight
             && !session.isPreparingInitialWorktree
             && !session.isChangingExecutionLocation
             && session.pendingInstructions.isEmpty
             && session.pendingACPSteeringInstructions.isEmpty
             && session.pendingClaudeSteeringInstructions.isEmpty
+            && !session.isSettlingACPBackgroundCompaction
             && session.pendingAskUser == nil
             && session.pendingUserInputRequest == nil
             && session.pendingApproval == nil

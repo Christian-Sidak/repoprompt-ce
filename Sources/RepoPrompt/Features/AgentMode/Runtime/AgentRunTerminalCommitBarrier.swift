@@ -181,6 +181,12 @@ final class AgentRunTerminalCommitBarrier {
                     publicationResult: publicationResult
                 )
             }
+            if let result = lifecycle.lastTerminalPublicationResult {
+                binding.hooks.onSelfCompactTerminalSettled(existingRevision, result) { [weak self] in
+                    guard let self else { return false }
+                    return terminalTeardownTasks[existingRevision.ownership] == nil
+                }
+            }
             return existingRevision
         }
         guard validatesOwnership(request) else {
@@ -351,6 +357,10 @@ final class AgentRunTerminalCommitBarrier {
 
         if let followUpInstruction {
             binding.hooks.startFollowUpRun(followUpInstruction)
+        }
+        binding.hooks.onSelfCompactTerminalSettled(revision, publicationResult) { [weak self] in
+            guard let self else { return false }
+            return terminalTeardownTasks[revision.ownership] == nil
         }
         if request.completion == .terminalTeardownCompleted {
             await teardownTask?.value

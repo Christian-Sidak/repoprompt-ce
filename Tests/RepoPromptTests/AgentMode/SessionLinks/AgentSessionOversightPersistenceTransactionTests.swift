@@ -112,6 +112,15 @@ final class AgentSessionOversightPersistenceTransactionTests: XCTestCase {
         ) async -> AgentSessionLinkSendTransactionOutcome {
             .blocked(.shuttingDown)
         }
+
+        func agentSessionLinkPerformCompact(
+            to _: AgentSessionLinkEndpointCandidate,
+            request _: AgentSessionLinkCompactRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkSendTransactionOutcome {
+            .blocked(.shuttingDown)
+        }
     }
 
     /// Lets one test fail exactly the write it cares about, without failing the setup writes.

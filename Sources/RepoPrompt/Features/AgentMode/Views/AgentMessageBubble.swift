@@ -849,6 +849,9 @@ struct AgentMessageBubble: View {
                 laneUpdateRow(laneUpdate)
             } else {
                 HStack(spacing: 6) {
+                    if let attribution = item.crossSessionAttribution {
+                        crossSessionAttributionBadge(attribution)
+                    }
                     Text(verbatim: item.text)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                         .foregroundColor(.secondary)

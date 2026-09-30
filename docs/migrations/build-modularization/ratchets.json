@@ -16,19 +16,19 @@
   ],
   "metrics": {
     "app_components": 69,
-    "app_files_over_2000_lines": 52,
+    "app_files_over_2000_lines": 53,
     "app_files_over_5000_lines": 17,
     "app_largest_cycle_components": 64,
     "app_share_permille": 867,
     "app_shared_accessor_uses": 1202,
     "app_static_shared_declarations": 93,
     "app_target_swift_files": 1104,
-    "app_target_swift_lines": 640091,
+    "app_target_swift_lines": 648696,
     "app_userdefaults_standard_uses": 234,
     "app_wrong_way_file_edges": 1099,
     "first_party_swift_lines": 737537,
     "tests_sleep_calls": 53,
-    "tests_testable_import_app_files": 320
+    "tests_testable_import_app_files": 329
   },
   "app_target_swift_lines_headroom": 2000
 }

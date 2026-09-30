@@ -39,6 +39,7 @@ enum AgentSessionLinkStopAdmission: Equatable {
         }
         if snapshot.terminalCommitInProgress || snapshot.isComposerSubmissionInFlight
             || snapshot.isPreparingInitialWorktree || snapshot.isChangingExecutionLocation
+            || snapshot.selfCompactBlocksManagedStop
             || snapshot.stopInProgress
         {
             return .blocked(.targetBusy)
