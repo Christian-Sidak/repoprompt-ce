@@ -213,6 +213,11 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertEqual(row.crossSessionAttribution?.sourceSessionID, request.observerSessionID)
         XCTAssertEqual(row.crossSessionAttribution?.linkID, request.linkID)
         XCTAssertEqual(row.crossSessionAttribution?.sourceName, "Planning")
+        XCTAssertEqual(row.dispatchedProviderText, AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
+            linkID: request.linkID, linkGeneration: request.linkGeneration,
+            message: request.message, framing: .coordination
+        ))
 
         // Persistence is the delivery linearization point: the durable payload already contained the
         // attributed row, and it committed before the provider controller was ever created.
@@ -475,6 +480,22 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
     }
 
+    func testCommittedQueuedDrainCannotDispatchAfterUserStopGenerationAdvances() async throws {
+        let fixture = try makeFixture()
+        var request = makeRequest(message: "committed queue entry")
+        request.startStopFence = AgentRunStartStopFence(session: fixture.session)
+        fixture.driftHook.duringDeliveryFlush = {
+            // The queued entry crossed its commit cutoff, so Stop cannot withdraw it.
+            fixture.session.stopState.invalidateScheduledStarts()
+        }
+        let outcome = await send(fixture, request: request)
+        guard case let .delivered(delivery) = outcome else {
+            return XCTFail("expected durable-only delivery, got \(outcome)")
+        }
+        XCTAssertEqual(delivery.deliveryState, .persisted)
+        XCTAssertFalse(fixture.events.contains(.providerControllerCreated))
+    }
+
     func testEndpointDriftAfterTheCommitFenceAbortsBeforeMutating() async throws {
         let fixture = try makeFixture()
 
@@ -528,6 +549,10 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             "No provider turn may start against a binding that replaced the admitted one"
         )
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt, "The composer claim must be released")
+        XCTAssertNil(
+            fixture.session.items.first(where: { $0.id == delivery.targetItemID })?.dispatchedProviderText,
+            "A persisted-only row was never handed to the provider"
+        )
     }
 
     // MARK: - Host-backed liveness across the committed send

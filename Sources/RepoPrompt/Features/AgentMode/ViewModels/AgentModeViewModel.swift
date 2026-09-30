@@ -477,6 +477,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
+            rebuildAgentSessionLinkSubagentCensus(reconcileLiveObservers: true)
             syncSidebarUIState(refresh: true, reason: .sessionList)
             // One eager revocation hook covering every live-session removal path (tab close, stash,
             // delete, MCP control teardown) instead of five separate call sites that could drift.
@@ -484,6 +485,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             syncAttentionNotificationObservers()
         }
     }
+
+    /// Passive board census, rebuilt once when a source changes rather than once per target.
+    var agentSessionLinkSubagentCensus = AgentSessionLinkSubagentCensus(persisted: [], index: [], live: [])
+    var agentSessionLinkCensusWorkspaceID: UUID?
+    var agentSessionLinkPersistedSubagentMeta: [AgentSessionMeta] = []
+    var agentSessionLinkPersistedSubagentWorkspaceID: UUID?
+    var agentSessionLinkSubagentRefreshGeneration: UInt64 = 0
+    var agentSessionLinkChildRunSubscriptions: [UUID: AnyCancellable] = [:]
+    let agentSessionLinkSubagentCensusChanged = PassthroughSubject<Set<UUID>, Never>()
 
     private var provisionalParentSessionIDBySessionID: [UUID: UUID] = [:]
 
@@ -619,6 +629,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
 
     #if DEBUG
+        var test_afterClaudeAttachmentSelfCancel: (@MainActor () async -> Void)?
+        var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
+        var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
+        var test_beforeACPToolIdleWait: (@MainActor () async throws -> Void)?
+        var test_beforeScheduledACPFollowUpStart: (@MainActor () async -> Void)?
+        var test_didFinishScheduledACPFollowUpStart: (@MainActor () -> Void)?
+
         /// Test-only live-authority seam for prompt readiness orchestration.
         var test_agentSessionLinkHasActiveOutboundLink:
             ((DomainAgentSessionLinkEndpointIdentity) async -> Bool)?
@@ -918,6 +935,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var tabDraftText: [UUID: String] = [:]
+    var draftRestorationLedger = AgentComposerDraftRestorationLedger()
     private var cancellables = Set<AnyCancellable>()
     private let listeners = ListenerRegistry()
     private(set) var isAgentModeActive = false
@@ -925,10 +943,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let notificationAttention = AgentModeNotificationAttentionTracker()
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
-        /// Holds provider-permission delivery after observation so tests can order a later opt-in.
-        var test_permissionAutoApprovalDeliveryQueue: DispatchQueue?
-        /// Observes sink delivery synchronously; callers must provide a thread-safe recorder.
-        var test_permissionAutoApprovalDidDeliver: (@Sendable (Set<UUID>) -> Void)?
         private var test_activeWorkspaceIDForSessionIndexOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
         private var test_persistentBindingResolutionSnapshotBuildCount = 0
@@ -3047,7 +3061,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self?.cancelActiveToolsForRun(runID: runID, reason: reason)
             },
             awaitNoActiveMCPTools: { [weak self] runID in
-                guard let self, let mcp = mcpServer else { return }
+                guard let self else { return }
+                #if DEBUG
+                    if let test_beforeACPToolIdleWait {
+                        try await test_beforeACPToolIdleWait()
+                        return
+                    }
+                #endif
+                guard let mcp = mcpServer else { return }
                 try await mcp.awaitNoActiveToolExecutions(runID: runID)
             },
             activeAgentRunWaitQuery: { [weak self] runID in
@@ -3116,6 +3137,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             queuedWorkRecovery: .init(
                 restoreDraftText: { [weak self] tabID, text, message, strategy in
                     self?.restoreComposerDraft(tabID: tabID, text: text, message: message, strategy: strategy)
+                },
+                isCurrentSessionBinding: { [weak self] session, fence in
+                    self?.sessions[session.tabID] === session
+                        && session.persistentSessionBindingIdentity == fence.binding
                 }
             ),
             persistence: .init(
@@ -3253,16 +3278,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 }
             ),
             continuation: .init(
-                startFollowUpRun: { [weak self] session, initialMessage in
+                startFollowUpRun: { [weak self] session, instruction in
+                    if session.selectedAgent.acpProviderID != nil {
+                        self?.scheduleTypedACPFollowUpRun(
+                            session: session, instruction: instruction,
+                            capturedStopFence: instruction.stopFence
+                        )
+                        return
+                    }
+                    let stopFence = instruction.stopFence ?? AgentRunStartStopFence(session: session)
                     Task { @MainActor [weak self, weak session] in
                         guard let self, let session else { return }
-                        await startFollowUpRun(for: session, initialMessage: initialMessage)
+                        await startFollowUpRun(
+                            for: session,
+                            initialMessage: instruction.providerText,
+                            stopFence: stopFence
+                        )
                     }
+                },
+                startTypedACPFollowUpRun: { [weak self] session, instruction in
+                    self?.scheduleTypedACPFollowUpRun(
+                        session: session, instruction: instruction,
+                        capturedStopFence: instruction.stopFence
+                    )
                 },
                 signalMCPInstructionDelivered: { [weak self] session in
                     await self?.signalMCPInstructionDelivered(for: session)
                 }
-            )
+            ),
+            prepareForCancellation: { [weak self] session, intent in
+                self?.prepareAgentRunCancellation(session: session, intent: intent)
+            }
         )
         let toolTrackingHooks = makeToolTrackingHooks()
         // Wire hooks so per-tab Claude handlers get proper viewmodel callbacks.
@@ -3275,9 +3321,108 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    private func scheduleTypedACPFollowUpRun(
+        session: TabSession,
+        instruction: TabSession.PendingInstruction,
+        capturedStopFence: AgentRunStartStopFence? = nil
+    ) {
+        let stopFence = capturedStopFence ?? AgentRunStartStopFence(session: session)
+        guard stopFence.permitsStart(of: session) else {
+            if sessions[session.tabID] === session,
+               stopFence.binding == session.persistentSessionBindingIdentity,
+               let draft = instruction.localDraftText
+            {
+                restoreComposerDraft(
+                    tabID: session.tabID, text: draft,
+                    message: "Restored local ACP follow-up after cancelled start",
+                    strategy: .prependAlways
+                )
+            }
+            return
+        }
+        session.mcpFollowUpRunPending = true
+        if var scheduled = session.scheduledACPFollowUp {
+            // Keep later fallbacks under the same Stop-owned producer until its start settles.
+            // A failed first start must not leave them in the general queue without an owner.
+            scheduled.queuedInstructions.append(.init(instruction: instruction, stopFence: stopFence))
+            session.scheduledACPFollowUp = scheduled
+            session.isDirty = true
+            updateBindingsFromSession(session)
+            scheduleSave(for: session.tabID)
+            return
+        }
+        let scheduled = TabSession.ScheduledACPFollowUp(
+            id: UUID(), instruction: instruction, stopFence: stopFence
+        )
+        session.scheduledACPFollowUp = scheduled
+        Task { @MainActor [weak self, weak session] in
+            guard let self, let session else { return }
+            #if DEBUG
+                defer { test_didFinishScheduledACPFollowUpStart?() }
+                await test_beforeScheduledACPFollowUpStart?()
+            #endif
+            guard session.scheduledACPFollowUp?.id == scheduled.id else { return }
+            let startOutcome = AgentRunStartOutcomeRecorder()
+            _ = await startAgentRun(
+                tabID: session.tabID, initialMessage: instruction.providerText,
+                directStartOptions: AgentDirectRunStartOptions(stopFence: stopFence),
+                startOutcome: startOutcome
+            )
+            guard let settled = session.scheduledACPFollowUp, settled.id == scheduled.id else { return }
+            session.scheduledACPFollowUp = nil
+            if startOutcome.outcome.didStart {
+                // Only an accepted run can transfer still-fenced successors. Keep each fence
+                // on the queued instruction through every later terminal handoff; otherwise a
+                // failed successor start could leave its siblings with a fresh post-Stop fence.
+                let eligible = settled.queuedInstructions.filter { $0.stopFence.permitsStart(of: session) }
+                let cancelledDrafts = settled.queuedInstructions
+                    .filter { !$0.stopFence.permitsStart(of: session) }
+                    .filter { $0.stopFence.binding == session.persistentSessionBindingIdentity }
+                    .compactMap(\.instruction.localDraftText)
+                if sessions[session.tabID] === session, !cancelledDrafts.isEmpty {
+                    restoreComposerDraft(
+                        tabID: session.tabID, text: cancelledDrafts.joined(separator: "\n"),
+                        message: "Restored local ACP follow-up after cancelled start",
+                        strategy: .prependAlways
+                    )
+                }
+                if session.runState.isActive {
+                    session.pendingInstructions.append(contentsOf: eligible.map {
+                        $0.instruction.retainingStopFence($0.stopFence)
+                    })
+                } else {
+                    for next in eligible {
+                        scheduleTypedACPFollowUpRun(
+                            session: session, instruction: next.instruction,
+                            capturedStopFence: next.stopFence
+                        )
+                    }
+                }
+            } else if sessions[session.tabID] === session {
+                let drafts = ([TabSession.ScheduledACPFollowUp.QueuedInstruction(
+                    instruction: settled.instruction, stopFence: settled.stopFence
+                )] + settled.queuedInstructions)
+                    .filter { $0.stopFence.binding == session.persistentSessionBindingIdentity }
+                    .compactMap(\.instruction.localDraftText)
+                if !drafts.isEmpty {
+                    restoreComposerDraft(
+                        tabID: session.tabID, text: drafts.joined(separator: "\n"),
+                        message: "Restored local ACP follow-up after failed start",
+                        strategy: .prependAlways
+                    )
+                }
+            }
+            if session.scheduledACPFollowUp == nil {
+                session.mcpFollowUpRunPending = false
+                handleObservedMCPStateChange(for: session)
+            }
+        }
+    }
+
     private func startFollowUpRun(
         for session: TabSession,
-        initialMessage: String
+        initialMessage: String,
+        stopFence: AgentRunStartStopFence? = nil
     ) async {
         guard sessions[session.tabID] === session else {
             session.mcpFollowUpRunPending = false
@@ -3292,7 +3437,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             handleObservedMCPStateChange(for: session)
             return
         }
-        await startAgentRun(tabID: session.tabID, initialMessage: initialMessage)
+        await startAgentRun(
+            tabID: session.tabID,
+            initialMessage: initialMessage,
+            directStartOptions: AgentDirectRunStartOptions(stopFence: stopFence)
+        )
     }
 
     /// Build the generic orchestration hooks that provider tool tracking handlers need.
@@ -4238,8 +4387,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func prepareSessionForWindowClose(_ session: TabSession) async {
-        session.permissionAutoApprovalCancellable?.cancel()
-        session.permissionAutoApprovalCancellable = nil
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
         // cancelEphemeralRuntimeState() cancels and nils agentTask before the
@@ -4986,6 +5133,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             tabID: session.tabID,
             sessionID: sessionID
         )
+        rebuildAgentSessionLinkSubagentCensus()
         postAgentSessionBindingDidChange(
             tabID: session.tabID,
             previousSessionID: previousSessionID,
@@ -6074,46 +6222,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // - Shared helpers: Services/MCP/Agent/AgentMCPToolHelpers.swift
 
     private func configureMCPStateObservation(for session: TabSession) {
-        #if DEBUG
-            let permissionDeliveryQueue = test_permissionAutoApprovalDeliveryQueue ?? DispatchQueue.main
-            let permissionDeliveryObserver = test_permissionAutoApprovalDidDeliver
-        #else
-            let permissionDeliveryQueue = DispatchQueue.main
-        #endif
         session.mcpStateObservationCancellable?.cancel()
-        session.permissionAutoApprovalCancellable?.cancel()
-        session.permissionAutoApprovalCancellable = Publishers.CombineLatest(
-            session.$pendingApproval.map { $0?.id },
-            session.$pendingPermissionsRequest.map { $0?.id }
-        )
-        .map { Set([$0, $1].compactMap(\.self)) }
-        .removeDuplicates()
-        // The first observation is a baseline; later changes emit only newly presented IDs.
-        .scan(OverseerPermissionRequestDelta()) { previous, requestIDs in
-            var next = previous
-            next.observe(requestIDs)
-            return next
-        }
-        .map(\.newRequestIDs)
-        .filter { [weak self, weak session] requestIDs in
-            guard !requestIDs.isEmpty,
-                  let self, let session,
-                  let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID)
-            else { return false }
-            return AgentSessionLinkRuntimeBridge.shared.hasAutoApprovalSelection(for: endpoint)
-        }
-        // @Published sends before storage changes; evaluate only after the settled value is visible.
-        .receive(on: permissionDeliveryQueue)
-        .sink { [weak self, weak session] requestIDs in
-            #if DEBUG
-                permissionDeliveryObserver?(requestIDs)
-            #endif
-            guard let self, let session else { return }
-            Task { @MainActor [weak self, weak session] in
-                guard let self, let session else { return }
-                await autoApproveOverseenProviderPermissions(for: session, requestIDs: requestIDs)
-            }
-        }
         let publishers: [AnyPublisher<Void, Never>] = [
             session.$runState.map { _ in () }.eraseToAnyPublisher(),
             session.$runningStatusText.map { _ in () }.eraseToAnyPublisher(),
@@ -6561,8 +6670,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    func prepareMCPWaitTrackingForRunStart(session: TabSession) async {
-        guard !session.runState.isActive,
+    func prepareMCPWaitTrackingForRunStart(
+        session: TabSession,
+        stopFence: AgentRunStartStopFence
+    ) async {
+        guard stopFence.permitsStart(of: session), !session.runState.isActive,
               let originalContext = session.mcpControlContext
         else { return }
         if originalContext.preparedEpoch != nil {
@@ -6596,7 +6708,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // A stale result means the existing record advanced to another epoch; only rejected
         // results are eligible for missing-record recovery through registerIfMissing.
         if case .rejected = result {
-            guard session.mcpControlActivationGeneration == activationGeneration,
+            guard stopFence.permitsStart(of: session),
+                  session.mcpControlActivationGeneration == activationGeneration,
                   let context = session.mcpControlContext,
                   context.activationID == originalContext.activationID,
                   context.registration == originalContext.registration,
@@ -6607,7 +6720,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             else {
                 return
             }
-            guard session.mcpControlActivationGeneration == activationGeneration,
+            guard stopFence.permitsStart(of: session),
+                  session.mcpControlActivationGeneration == activationGeneration,
                   let context = session.mcpControlContext,
                   context.activationID == originalContext.activationID,
                   context.registration == originalContext.registration,
@@ -6628,6 +6742,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await test_afterMCPStoreEpochBegan?()
         #endif
         guard case let .accepted(epoch) = result,
+              stopFence.permitsStart(of: session),
               session.mcpControlActivationGeneration == activationGeneration,
               var context = session.mcpControlContext,
               context.activationID == originalContext.activationID,
@@ -7072,7 +7187,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     /// Single source for the current pending interaction a remote responder may see: `agent_run`
-    /// snapshots and the oversight `get_interaction` projection both start from this value.
+    /// snapshots and the managed oversight `poll`/`wait` projection both start from this value.
     func mcpPendingInteraction(for session: TabSession) -> AgentRunMCPSnapshot.Interaction? {
         if let request = session.pendingCodexHookReview {
             return mcpCodexHookInteraction(
@@ -7565,6 +7680,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sessionID: sessionID,
             parentSessionID: effectiveParentSessionID
         )
+        rebuildAgentSessionLinkSubagentCensus()
         let didCopyParentWorktreeBindings = assignedParent
             && inheritWorktreeBindings
             && copyParentWorktreeBindingsIfNeeded(parentSessionID: effectiveParentSessionID, to: session)
@@ -11771,7 +11887,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 + pendingClaudeReasoningStatusBytes
                 + pendingAssistantDeltaBytes
             let pendingInstructionBytes = session.pendingInstructions.reduce(0) { partial, instruction in
-                partial + instruction.utf8.count
+                partial + instruction.providerText.utf8.count
             }
             let ownership = session.activeRunOwnership
             let liveness = session.activeRunLiveness
@@ -14013,6 +14129,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         session.provider = nil
         session.acpSteeringFlushTask?.cancel()
         session.acpSteeringFlushTask = nil
+        session.acpSteeringFlushID = nil
+        session.settlePendingManagedACPSteeringAsNotAccepted()
         session.pendingACPSteeringInstructions.removeAll()
         let acpController = session.acpController
         session.acpController = nil
@@ -14136,6 +14254,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         tabsWithActiveAgentRun.removeAll()
         mcpControlledTabIDs.removeAll()
         tabDraftText.removeAll()
+        draftRestorationLedger.removeAll()
         sidebarObservedRunStateByTabID.removeAll()
         workspaceSwitchProvider.scheduleBackgroundCleanup(
             targets: cleanupTargets,
@@ -14913,6 +15032,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             {
                 removeSessionIndex(forTabID: tabID)
                 tabDraftText.removeValue(forKey: tabID)
+                draftRestorationLedger.remove(tabID: tabID)
                 sessionIndexStore.removeSortDate(forTabID: tabID)
             }
             #if DEBUG
@@ -16248,6 +16368,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
             return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
         }
+        if session.stopState.isStopping(binding: session.persistentSessionBindingIdentity) {
+            return .blocked(message: "Stopping this run…")
+        }
         if session.selectedAgent == .codexExec, CodexManagedSessionFence.shared.isFenced {
             return .blocked(message: CodexManagedSessionFence.blockedMessage)
         }
@@ -16342,10 +16465,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
+            let stopFence = AgentRunStartStopFence(session: session)
+            let originalBinding = session.persistentSessionBindingIdentity
             Task { [weak self] in
                 guard let self else { return }
                 await submitUserTurnAfterHydration(
                     tabID: tabID,
+                    originalSession: session,
+                    originalBinding: originalBinding,
                     trimmedText: trimmedText,
                     attachmentsToSend: attachmentsToSend,
                     taggedFilesToSend: taggedFilesToSend,
@@ -16357,7 +16484,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     autoEffortAudit: autoEffortAudit,
                     routerAudit: routerAudit,
                     restorationSelectedWorkflow: activeWorkflow,
-                    restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
+                    restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                    stopFence: stopFence
                 )
             }
             return .submitted
@@ -16381,8 +16509,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func submitUserTurnAfterHydration(
+    #if DEBUG
+        func test_replaceSessionForDeferredHydration(tabID: UUID, with replacement: TabSession) {
+            sessions[tabID] = replacement
+        }
+    #endif
+
+    func submitUserTurnAfterHydration(
         tabID: UUID,
+        originalSession: TabSession,
+        originalBinding: AgentPersistentSessionBindingIdentity?,
         trimmedText: String,
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
@@ -16394,9 +16530,32 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
-        restorationSelectedWorkflowMutationGeneration: UInt64? = nil
+        restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
+        stopFence: AgentRunStartStopFence
     ) async {
-        guard let session = sessions[tabID] else { return }
+        guard sessions[tabID] === originalSession,
+              originalSession.persistentSessionBindingIdentity == originalBinding
+        else { return }
+        let session = originalSession
+        func restoreStoppedSubmission() {
+            guard sessions[tabID] === originalSession,
+                  originalSession.persistentSessionBindingIdentity == originalBinding
+            else { return }
+            restoreRejectedManualSubmissionComposerState(
+                tabID: tabID,
+                session: session,
+                draftText: rawDraftText ?? trimmedText,
+                images: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                selectedWorkflow: restorationSelectedWorkflow,
+                selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                message: "This scheduled run was cancelled by Stop."
+            )
+        }
+        guard stopFence.permitsStart(of: session) else {
+            restoreStoppedSubmission()
+            return
+        }
         if session.selectedAgent == .codexExec, CodexManagedSessionFence.shared.isFenced {
             restoreRejectedManualSubmissionComposerState(
                 tabID: tabID,
@@ -16411,7 +16570,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
-        guard let hydratedSession = sessions[tabID] else { return }
+        guard let hydratedSession = sessions[tabID], hydratedSession === session,
+              stopFence.permitsStart(of: hydratedSession)
+        else {
+            restoreStoppedSubmission()
+            return
+        }
         _ = submitPreparedUserTurn(
             tabID: tabID,
             session: hydratedSession,
@@ -16426,7 +16590,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEffortAudit: autoEffortAudit,
             routerAudit: routerAudit,
             restorationSelectedWorkflow: restorationSelectedWorkflow,
-            restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
+            restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+            stopFence: stopFence
         )
     }
 
@@ -16746,16 +16911,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// The provider route a managed cross-session steer would take right now, following
     /// `submitPreparedUserTurn`'s own branch order, or `nil` when no managed route exists.
     ///
-    /// It lives beside the submission path because classification happens before the attributed row
-    /// exists, so the two have to agree branch for branch. The shared follow-up queue is deliberately
-    /// not a managed route: a queued instruction can later be restored into the target user's
-    /// composer (on an execution-location change, for example), and an overseer's words must never
-    /// reappear there as the user's own draft.
-    ///
-    /// An idle target has no route here either: it is delivered only through the durable,
-    /// exact-endpoint send transaction. ACP live steering is not a managed route because a refused
-    /// ACP steer is requeued into that same follow-up queue and an interrupted ACP prompt is replayed
-    /// from transcript text, neither of which is aware of managed framing yet.
+    /// It lives beside submission because classification happens before the attributed row exists.
+    /// An idle target uses the durable send transaction. ACP's serialized queue carries managed
+    /// context through flush and follow-up, and only local draft text can return to the composer.
     func agentSessionLinkManagedSteerRoute(for session: TabSession) -> AgentSessionLinkManagedSteerRoute? {
         if session.runState == .waitingForUser, session.instructionContinuation != nil {
             return .waitingInstruction
@@ -16767,7 +16925,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         switch activeProviderSteeringRoute(for: session) {
         case .claudeNativeInterrupt:
             return .claudeInterrupt
-        case .acpPrompt, nil:
+        case .acpPrompt:
+            return .acpQueued
+        case nil:
             return nil
         }
     }
@@ -16813,6 +16973,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Codex reports its terminal state through the acknowledgement tracker `agent_run` uses. The
         // `.mcp` fallback origin that an attempt ID selects is the programmatic-dispatch origin,
         // which never restores a composer draft on failure.
+        guard agentSessionLinkManagedSteerRoute(for: session) == route else { return false }
         let codexAttemptID = route == .codex ? session.codexSteerAckTracker.beginAttempt() : nil
         let submission = submitPreparedUserTurn(
             tabID: tabID,
@@ -16885,8 +17046,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
-        managedTurn: AgentSessionLinkManagedTurn? = nil
+        managedTurn: AgentSessionLinkManagedTurn? = nil,
+        stopFence: AgentRunStartStopFence? = nil
     ) -> UserTurnSubmissionResult {
+        guard stopFence?.permitsStart(of: session) ?? true else {
+            return .blocked(message: "This scheduled run was cancelled by Stop.")
+        }
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
         // Composer claims preserve the exact raw snapshot separately from provider-normalized text.
         // A managed cross-session steer has no composer draft and must never restore one: an empty
@@ -16983,7 +17148,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             taggedFileAttachments: taggedFilesToSend,
             sequenceIndex: session.nextSequenceIndex,
             workflow: activeWorkflow,
-            crossSessionAttribution: managedTurn?.attribution
+            crossSessionAttribution: managedTurn?.attribution,
+            dispatchedProviderText: managedTurn?.providerText
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
@@ -17092,6 +17258,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         if session.selectedAgent == .codexExec {
             let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
+            let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
             let fallbackContext = TabSession.CodexFallbackSubmissionContext(
                 queueID: UUID(),
                 providerText: wrappedText,
@@ -17100,7 +17267,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 draftText: restorationDraftText,
                 optimisticUserItemID: userItem.id,
                 origin: codexAttemptID.map(TabSession.CodexFallbackOrigin.mcp) ?? .manual,
-                dispatchTicket: dispatchTicket
+                dispatchTicket: dispatchTicket,
+                stopFence: producerStopFence
             )
             // The exact run a managed steer was classified to steer. If it settles before dispatch,
             // the steer is withdrawn rather than becoming a new turn outside the durable idle path.
@@ -17138,6 +17306,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // must not receive direction the grant never covered, and a run that settled in
                 // between must not be restarted from here. Either refusal withdraws the row below.
                 let dispatchIsCurrent = self.sessions[tabID] === session
+                    && producerStopFence.permitsStart(of: session)
                     && managedTurn.map { turn in
                         self.agentSessionLinkLiveSession(matching: turn.candidate) === session
                             && session.runState.isActive
@@ -17151,7 +17320,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
                         codexFallbackContext: fallbackContext,
-                        autoEffortSelection: autoEffortSelection
+                        autoEffortSelection: autoEffortSelection,
+                        directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence)
                     )
                 } else {
                     .preDispatchRejected(
@@ -17249,15 +17419,54 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // otherwise attachment references are not forwarded reliably.
         if session.runState == .waitingForUser {
             if session.selectedAgent.usesClaudeNativeRuntime, !attachmentsToSend.isEmpty {
-                Task { [weak self] in
-                    guard let self else { return }
+                let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
+                Task { [weak self, weak session] in
+                    guard let self, let session else { return }
+                    #if DEBUG
+                        defer { test_claudeAttachmentRestartFinished?() }
+                    #endif
+                    @MainActor func restoreIfStopped() {
+                        guard sessions[tabID] === session,
+                              session.persistentSessionBindingIdentity == producerStopFence.binding
+                        else { return }
+                        if let index = session.items.firstIndex(where: { $0.id == userItem.id }) {
+                            _ = session.removeItem(at: index)
+                        }
+                        restoreRejectedManualSubmissionComposerState(
+                            tabID: tabID,
+                            session: session,
+                            draftText: restorationDraftText,
+                            images: attachmentsToSend,
+                            taggedFiles: taggedFilesToSend,
+                            selectedWorkflow: restorationSelectedWorkflow,
+                            selectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+                            message: "This scheduled run was cancelled by Stop."
+                        )
+                    }
+                    guard sessions[tabID] === session, producerStopFence.permitsStart(of: session) else {
+                        restoreIfStopped()
+                        return
+                    }
                     await cancelAgentRun(tabID: tabID)
+                    #if DEBUG
+                        await test_afterClaudeAttachmentSelfCancel?()
+                    #endif
+                    // This submission itself issued one Stop; any additional Stop invalidates it.
+                    guard sessions[tabID] === session,
+                          session.persistentSessionBindingIdentity == producerStopFence.binding,
+                          session.stopState.cancellationCount == producerStopFence.cancellationCount + 1
+                    else {
+                        restoreIfStopped()
+                        return
+                    }
+                    let resumedFence = AgentRunStartStopFence(session: session)
                     await startAgentRun(
                         tabID: tabID,
                         initialMessage: wrappedText,
                         attachments: attachmentsToSend,
                         taggedFileAttachments: taggedFilesToSend,
-                        autoEffortSelection: autoEffortSelection
+                        autoEffortSelection: autoEffortSelection,
+                        directStartOptions: AgentDirectRunStartOptions(stopFence: resumedFence)
                     )
                 }
                 return UserTurnSubmissionResult.submitted
@@ -17282,14 +17491,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
-        // A managed steer never starts a run, uses ACP live steering, or enters the shared follow-up
-        // queue from here (see `agentSessionLinkManagedSteerRoute`). Reaching any of them means the
-        // state drifted from its classification, so the turn is withdrawn instead.
+        // Managed steers use only the classified live route; a drift to idle or to the
+        // unqualified follow-up path withdraws the attributed row instead.
         if let managedTurn {
             let steeringRoute = session.runState.isActive
                 ? activeProviderSteeringRoute(for: session, attachments: attachmentsToSend)
                 : nil
-            guard steeringRoute == .claudeNativeInterrupt else {
+            guard steeringRoute == .claudeNativeInterrupt || steeringRoute == .acpPrompt else {
                 withdrawAgentSessionLinkManagedTurn(
                     managedTurn,
                     userItemID: userItem.id,
@@ -17303,13 +17511,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // If agent is not running, start it
         if !session.runState.isActive {
+            let producerStopFence = stopFence ?? AgentRunStartStopFence(session: session)
             Task {
                 await startAgentRun(
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
                     taggedFileAttachments: taggedFilesToSend,
-                    autoEffortSelection: autoEffortSelection
+                    autoEffortSelection: autoEffortSelection,
+                    directStartOptions: AgentDirectRunStartOptions(stopFence: producerStopFence)
                 )
             }
         } else if let route = activeProviderSteeringRoute(for: session, attachments: attachmentsToSend) {
@@ -17326,20 +17536,25 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         } else {
             // Shared follow-up queue for providers that consume queued instructions at the next turn boundary.
-            session.pendingInstructions.append(wrappedText)
+            session.pendingInstructions.append(.init(
+                providerText: wrappedText,
+                localDraftText: managedTurn == nil ? wrappedText : nil
+            ))
         }
         return UserTurnSubmissionResult.submitted
     }
 
-    private func interruptedACPProviderText(for session: TabSession, before steeringUserItem: AgentChatItem) -> String? {
+    func interruptedACPProviderText(for session: TabSession, before steeringUserItem: AgentChatItem) -> String? {
         guard let interruptedUserItem = session.items.last(where: {
             $0.kind == .user && $0.sequenceIndex < steeringUserItem.sequenceIndex
         }) else {
             return nil
         }
-        // A cross-session row stores only the sender's raw words; its RepoPrompt framing was
-        // provider-only. Replaying those words would present another session's text as this
-        // session's own user prompt, so an interrupted cross-session turn is not replayed.
+        // New attributed rows retain the exact payload passed to the provider. Legacy attributed
+        // rows lack a provable envelope and must still be omitted rather than impersonated.
+        if let dispatched = interruptedUserItem.dispatchedProviderText {
+            return dispatched
+        }
         guard interruptedUserItem.crossSessionAttribution == nil else { return nil }
         let rendered = renderProviderMessage(
             text: interruptedUserItem.text,
@@ -17390,6 +17605,38 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return true
     }
 
+    private func settleRejectedACPSteeringSubmission(
+        id: UUID,
+        session: TabSession,
+        stopFence: AgentRunStartStopFence
+    ) {
+        guard stopFence.permitsStart(of: session),
+              let queuedIndex = session.pendingACPSteeringInstructions.firstIndex(where: { $0.id == id })
+        else { return }
+        let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
+        let instruction = TabSession.PendingInstruction(
+            providerText: queued.providerText,
+            localDraftText: queued.managed == nil ? queued.draftText : nil,
+            stopFence: stopFence
+        )
+        if session.runState.isActive {
+            session.pendingInstructions.insert(instruction, at: 0)
+            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
+        } else if session.runState == .completed, session.acpController != nil {
+            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
+            scheduleTypedACPFollowUpRun(
+                session: session, instruction: instruction, capturedStopFence: instruction.stopFence
+            )
+        } else {
+            // A rejected ACP steer remains a provider follow-up, never a composer draft.
+            session.pendingInstructions.insert(instruction, at: 0)
+            queued.managed?.sink.resolve(.delivered(.queuedFollowUp))
+            session.isDirty = true
+            updateBindingsFromSession(session)
+            scheduleSave(for: session.tabID)
+        }
+    }
+
     private func submitActiveProviderSteering(
         _ route: ActiveProviderSteeringRoute,
         session: TabSession,
@@ -17421,7 +17668,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 taggedFileAttachments: taggedFilesToSend,
                 draftText: restorableDraftText,
                 optimisticUserItemID: userItem.id,
-                createdAt: Date()
+                createdAt: Date(),
+                managed: managedTurn.map {
+                    TabSession.ACPSteeringManagedContext(
+                        sink: $0.sink,
+                        attributedItemID: userItem.id,
+                        candidate: $0.candidate,
+                        attribution: $0.attribution
+                    )
+                }
             )
             session.pendingACPSteeringInstructions.append(steering)
             Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID)) queue=\(session.pendingACPSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
@@ -17429,28 +17684,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering flush owned by MCP dispatch tab=\(session.tabID) queue=\(session.pendingACPSteeringInstructions.count)")
                 return
             }
+            let producerStopFence = AgentRunStartStopFence(session: session)
             Task { [weak self, weak session] in
-                guard let self, let session else { return }
+                guard let self, let session, producerStopFence.permitsStart(of: session) else { return }
                 let accepted = await runService.submitQueuedACPSteeringIfSupported(session: session)
-                guard !accepted,
-                      let queuedIndex = session.pendingACPSteeringInstructions.firstIndex(where: { $0.id == steering.id })
-                else {
-                    return
-                }
-                let queued = session.pendingACPSteeringInstructions.remove(at: queuedIndex)
-                if session.runState.isActive {
-                    session.pendingInstructions.insert(queued.providerText, at: 0)
-                } else if session.runState == .completed, session.acpController != nil {
-                    await startAgentRun(tabID: session.tabID, initialMessage: queued.providerText)
-                } else {
-                    // ACP steering should never bounce back into the composer. If the
-                    // active-steering queue was rejected before the run service could take it,
-                    // preserve it as a normal provider follow-up instead.
-                    session.pendingInstructions.insert(queued.providerText, at: 0)
-                    session.isDirty = true
-                    updateBindingsFromSession(session)
-                    scheduleSave(for: session.tabID)
-                }
+                guard producerStopFence.permitsStart(of: session) else { return }
+                guard !accepted else { return }
+                settleRejectedACPSteeringSubmission(
+                    id: steering.id, session: session, stopFence: producerStopFence
+                )
             }
         case .claudeNativeInterrupt:
             // Claude Code preserves draft text and wakes current MCP waiters as soon
@@ -18339,8 +18581,17 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             attachments: attachments,
             agent: effectiveAgent
         )
-        guard let session, !ignoresPendingHandoff else { return withAttachmentRendering }
-        return prependPendingHandoffIfNeeded(withAttachmentRendering, session: session)
+        let providerText: String = if let session, !ignoresPendingHandoff {
+            prependPendingHandoffIfNeeded(withAttachmentRendering, session: session)
+        } else {
+            withAttachmentRendering
+        }
+        #if DEBUG
+            if effectiveAgent.acpProviderID != nil {
+                await test_afterProviderInputAugmentation?()
+            }
+        #endif
+        return providerText
     }
 
     @MainActor
@@ -18588,6 +18839,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             session = self.session(for: tabID)
         }
+        guard directStartOptions.stopFence?.permitsStart(of: session) ?? true else {
+            startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
+            return nil
+        }
         func periodicStartIsCurrent() -> Bool {
             guard let wakeID = directStartOptions.periodicWakeID else { return true }
             guard directStartOptions.laneUpdateWakeID == nil,
@@ -18601,7 +18856,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
         guard periodicStartIsCurrent() else { return nil }
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
-            if session.mcpFollowUpRunPending {
+            if session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil {
                 session.mcpFollowUpRunPending = false
                 handleObservedMCPStateChange(for: session)
             }
@@ -18610,7 +18865,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return .failed(message: message)
         }
         defer {
-            if session.mcpFollowUpRunPending {
+            if session.mcpFollowUpRunPending, session.scheduledACPFollowUp == nil {
                 session.mcpFollowUpRunPending = false
                 handleObservedMCPStateChange(for: session)
             }
@@ -18619,6 +18874,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let message = "The tab could not be bound to an agent session."
             startOutcome?.recordStartFailure(message: message)
             return .failed(message: message)
+        }
+        let stopFence = directStartOptions.stopFence ?? AgentRunStartStopFence(session: session)
+        guard stopFence.permitsStart(of: session) else {
+            startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
+            return nil
         }
         // The one provider-neutral fence for an automatic lane-update turn, placed here because this
         // is the last app-owned instant before *every* provider family (Codex start/fallback, Claude
@@ -18644,9 +18904,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
         await prepareSessionForRunStart(tabID: tabID, session: session)
-        guard periodicStartIsCurrent() else { return nil }
-        await prepareMCPWaitTrackingForRunStart(session: session)
-        guard periodicStartIsCurrent() else { return nil }
+        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session) else { return nil }
+        await prepareMCPWaitTrackingForRunStart(session: session, stopFence: stopFence)
+        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session) else { return nil }
         // A lane update has no user-authored base instruction, so every augmentation this applies —
         // skill context, tagged-file expansion, attachment rendering, staged handoff — is user-only
         // work with nothing to act on. Skipping it is what keeps the turn's only new provider input
@@ -18667,7 +18927,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session: session,
             initialMessage: augmentedInitialMessage
         )
-        guard periodicStartIsCurrent() else { return nil }
+        guard periodicStartIsCurrent(), stopFence.permitsStart(of: session) else { return nil }
         let preparedCodexFallbackContext = codexFallbackContext.map { context in
             TabSession.CodexFallbackSubmissionContext(
                 queueID: context.queueID,
@@ -18677,7 +18937,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 draftText: context.draftText,
                 optimisticUserItemID: context.optimisticUserItemID,
                 origin: context.origin,
-                dispatchTicket: context.dispatchTicket
+                dispatchTicket: context.dispatchTicket,
+                stopFence: context.stopFence ?? stopFence
             )
         }
 
@@ -18689,7 +18950,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             attachments: attachments,
             codexFallbackContext: preparedCodexFallbackContext,
             autoEffortSelection: autoEffortSelection,
-            startOutcome: startOutcome
+            startOutcome: startOutcome,
+            stopFence: stopFence
         )
     }
 
@@ -19537,8 +19799,55 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         completion: AgentModeRunService.CancellationCompletion = .terminalPublished
     ) async {
         guard let session = sessions[tabID] else { return }
-        cancelPendingInstruction(for: session)
+        if !session.runState.isActive,
+           session.stopState.forceRetireUnclaimedStop(
+               binding: session.persistentSessionBindingIdentity,
+               runIsTerminal: session.runState.isTerminalForCommit
+           )
+        {
+            session.noteMonitorObservationInputsChanged()
+            requestUIRefresh(tabID: tabID, urgent: true)
+        }
         await runService.cancelRun(tabID: tabID, session: session, completion: completion)
+    }
+
+    /// Routes a managed Stop through the same user-Stop spine for the exact admitted object.
+    @discardableResult
+    func cancelAgentRunForSessionLink(
+        session: TabSession,
+        admission: AgentRunCancellationAdmission,
+        outcomeRecorder: AgentRunCancellationOutcomeRecorder
+    ) async -> Bool {
+        guard sessions[session.tabID] === session else { return false }
+        await runService.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            intent: .userStop,
+            completion: .terminalTeardownCompleted,
+            admission: admission,
+            outcomeRecorder: outcomeRecorder
+        )
+        return outcomeRecorder.initiatedCancellation
+    }
+
+    /// Withdraw the exact startup-pending producer; no terminal run is synthesized.
+    @discardableResult
+    func withdrawPendingStartForSessionLink(
+        session: TabSession,
+        admission: AgentRunCancellationAdmission
+    ) -> Bool {
+        guard sessions[session.tabID] === session else { return false }
+        let withdrawn = runService.withdrawPendingStartForSessionLink(
+            tabID: session.tabID,
+            session: session,
+            admission: admission
+        )
+        if withdrawn {
+            updateBindingsFromSession(session)
+            scheduleSave(for: session.tabID)
+            requestUIRefresh(tabID: session.tabID, urgent: true)
+        }
+        return withdrawn
     }
 
     /// Cancel a render-time run target, refusing if the live tab no longer matches that target.
@@ -19558,7 +19867,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             resyncAfterRejectedCancelTarget(target)
             return false
         }
-        cancelPendingInstruction(for: session)
         await runService.cancelRun(tabID: target.tabID, session: session, completion: completion)
         return true
     }
@@ -19979,7 +20287,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if !session.pendingInstructions.isEmpty {
             let queuedText = session.pendingInstructions.removeFirst()
             let text = await augmentUserMessageForProviderSend(
-                queuedText,
+                queuedText.providerText,
                 agent: session.selectedAgent,
                 session: session
             )
@@ -20482,6 +20790,73 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let scope = applyEditsScope(for: session.tabID)
         Task { [applyEditsApprovalStore] in
             await applyEditsApprovalStore.cancelPendingReview(scope: scope, reason: reason)
+        }
+    }
+
+    #if DEBUG
+        func test_setBeforeCancellationCommit(_ action: (@MainActor (TabSession) async -> Void)?) {
+            runService.testBeforeCancellationCommit = action
+        }
+
+        func test_publishNaturalCompletion(_ session: TabSession, supportsFollowUp: Bool = false) async {
+            await runService.test_publishNaturalCompletion(session, supportsFollowUp: supportsFollowUp)
+        }
+
+        func test_settleRejectedACPSteeringSubmission(
+            id: UUID, session: TabSession, stopFence: AgentRunStartStopFence
+        ) {
+            settleRejectedACPSteeringSubmission(id: id, session: session, stopFence: stopFence)
+        }
+
+        func test_submitWaitingClaudeAttachment(
+            session: TabSession,
+            text: String,
+            attachment: AgentImageAttachment
+        ) -> UserTurnSubmissionResult {
+            submitPreparedUserTurn(
+                tabID: session.tabID, session: session, trimmedText: text,
+                attachmentsToSend: [attachment], taggedFilesToSend: [], activeWorkflow: nil
+            )
+        }
+
+        func test_resumeStaleACPFlush(
+            session: TabSession, runID: UUID, runAttemptID: UUID, stopFence: AgentRunStartStopFence
+        ) {
+            runService.test_resumeStaleACPFlush(
+                session: session, runID: runID, runAttemptID: runAttemptID, stopFence: stopFence
+            )
+        }
+
+        func test_requeueDequeuedACPSteeringAfterStop(
+            _ instructions: [TabSession.ACPSteeringInstruction],
+            session: TabSession, stopFence: AgentRunStartStopFence
+        ) {
+            runService.test_requeueDequeuedACPSteeringAfterStop(
+                instructions, session: session, stopFence: stopFence
+            )
+        }
+    #endif
+
+    func withdrawQueuedWorkForManagedStop(session: TabSession) {
+        runService.withdrawQueuedWorkForManagedStop(tabID: session.tabID, session: session)
+        updateBindingsFromSession(session)
+        scheduleSave(for: session.tabID)
+    }
+
+    func prepareAgentRunCancellation(
+        session: TabSession,
+        intent: DomainAgentRunCancellationIntent
+    ) {
+        cancelPendingInstruction(for: session)
+        session.stopState.invalidateScheduledStarts()
+        guard intent == .userStop else { return }
+        session.mcpFollowUpRunPending = false
+        agentSessionLinkRetractAutoWakeForUserStop(session)
+        if let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID) {
+            AgentSessionLinkRuntimeBridge.shared.withdrawCancellableInboundPendingSends(
+                to: endpoint,
+                requiringNoCommittedDrain: false
+            )
         }
     }
 
@@ -21212,6 +21587,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             removeSessionIndex(forTabID: tabID)
         }
         tabDraftText.removeValue(forKey: tabID)
+        draftRestorationLedger.remove(tabID: tabID)
         sessions.removeValue(forKey: tabID)
         tabsWithActiveAgentRun.remove(tabID)
         mcpControlledTabIDs.remove(tabID)
@@ -21765,6 +22141,7 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
     ) {
         switch reason {
         case .sessionIndex:
+            rebuildAgentSessionLinkSubagentCensus()
             syncSidebarUIState(refresh: true, reason: .sessionIndex)
         case .sortDates:
             syncSidebarUIState(refresh: true, reason: .sortDates)

@@ -75,8 +75,10 @@ final class ClaudeIntegratedAgentModeRunner {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease,
-        autoEffortSelection: AutoEffortTurnSelection? = nil
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        stopFence: AgentRunStartStopFence? = nil
     ) async {
+        guard stopFence?.permitsStart(of: session) ?? true else { return }
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
@@ -93,6 +95,10 @@ final class ClaudeIntegratedAgentModeRunner {
             AgentModeProcessRunIdentity.existingProcessRunID(for: session)
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
+        guard stopFence?.permitsStart(of: session) ?? true else {
+            Task { await lease.cancelAndCleanup() }
+            return
+        }
         let ownership = session.beginRunAttempt(source: "claudeNative")
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak session] terminalState in
             {

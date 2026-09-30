@@ -56,6 +56,8 @@ struct AgentSessionLinkAutoWakeAttempt {
 
     /// Periodic admission has no queue evidence. Notification admission always supplies it.
     var queue: QueueEvidence?
+    /// Producer fence captured at reservation, before the reevaluation task is created.
+    var stopFence: AgentRunStartStopFence?
     var queueEpoch: UUID? {
         queue?.epoch
     }
@@ -112,10 +114,12 @@ struct AgentSessionLinkAutoWakeAttempt {
         attemptedFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?,
         physicalOutcome: AgentSessionLinkPhysicalDispatchOutcome,
         phase: Phase,
-        task: Task<Void, Never>?
+        task: Task<Void, Never>?,
+        stopFence: AgentRunStartStopFence? = nil
     ) {
         self.wakeID = wakeID
         self.observerEndpoint = observerEndpoint
+        self.stopFence = stopFence
         if let queueEpoch, let wakeFingerprint {
             queue = QueueEvidence(epoch: queueEpoch, revision: queueRevision, fingerprint: wakeFingerprint)
         }
@@ -138,6 +142,8 @@ enum AgentSessionLinkAutoWakeCancellationReason: String {
     case queueCleared = "queue_cleared"
     case naturalDeliveryWon = "natural_delivery_won"
     case localUserWon = "local_user_won"
+    /// User or managed Stop: never proves a physical provider call was absent.
+    case userStop = "user_stop"
     case eligibilityLost = "eligibility_lost"
     case shutdown
     /// The required lane claim disappeared before any provider call could begin.
@@ -421,7 +427,8 @@ extension AgentModeViewModel {
             attemptedFingerprint: nil,
             physicalOutcome: .notAttempted,
             phase: .scheduled,
-            task: nil
+            task: nil,
+            stopFence: AgentRunStartStopFence(session: session)
         )
         session.oversight.pendingAutoWake = attempt
         agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
@@ -472,6 +479,20 @@ extension AgentModeViewModel {
         if attempt.isPeriodic || attempt.isManual {
             agentSessionLinkDrainAutoWakeReevaluationIfOwed(session: session)
         }
+    }
+
+    /// Retracts this session's current wake without acknowledging its reducer content.
+    /// The exact pending fingerprint stays suppressed until a genuinely new eligible change.
+    func agentSessionLinkRetractAutoWakeForUserStop(_ session: TabSession) {
+        session.oversight.invalidatePeriodicIdleSpan()
+        guard let endpoint = agentSessionLinkObserverEndpoint(tabID: session.tabID),
+              let attempt = session.oversight.pendingAutoWake,
+              attempt.observerEndpoint == endpoint
+        else { return }
+        if let fingerprint = attempt.wakeFingerprint {
+            session.oversight.suppressedWakeFingerprint = fingerprint
+        }
+        cancelAgentSessionLinkAutoWake(for: endpoint, reason: .userStop)
     }
 
     /// Clears suppression so an explicit off/on cycle can retry a known failure.
@@ -604,7 +625,7 @@ extension AgentModeViewModel {
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
-                    directStartOptions: .laneUpdate(wakeID: wakeID)
+                    directStartOptions: .laneUpdate(wakeID: wakeID, stopFence: attempt.stopFence)
                 )
                 if case .some(.queuedFallback) = startOutcome {
                     // Codex owns a durable queued submission. Keep the wake identity attached until

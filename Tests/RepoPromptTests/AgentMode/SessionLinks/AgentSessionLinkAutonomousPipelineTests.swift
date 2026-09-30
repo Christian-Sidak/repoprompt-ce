@@ -550,6 +550,7 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: .empty,
                 idleForSend: false,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
@@ -721,6 +722,13 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
             targetEndpointIsLive: live.contains { $0.domainEndpoint == target },
             targetWindowIsClosing: viewModelsByWindowID[target.windowID] == nil
         )
+    }
+
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        guard let viewModel = viewModelsByWindowID[candidate.windowID],
+              let session = viewModel.agentSessionLinkLiveSession(matching: candidate)
+        else { return nil }
+        return AgentRunStartStopFence(session: session)
     }
 
     func agentSessionLinkPerformSend(

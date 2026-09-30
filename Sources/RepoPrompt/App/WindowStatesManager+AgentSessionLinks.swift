@@ -27,6 +27,13 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: DomainAgentSessionLaneBoard(
+                    runOutcome: .none,
+                    failureReason: nil,
+                    sendBlockers: [AgentModeViewModel.SendBlocker.sessionUnavailable.rawValue],
+                    subagentRunning: 0,
+                    subagentFinished: 0
+                ),
                 idleForSend: false,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
@@ -35,6 +42,32 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
             )
         }
         return window.agentModeViewModel.agentSessionLinkObservationSnapshot(for: candidate)
+    }
+
+    func agentSessionLinkRefreshSubagentCensus(
+        for candidates: [AgentSessionLinkEndpointCandidate]
+    ) async {
+        guard !isTerminating else { return }
+        // One metadata load per workspace/window in a multi-target poll or wait. Never activate a
+        // workspace or switch focus just to observe it.
+        var refreshed: Set<String> = []
+        for candidate in candidates {
+            guard let window = window(withID: candidate.windowID),
+                  !window.isClosing,
+                  let workspace = window.workspaceManager.activeWorkspace,
+                  workspace.id == candidate.workspaceID
+            else { continue }
+            let key = "\(candidate.windowID):\(workspace.id.uuidString)"
+            guard refreshed.insert(key).inserted else { continue }
+            await window.agentModeViewModel.agentSessionLinkRefreshSubagentCensus(for: workspace)
+        }
+    }
+
+    func agentSessionLinkForgetDeletedSubagent(_ sessionID: UUID) {
+        guard !isTerminating else { return }
+        for window in allWindows where !window.isClosing {
+            window.agentModeViewModel.agentSessionLinkForgetDeletedSubagent(sessionID)
+        }
     }
 
     func agentSessionLinkStatusProjection(
@@ -314,6 +347,14 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     /// transaction runs on that window's `AgentModeViewModel`, and a terminating manager or closing
     /// window must refuse before any target state is touched. Nothing here focuses or activates the
     /// window.
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        guard !isTerminating,
+              let window = window(withID: candidate.windowID), !window.isClosing,
+              let session = window.agentModeViewModel.agentSessionLinkLiveSession(matching: candidate)
+        else { return nil }
+        return AgentRunStartStopFence(session: session)
+    }
+
     func agentSessionLinkPerformSend(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
@@ -354,6 +395,29 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
         )
     }
 
+    /// Routes Stop without focusing or activating the target window.
+    func agentSessionLinkPerformStop(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkStopRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        queueHasCommittedDrain: @escaping @MainActor () -> Bool,
+        withdrawInbound: @escaping @MainActor () -> Bool,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkStopTransactionOutcome {
+        guard !isTerminating else { return .blocked(.shuttingDown) }
+        guard let window = window(withID: candidate.windowID), !window.isClosing else {
+            return .blocked(.endpointInvalidated)
+        }
+        return await window.agentModeViewModel.agentSessionLinkPerformStop(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            queueHasCommittedDrain: queueHasCommittedDrain,
+            withdrawInbound: withdrawInbound,
+            commitAuthorization: commitAuthorization
+        )
+    }
+
     /// Routes a read-only interaction inspection to the exact owning window. Never focuses it.
     func agentSessionLinkPendingInteraction(
         for candidate: AgentSessionLinkEndpointCandidate
@@ -363,36 +427,6 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
               !window.isClosing
         else { return .none }
         return window.agentModeViewModel.agentSessionLinkPendingInteraction(for: candidate)
-    }
-
-    /// Classifies the exact observer's window-owned session; refuses during teardown.
-    func agentSessionLinkCapabilityNoticeRoute(
-        for observerEndpoint: DomainAgentSessionLinkEndpointIdentity
-    ) -> AgentSessionLinkCapabilityNoticeRoute {
-        guard !isTerminating,
-              let window = window(withID: observerEndpoint.windowID),
-              !window.isClosing
-        else { return .unavailable(.observerUnavailable) }
-        return window.agentModeViewModel.agentSessionLinkCapabilityNoticeRoute(for: observerEndpoint)
-    }
-
-    /// Routes one capability notice to the exact observer's owning window, refusing during teardown.
-    func agentSessionLinkDeliverCapabilityNotice(
-        to observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        providerText: String,
-        notices: [DomainAgentSessionLinkCapabilityNotice],
-        isCurrent: @escaping @MainActor () async -> Bool
-    ) async -> Bool {
-        guard !isTerminating,
-              let window = window(withID: observerEndpoint.windowID),
-              !window.isClosing
-        else { return false }
-        return await window.agentModeViewModel.agentSessionLinkDeliverCapabilityNotice(
-            to: observerEndpoint,
-            providerText: providerText,
-            notices: notices,
-            isCurrent: isCurrent
-        )
     }
 
     /// Routes one observer answer to the exact owning window, refusing during teardown.

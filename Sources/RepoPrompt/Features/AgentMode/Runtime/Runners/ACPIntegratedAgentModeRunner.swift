@@ -148,8 +148,10 @@ final class ACPIntegratedAgentModeRunner {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         runRequest: ACPRunRequest,
-        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease
+        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
+        stopFence: AgentRunStartStopFence? = nil
     ) async {
+        guard stopFence?.permitsStart(of: session) ?? true else { return }
         let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
@@ -162,6 +164,7 @@ final class ACPIntegratedAgentModeRunner {
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
 
+        guard stopFence?.permitsStart(of: session) ?? true else { return }
         let ownership = session.beginRunAttempt(source: "acp")
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)

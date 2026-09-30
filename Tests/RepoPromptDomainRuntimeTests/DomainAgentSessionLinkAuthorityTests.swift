@@ -50,6 +50,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         pendingInteractionKind: DomainAgentSessionLinkPendingInteractionKind? = nil,
         displayName: String? = "Target",
         visibleRowCount: Int = 3,
+        board: DomainAgentSessionLaneBoard = .empty,
         /// `nil` derives the ordinary case. Pass `false` for the state that motivates `until: sendable`:
         /// status-idle with no interaction, but still committing, queued, or preparing.
         idleForSend: Bool? = nil
@@ -59,6 +60,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             displayName: displayName,
             providerDisplayName: "Codex CLI",
             status: status,
+            board: board,
             idleForSend: idleForSend ?? (status == .idle && pendingInteractionKind == nil),
             pendingInteractionKind: pendingInteractionKind,
             latestVisibleAssistantPreview: "preview",
@@ -1326,6 +1328,38 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         XCTAssertEqual(DomainAgentSessionContextLoad.Confidence.bestEffort.rawValue, "best_effort")
     }
 
+    func testLaneBoardSurvivesCanonicalizationAndJoinsChangeDetection() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint(windowID: 2)
+        _ = try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorPoll,
+            observerEndpoint: observer,
+            targetSessionID: target.sessionID
+        ).get()
+        let baselineState = await authority.targetState(for: lease)
+        let baseline = try XCTUnwrap(baselineState)
+        XCTAssertEqual(baseline.snapshot.board, .empty)
+
+        let board = DomainAgentSessionLaneBoard(
+            runOutcome: .failed,
+            failureReason: .timeout,
+            sendBlockers: ["terminal_commit_in_progress"],
+            subagentRunning: 1,
+            subagentFinished: 2
+        )
+        guard case .accepted = await authority.publishTargetSnapshot(
+            endpoint: target,
+            snapshot: makeSnapshot(sessionID: target.sessionID, board: board),
+            sourcePublicationSequence: 2
+        ) else { return XCTFail("A board-only change must publish") }
+        let changedState = await authority.targetState(for: lease)
+        let changed = try XCTUnwrap(changedState)
+        XCTAssertEqual(changed.snapshot.board, board)
+        XCTAssertEqual(changed.changeSequence, baseline.changeSequence + 1)
+    }
+
     func testContextLoadSurvivesCanonicalizationAndJoinsChangeDetection() async throws {
         let authority = makeAuthority()
         let observer = makeEndpoint()
@@ -1347,6 +1381,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
                 displayName: plain.displayName,
                 providerDisplayName: plain.providerDisplayName,
                 status: plain.status,
+                board: .empty,
                 idleForSend: plain.idleForSend,
                 pendingInteractionKind: plain.pendingInteractionKind,
                 latestVisibleAssistantPreview: plain.latestVisibleAssistantPreview,
@@ -1409,6 +1444,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
                 displayName: plain.displayName,
                 providerDisplayName: plain.providerDisplayName,
                 status: plain.status,
+                board: .empty,
                 idleForSend: plain.idleForSend,
                 pendingInteractionKind: plain.pendingInteractionKind,
                 latestVisibleAssistantPreview: plain.latestVisibleAssistantPreview,
@@ -2454,6 +2490,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             displayName: "Build\n\tAPI   session \(long)",
             providerDisplayName: "Codex",
             status: .running,
+            board: .empty,
             idleForSend: true,
             pendingInteractionKind: nil,
             latestVisibleAssistantPreview: long,
@@ -2490,6 +2527,7 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
             displayName: "Planning",
             providerDisplayName: nil,
             status: .idle,
+            board: .empty,
             idleForSend: true,
             pendingInteractionKind: .approval,
             latestVisibleAssistantPreview: nil,

@@ -150,9 +150,9 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             // lane and nothing stronger.
             .monitorSnoozeAutoWake: .poll,
             // Acting for the user in the target needs the user's explicit management delegation.
-            .monitorGetInteraction: .manage,
             .monitorRespond: .manage,
             .monitorSteer: .manage,
+            .monitorStop: .manage,
         ]
         for operation in targetBearingMonitorOperations {
             guard let capability = expected[operation] else {
@@ -324,7 +324,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             [
                 "agent_run.poll", "agent_run.wait", "agent_run.cancel", "agent_run.steer", "agent_run.respond",
                 "agent_manage.list_sessions", "agent_manage.get_log", "agent_manage.extract_handoff",
-                "agent_manage.resume_session", "agent_manage.stop_session", "agent_manage.cleanup_sessions",
+                "agent_manage.resume_session", "agent_manage.stop_session", "agent_manage.cleanup_sessions"
             ]
         )
         XCTAssertEqual(
@@ -333,8 +333,8 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
                 "agent_session_link.list", "agent_session_link.poll", "agent_session_link.wait",
                 "agent_session_link.read", "agent_session_link.send",
                 "agent_session_link.snooze_auto_wake",
-                "agent_session_link.get_interaction", "agent_session_link.respond",
-                "agent_session_link.steer",
+                "agent_session_link.respond",
+"agent_session_link.steer", "agent_session_link.stop"
             ]
         )
         for operation in sessionControlOperations where operation.requiredMonitorCapability != nil {
@@ -356,12 +356,11 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .poll
         )
         XCTAssertEqual(DomainAgentSessionTargetOperation.monitorSnoozeAutoWake.family, .monitor)
-        // Management: inspection reads, answering and steering mutate, and none is observer-scoped.
-        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorGetInteraction.mutatesTarget)
+        // Management: answering and steering mutate, and neither is observer-scoped.
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorRespond.mutatesTarget)
         XCTAssertTrue(DomainAgentSessionTargetOperation.monitorSteer.mutatesTarget)
         for operation in [
-            DomainAgentSessionTargetOperation.monitorGetInteraction, .monitorRespond, .monitorSteer
+            DomainAgentSessionTargetOperation.monitorRespond, .monitorSteer
         ] {
             XCTAssertFalse(operation.isObserverScoped, operation.rawValue)
             XCTAssertEqual(operation.requiredMonitorCapability, .manage, operation.rawValue)
@@ -372,5 +371,10 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             DomainAgentSessionLinkCapability.managed,
             DomainAgentSessionLinkCapability.version1.union([.manage])
         )
+        // Managed Stop mutates one exact target under the Manage grant.
+        XCTAssertTrue(DomainAgentSessionTargetOperation.monitorStop.mutatesTarget)
+        XCTAssertFalse(DomainAgentSessionTargetOperation.monitorStop.isObserverScoped)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorStop.requiredMonitorCapability, .manage)
+        XCTAssertEqual(DomainAgentSessionTargetOperation.monitorStop.family, .monitor)
     }
 }

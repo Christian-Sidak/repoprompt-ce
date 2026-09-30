@@ -55,6 +55,8 @@ enum AgentSessionLinkDeliveryReadiness {
         /// another observer must not `send` into it any more than into an active run — otherwise the
         /// wake and the send race for the same terminal boundary.
         var pendingOversightAutoWake: Bool = false
+        /// A binding-qualified managed stop owns this target until cleanup releases its gate.
+        var stopInProgress: Bool = false
 
         // Target interactions. Waiting states are never ready: answering one would be a different
         // capability than sending a new instruction, and `send` never gains it.
@@ -82,6 +84,7 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingACPSteeringCount: Int,
             pendingClaudeSteeringCount: Int,
             pendingOversightAutoWake: Bool = false,
+            stopInProgress: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
             hasPendingUserInputRequest: Bool,
@@ -105,6 +108,7 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingACPSteeringCount = pendingACPSteeringCount
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount
             self.pendingOversightAutoWake = pendingOversightAutoWake
+            self.stopInProgress = stopInProgress
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
             self.hasPendingUserInputRequest = hasPendingUserInputRequest
@@ -200,6 +204,13 @@ enum AgentSessionLinkDeliveryReadiness {
         return .ready
     }
 
+    static func failure(snapshot: Snapshot) -> AgentSessionLinkSendFailure? {
+        switch evaluate(snapshot: snapshot) {
+        case let .blocked(reason): AgentSessionLinkSendFailure(reason)
+        case .ready: nil
+        }
+    }
+
     /// Every non-lifecycle blocker. Completed, cancelled, and failed prior runs are *not* blockers:
     /// a terminal run in a still-live session is idle and remains sendable.
     private static func isTargetBusy(_ snapshot: Snapshot) -> Bool {
@@ -213,6 +224,7 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingACPSteeringCount > 0
             || snapshot.pendingClaudeSteeringCount > 0
             || snapshot.pendingOversightAutoWake
+            || snapshot.stopInProgress
             || snapshot.hasWaitingPrompt
             || snapshot.hasPendingAskUser
             || snapshot.hasPendingUserInputRequest

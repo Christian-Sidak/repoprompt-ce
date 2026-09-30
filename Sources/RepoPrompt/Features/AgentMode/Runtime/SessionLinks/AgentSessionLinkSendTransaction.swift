@@ -47,6 +47,8 @@ struct AgentSessionLinkSendRequest: Equatable {
     /// a `steer` whose commit fence re-proved the user's management delegation is framed as managed
     /// direction.
     var framing: AgentSessionLinkMessageFraming = .coordination
+    /// Queued sends retain their admission-time Stop fence across every drain suspension.
+    var startStopFence: AgentRunStartStopFence?
 
     /// Canonical session UUID of the granted observer incarnation. Attribution and the provider
     /// envelope are session-scoped by design; only the fences need the full identity.
@@ -150,6 +152,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     /// A managed `steer` found the target between states (committing its last turn, saving, changing
     /// where it runs, or taking a local submission). Nothing was delivered.
     case targetBusy = "target_busy"
+    /// A queued inbound send was withdrawn when its exact target endpoint was stopped.
+    case targetStopped = "target_stopped"
     /// The target is running on a provider path that cannot take live steering. Nothing was
     /// delivered; the message can be queued with `send` and `delivery: "when_sendable"`.
     case steerUnavailable = "steer_unavailable"
@@ -179,7 +183,7 @@ enum AgentSessionLinkSendFailure: String, Equatable {
              .targetBusy, .steerUnavailable, .steerNotAccepted:
             true
         case .endpointInvalidated, .linkRevoked, .persistenceIndeterminate, .shuttingDown,
-             .managementRevoked, .steerUnconfirmed:
+             .managementRevoked, .steerUnconfirmed, .targetStopped:
             false
         }
     }
@@ -208,15 +212,17 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .shuttingDown:
             "RepoPrompt is shutting down."
         case .managementRevoked:
-            "Your user withdrew management of this session before the steer was authorized. "
-                + "Nothing was delivered. Without management you may only observe and send."
+            "This exact link no longer authorizes steering. Nothing was delivered. Refresh `list` "
+                + "before retrying; an old session ID or grant is not authority."
         case .targetAwaitingInteraction:
-            "The overseen session is waiting on a prompt. Inspect it with get_interaction and answer "
+            "The overseen session is waiting on a prompt. Inspect it with managed poll or wait and answer "
                 + "it with respond, or leave it for the session's user if it is manual-only. Nothing "
                 + "was delivered."
         case .targetBusy:
             "The overseen session is between states and cannot take a steer this instant. Nothing "
                 + "was delivered. Wait for a change and try again with the same idempotency_key."
+        case .targetStopped:
+            "The queued message was withdrawn because the target was stopped and was not delivered."
         case .steerUnavailable:
             "This session's provider cannot take live steering while it runs. Nothing was "
                 + "delivered. Steer again once it is idle, or queue a message with send and "
@@ -529,6 +535,13 @@ enum AgentSessionLinkMessageDigest {
     static func steerDigest(message: String) -> String {
         let canonical = "steer:\(message)"
         return SHA256.hash(data: Data(canonical.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    /// A stop request shares the send/steer ledger but cannot collide with either.
+    static func stopDigest() -> String {
+        SHA256.hash(data: Data("agent_session_link.stop/v1".utf8))
             .map { String(format: "%02x", $0) }
             .joined()
     }

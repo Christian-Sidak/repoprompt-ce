@@ -246,6 +246,7 @@ final class AgentSessionLinkRunnerHarness {
             ),
             continuation: .init(
                 startFollowUpRun: { _, _ in },
+                startTypedACPFollowUpRun: { _, _ in },
                 signalMCPInstructionDelivered: { _ in }
             )
         )

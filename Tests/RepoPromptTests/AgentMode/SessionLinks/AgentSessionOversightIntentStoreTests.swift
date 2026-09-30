@@ -225,73 +225,18 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
         XCTAssertEqual(repeatedMissing.source, .missing)
     }
 
-    // MARK: - Delegation
+    // MARK: - Legacy delegation migration
 
-    /// The user's management / auto-approval choice is part of the saved pair: it survives a relaunch
-    /// and is dropped together with the pair.
-    func testDelegationRoundTripsAcrossLaunchesAndIsDroppedWithItsPair() async throws {
-        let managed = pair()
-        let plain = pair()
-        let first = makeStore()
-        _ = await first.loadForLaunch()
-        _ = await first.insert(managed)
-        _ = await first.insert(plain)
-
-        let receipt = await first.setDelegation(for: managed, manage: true)
-        XCTAssertEqual(receipt.outcome, .applied)
-        XCTAssertTrue(receipt.wroteFile)
-        // Field-level merge: setting one field keeps the other.
-        _ = await first.setDelegation(for: managed, autoApprovePermissions: true)
-        let repeated = await first.setDelegation(for: managed, manage: true)
-        XCTAssertEqual(repeated.outcome, .unchanged)
-        XCTAssertFalse(repeated.wroteFile)
-
-        let relaunched = makeStore()
-        guard case let .ready(load) = await relaunched.loadForLaunch() else {
-            return XCTFail("Expected a ready load")
-        }
-        XCTAssertEqual(load.pairs, [managed, plain])
-        XCTAssertEqual(
-            load.delegationByPair,
-            [managed: AgentSessionOversightDelegation(manage: true, autoApprovePermissions: true)]
-        )
-        let plainDelegation = await relaunched.delegation(for: plain)
-        XCTAssertEqual(plainDelegation, .none)
-
-        let token = try XCTUnwrap(load.tokenByPair[managed])
-        let removal = await relaunched.remove(managed, ifCurrent: token)
-        XCTAssertEqual(removal.outcome, .applied)
-        let afterRemoval = await relaunched.delegation(for: managed)
-        XCTAssertEqual(afterRemoval, .none)
-
-        // Re-adding the same pair starts with no delegation: removal ended the relationship.
-        _ = await relaunched.insert(managed)
-        let afterReAdd = await relaunched.delegation(for: managed)
-        XCTAssertEqual(afterReAdd, .none)
-        let third = makeStore()
-        guard case let .ready(reloaded) = await third.loadForLaunch() else {
-            return XCTFail("Expected a ready load")
-        }
-        XCTAssertTrue(reloaded.delegationByPair.isEmpty)
-    }
-
-    /// Delegation never creates a relationship on its own.
-    func testDelegationForAnUnsavedPairIsAbsentAndWritesNothing() async {
-        let store = makeStore()
-        _ = await store.loadForLaunch()
-        let receipt = await store.setDelegation(for: pair(), manage: true)
-        XCTAssertEqual(receipt.outcome, .absent)
-        XCTAssertFalse(receipt.wroteFile)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
-    }
-
-    /// Files written before delegation existed load unchanged, and a document with no delegation keeps
-    /// the original on-disk shape so an older build reads it exactly as before.
-    func testLegacyDocumentLoadsAndAnUndelegatedDocumentOmitsTheDelegationsKey() async throws {
+    func testLegacyDelegationsAreIgnoredButDirectedLinksSurviveAndNextWriteDropsThem() async throws {
         let observer = UUID()
         let target = UUID()
+        let orphan = UUID()
         try writeRawDocument("""
-        {"version":1,"links":[{"observerSessionID":"\(observer.uuidString)","targetSessionID":"\(target.uuidString)"}]}
+        {"version":1,"links":[{"observerSessionID":"\(observer.uuidString)","targetSessionID":"\(target.uuidString)"}],
+        "delegations":[
+          {"observerSessionID":"\(observer.uuidString)","targetSessionID":"\(target.uuidString)","manage":false,"autoApprovePermissions":true},
+          {"observerSessionID":"\(orphan.uuidString)","targetSessionID":"\(target.uuidString)","manage":true}
+        ]}
         """)
         let store = makeStore()
         guard case let .ready(load) = await store.loadForLaunch() else {
@@ -299,45 +244,14 @@ final class AgentSessionOversightIntentStoreTests: XCTestCase {
         }
         let legacy = AgentSessionOversightIntent(observerSessionID: observer, targetSessionID: target)
         XCTAssertEqual(load.source, .loaded)
-        XCTAssertEqual(load.pairs, [legacy])
-        XCTAssertTrue(load.delegationByPair.isEmpty)
+        XCTAssertEqual(load.pairs, [legacy], "Legacy fields cannot reverse or create a pair")
+        XCTAssertEqual(try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: Data(contentsOf: fileURL)).links, [legacy])
 
         _ = await store.insert(pair())
         let written = try String(contentsOf: fileURL, encoding: .utf8)
-        XCTAssertFalse(written.contains("delegations"))
-
-        _ = await store.setDelegation(for: legacy, autoApprovePermissions: true)
-        let delegated = try Data(contentsOf: fileURL)
-        let document = try JSONDecoder().decode(AgentSessionOversightIntentDocument.self, from: delegated)
-        XCTAssertEqual(document.version, 1, "Additive field: the schema version must not block older builds.")
-        XCTAssertEqual(document.delegations?.map(\.pair), [legacy])
-        XCTAssertEqual(document.delegations?.first?.manage, nil, "Unset fields are omitted, not written false.")
-        XCTAssertEqual(document.delegations?.first?.autoApprovePermissions, true)
-    }
-
-    /// A delegation row whose pair is not saved is an authorization with no relationship behind it.
-    func testOrphanDelegationRowsAreIgnoredOnLoad() async throws {
-        let saved = pair()
-        let orphan = pair()
-        let document = AgentSessionOversightIntentDocument(
-            links: [saved],
-            delegations: [
-                AgentSessionOversightDelegationRecord(
-                    observerSessionID: orphan.observerSessionID,
-                    targetSessionID: orphan.targetSessionID,
-                    manage: true,
-                    autoApprovePermissions: true
-                )
-            ]
-        )
-        try JSONEncoder().encode(document).write(to: fileURL, options: .atomic)
-
-        let store = makeStore()
-        guard case let .ready(load) = await store.loadForLaunch() else {
-            return XCTFail("Expected a ready load")
-        }
-        XCTAssertEqual(load.pairs, [saved])
-        XCTAssertTrue(load.delegationByPair.isEmpty)
+        XCTAssertFalse(written.contains("delegations"), "A write discards obsolete authority data")
+        XCTAssertTrue(written.contains(observer.uuidString))
+        XCTAssertTrue(written.contains(target.uuidString))
     }
 
     // MARK: - Insert / remove

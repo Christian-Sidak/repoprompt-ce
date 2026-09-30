@@ -20,6 +20,9 @@ extension AgentModeViewModel {
         guard let session = agentSessionLinkLiveSession(matching: candidate),
               let interaction = mcpPendingInteraction(for: session)
         else { return .none }
+        if AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction) {
+            return .tooLarge(interaction)
+        }
         return AgentSessionLinkPendingInteractionInspection(
             interaction: Self.overseerProjection(of: interaction),
             manualOnlyReason: overseerManualOnlyReason(for: interaction, session: session)
@@ -36,8 +39,18 @@ extension AgentModeViewModel {
         guard interaction.id == request.interactionID else {
             return .interactionMismatch(currentInteractionID: interaction.id)
         }
-        if let reason = overseerManualOnlyReason(for: interaction, session: session) {
-            return .manualOnly(reason)
+        if AgentSessionLinkPendingInteractionInspection.rawPromptExceedsWorkLimit(interaction) {
+            return .manualOnly(.tooLarge)
+        }
+        let manualOnlyReason = overseerManualOnlyReason(for: interaction, session: session)
+        let inspection = AgentSessionLinkPendingInteractionInspection(
+            interaction: Self.overseerProjection(of: interaction), manualOnlyReason: manualOnlyReason
+        )
+        if inspection.exceedsPromptLimit {
+            return .manualOnly(.tooLarge)
+        }
+        if let manualOnlyReason {
+            return .manualOnly(manualOnlyReason)
         }
 
         let resolution: PendingInteractionResolution
@@ -109,6 +122,13 @@ extension AgentModeViewModel {
         case .approval:
             if session.pendingWorktreeMergeReview?.id == interaction.id {
                 return .worktreeMergeReview
+            }
+            if let approval = session.pendingApproval,
+               approval.id == interaction.id,
+               case .acp = approval.requestID,
+               approval.overseerOneTimeAllowAvailable != true
+            {
+                return .noOneTimeAllowOption
             }
             return nil
         case .userInput:
@@ -199,7 +219,7 @@ extension AgentModeViewModel {
             fields: fields,
             details: interaction.details.map {
                 Interaction.Detail(
-                    label: $0.label,
+                    label: AgentSessionLinkTextRedactor.redact($0.label),
                     value: AgentSessionLinkTextRedactor.redact($0.value),
                     isCode: $0.isCode
                 )

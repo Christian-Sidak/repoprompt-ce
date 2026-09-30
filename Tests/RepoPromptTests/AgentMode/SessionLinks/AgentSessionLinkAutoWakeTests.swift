@@ -176,10 +176,10 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
 
     // MARK: - Guidance revision
 
-    /// A provider context that physically accepted an earlier revision is re-owed revision 7 in full.
-    /// Merely rendering or abandoning revision 7 does not advance the acknowledgement; only physical
+    /// A provider context that physically accepted an earlier revision is re-owed revision 10 in full.
+    /// Merely rendering or abandoning revision 10 does not advance the acknowledgement; only physical
     /// acceptance earns the reminder, and a rebuilt context owes the full block again.
-    func testRevisionSevenReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
+    func testRevisionElevenReOwesFullGuidanceAndReminderIsAcceptanceGated() throws {
         let observerSessionID = UUID()
         let epoch = Self.epoch(observerSessionID: observerSessionID)
         let inventory = Self.inventory(observerSessionID: observerSessionID, revision: 1)
@@ -212,6 +212,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 displayAttribution: passive.displayAttribution
             ),
             laneGuidanceMode: first.laneGuidanceMode,
+            inventoryGuidanceRevision: first.inventoryGuidanceRevision,
             fragment: first.fragment
         )
         store.accept(priorRevisionClaim)
@@ -228,8 +229,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 7 supersedes"))
-        // The rule revision 7 changes: a context taught it may only observe — and that may have
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 11 supersedes"))
+        // The rule revision 10 restates: a context taught it may only observe — and that may have
         // refused its own user on that basis — is told outright what replaced it.
         XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))
         XCTAssertTrue(reOwed.fragment.contains("by RepoPrompt or by you"))
@@ -1430,6 +1431,60 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.viewModel.cancelAgentSessionLinkAutoWake(
             for: reserved.observerEndpoint,
             reason: .settingDisabled
+        )
+    }
+
+    func testUserStopRetractsOnlyPreDispatchAutoWakePhases() throws {
+        for phase: AgentSessionLinkAutoWakeAttempt.Phase in [
+            .scheduled, .awaitingSettlement, .preparingDispatch,
+            .cancelledBeforeDispatch, .dispatching
+        ] {
+            let fixture = try makeFixture()
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            fixture.session.runState = .running
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            var reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+            reserved.task?.cancel()
+            reserved.phase = phase
+            fixture.session.oversight.pendingAutoWake = reserved
+
+            fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, reserved.wakeFingerprint)
+            switch phase {
+            case .scheduled, .awaitingSettlement:
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            case .preparingDispatch, .cancelledBeforeDispatch:
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .cancelledBeforeDispatch)
+                fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, reserved.wakeID)
+            case .dispatching:
+                XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .dispatching)
+            }
+        }
+    }
+
+    func testObserverAdmitsOneWakeForCancelledTargetStatusEdge() throws {
+        // This fixture is the observer side of Stop: the target's accepted cancelled publication
+        // appears here as one running -> idle status edge, not as a target-side wake retraction.
+        let observer = try makeFixture()
+        try publishInventory(observer, revision: 1)
+        observer.session.oversight.autoWakeOnUpdates = true
+        observer.session.runState = .running
+        XCTAssertNil(observer.session.oversight.suppressedWakeFingerprint)
+        try publishLane(
+            observer, linkSetRevision: 1, queueRevision: 0,
+            targetIndices: [], laneIndices: [0]
+        )
+        XCTAssertNil(observer.session.oversight.pendingAutoWake)
+        try publishLane(observer, linkSetRevision: 1, queueRevision: 1)
+        let first = try XCTUnwrap(observer.session.oversight.pendingAutoWake)
+        first.task?.cancel()
+        try publishLane(observer, linkSetRevision: 1, queueRevision: 1)
+        XCTAssertEqual(observer.session.oversight.pendingAutoWake?.wakeID, first.wakeID)
+        XCTAssertEqual(observer.session.oversight.pendingAutoWake?.wakeFingerprint, first.wakeFingerprint)
+        observer.viewModel.cancelAgentSessionLinkAutoWake(
+            for: first.observerEndpoint, reason: .settingDisabled
         )
     }
 

@@ -434,6 +434,7 @@ final class AgentSessionLinkSteerAdmissionTests: XCTestCase {
         )
         // Running but between states.
         let betweenStates: [(inout AgentSessionLinkDeliveryReadiness.Snapshot) -> Void] = [
+            { $0.stopInProgress = true },
             { $0.terminalCommitInProgress = true },
             { $0.isComposerSubmissionInFlight = true },
             { $0.isPreparingInitialWorktree = true },
@@ -455,7 +456,7 @@ final class AgentSessionLinkSteerAdmissionTests: XCTestCase {
             Admission.evaluate(readiness: running, runStateIsActive: true, pendingPromptExists: false, route: nil),
             .blocked(.steerUnavailable)
         )
-        for route: AgentSessionLinkManagedSteerRoute in [.codex, .claudeInterrupt, .waitingInstruction] {
+        for route: AgentSessionLinkManagedSteerRoute in [.codex, .claudeInterrupt, .acpQueued, .waitingInstruction] {
             XCTAssertEqual(
                 Admission.evaluate(readiness: running, runStateIsActive: true, pendingPromptExists: false, route: route),
                 .steer(route)
