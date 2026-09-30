@@ -2401,6 +2401,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         get { workspace(withID: activeWorkspaceID) }
         set {
             noteNonStartupWorkspaceActivationRequested()
+            // The notification may reentrantly close the window; never publish after close.
+            guard !isPreparingForWindowClose else { return }
             activeWorkspaceID = newValue?.id
         }
     }
@@ -2541,9 +2543,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         operationID: UUID,
         workspaceID: UUID
     ) -> WorkspaceSwitchResult? {
-        guard recoveringWorkspaceSwitchOperationID != operationID,
-              let attempt = initialDefaultAttempt(owning: operationID)
-        else { return nil }
+        guard let attempt = initialDefaultAttempt(owning: operationID) else { return nil }
+        // Closing fences startup recovery too; supersession does not (recovery is not a new
+        // startup publication).
+        if isPreparingForWindowClose {
+            return .cancelled("Initial workspace activation was cancelled because the window is closing.")
+        }
+        guard recoveringWorkspaceSwitchOperationID != operationID else { return nil }
         guard ownsWorkspaceSwitchOperation(operationID),
               initialDefaultActivationMayProceed(attempt)
         else {
@@ -5001,7 +5007,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                 explicitlyReturnToSystem: explicitlyRequestedRecovery,
                 allowExpiredDeletionRecovery: deletionTokenExpired && crossedDestructiveBoundary
             )
-            if !recoveryResult.didSwitch {
+            let isClosingStartup = isPreparingForWindowClose && initialDefaultAttempt(owning: operationID) != nil
+            if !recoveryResult.didSwitch, !isClosingStartup {
                 let detail = recoveryResult.message ?? "Unknown recovery failure."
                 let message = "Workspace switch recovery could not restore a usable workspace: \(detail)"
                 pendingWorkspaceSwitchBlockedNotice = WorkspaceSwitchBlockedNotice(message: message)
@@ -5177,15 +5184,17 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard ownsWorkspaceSwitchOperation(operationID) else {
             return .cancelled("Workspace switch to \"\(targetWorkspace.name)\" was superseded at \(boundary).")
         }
-        // Startup-only checks; ordinary recovery reuses the operation ID but is not a startup
-        // publication. Published startup is not aborted merely because explicit intent arrived.
-        if recoveringWorkspaceSwitchOperationID != operationID,
-           let attempt = initialDefaultAttempt(owning: operationID)
-        {
+        // Startup-only checks. Closing fences startup including its recovery; supersession does
+        // not apply to recovery, which reuses the operation ID but is not a startup publication.
+        // Published startup is not aborted merely because explicit intent arrived.
+        if let attempt = initialDefaultAttempt(owning: operationID) {
             if isPreparingForWindowClose {
                 return .cancelled("Initial workspace activation was cancelled because the window is closing at \(boundary).")
             }
-            if attempt.isSuperseded, !attempt.didPublishSelection {
+            if recoveringWorkspaceSwitchOperationID != operationID,
+               attempt.isSuperseded,
+               !attempt.didPublishSelection
+            {
                 return .cancelled("Initial workspace activation was superseded at \(boundary).")
             }
         }
@@ -5259,6 +5268,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             let classification = await refreshAuthorityConsolidatedRestoreClassification(
                 workspaceID: newWorkspace.id
             )
+            if let cancellation = explicitActivationCancellation(for: newWorkspace) {
+                return cancellation
+            }
             let currentAfterAdmission = workspace(withID: newWorkspace.id)
             let classificationBlocksSwitch = switch classification {
             case .clear:
@@ -6339,11 +6351,14 @@ class WorkspaceManagerViewModel: ObservableObject {
                 await workspaceRootHydrationWillSpawnHandlerForTesting?(activeWS.id)
             #endif
             // Releasing a gate after close must not launch fresh startup-owned hydration.
-            if let cancellation = cancellationResult(
-                operationID: operationID,
-                targetWorkspace: newWorkspace,
-                boundary: "spawning root hydration"
-            ) {
+            // Scoped to startup/close so ordinary switch behavior is unchanged.
+            if isPreparingForWindowClose || initialDefaultAttempt(owning: operationID) != nil,
+               let cancellation = cancellationResult(
+                   operationID: operationID,
+                   targetWorkspace: newWorkspace,
+                   boundary: "spawning root hydration"
+               )
+            {
                 return cancellation
             }
             folderLoadTask = Task { @MainActor in
@@ -7655,8 +7670,6 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Also fences a late Bridge application after startup ownership was cleared by close.
         guard !isPreparingForWindowClose else { return }
         let previousActiveWorkspaceID = activeWorkspaceID
-        // A stored ID that was dangling at assignment may resolve now.
-        latchEstablishedWorkspaceSelectionIfValid()
         if hasEstablishedWorkspaceSelection {
             reconcileEstablishedProjectedWorkspaceSelection(
                 preferredActiveWorkspaceID: preferredActiveWorkspaceID

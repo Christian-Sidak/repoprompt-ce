@@ -332,6 +332,12 @@ final class DomainWorkspacePresentationBridge {
     func stop() {
         subscriptionRunID = nil
         subscriptionTask?.cancel()
+        #if DEBUG
+            // Cancellation alone is not a join; keep stopped incarnations joinable.
+            if let subscriptionTask {
+                retiredSubscriptionTasks.append(subscriptionTask)
+            }
+        #endif
         subscriptionTask = nil
         projectedDigests.removeAll(keepingCapacity: false)
         projectedHealth.removeAll(keepingCapacity: false)
@@ -375,15 +381,24 @@ final class DomainWorkspacePresentationBridge {
         private var projectionWaiters: [UUID: ProjectionWaiter] = [:]
         /// Deadline tasks stay tracked until they actually exit so stop-and-join can join them.
         private var projectionWaiterDeadlines: [UUID: Task<Void, Never>] = [:]
+        private var retiredSubscriptionTasks: [Task<Void, Never>] = []
 
         /// Cancellation alone does not join a suspended projection into a fixture-owned manager.
+        /// Joins the current and every previously stopped subscription incarnation.
         func stopAndJoinForTesting() async {
-            let task = subscriptionTask
             stop()
-            await task?.value
+            let retired = retiredSubscriptionTasks
+            retiredSubscriptionTasks.removeAll()
+            for task in retired {
+                await task.value
+            }
             for deadline in Array(projectionWaiterDeadlines.values) {
                 await deadline.value
             }
+        }
+
+        var pendingProjectionWaiterCountForTesting: Int {
+            projectionWaiters.count
         }
 
         var hasActiveSubscriptionForTesting: Bool {

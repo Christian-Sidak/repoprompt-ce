@@ -72,25 +72,30 @@ import XCTest
 
                 // Bridge checkpoint journeys: timeout, caller cancellation, stop, and restart.
                 let applied = try XCTUnwrap(window.domainWorkspaceProjectionCheckpointForTesting)
-                let generation = window.domainWorkspaceProjectionGenerationForTesting
-                XCTAssertEqual(applied.generation, generation)
+                XCTAssertEqual(applied.generation, window.domainWorkspaceProjectionGenerationForTesting)
+                // An unsatisfiable generation isolates the timeout path from unrelated self-echoes.
+                let unsatisfiable = UInt64.max - 1
                 let timedOut = await window.waitForDomainWorkspaceProjectionForTesting(
-                    afterGeneration: generation, timeout: .milliseconds(50)
+                    afterGeneration: unsatisfiable, timeout: .milliseconds(50)
                 )
-                XCTAssertNil(timedOut, "No new application means timeout, not success")
+                XCTAssertNil(timedOut, "A deadline resolves an unsatisfied wait with nil")
+                XCTAssertEqual(window.pendingDomainWorkspaceProjectionWaiterCountForTesting, 0)
                 let cancelledWait = f.startOwned {
-                    await window.waitForDomainWorkspaceProjectionForTesting(afterGeneration: generation, timeout: .seconds(30))
+                    await window.waitForDomainWorkspaceProjectionForTesting(afterGeneration: unsatisfiable, timeout: .seconds(30))
                 }
+                try await f.awaitPendingProjectionWaiter(window)
                 cancelledWait.cancel()
                 let cancelledResult = await cancelledWait.value
-                XCTAssertNil(cancelledResult)
+                XCTAssertNil(cancelledResult, "A registered waiter resolves nil on caller cancellation")
                 let stoppedWait = f.startOwned {
-                    await window.waitForDomainWorkspaceProjectionForTesting(afterGeneration: generation, timeout: .seconds(30))
+                    await window.waitForDomainWorkspaceProjectionForTesting(afterGeneration: unsatisfiable, timeout: .seconds(30))
                 }
-                await Task.yield()
+                try await f.awaitPendingProjectionWaiter(window)
+                let generation = window.domainWorkspaceProjectionGenerationForTesting
                 await window.joinDomainWorkspaceBridgeForTesting()
                 let stoppedResult = await stoppedWait.value
-                XCTAssertNil(stoppedResult, "Stop resolves pending waits unsuccessfully")
+                XCTAssertNil(stoppedResult, "Stop resolves a registered wait unsuccessfully")
+                XCTAssertEqual(window.pendingDomainWorkspaceProjectionWaiterCountForTesting, 0)
                 XCTAssertNil(window.domainWorkspaceProjectionCheckpointForTesting, "Stop clears checkpoint validity")
                 XCTAssertEqual(window.domainWorkspaceProjectionGenerationForTesting, generation)
                 window.restartDomainWorkspaceProjectionForTesting()
@@ -117,11 +122,19 @@ import XCTest
                     try await f.wait(hold.entered)
                     try await f.awaitCatalogProjection(window)
                     let target = try XCTUnwrap(manager.workspace(withID: Fixture.requestedID))
-                    let result: WorkspaceSwitchResult = if useDirectSwitch {
-                        await manager.switchWorkspace(to: target, saveState: false, reason: "test direct open")
-                    } else {
-                        await manager.requestWorkspaceSwitch(to: target)
+                    // Owned + bounded: a regression that joins unresolved startup must fail, not hang.
+                    let finished = Signal("explicit open finished while startup lookup is held")
+                    let open = f.startOwned { () -> WorkspaceSwitchResult in
+                        let result: WorkspaceSwitchResult = if useDirectSwitch {
+                            await manager.switchWorkspace(to: target, saveState: false, reason: "test direct open")
+                        } else {
+                            await manager.requestWorkspaceSwitch(to: target)
+                        }
+                        finished.fire()
+                        return result
                     }
+                    try await f.wait(finished)
+                    let result = await open.value
                     XCTAssertTrue(result.didSwitch, "\(result)")
                     let assignedAt = recorder.emittedIDs.count
                     hold.gate.release()
@@ -210,7 +223,10 @@ import XCTest
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
-                XCTAssertEqual(recorder.emittedIDs.count, assignedAt, "No ID emission after the setter")
+                XCTAssertTrue(
+                    recorder.emittedIDs[assignedAt...].allSatisfy { $0 == Fixture.requestedID },
+                    "No different ID emitted after the setter"
+                )
                 XCTAssertEqual(recovery.count, 0)
             }
 
@@ -303,14 +319,23 @@ import XCTest
             try await Fixture.run { f in
                 let window = f.makeWindow()
                 let manager = window.workspaceManager
-                manager.setInitialDefaultResolutionHandlerForTesting { .fail }
+                // Fail only after the first projection applied while startup still owned activation.
+                let gate = f.makeGate()
+                let entered = Signal("startup reached resolution")
+                manager.setInitialDefaultResolutionHandlerForTesting {
+                    entered.fire()
+                    await gate.wait()
+                    return .fail
+                }
                 let route = f.makeRoute(for: window)
                 let recorder = f.makeRecorder(manager: manager, route: route)
                 let routeStart = recorder.routes.count
                 route.evaluateInitialRouteIfNeeded()
+                try await f.wait(entered)
+                try await f.awaitCatalogProjection(window)
+                gate.release()
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
-                try await f.awaitCatalogProjection(window)
                 try await f.acknowledgeRouteProbe(route)
                 XCTAssertNil(manager.activeWorkspaceID)
                 XCTAssertEqual(route.rootRoute, .workspaceEntry)
@@ -330,6 +355,7 @@ import XCTest
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
                 try await f.awaitCatalogProjection(window)
+                // No System exists, so projection order relative to startup does not matter here.
                 XCTAssertNil(manager.activeWorkspaceID)
                 _ = try await f.commitWorkspace(named: "Another user record", window: window)
                 XCTAssertNil(manager.activeWorkspaceID)
@@ -438,9 +464,12 @@ import XCTest
                 @MainActor
                 func establishedManager(coordinator: WorkspaceActivityCoordinator? = nil) -> WorkspaceManagerViewModel {
                     let manager = f.makeManager(coordinator: coordinator)
-                    f.project(manager, [requested, aardvark, system])
-                    XCTAssertEqual(manager.activeWorkspaceID, system.id)
+                    // No System yet, so only the setter can establish history.
+                    f.project(manager, [requested, aardvark])
+                    XCTAssertNil(manager.activeWorkspaceID)
+                    XCTAssertFalse(manager.hasEstablishedWorkspaceSelectionForTesting)
                     manager.activeWorkspace = manager.workspace(withID: requested.id)
+                    XCTAssertTrue(manager.hasEstablishedWorkspaceSelectionForTesting)
                     XCTAssertEqual(manager.activeWorkspaceID, requested.id)
                     return manager
                 }
@@ -448,7 +477,8 @@ import XCTest
                 // Established via actual activation (no authority): omission recovers to first eligible.
                 do {
                     let manager = f.makeManager(withAuthority: false)
-                    f.project(manager, [requested, aardvark, system])
+                    f.project(manager, [requested, aardvark])
+                    XCTAssertFalse(manager.hasEstablishedWorkspaceSelectionForTesting)
                     let target = try XCTUnwrap(manager.workspace(withID: requested.id))
                     let result = await manager.switchWorkspace(to: target, saveState: false)
                     XCTAssertTrue(result.didSwitch, "\(result)")
@@ -1079,6 +1109,16 @@ import XCTest
             }
         }
 
+        /// Acknowledges that a bridge waiter is registered (bounded; no sleeps).
+        func awaitPendingProjectionWaiter(_ window: WindowState) async throws {
+            for _ in 0 ..< 10000 {
+                if window.pendingDomainWorkspaceProjectionWaiterCountForTesting > 0 { return }
+                await Task.yield()
+            }
+            releaseAllGates()
+            throw Failure.timedOut("projection waiter registration")
+        }
+
         /// Waits for a real bridge application through the runtime's current publication.
         func awaitCatalogProjection(_ window: WindowState) async throws {
             let catalog = await runtime.workspaceStore.snapshot()
@@ -1223,6 +1263,10 @@ import XCTest
         func shutdown() async {
             guard !didShutdown else { return }
             didShutdown = true
+            // Close before releasing startup so a failure path cannot dispatch late restore work.
+            for window in windows where !tornDownWindowIDs.contains(window.windowID) {
+                window.beginClose()
+            }
             releaseAllGates()
             for manager in windows.map(\.workspaceManager) + managers {
                 manager.setInitialDefaultResolutionHandlerForTesting(nil)

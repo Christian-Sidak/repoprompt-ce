@@ -475,14 +475,16 @@ class WindowState: ObservableObject {
     func beginClose() {
         guard !isClosing else { return }
         isClosing = true
-        // Close-triggered initialization completion must never dispatch a pending restore.
-        retirePendingRestoreEntry()
         failUnstartedCommandsForWindowClose()
 
         let manager = windowStatesManager ?? WindowStatesManager.shared
         if !manager.isTerminating {
             manager.markWindowAsExplicitlyClosing(windowID: windowID)
         }
+        // Close-triggered initialization completion must never dispatch a pending restore.
+        // Retired after the explicit-close mark so a persist flushed by the completion already
+        // excludes this window.
+        retirePendingRestoreEntry()
         closeCoordinator.beginClose()
         onFocusChanged = nil
         removeFocusObservers()
@@ -568,6 +570,10 @@ class WindowState: ObservableObject {
                 through: publicationSequence,
                 timeout: timeout
             )
+        }
+
+        var pendingDomainWorkspaceProjectionWaiterCountForTesting: Int {
+            domainWorkspacePresentationBridge?.pendingProjectionWaiterCountForTesting ?? 0
         }
 
         func restartDomainWorkspaceProjectionForTesting() {
