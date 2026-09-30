@@ -740,6 +740,53 @@ import XCTest
                     XCTAssertFalse(window.hasPendingRestoreEntryForTesting)
                 }
             }
+
+            // Close while published startup is suspended in recovery: the recovery target is a
+            // different System, so only the closing fence prevents a late fallback publication.
+            try await Fixture.run(seeds: Fixture.twoSystemSeeds) { f in
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                let hydration = f.holdHydrationSpawn(manager, of: Fixture.defaultID)
+                let recoveryGate = f.makeGate()
+                let recoveryEntered = Signal("startup recovery began")
+                manager.setWorkspaceSwitchRecoveryWillBeginHandlerForTesting {
+                    recoveryEntered.fire()
+                    await recoveryGate.wait()
+                }
+                let recorder = f.makeRecorder(manager: manager, route: nil)
+                try await f.wait(hydration.entered)
+                try await f.awaitCatalogProjection(window)
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID, "startup published before recovery")
+
+                let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
+                let closeCompleted = Signal("pending restore completed by close during recovery")
+                window.applyWindowRestoreEntry(entry) { closeCompleted.fire() }
+
+                // A user cancel of the published, uncommitted startup switch requests recovery.
+                await manager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+                hydration.gate.release()
+                try await f.wait(recoveryEntered)
+
+                await window.joinDomainWorkspaceBridgeForTesting()
+                let teardown = f.startOwned { await window.tearDown() }
+                f.markTornDown(window)
+                try await f.wait(closeCompleted)
+                recoveryGate.release()
+                await teardown.value
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                await manager.awaitInitialized()
+
+                XCTAssertEqual(closeCompleted.count, 1)
+                XCTAssertFalse(
+                    recorder.emittedIDs.contains(Fixture.earlierSystemID),
+                    "Recovery must not publish a fallback after close"
+                )
+                XCTAssertFalse(recorder.emittedIDs.contains(Fixture.requestedID), "Restore never dispatched")
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
+                XCTAssertNil(manager.activeWorkspaceSwitch)
+                XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice, "No blocked notice on close")
+                XCTAssertFalse(manager.test_isPollTimerActive)
+            }
         }
     }
 
@@ -864,6 +911,13 @@ import XCTest
                 model(id: aardvarkID, name: "Mango"),
                 model(id: requestedID, name: "Z requested")
             ]
+        }
+
+        static let earlierSystemID = UUID(uuidString: "5B000000-0000-0000-0000-000000000006")!
+
+        /// A second System sorting before Default makes startup recovery target a different ID.
+        static var twoSystemSeeds: [WorkspaceModel] {
+            standardSeeds + [model(id: earlierSystemID, name: "Aaa System", isSystem: true)]
         }
 
         static var userOnlySeeds: [WorkspaceModel] {
