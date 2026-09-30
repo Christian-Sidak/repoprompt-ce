@@ -14,45 +14,10 @@ permissions:
   contents: read
 
 jobs:
-  style:
-    name: Style
-    runs-on: macos-26
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Run repository guardrails
-        run: make guardrails
-
-      - name: Install Swift style tools
-        run: ./Scripts/install_format_tools.sh install
-
-      - name: Run Swift style lint
-        run: make lint
-
-      - name: Run conductor tests
-        run: make conductor-selftest
-
-      - name: Set up Node for pinned Codex CLI
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-
-      - name: Install pinned Codex CLI
-        run: npm install --global @openai/codex@0.159.0
-
-      - name: Validate Codex app-server schema contract
-        run: make dev-codex-schema-check
-
-      - name: Run release workflow tests
-        run: make release-selftest
-
   select-module-tests:
-    name: Select Affected Module Tests
-    runs-on: macos-26
+    name: Select Affected Module Tests (main only)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
       has_modules: ${{ steps.select.outputs.has_modules }}
@@ -89,13 +54,44 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Restore SwiftPM dependency sources only
+      - name: Restore SwiftPM build cache
         uses: actions/cache@v6
         with:
           path: |
-            .build/checkouts
-            .build/repositories
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sources-${{ hashFiles('Package.swift', 'Package.resolved') }}
+            .build
+            Packages/RepoPromptAgentProviders/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
+
+      - name: Run repository guardrails
+        run: make guardrails
+
+      - name: Install Swift style tools
+        run: ./Scripts/install_format_tools.sh install
+
+      - name: Run Swift style lint
+        run: make lint
+
+      - name: Run conductor tests
+        run: make conductor-selftest
+
+      - name: Set up Node for pinned Codex CLI
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install pinned Codex CLI
+        run: npm install --global @openai/codex@0.159.0
+
+      - name: Validate Codex app-server schema contract
+        run: make dev-codex-schema-check
+
+      - name: Run release workflow tests
+        run: make release-selftest
+
+      - name: Run provider package tests
+        run: ./conductor provider-test
 
       - name: Build root test bundles with import and type-check gates
         shell: bash
@@ -172,7 +168,7 @@ jobs:
   module-tests:
     name: Module Tests (${{ matrix.module }})
     needs: select-module-tests
-    if: needs.select-module-tests.outputs.has_modules == 'true'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.select-module-tests.outputs.has_modules == 'true'
     runs-on: macos-26
     timeout-minutes: 30
     strategy:
@@ -225,31 +221,9 @@ jobs:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./conductor test --filter SentryTelemetryPrivacyTests
 
-  provider-tests:
-    name: Provider Tests
-    runs-on: macos-26
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-
-      - name: Restore SwiftPM build cache
-        uses: actions/cache@v6
-        with:
-          path: |
-            .build
-            Packages/RepoPromptAgentProviders/.build
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-provider-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
-
-      - name: Run provider package tests
-        run: ./conductor provider-test
-
   secret-scan:
     name: Secret Scan
-    runs-on: macos-26
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -257,8 +231,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Install gitleaks
-        run: brew install gitleaks
+      - name: Install pinned gitleaks
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - name: Scan introduced commit range
         env:

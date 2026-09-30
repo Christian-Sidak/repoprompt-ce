@@ -3,9 +3,10 @@
   "ratcheted": [
     "app_files_over_5000_lines",
     "app_files_over_2000_lines",
-    "app_static_shared_declarations",
-    "tests_testable_import_app_files"
+    "tests_testable_import_app_files",
+    "app_static_shared_declarations"
   ],
+  "app_target_swift_lines_headroom": 2000,
   "tracked": [
     "app_target_swift_lines",
     "app_shared_accessor_uses",
@@ -19,16 +20,15 @@
     "app_files_over_2000_lines": 53,
     "app_files_over_5000_lines": 17,
     "app_largest_cycle_components": 64,
-    "app_share_permille": 867,
-    "app_shared_accessor_uses": 1202,
+    "app_share_permille": 868,
+    "app_shared_accessor_uses": 1217,
     "app_static_shared_declarations": 93,
-    "app_target_swift_files": 1104,
-    "app_target_swift_lines": 646930,
+    "app_target_swift_files": 1125,
+    "app_target_swift_lines": 649172,
     "app_userdefaults_standard_uses": 234,
-    "app_wrong_way_file_edges": 1099,
-    "first_party_swift_lines": 737537,
-    "tests_sleep_calls": 53,
+    "app_wrong_way_file_edges": 1116,
+    "first_party_swift_lines": 747652,
+    "tests_sleep_calls": 59,
     "tests_testable_import_app_files": 329
-  },
-  "app_target_swift_lines_headroom": 2000
+  }
 }
