@@ -29,6 +29,59 @@ class ContentViewModel: ObservableObject {
     /// Using Combine for notification handling
     private var cancellables = Set<AnyCancellable>()
 
+    #if DEBUG
+        /// One actually-consumed active-ID route input: the ID the publisher emitted, the ID the
+        /// scheduled consumer really read, and the route that evaluation produced.
+        struct WorkspaceRouteConsumptionForTesting: Equatable {
+            let ordinal: UInt64
+            let publisherEmittedID: UUID?
+            let idActuallyRead: UUID?
+            let resultingRoute: AppRootRoute
+        }
+
+        private enum WorkspaceRouteInput {
+            case workspace(UUID?)
+            case probe(UUID)
+        }
+
+        private let workspaceRouteProbeSubject = PassthroughSubject<UUID, Never>()
+        private var workspaceRouteConsumptionOrdinal: UInt64 = 0
+        private var workspaceRouteConsumptionHandlerForTesting: ((WorkspaceRouteConsumptionForTesting) -> Void)?
+        private var workspaceRouteProbeAcknowledgementHandlerForTesting: ((UUID) -> Void)?
+
+        func setWorkspaceRouteConsumptionHandlerForTesting(
+            _ handler: ((WorkspaceRouteConsumptionForTesting) -> Void)?
+        ) {
+            workspaceRouteConsumptionHandlerForTesting = handler
+        }
+
+        func setWorkspaceRouteProbeAcknowledgementHandlerForTesting(_ handler: ((UUID) -> Void)?) {
+            workspaceRouteProbeAcknowledgementHandlerForTesting = handler
+        }
+
+        /// Enqueues a barrier through the same scheduler as active-ID route inputs. Its
+        /// acknowledgement proves every earlier route input was consumed; it never routes.
+        func enqueueWorkspaceRouteProbeForTesting(token: UUID) {
+            workspaceRouteProbeSubject.send(token)
+        }
+
+        private func consumeWorkspaceRouteInput(_ input: WorkspaceRouteInput) {
+            switch input {
+            case let .workspace(emittedID):
+                let readID = synchronizeRouteWithCapturedSelection()
+                workspaceRouteConsumptionOrdinal += 1
+                workspaceRouteConsumptionHandlerForTesting?(WorkspaceRouteConsumptionForTesting(
+                    ordinal: workspaceRouteConsumptionOrdinal,
+                    publisherEmittedID: emittedID,
+                    idActuallyRead: readID,
+                    resultingRoute: rootRoute
+                ))
+            case let .probe(token):
+                workspaceRouteProbeAcknowledgementHandlerForTesting?(token)
+            }
+        }
+    #endif
+
     /// Instead of storing each manager individually, store a reference to the whole window's state.
     let state: WindowState
 
@@ -48,13 +101,25 @@ class ContentViewModel: ObservableObject {
     init(state: WindowState) {
         self.state = state
 
-        // Sync workspace changes to drive routing
-        state.workspaceManager.$activeWorkspaceID
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                self?.syncRouteWithWorkspaceState()
-            }
-            .store(in: &cancellables)
+        // Sync workspace changes to drive routing. The consumer deliberately rereads current
+        // manager state after scheduling rather than trusting the emitted ID.
+        #if DEBUG
+            state.workspaceManager.$activeWorkspaceID
+                .map(WorkspaceRouteInput.workspace)
+                .merge(with: workspaceRouteProbeSubject.map(WorkspaceRouteInput.probe))
+                .receive(on: RunLoop.main)
+                .sink { [weak self] input in
+                    self?.consumeWorkspaceRouteInput(input)
+                }
+                .store(in: &cancellables)
+        #else
+            state.workspaceManager.$activeWorkspaceID
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in
+                    self?.syncRouteWithWorkspaceState()
+                }
+                .store(in: &cancellables)
+        #endif
 
         // The root shell reads approval state through this model. Forward only
         // presentation changes so a request can appear without unrelated root
@@ -74,8 +139,17 @@ class ContentViewModel: ObservableObject {
 
     /// Whether the active workspace is the system fallback (i.e. no real workspace selected).
     var isInSystemFallback: Bool {
-        guard let ws = state.workspaceManager.activeWorkspace else { return true }
-        return ws.isSystemWorkspace
+        capturedSelectionRouteState().isSystemFallback
+    }
+
+    /// Reads the active ID exactly once and resolves that same ID, so one evaluation cannot
+    /// mix two different selections.
+    private func capturedSelectionRouteState() -> (activeID: UUID?, isSystemFallback: Bool) {
+        let activeID = state.workspaceManager.activeWorkspaceID
+        guard let workspace = state.workspaceManager.workspace(withID: activeID) else {
+            return (activeID, true)
+        }
+        return (activeID, workspace.isSystemWorkspace)
     }
 
     /// Called on first appear to determine initial route and optionally show onboarding.
@@ -102,11 +176,18 @@ class ContentViewModel: ObservableObject {
 
     /// Keeps route in sync when workspace changes (e.g. exit to fallback, or open workspace).
     func syncRouteWithWorkspaceState() {
+        synchronizeRouteWithCapturedSelection()
+    }
+
+    /// Shared route body; returns the active ID it actually evaluated.
+    @discardableResult
+    private func synchronizeRouteWithCapturedSelection() -> UUID? {
+        let selection = capturedSelectionRouteState()
         if AppLaunchConfiguration.current.forcedRootRoute == .main {
             rootRoute = .main
-            return
+            return selection.activeID
         }
-        if isInSystemFallback {
+        if selection.isSystemFallback {
             if rootRoute != .workspaceEntry {
                 rootRoute = .workspaceEntry
                 workspaceEntryTab = .workspaces
@@ -116,6 +197,7 @@ class ContentViewModel: ObservableObject {
                 rootRoute = .main
             }
         }
+        return selection.activeID
     }
 
     /// Shows the workspace entry flow with the setup guide tab (user-invoked from Help menu / notification).

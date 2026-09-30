@@ -475,6 +475,8 @@ class WindowState: ObservableObject {
     func beginClose() {
         guard !isClosing else { return }
         isClosing = true
+        // Close-triggered initialization completion must never dispatch a pending restore.
+        retirePendingRestoreEntry()
         failUnstartedCommandsForWindowClose()
 
         let manager = windowStatesManager ?? WindowStatesManager.shared
@@ -545,6 +547,35 @@ class WindowState: ObservableObject {
 
         func joinDomainWorkspaceBridgeForTesting() async {
             await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
+        }
+
+        var domainWorkspaceProjectionGenerationForTesting: UInt64 {
+            domainWorkspacePresentationBridge?.projectionGenerationForTesting ?? 0
+        }
+
+        var domainWorkspaceProjectionCheckpointForTesting: DomainWorkspacePresentationBridge.ProjectionCheckpoint? {
+            domainWorkspacePresentationBridge?.projectionCheckpointForTesting
+        }
+
+        func waitForDomainWorkspaceProjectionForTesting(
+            afterGeneration: UInt64,
+            through publicationSequence: UInt64 = 0,
+            timeout: Duration = .seconds(5)
+        ) async -> DomainWorkspacePresentationBridge.ProjectionCheckpoint? {
+            guard let domainWorkspacePresentationBridge else { return nil }
+            return await domainWorkspacePresentationBridge.waitForProjectionForTesting(
+                afterGeneration: afterGeneration,
+                through: publicationSequence,
+                timeout: timeout
+            )
+        }
+
+        func restartDomainWorkspaceProjectionForTesting() {
+            domainWorkspacePresentationBridge?.start()
+        }
+
+        var hasPendingRestoreEntryForTesting: Bool {
+            pendingRestoreEntry != nil
         }
 
         convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
@@ -669,10 +700,17 @@ class WindowState: ObservableObject {
             }
         }
 
+        // Explicit (non-startup) activation wins over a restore that has not dispatched yet.
+        // Installed before yielding so startup cannot race ahead of it.
+        workspaceManager.onNonStartupWorkspaceActivationRequested = { [weak self] in
+            self?.retirePendingRestoreEntry()
+        }
+
         // Process any queued commands once the workspace is initialized
         workspaceManager.onceInitialized { [weak self] in
             guard let self else { return }
             Task {
+                guard !self.isClosing else { return }
                 self.applyPendingRestoreEntryIfPossible()
                 await self.processCommands()
             }
@@ -1472,18 +1510,42 @@ class WindowState: ObservableObject {
     /// after the restore attempt finished (successfully or not) or when the entry is
     /// skipped, so callers can release restore-in-progress guards.
     func applyWindowRestoreEntry(_ entry: WindowSessionEntry, completion: (() -> Void)? = nil) {
+        guard !isClosing else {
+            completion?()
+            return
+        }
         guard !entry.isEphemeral else {
             completion?()
             return
         }
-        // Never drop a previously pending completion if the entry is replaced.
-        pendingRestoreCompletion?()
+        // Install the newer state before invoking the displaced completion so reentrant capture
+        // or explicit intent sees the newer acceptance. Never drop the displaced completion.
+        let displacedCompletion = pendingRestoreCompletion
         pendingRestoreEntry = entry
         pendingRestoreCompletion = completion
+        // Armed at acceptance, not dispatch: termination can persist the session before the
+        // restore (or failed startup) runs. A System-intended entry needs no protection.
+        unresolvedRestoreEntry = entry.isSystemWorkspace ? nil : entry
+        displacedCompletion?()
         applyPendingRestoreEntryIfPossible()
     }
 
+    /// Completes a not-yet-dispatched restore exactly once without dispatching it, keeping its
+    /// entry protected for session capture until a later successful non-System selection.
+    private func retirePendingRestoreEntry() {
+        guard pendingRestoreEntry != nil || pendingRestoreCompletion != nil else { return }
+        let entry = pendingRestoreEntry
+        let completion = pendingRestoreCompletion
+        pendingRestoreEntry = nil
+        pendingRestoreCompletion = nil
+        if let entry, !entry.isSystemWorkspace {
+            unresolvedRestoreEntry = entry
+        }
+        completion?()
+    }
+
     private func applyPendingRestoreEntryIfPossible() {
+        guard !isClosing else { return }
         guard workspaceManager.isInitialized else { return }
         guard let entry = pendingRestoreEntry else { return }
         pendingRestoreEntry = nil
@@ -1491,7 +1553,9 @@ class WindowState: ObservableObject {
         pendingRestoreCompletion = nil
 
         Task {
-            await restoreWorkspace(from: entry)
+            if !self.isClosing {
+                await restoreWorkspace(from: entry)
+            }
             completion?()
         }
     }
@@ -1500,10 +1564,10 @@ class WindowState: ObservableObject {
         #if DEBUG
             let restoreStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
-        // Armed up front, cleared only once a real workspace actually becomes active. Resolving
-        // a target does not prove the switch took, so clearing on resolution alone would let a
-        // refused switch persist the Default fallback over the snapshot.
-        unresolvedRestoreEntry = entry
+        // `unresolvedRestoreEntry` was armed when this entry was accepted and is cleared only once
+        // a real workspace actually becomes active. Resolving a target does not prove the switch
+        // took, so clearing on resolution alone would let a refused switch persist the Default
+        // fallback over the snapshot. Re-arming here could overwrite a newer acceptance.
         if let target = resolveWorkspace(for: entry) {
             #if DEBUG
                 WorkspaceRestorePerfLog.log(
@@ -1536,7 +1600,7 @@ class WindowState: ObservableObject {
             }
         #endif
         // No existing workspace matches; leave the window in its default state. The entry armed
-        // above stays set, so `captureCurrentSession` re-emits it instead of persisting the
+        // at acceptance stays set, so `captureCurrentSession` re-emits it instead of persisting the
         // Default fallback, which would discard the user's real window layout.
     }
 
@@ -2468,6 +2532,8 @@ class WindowState: ObservableObject {
 
     func tearDown() async {
         beginClose()
+        // Join cancelled startup before saves/root drains so it cannot publish or hydrate late.
+        await workspaceManager.awaitInitialWorkspaceActivationCompletion()
         // Finish this window's own saves (including the final `onDisappear` capture) before any
         // teardown step can stop the presentation that owns them (#1089).
         await workspaceManager.awaitOwnSavesForWindowClose()

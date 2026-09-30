@@ -312,6 +312,9 @@ final class DomainWorkspacePresentationBridge {
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private let client: DomainWorkspaceAuthorityClient
     private var subscriptionTask: Task<Void, Never>?
+    /// Subscription incarnation created by `start()` and invalidated by `stop()`. An authority read
+    /// that returns after stop must neither apply a stale snapshot nor credit a newer run.
+    private var subscriptionRunID: UUID?
     private var lastPublicationSequence: UInt64 = 0
     private var projectedDigests: [UUID: String] = [:]
     private var projectedHealth: [UUID: DomainAuthorityHealth] = [:]
@@ -327,63 +330,171 @@ final class DomainWorkspacePresentationBridge {
     }
 
     func stop() {
+        subscriptionRunID = nil
         subscriptionTask?.cancel()
         subscriptionTask = nil
         projectedDigests.removeAll(keepingCapacity: false)
         projectedHealth.removeAll(keepingCapacity: false)
         projectedModels.removeAll(keepingCapacity: false)
+        #if DEBUG
+            projectionCheckpoint = nil
+            for waiterID in Array(projectionWaiters.keys) {
+                resolveProjectionWaiter(waiterID, with: nil)
+            }
+        #endif
+    }
+
+    private func isCurrentRun(_ runID: UUID) -> Bool {
+        subscriptionRunID == runID && !Task.isCancelled
     }
 
     #if DEBUG
+        /// A completed manager application by one subscription incarnation.
+        struct ProjectionCheckpoint: Equatable {
+            let runID: UUID
+            /// Monotonic across stop/start; zero means no application has completed.
+            let generation: UInt64
+            let publicationSequence: UInt64
+        }
+
+        private struct ProjectionWaiter {
+            let runID: UUID?
+            let afterGeneration: UInt64
+            let publicationSequence: UInt64
+            let continuation: CheckedContinuation<ProjectionCheckpoint?, Never>
+
+            func isSatisfied(by checkpoint: ProjectionCheckpoint) -> Bool {
+                checkpoint.runID == runID
+                    && checkpoint.generation > afterGeneration
+                    && checkpoint.publicationSequence >= publicationSequence
+            }
+        }
+
+        private var projectionCheckpoint: ProjectionCheckpoint?
+        private var projectionGeneration: UInt64 = 0
+        private var projectionWaiters: [UUID: ProjectionWaiter] = [:]
+        /// Deadline tasks stay tracked until they actually exit so stop-and-join can join them.
+        private var projectionWaiterDeadlines: [UUID: Task<Void, Never>] = [:]
+
         /// Cancellation alone does not join a suspended projection into a fixture-owned manager.
         func stopAndJoinForTesting() async {
             let task = subscriptionTask
             stop()
             await task?.value
+            for deadline in Array(projectionWaiterDeadlines.values) {
+                await deadline.value
+            }
         }
 
         var hasActiveSubscriptionForTesting: Bool {
             subscriptionTask != nil
         }
 
+        var projectionGenerationForTesting: UInt64 {
+            projectionGeneration
+        }
+
+        var projectionCheckpointForTesting: ProjectionCheckpoint? {
+            projectionCheckpoint
+        }
+
+        /// Returns the first checkpoint of the current incarnation with a generation after
+        /// `afterGeneration` that applied at least `through`, or nil on timeout/cancellation/stop.
+        /// Sequence zero is satisfied only by a real application.
+        func waitForProjectionForTesting(
+            afterGeneration: UInt64,
+            through publicationSequence: UInt64 = 0,
+            timeout: Duration = .seconds(5)
+        ) async -> ProjectionCheckpoint? {
+            let waiterID = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { (continuation: CheckedContinuation<ProjectionCheckpoint?, Never>) in
+                    let waiter = ProjectionWaiter(
+                        runID: subscriptionRunID,
+                        afterGeneration: afterGeneration,
+                        publicationSequence: publicationSequence,
+                        continuation: continuation
+                    )
+                    // Register before checking so every exit resolves through one helper.
+                    projectionWaiters[waiterID] = waiter
+                    if Task.isCancelled || subscriptionRunID == nil {
+                        resolveProjectionWaiter(waiterID, with: nil)
+                        return
+                    }
+                    if let projectionCheckpoint, waiter.isSatisfied(by: projectionCheckpoint) {
+                        resolveProjectionWaiter(waiterID, with: projectionCheckpoint)
+                        return
+                    }
+                    projectionWaiterDeadlines[waiterID] = Task { @MainActor [weak self] in
+                        try? await Task.sleep(for: timeout)
+                        self?.resolveProjectionWaiter(waiterID, with: nil)
+                        self?.projectionWaiterDeadlines.removeValue(forKey: waiterID)
+                    }
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.resolveProjectionWaiter(waiterID, with: nil)
+                }
+            }
+        }
+
         func waitUntilProjected(
             through publicationSequence: UInt64,
             timeout: Duration = .seconds(5)
         ) async -> Bool {
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: timeout)
-            repeat {
-                if lastPublicationSequence >= publicationSequence { return true }
-                do {
-                    try await Task.sleep(nanoseconds: 10_000_000)
-                } catch {
-                    return false
-                }
-            } while clock.now < deadline
-            return lastPublicationSequence >= publicationSequence
+            await waitForProjectionForTesting(
+                afterGeneration: 0,
+                through: publicationSequence,
+                timeout: timeout
+            ) != nil
+        }
+
+        private func resolveProjectionWaiter(_ waiterID: UUID, with checkpoint: ProjectionCheckpoint?) {
+            guard let waiter = projectionWaiters.removeValue(forKey: waiterID) else { return }
+            projectionWaiterDeadlines[waiterID]?.cancel()
+            waiter.continuation.resume(returning: checkpoint)
         }
 
         func suppressSelfEchoForTesting(_ event: DomainWorkspaceEvent) async -> Bool {
-            await suppressSelfEcho(for: event)
+            await suppressSelfEcho(for: event, runID: nil)
         }
     #endif
 
+    /// Records a completed manager application for the still-current incarnation (DEBUG only).
+    private func didApplyProjection(runID: UUID?, publicationSequence: UInt64) {
+        #if DEBUG
+            guard let runID, subscriptionRunID == runID, workspaceManager != nil else { return }
+            projectionGeneration += 1
+            let checkpoint = ProjectionCheckpoint(
+                runID: runID,
+                generation: projectionGeneration,
+                publicationSequence: publicationSequence
+            )
+            projectionCheckpoint = checkpoint
+            for (waiterID, waiter) in projectionWaiters where waiter.isSatisfied(by: checkpoint) {
+                resolveProjectionWaiter(waiterID, with: checkpoint)
+            }
+        #endif
+    }
+
     func start() {
         guard subscriptionTask == nil else { return }
+        let runID = UUID()
+        subscriptionRunID = runID
         subscriptionTask = Task { [weak self, client] in
             let subscription = await client.store.subscribe()
             guard subscription.snapshot.isBootstrapped else { return }
-            if let self {
-                await projectInitial(subscription.snapshot)
+            if let self, isCurrentRun(runID) {
+                await projectInitial(subscription.snapshot, runID: runID)
             }
             for await event in subscription.events {
-                guard !Task.isCancelled, let self else { return }
-                await self.consume(event)
+                guard !Task.isCancelled, let self, isCurrentRun(runID) else { return }
+                await self.consume(event, runID: runID)
             }
         }
     }
 
-    private func projectInitial(_ snapshot: DomainWorkspaceCatalogSnapshot) async {
+    private func projectInitial(_ snapshot: DomainWorkspaceCatalogSnapshot, runID: UUID) async {
         var initial = snapshot
         if initial.workspaces.isEmpty,
            let candidate = workspaceManager?.runtimeOwnedDefaultWorkspaceCandidate()
@@ -405,17 +516,20 @@ final class DomainWorkspacePresentationBridge {
                 initial = await client.snapshot()
             }
         }
-        project(initial, force: true)
+        guard isCurrentRun(runID) else { return }
+        project(initial, force: true, runID: runID)
     }
 
-    private func consume(_ event: DomainWorkspaceEvent) async {
+    private func consume(_ event: DomainWorkspaceEvent, runID: UUID) async {
         guard event.sequence > lastPublicationSequence else { return }
         let gap = lastPublicationSequence != 0 && event.sequence != lastPublicationSequence &+ 1
-        if !gap, await suppressSelfEcho(for: event) { return }
+        if !gap, await suppressSelfEcho(for: event, runID: runID) { return }
         let snapshot = await client.snapshot()
+        guard isCurrentRun(runID) else { return }
         project(
             snapshot,
-            force: gap || event.kind == .externalReloaded
+            force: gap || event.kind == .externalReloaded,
+            runID: runID
         )
     }
 
@@ -423,7 +537,7 @@ final class DomainWorkspacePresentationBridge {
     /// `applyDomainAuthorityOutcome`, so echoing its own commit back through a full catalog
     /// snapshot plus a MainActor document decode would only amplify every capture by W windows.
     /// Bookkeeping is refreshed from a single-workspace snapshot instead.
-    private func suppressSelfEcho(for event: DomainWorkspaceEvent) async -> Bool {
+    private func suppressSelfEcho(for event: DomainWorkspaceEvent, runID: UUID?) async -> Bool {
         let suppressibleKinds: Set<DomainWorkspaceEventKind> = [
             .workingStateCommitted, .savedDocumentCommitted, .operationDeduplicated
         ]
@@ -437,6 +551,7 @@ final class DomainWorkspacePresentationBridge {
               workspace.health.acceptsMutations,
               let model = workspaceManager?.workspace(withID: workspaceID)
         else { return false }
+        if let runID, !isCurrentRun(runID) { return false }
         // A same-window commit can be accepted just before a newer local edit is captured. Keep the
         // local model in both the manager and bridge cache: advancing the baseline below lets the
         // newer edit commit from the accepted revision, and explicit failed-save reconciliation
@@ -453,10 +568,11 @@ final class DomainWorkspacePresentationBridge {
             catalogRevision: event.catalogRevision
         )
         lastPublicationSequence = event.sequence
+        didApplyProjection(runID: runID, publicationSequence: event.sequence)
         return true
     }
 
-    private func project(_ snapshot: DomainWorkspaceCatalogSnapshot, force: Bool) {
+    private func project(_ snapshot: DomainWorkspaceCatalogSnapshot, force: Bool, runID: UUID) {
         guard snapshot.isBootstrapped,
               snapshot.publicationSequence >= lastPublicationSequence
         else { return }
@@ -487,8 +603,14 @@ final class DomainWorkspacePresentationBridge {
                 digestsByWorkspaceID: nextDigests,
                 healthByWorkspaceID: nextHealth,
                 catalogRevision: snapshot.catalogRevision,
-                publicationSequence: snapshot.publicationSequence
+                publicationSequence: snapshot.publicationSequence,
+                canonicalSystemWorkspaceIDs: Set(snapshot.workspaces.compactMap { workspace in
+                    workspace.document.metadata.isSystemWorkspace && !workspace.document.metadata.isEphemeral
+                        ? workspace.document.workspaceID
+                        : nil
+                })
             )
+            didApplyProjection(runID: runID, publicationSequence: snapshot.publicationSequence)
             return
         }
 
@@ -534,6 +656,7 @@ final class DomainWorkspacePresentationBridge {
             preferredActiveWorkspaceID: workspaceManager?.activeWorkspaceID,
             publicationSequence: snapshot.publicationSequence
         )
+        didApplyProjection(runID: runID, publicationSequence: snapshot.publicationSequence)
     }
 }
 
