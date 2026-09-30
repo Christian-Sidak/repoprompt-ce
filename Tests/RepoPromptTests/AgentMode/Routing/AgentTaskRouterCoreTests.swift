@@ -721,10 +721,14 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
         })
         XCTAssertEqual(CodexModelSpecifier(raw: solCandidate.target.modelRaw).baseModel, "gpt-6.1-sol")
         XCTAssertTrue(solCandidate.descriptor.targetDescription.contains("GPT-6.1 Sol"))
+        XCTAssertTrue(solCandidate.descriptor.targetDescription.contains("$2 input / $10 output"))
+        XCTAssertFalse(solCandidate.descriptor.targetDescription.contains("No verified API list price"))
 
         let sonnetCandidate = try XCTUnwrap(candidates.first { $0.utilityTier == "claude-sonnet" })
         XCTAssertEqual(ClaudeModelSpecifier(raw: sonnetCandidate.target.modelRaw).baseModel, "claude-sonnet-5-5")
         XCTAssertTrue(sonnetCandidate.descriptor.targetDescription.contains("Claude Sonnet 5.5"))
+        XCTAssertTrue(sonnetCandidate.descriptor.targetDescription.contains("$2 input / $10 output"))
+        XCTAssertFalse(sonnetCandidate.descriptor.targetDescription.contains("No verified API list price"))
 
         XCTAssertEqual(
             AutoEffortModelPolicy.codexEfforts(modelRaw: "gpt-6.1-sol-high", advertised: [.low, .medium, .high, .xhigh, .max, .ultra]),
