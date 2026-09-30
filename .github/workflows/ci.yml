@@ -98,7 +98,32 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-sources-${{ hashFiles('Package.swift', 'Package.resolved') }}
 
       - name: Build root test bundles with import and type-check gates
-        run: ./conductor ci-build-tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          ./conductor ci-build-tests 2>&1 | tee "$RUNNER_TEMP/ci-build-tests-conductor.txt"
+          build_status=${PIPESTATUS[0]}
+          if (( build_status != 0 )); then
+            log_path="$(sed -n 's/^Log:[[:space:]]*//p' "$RUNNER_TEMP/ci-build-tests-conductor.txt" | tail -n 1)"
+            if [[ -n "$log_path" && -f "$log_path" ]]; then
+              cp "$log_path" "$RUNNER_TEMP/ci-build-tests.log"
+              echo 'Compiler errors and test failures from the full conductor log:'
+              grep -E 'error:|FAIL' "$RUNNER_TEMP/ci-build-tests.log" || true
+            else
+              echo "Conductor full log was unavailable: $log_path" >&2
+            fi
+          fi
+          exit "$build_status"
+
+      - name: Upload failed root test build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: root-build-tests-failure-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/ci-build-tests.log
+            ${{ runner.temp }}/ci-build-tests-conductor.txt
+          if-no-files-found: warn
 
       - name: Gate compiler index ratchets on the built sources
         run: python3 Scripts/modularization_index_graph.py check --output .build/modularization/index-check.json
