@@ -345,18 +345,23 @@ extension AgentModeViewModel {
 
     /// Refresh durable child metadata once for a poll/wait batch. The synchronous snapshot path
     /// reads only the already-merged parent lookup and never scans the registry per target.
+    ///
+    /// Runs on every `poll`/`wait`, so it reads only the cached metadata index (one index-file read on
+    /// a cold cache) and never backfills or reconciles session files on this hot path.
     func agentSessionLinkRefreshSubagentCensus(for workspace: WorkspaceModel) async {
         agentSessionLinkSubagentRefreshGeneration &+= 1
         let generation = agentSessionLinkSubagentRefreshGeneration
-        let persisted = try? await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace)
+        let persisted = await agentSessionLinkPersistedSubagentMetaLoader(workspace)
         guard !Task.isCancelled,
               generation == agentSessionLinkSubagentRefreshGeneration,
               workspaceManager?.activeWorkspace?.id == workspace.id
         else { return }
-        // A metadata read failure must not leave the prior durable census looking current.
-        // Live and owner-validated index entries still provide a bounded fallback.
+        // An unavailable index keeps the last good list instead of flapping `finished` counts (and
+        // the change cursor) on a transient read failure. A list from another workspace is already
+        // excluded by the rebuild's workspace gate, and committed deletions are filtered on rebuild.
+        guard let persisted else { return }
         agentSessionLinkPersistedSubagentWorkspaceID = workspace.id
-        agentSessionLinkPersistedSubagentMeta = persisted ?? []
+        agentSessionLinkPersistedSubagentMeta = persisted
         rebuildAgentSessionLinkSubagentCensus()
     }
 
@@ -659,7 +664,7 @@ extension AgentModeViewModel {
 
     /// Passive board state from the target's own run, before `linkStatus` flattens terminal runs.
     /// Subagent counts are supplied by the caller so this projection remains independent of the
-    /// view model's session collection; the census is wired separately.
+    /// view model's session collection; the caller reads them from `agentSessionLinkSubagentCensus`.
     static func laneBoard(
         for session: TabSession,
         blockers: [SendBlocker],

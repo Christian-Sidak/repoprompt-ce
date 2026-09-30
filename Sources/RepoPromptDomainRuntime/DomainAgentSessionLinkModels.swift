@@ -219,7 +219,7 @@ package struct DomainAgentSessionContextLoad: Hashable, Sendable {
 }
 
 /// Derived target state for passive oversight. Blocker names are internal and opaque on the wire;
-/// only an empty versus non-empty list is contractual. Counts are zero until the census is wired.
+/// only an empty versus non-empty list is contractual. Counts come from the target view model's child census.
 package struct DomainAgentSessionLaneBoard: Hashable, Sendable {
     package enum RunOutcome: String, Hashable, Sendable {
         case none

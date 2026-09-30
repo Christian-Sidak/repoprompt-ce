@@ -490,6 +490,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var agentSessionLinkPersistedSubagentWorkspaceID: UUID?
     var agentSessionLinkSubagentRefreshGeneration: UInt64 = 0
     var agentSessionLinkChildRunSubscriptions: [UUID: AnyCancellable] = [:]
+
+    /// Cache-first durable child metadata for the lane-board census: the in-memory metadata index, or
+    /// one index-file read on a cold cache. Never backfills or reconciles; `nil` means unavailable.
+    /// Replaceable in tests.
+    var agentSessionLinkPersistedSubagentMetaLoader: @MainActor (WorkspaceModel) async -> [AgentSessionMeta]? = { workspace in
+        guard let result = try? await AgentSessionDataService.shared.fastMetadataRecordsIfAvailable(for: workspace)
+        else { return nil }
+        return result.records.map { $0.agentSessionMeta() }
+    }
+
     let agentSessionLinkSubagentCensusChanged = PassthroughSubject<Set<UUID>, Never>()
 
     private var provisionalParentSessionIDBySessionID: [UUID: UUID] = [:]

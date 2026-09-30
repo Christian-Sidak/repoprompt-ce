@@ -457,4 +457,97 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
         print("LaneBoardCensusProjectionStress: 32 targets, 16384 children, elapsed=\(String(format: "%.4f", elapsed))s")
         XCTAssertLessThan(elapsed, 1.0, "One in-memory 32-target projection batch should stay below 1 s")
     }
+
+    func testCensusRefreshKeepsLastGoodPersistedListWhenMetadataIsUnavailable() async throws {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Lane-board tests must not start a provider")
+            }
+        )
+        let workspaceManager = AgentSessionLinkEndpointTestSupport.installWorkspace(
+            on: viewModel, tabID: tabID, name: "Lane board refresh"
+        )
+        defer { withExtendedLifetime(workspaceManager) {} }
+        let workspace = try XCTUnwrap(workspaceManager.activeWorkspace)
+        let parent = viewModel.session(for: tabID)
+        let parentID = try XCTUnwrap(viewModel.test_ensureSessionBoundToTab(parent))
+        let target = candidate(tabID: tabID, sessionID: parentID, workspaceID: workspace.id)
+
+        final class LoaderStub {
+            var result: [AgentSessionMeta]?
+            var calls = 0
+        }
+        let stub = LoaderStub()
+        stub.result = [AgentSessionMeta(
+            id: UUID(),
+            composeTabID: nil,
+            name: "Persisted child",
+            lastModified: Date(),
+            itemCount: 0,
+            agentKind: nil,
+            agentModel: nil,
+            lastRunState: AgentSessionRunState.completed.rawValue,
+            acpModelParameterSelections: [],
+            parentSessionID: parentID,
+            isMCPOriginated: true,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )]
+        viewModel.agentSessionLinkPersistedSubagentMetaLoader = { _ in
+            stub.calls += 1
+            return stub.result
+        }
+
+        await viewModel.agentSessionLinkRefreshSubagentCensus(for: workspace)
+        XCTAssertEqual(viewModel.agentSessionLinkObservationSnapshot(for: target).board.subagentFinished, 1)
+
+        stub.result = nil
+        await viewModel.agentSessionLinkRefreshSubagentCensus(for: workspace)
+        XCTAssertEqual(
+            viewModel.agentSessionLinkObservationSnapshot(for: target).board.subagentFinished, 1,
+            "an unavailable metadata index must keep the last good list rather than flap the count"
+        )
+
+        stub.result = []
+        await viewModel.agentSessionLinkRefreshSubagentCensus(for: workspace)
+        XCTAssertEqual(viewModel.agentSessionLinkObservationSnapshot(for: target).board.subagentFinished, 0)
+        XCTAssertEqual(stub.calls, 3, "one metadata load per refresh")
+    }
+
+    func testDefaultCensusLoaderReadsCachedIndexWithoutBackfill() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaneBoardCensusLoader-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        await AgentSessionDataService.shared.test_setWorkspaceRootOverride(root)
+        addTeardownBlock {
+            await AgentSessionDataService.shared.test_setWorkspaceRootOverride(nil)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Lane-board tests must not start a provider")
+            }
+        )
+        let workspace = WorkspaceModel(name: "Lane board loader", repoPaths: [root.path])
+        func indexFileExists() -> Bool {
+            let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
+            while let url = enumerator?.nextObject() as? URL {
+                if url.lastPathComponent == "AgentSessionIndex.json" { return true }
+            }
+            return false
+        }
+
+        let missing = await viewModel.agentSessionLinkPersistedSubagentMetaLoader(workspace)
+        XCTAssertNil(missing, "a missing index reads as unavailable")
+        XCTAssertFalse(indexFileExists(), "the poll/wait census path must never backfill the index")
+
+        // The full listing path does backfill, which is exactly what the hot path avoids.
+        _ = try await AgentSessionDataService.shared.listAgentSessionsMeta(for: workspace)
+        XCTAssertTrue(indexFileExists())
+        let cached = await viewModel.agentSessionLinkPersistedSubagentMetaLoader(workspace)
+        XCTAssertEqual(cached?.count, 0, "an existing index is served, not reported unavailable")
+    }
 }
