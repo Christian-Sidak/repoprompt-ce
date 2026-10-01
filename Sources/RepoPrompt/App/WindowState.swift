@@ -503,11 +503,9 @@ class WindowState: ObservableObject {
         promptManager.gitViewModel.prepareForWindowClose()
     }
 
-    private var pendingRestoreEntry: WindowSessionEntry?
-    /// The session entry this window failed to restore, kept so a Default fallback is never
-    /// written back over a still-valid snapshot entry. Cleared as soon as a restore resolves.
-    private(set) var unresolvedRestoreEntry: WindowSessionEntry?
-    private var pendingRestoreCompletion: (() -> Void)?
+    /// Accepted restore execution and the protection session capture relies on. See
+    /// `WindowRestoreLifetime` for why the two lifetimes stay independent.
+    private var restoreLifetime = WindowRestoreLifetime()
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
 
@@ -561,7 +559,12 @@ class WindowState: ObservableObject {
         }
 
         var hasPendingRestoreEntryForTesting: Bool {
-            pendingRestoreEntry != nil
+            restoreLifetime.hasPendingEntry
+        }
+
+        /// The restore entry session capture currently protects, if any.
+        var protectedRestoreEntryForTesting: WindowSessionEntry? {
+            restoreLifetime.protectedEntry
         }
 
         convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
@@ -702,19 +705,24 @@ class WindowState: ObservableObject {
             }
         }
 
-        // Once this window lands on any real workspace, a failed restore no longer describes it,
-        // so stop carrying the unresolved entry forward. This covers a successful restore, a
-        // user switch, and a restore whose switch was refused after resolution succeeded --
-        // and it lets a later deliberate switch back to Default persist normally.
+        // Once this window lands on any real workspace, a protected restore entry no longer
+        // describes it. This covers a successful restore, a user switch, and a restore whose
+        // switch was refused after resolution succeeded -- and it lets a later deliberate switch
+        // back to Default persist normally. The witness is taken at publication, before the
+        // deferred hop, so a selection published before a newer acceptance cannot release it.
         workspaceManager.$activeWorkspaceID
+            .map { [weak self] newWorkspaceID in
+                (newWorkspaceID, self?.restoreLifetime.selectionWitness)
+            }
             .receive(on: RunLoop.main)
-            .sink { [weak self] newWorkspaceID in
+            .sink { [weak self] newWorkspaceID, witness in
                 guard let self,
                       let newWorkspaceID,
+                      let witness,
                       let workspace = workspaceManager.workspaces.first(where: { $0.id == newWorkspaceID }),
                       !workspace.isSystemWorkspace
                 else { return }
-                unresolvedRestoreEntry = nil
+                restoreLifetime.noteRealSelectionPublished(witness)
             }
             .store(in: &cancellables)
 
@@ -1504,56 +1512,44 @@ class WindowState: ObservableObject {
             completion?()
             return
         }
-        // Install the newer state before invoking the displaced completion so reentrant capture
-        // or explicit intent sees the newer acceptance. Never drop the displaced completion.
-        let displacedCompletion = pendingRestoreCompletion
-        pendingRestoreEntry = entry
-        pendingRestoreCompletion = completion
-        // Armed at acceptance, not dispatch: termination can persist the session before the
-        // restore (or failed startup) runs. A System-intended entry needs no protection.
-        unresolvedRestoreEntry = entry.isSystemWorkspace ? nil : entry
+        // Protection is armed at acceptance, not dispatch: termination can persist the session
+        // before the restore (or failed startup) runs. The newer state is installed before the
+        // displaced completion runs so reentrant capture or explicit intent sees it.
+        let displacedCompletion = restoreLifetime.accept(entry, completion: completion)
         displacedCompletion?()
         applyPendingRestoreEntryIfPossible()
     }
 
-    /// Completes a not-yet-dispatched restore exactly once without dispatching it, keeping its
-    /// entry protected for session capture until a later successful non-System selection.
+    /// Completes a not-yet-dispatched restore exactly once without dispatching it. Its protection
+    /// is untouched, so session capture keeps the requested entry if explicit intent is refused.
     private func retirePendingRestoreEntry() {
-        guard pendingRestoreEntry != nil || pendingRestoreCompletion != nil else { return }
-        let entry = pendingRestoreEntry
-        let completion = pendingRestoreCompletion
-        pendingRestoreEntry = nil
-        pendingRestoreCompletion = nil
-        if let entry, !entry.isSystemWorkspace {
-            unresolvedRestoreEntry = entry
-        }
+        let completion = restoreLifetime.retirePending()
         completion?()
     }
 
     private func applyPendingRestoreEntryIfPossible() {
         guard !isClosing else { return }
         guard workspaceManager.isInitialized else { return }
-        guard let entry = pendingRestoreEntry else { return }
-        pendingRestoreEntry = nil
-        let completion = pendingRestoreCompletion
-        pendingRestoreCompletion = nil
+        // The dispatch task owns this acceptance's completion from here on, even if a newer
+        // acceptance arrives before it finishes.
+        guard let dispatch = restoreLifetime.takePendingForDispatch() else { return }
 
         Task {
             if !self.isClosing {
-                await restoreWorkspace(from: entry)
+                await restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
             }
-            completion?()
+            dispatch.completion?()
         }
     }
 
-    private func restoreWorkspace(from entry: WindowSessionEntry) async {
+    private func restoreWorkspace(from entry: WindowSessionEntry, acceptanceSequence: UInt64) async {
         #if DEBUG
             let restoreStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
-        // `unresolvedRestoreEntry` was armed when this entry was accepted and is cleared only once
-        // a real workspace actually becomes active. Resolving a target does not prove the switch
-        // took, so clearing on resolution alone would let a refused switch persist the Default
-        // fallback over the snapshot. Re-arming here could overwrite a newer acceptance.
+        // Protection was armed when this entry was accepted and is released only once a real
+        // workspace is published after that acceptance. Resolving a target does not prove the
+        // switch took, so releasing on resolution alone would let a refused switch persist the
+        // Default fallback over the snapshot.
         if let target = resolveWorkspace(for: entry) {
             #if DEBUG
                 WorkspaceRestorePerfLog.log(
@@ -1564,8 +1560,9 @@ class WindowState: ObservableObject {
                 // The entry intended the system workspace, so the fallback state and the intended
                 // state coincide and there is nothing to protect. Clearing here keeps such a window
                 // capturing live state instead of re-emitting its restore-time entry for good --
-                // the observer below only fires for non-system workspaces.
-                unresolvedRestoreEntry = nil
+                // the selection observer only fires for non-system workspaces. Scoped to this
+                // acceptance so it never releases a newer one.
+                restoreLifetime.releaseProtection(forDispatchedAcceptance: acceptanceSequence)
             }
             _ = await workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
             #if DEBUG
@@ -1585,9 +1582,47 @@ class WindowState: ObservableObject {
                 )
             }
         #endif
-        // No existing workspace matches; leave the window in its default state. The entry armed
-        // at acceptance stays set, so `captureCurrentSession` re-emits it instead of persisting the
+        // No existing workspace matches; leave the window in its default state. The protection
+        // armed at acceptance stays set, so session capture re-emits it instead of persisting the
         // Default fallback, which would discard the user's real window layout.
+    }
+
+    /// This window's session-capture decision, computed from the authoritative live selection.
+    /// Explicit-close exclusion and persistence gating stay in `WindowStatesManager`, so a
+    /// closing window still reports its candidate here.
+    func sessionCaptureCandidate() -> WindowSessionCaptureCandidate {
+        let workspace = workspaceManager.activeWorkspace
+        let selection: WindowRestoreLifetime.LiveSelection = switch workspace {
+        case nil: .none
+        case let workspace? where workspace.isEphemeral: .ephemeral
+        case let workspace? where workspace.isSystemWorkspace: .system
+        case .some: .persistent
+        }
+
+        switch restoreLifetime.captureDisposition(for: selection) {
+        case .omit:
+            return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
+        case let .preserve(entry):
+            return WindowSessionCaptureCandidate(windowID: windowID, entry: entry)
+        case .captureLive:
+            guard let workspace else {
+                return WindowSessionCaptureCandidate(windowID: windowID, entry: nil)
+            }
+            let primaryPath = workspace.repoPaths.first.map { repoPath in
+                (repoPath as NSString).expandingTildeInPath
+            }
+            let entry = WindowSessionEntry(
+                windowKind: kind,
+                workspaceID: workspace.id,
+                workspaceName: workspace.name,
+                isSystemWorkspace: workspace.isSystemWorkspace,
+                isEphemeral: workspace.isEphemeral,
+                primaryRepoPath: primaryPath,
+                lastFocused: isCurrentlyFocused,
+                workspaceInstanceNumber: workspaceInstanceNumber
+            )
+            return WindowSessionCaptureCandidate(windowID: windowID, entry: entry)
+        }
     }
 
     private func resolveWorkspace(for entry: WindowSessionEntry) -> WorkspaceModel? {

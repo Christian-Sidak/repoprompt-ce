@@ -303,15 +303,15 @@ import XCTest
                     if rejectsExplicitTarget {
                         guard case .blocked = result else { return XCTFail("Expected blocked, got \(result)") }
                         XCTAssertNil(manager.activeWorkspaceID)
-                        XCTAssertEqual(window.unresolvedRestoreEntry?.workspaceID, Fixture.requestedID)
+                        XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, Fixture.requestedID)
                         XCTAssertEqual(
-                            WindowStatesManager.shared.captureCandidate(for: window).entry?.workspaceID,
+                            window.sessionCaptureCandidate().entry?.workspaceID,
                             Fixture.requestedID
                         )
                     } else {
                         XCTAssertTrue(result.didSwitch, "\(result)")
                         XCTAssertEqual(manager.activeWorkspaceID, Fixture.aardvarkID)
-                        XCTAssertNil(window.unresolvedRestoreEntry)
+                        XCTAssertNil(window.protectedRestoreEntryForTesting)
                     }
                 }
             }
@@ -621,9 +621,9 @@ import XCTest
                     let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
                     let restored = Signal("restore completion")
                     window.applyWindowRestoreEntry(entry) { restored.fire() }
-                    XCTAssertEqual(window.unresolvedRestoreEntry?.workspaceID, Fixture.requestedID, "armed at acceptance")
+                    XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, Fixture.requestedID, "armed at acceptance")
                     XCTAssertEqual(
-                        WindowStatesManager.shared.captureCandidate(for: window).entry?.workspaceID,
+                        window.sessionCaptureCandidate().entry?.workspaceID,
                         Fixture.requestedID,
                         "nil-active capture re-emits the protected entry"
                     )
@@ -638,15 +638,107 @@ import XCTest
                     XCTAssertEqual(restored.count, 1)
                     XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
                     XCTAssertEqual(route.rootRoute, .main)
-                    XCTAssertNil(window.unresolvedRestoreEntry)
+                    XCTAssertNil(window.protectedRestoreEntryForTesting)
                     XCTAssertEqual(
-                        WindowStatesManager.shared.captureCandidate(for: window).entry?.workspaceID,
+                        window.sessionCaptureCandidate().entry?.workspaceID,
                         Fixture.requestedID,
                         "successful selection captures its target"
                     )
 
                     _ = try await f.commitWorkspace(named: "Later user record", window: window)
                     XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID, "Projection cannot restore Default over it")
+                }
+            }
+        }
+
+        /// A selection published before a restore acceptance must not release that acceptance's
+        /// protection, even when the window's observer delivers the selection afterwards.
+        func testSelectionPublishedBeforeRestoreAcceptanceKeepsItsProtection() async throws {
+            try await Fixture.run { f in
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                let hold = f.holdInitialResolution(manager)
+                try await f.wait(hold.entered)
+                try await f.awaitCatalogProjection(window)
+
+                // Publish a real selection and accept a restore in the same MainActor turn, so the
+                // observer's RunLoop delivery lands after the acceptance. The setter publishes
+                // synchronously; a requested switch suspends and could let the observer drain first.
+                manager.activeWorkspace = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
+                let restored = Signal("restore completion")
+                window.applyWindowRestoreEntry(entry) { restored.fire() }
+                XCTAssertTrue(window.hasPendingRestoreEntryForTesting)
+                try await f.acknowledgeWindowObservers(window)
+
+                XCTAssertEqual(
+                    window.protectedRestoreEntryForTesting?.workspaceID,
+                    Fixture.requestedID,
+                    "A late-delivered pre-acceptance selection keeps the newer protection"
+                )
+                XCTAssertEqual(
+                    window.sessionCaptureCandidate().entry?.workspaceID,
+                    Fixture.aardvarkID,
+                    "Protection never overrides a real live selection"
+                )
+
+                hold.gate.release()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                try await f.wait(restored)
+                try await f.acknowledgeWindowObservers(window)
+                XCTAssertEqual(restored.count, 1)
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
+                XCTAssertNil(window.protectedRestoreEntryForTesting, "Post-acceptance selection releases protection")
+                XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, Fixture.requestedID)
+            }
+        }
+
+        /// A displaced completion runs after the newer acceptance is installed, so reentrant
+        /// acceptance or close sees it, and every acceptance completes exactly once.
+        func testDisplacedRestoreCompletionReentrancy() async throws {
+            for reentrantClose in [false, true] {
+                try await Fixture.run { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    let hold = f.holdInitialResolution(manager)
+                    try await f.wait(hold.entered)
+                    try await f.awaitCatalogProjection(window)
+
+                    var log: [String] = []
+                    let reentrantID = UUID()
+                    window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.requestedID, window: window)) {
+                        log.append("A")
+                        XCTAssertEqual(
+                            window.protectedRestoreEntryForTesting?.workspaceID,
+                            Fixture.aardvarkID,
+                            "Newer acceptance is visible to the displaced completion"
+                        )
+                        if reentrantClose {
+                            window.beginClose()
+                        } else {
+                            window.applyWindowRestoreEntry(f.restoreEntry(for: reentrantID, window: window)) {
+                                log.append("B")
+                            }
+                        }
+                    }
+                    window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.aardvarkID, window: window)) {
+                        log.append("C")
+                    }
+
+                    XCTAssertEqual(log, ["A", "C"], "Displaced C completes once, by reentrant displacement or close")
+                    XCTAssertEqual(window.hasPendingRestoreEntryForTesting, !reentrantClose)
+                    XCTAssertEqual(
+                        window.protectedRestoreEntryForTesting?.workspaceID,
+                        reentrantClose ? Fixture.aardvarkID : reentrantID,
+                        "Retirement by close keeps protection; reentrant acceptance replaces it"
+                    )
+
+                    await window.joinDomainWorkspaceBridgeForTesting()
+                    let teardown = f.startOwned { await window.tearDown() }
+                    f.markTornDown(window)
+                    hold.gate.release()
+                    await teardown.value
+                    XCTAssertEqual(log, reentrantClose ? ["A", "C"] : ["A", "C", "B"], "Each acceptance completes exactly once")
                 }
             }
         }
@@ -757,7 +849,7 @@ import XCTest
                     let closeCompleted = Signal("pending restore completed by close")
                     window.applyWindowRestoreEntry(entry) { closeCompleted.fire() }
                     XCTAssertEqual(
-                        WindowStatesManager.shared.captureCandidate(for: window).entry?.workspaceID,
+                        window.sessionCaptureCandidate().entry?.workspaceID,
                         Fixture.requestedID,
                         "\(stage): nil/System capture keeps the protected entry before close"
                     )
@@ -778,8 +870,8 @@ import XCTest
                     if stage != .postPublication {
                         XCTAssertNil(manager.activeWorkspaceID, "\(stage): no late initial selection")
                     }
-                    XCTAssertEqual(window.unresolvedRestoreEntry?.workspaceID, Fixture.requestedID)
-                    let candidate = WindowStatesManager.shared.captureCandidate(for: window)
+                    XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, Fixture.requestedID)
+                    let candidate = window.sessionCaptureCandidate()
                     XCTAssertEqual(candidate.entry?.workspaceID, Fixture.requestedID, "\(stage): protected entry survives close")
                     let snapshot = WindowSessionSnapshotBuilder.build(
                         version: 4,
@@ -1505,3 +1597,131 @@ import XCTest
         }
     }
 #endif
+
+// MARK: - WindowRestoreLifetime contract
+
+/// Contract tests for `WindowRestoreLifetime`: execution and protection are independent
+/// lifetimes, protection is fenced by acceptance order, and capture follows the documented
+/// precedence. Window/manager journeys live in `NewWindowInitialSelectionTests` above.
+final class WindowRestoreLifetimeTests: XCTestCase {
+    private func entry(_ id: UUID = UUID(), isSystem: Bool = false) -> WindowSessionEntry {
+        WindowSessionEntry(
+            windowKind: .standard,
+            workspaceID: id,
+            workspaceName: nil,
+            isSystemWorkspace: isSystem,
+            isEphemeral: false,
+            primaryRepoPath: nil,
+            lastFocused: false,
+            workspaceInstanceNumber: nil
+        )
+    }
+
+    private func preservedID(_ disposition: WindowRestoreLifetime.CaptureDisposition) -> UUID? {
+        if case let .preserve(entry) = disposition { return entry.workspaceID }
+        return nil
+    }
+
+    private func isOmit(_ disposition: WindowRestoreLifetime.CaptureDisposition) -> Bool {
+        if case .omit = disposition { return true }
+        return false
+    }
+
+    private func isCaptureLive(_ disposition: WindowRestoreLifetime.CaptureDisposition) -> Bool {
+        if case .captureLive = disposition { return true }
+        return false
+    }
+
+    func testRetirementEndsExecutionButKeepsProtection() {
+        var lifetime = WindowRestoreLifetime()
+        let requested = entry()
+        var completions = 0
+        XCTAssertNil(lifetime.accept(requested) { completions += 1 })
+
+        let retired = lifetime.retirePending()
+        retired?()
+        XCTAssertEqual(completions, 1)
+        XCTAssertFalse(lifetime.hasPendingEntry)
+        XCTAssertEqual(lifetime.protectedEntry?.workspaceID, requested.workspaceID, "Explicit intent wins over dispatch only")
+        XCTAssertNil(lifetime.retirePending(), "Execution ends exactly once")
+        XCTAssertNil(lifetime.takePendingForDispatch())
+    }
+
+    func testDispatchOwnsItsCompletionAcrossNewerAcceptance() throws {
+        var lifetime = WindowRestoreLifetime()
+        var log: [String] = []
+        _ = lifetime.accept(entry()) { log.append("first") }
+        let dispatch = try XCTUnwrap(lifetime.takePendingForDispatch())
+        XCTAssertNil(lifetime.accept(entry()) { log.append("second") }, "A dispatched completion is never displaced")
+        dispatch.completion?()
+        let retired = lifetime.retirePending()
+        retired?()
+        XCTAssertEqual(log, ["first", "second"])
+    }
+
+    func testNewerAcceptanceReturnsDisplacedCompletionAndReplacesProtection() {
+        var lifetime = WindowRestoreLifetime()
+        var log: [String] = []
+        _ = lifetime.accept(entry()) { log.append("displaced") }
+        let newer = entry()
+        let displaced = lifetime.accept(newer) { log.append("newer") }
+        XCTAssertEqual(lifetime.protectedEntry?.workspaceID, newer.workspaceID, "Installed before the caller runs displaced")
+        displaced?()
+        XCTAssertEqual(log, ["displaced"])
+
+        _ = lifetime.accept(entry(isSystem: true), completion: nil)
+        XCTAssertNil(lifetime.protectedEntry, "A System-intended acceptance needs no protection")
+    }
+
+    func testSelectionPublishedBeforeAcceptanceCannotReleaseIt() {
+        var lifetime = WindowRestoreLifetime()
+        let staleWitness = lifetime.selectionWitness
+        let requested = entry()
+        _ = lifetime.accept(requested, completion: nil)
+
+        lifetime.noteRealSelectionPublished(staleWitness)
+        XCTAssertEqual(lifetime.protectedEntry?.workspaceID, requested.workspaceID)
+
+        // Same target accepted twice: workspace identity is not acceptance identity.
+        let witnessAfterFirst = lifetime.selectionWitness
+        _ = lifetime.accept(requested, completion: nil)
+        lifetime.noteRealSelectionPublished(witnessAfterFirst)
+        XCTAssertNotNil(lifetime.protectedEntry, "A re-acceptance of the same target is still newer")
+
+        lifetime.noteRealSelectionPublished(lifetime.selectionWitness)
+        XCTAssertNil(lifetime.protectedEntry, "A selection published after acceptance releases it")
+    }
+
+    func testSystemResolutionReleasesOnlyItsOwnAcceptance() throws {
+        var lifetime = WindowRestoreLifetime()
+        _ = lifetime.accept(entry(), completion: nil)
+        let dispatch = try XCTUnwrap(lifetime.takePendingForDispatch())
+        let newer = entry()
+        _ = lifetime.accept(newer, completion: nil)
+
+        lifetime.releaseProtection(forDispatchedAcceptance: dispatch.acceptanceSequence)
+        XCTAssertEqual(lifetime.protectedEntry?.workspaceID, newer.workspaceID)
+
+        let newerDispatch = try XCTUnwrap(lifetime.takePendingForDispatch())
+        lifetime.releaseProtection(forDispatchedAcceptance: newerDispatch.acceptanceSequence)
+        XCTAssertNil(lifetime.protectedEntry)
+    }
+
+    func testCaptureDispositionPrecedence() {
+        var lifetime = WindowRestoreLifetime()
+        XCTAssertTrue(isOmit(lifetime.captureDisposition(for: .none)), "No selection, no protection: omit")
+        XCTAssertTrue(isOmit(lifetime.captureDisposition(for: .ephemeral)))
+        XCTAssertTrue(isCaptureLive(lifetime.captureDisposition(for: .system)))
+        XCTAssertTrue(isCaptureLive(lifetime.captureDisposition(for: .persistent)))
+
+        let requested = entry()
+        _ = lifetime.accept(requested, completion: nil)
+        XCTAssertEqual(preservedID(lifetime.captureDisposition(for: .none)), requested.workspaceID)
+        XCTAssertTrue(isOmit(lifetime.captureDisposition(for: .ephemeral)), "Ephemeral exclusion wins over protection")
+        XCTAssertEqual(preservedID(lifetime.captureDisposition(for: .system)), requested.workspaceID)
+        XCTAssertTrue(
+            isCaptureLive(lifetime.captureDisposition(for: .persistent)),
+            "Protection never overrides a real live selection"
+        )
+    }
+}
