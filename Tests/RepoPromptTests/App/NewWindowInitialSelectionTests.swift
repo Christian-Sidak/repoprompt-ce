@@ -20,6 +20,7 @@ import XCTest
             try await Fixture.run { f in
                 let window = f.makeWindow()
                 let manager = window.workspaceManager
+                let projectionObserver = f.projectionObserver(for: window)
                 let defaultGate = f.makeGate()
                 let defaultEntered = Signal("initial Default reached its publication gate")
                 manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { workspaceID in
@@ -27,28 +28,31 @@ import XCTest
                     defaultEntered.fire()
                     await defaultGate.wait()
                 }
-                let route = f.makeRoute(for: window)
-                let recorder = f.makeRecorder(manager: manager, route: route)
+                let (route, recorder) = f.makeRecordedRoute(for: window)
                 let routeStart = recorder.routes.count
                 route.evaluateInitialRouteIfNeeded()
                 XCTAssertEqual(route.rootRoute, .workspaceEntry)
 
-                try await f.wait(defaultEntered)
-                let zeroCheckpoint = await window.waitForDomainWorkspaceProjectionForTesting(afterGeneration: 0, through: 0)
+                let zeroCheckpoint = await projectionObserver.waitForProjection(afterGeneration: 0, through: 0)
                 XCTAssertNotNil(zeroCheckpoint, "Sequence zero must still require a real bridge application")
                 try await f.awaitCatalogProjection(window)
                 XCTAssertTrue(Fixture.standardIDs.isSubset(of: Set(manager.workspaces.map(\.id))))
-                XCTAssertEqual(manager.activeWorkspaceSwitch?.targetWorkspaceID, Fixture.defaultID)
-                try await f.acknowledgeRouteProbe(route)
+                try await f.acknowledgeRouteConsumption(recorder)
+                guard f.assertNoUnsolicitedSelection(
+                    recorder,
+                    routeStart: routeStart,
+                    context: "while Default is gated"
+                ) else { return }
 
-                f.assertNoUnsolicitedSelection(recorder, routeStart: routeStart, context: "while Default is gated")
+                try await f.wait(defaultEntered)
+                XCTAssertEqual(manager.activeWorkspaceSwitch?.targetWorkspaceID, Fixture.defaultID)
                 XCTAssertNil(manager.activeWorkspaceID)
                 XCTAssertEqual(route.rootRoute, .workspaceEntry)
 
                 defaultGate.release()
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
-                try await f.acknowledgeRouteProbe(route)
+                try await f.acknowledgeRouteConsumption(recorder)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
                 XCTAssertEqual(route.rootRoute, .workspaceEntry)
                 f.assertNoUnsolicitedSelection(recorder, routeStart: routeStart, context: "after Default published")
@@ -58,48 +62,48 @@ import XCTest
             try await Fixture.run(seeds: Fixture.defaultFirstSeeds) { f in
                 let window = f.makeWindow()
                 let manager = window.workspaceManager
-                let route = f.makeRoute(for: window)
-                let recorder = f.makeRecorder(manager: manager, route: route)
+                let projectionObserver = f.projectionObserver(for: window)
+                let (route, recorder) = f.makeRecordedRoute(for: window)
                 let routeStart = recorder.routes.count
                 route.evaluateInitialRouteIfNeeded()
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
                 try await f.awaitCatalogProjection(window)
-                try await f.acknowledgeRouteProbe(route)
+                try await f.acknowledgeRouteConsumption(recorder)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
                 XCTAssertEqual(route.rootRoute, .workspaceEntry)
                 f.assertNoUnsolicitedSelection(recorder, routeStart: routeStart, context: "Default-first control")
 
                 // Bridge checkpoint journeys: timeout, caller cancellation, stop, and restart.
-                let applied = try XCTUnwrap(window.domainWorkspaceProjectionCheckpointForTesting)
-                XCTAssertEqual(applied.generation, window.domainWorkspaceProjectionGenerationForTesting)
+                let applied = try XCTUnwrap(f.projectionState(for: window).checkpoint)
+                XCTAssertEqual(applied.generation, f.projectionState(for: window).generation)
                 // An unsatisfiable generation isolates the timeout path from unrelated self-echoes.
                 let unsatisfiable = UInt64.max - 1
-                let timedOut = await window.waitForDomainWorkspaceProjectionForTesting(
+                let timedOut = await projectionObserver.waitForProjection(
                     afterGeneration: unsatisfiable, timeout: .milliseconds(50)
                 )
                 XCTAssertNil(timedOut, "A deadline resolves an unsatisfied wait with nil")
-                XCTAssertEqual(window.pendingDomainWorkspaceProjectionWaiterCountForTesting, 0)
+                XCTAssertEqual(projectionObserver.pendingWaiterCount, 0)
                 let cancelledWait = f.startOwned {
-                    await window.waitForDomainWorkspaceProjectionForTesting(afterGeneration: unsatisfiable, timeout: .seconds(30))
+                    await projectionObserver.waitForProjection(afterGeneration: unsatisfiable, timeout: .seconds(30))
                 }
-                try await f.awaitPendingProjectionWaiter(window)
+                try await f.awaitPendingProjectionWaiter(projectionObserver)
                 cancelledWait.cancel()
                 let cancelledResult = await cancelledWait.value
                 XCTAssertNil(cancelledResult, "A registered waiter resolves nil on caller cancellation")
                 let stoppedWait = f.startOwned {
-                    await window.waitForDomainWorkspaceProjectionForTesting(afterGeneration: unsatisfiable, timeout: .seconds(30))
+                    await projectionObserver.waitForProjection(afterGeneration: unsatisfiable, timeout: .seconds(30))
                 }
-                try await f.awaitPendingProjectionWaiter(window)
-                let generation = window.domainWorkspaceProjectionGenerationForTesting
+                try await f.awaitPendingProjectionWaiter(projectionObserver)
+                let generation = f.projectionState(for: window).generation
                 await window.joinDomainWorkspaceBridgeForTesting()
                 let stoppedResult = await stoppedWait.value
                 XCTAssertNil(stoppedResult, "Stop resolves a registered wait unsuccessfully")
-                XCTAssertEqual(window.pendingDomainWorkspaceProjectionWaiterCountForTesting, 0)
-                XCTAssertNil(window.domainWorkspaceProjectionCheckpointForTesting, "Stop clears checkpoint validity")
-                XCTAssertEqual(window.domainWorkspaceProjectionGenerationForTesting, generation)
+                XCTAssertEqual(projectionObserver.pendingWaiterCount, 0)
+                XCTAssertNil(f.projectionState(for: window).checkpoint, "Stop clears checkpoint validity")
+                XCTAssertEqual(f.projectionState(for: window).generation, generation)
                 window.restartDomainWorkspaceProjectionForTesting()
-                let restartedCheckpoint = await window.waitForDomainWorkspaceProjectionForTesting(
+                let restartedCheckpoint = await projectionObserver.waitForProjection(
                     afterGeneration: generation, timeout: .seconds(15)
                 )
                 let restarted = try XCTUnwrap(restartedCheckpoint)
@@ -118,7 +122,7 @@ import XCTest
                     let window = f.makeWindow()
                     let manager = window.workspaceManager
                     let hold = f.holdInitialResolution(manager)
-                    let recorder = f.makeRecorder(manager: manager, route: nil)
+                    let recorder = f.makeRecorder(manager: manager)
                     try await f.wait(hold.entered)
                     try await f.awaitCatalogProjection(window)
                     let target = try XCTUnwrap(manager.workspace(withID: Fixture.requestedID))
@@ -172,7 +176,7 @@ import XCTest
                 let manager = window.workspaceManager
                 let hold = f.holdPublication(manager, of: Fixture.defaultID)
                 let recovery = f.countRecoveryBegins(manager)
-                let recorder = f.makeRecorder(manager: manager, route: nil)
+                let recorder = f.makeRecorder(manager: manager)
                 try await f.wait(hold.entered)
                 try await f.awaitCatalogProjection(window)
                 let superseded = f.observeSupersession(manager)
@@ -214,7 +218,7 @@ import XCTest
                 let manager = window.workspaceManager
                 let hold = f.holdPublication(manager, of: Fixture.defaultID)
                 let recovery = f.countRecoveryBegins(manager)
-                let recorder = f.makeRecorder(manager: manager, route: nil)
+                let recorder = f.makeRecorder(manager: manager)
                 try await f.wait(hold.entered)
                 try await f.awaitCatalogProjection(window)
                 manager.activeWorkspace = manager.workspace(withID: Fixture.requestedID)
@@ -236,7 +240,7 @@ import XCTest
                 let manager = window.workspaceManager
                 let hold = f.holdHydrationSpawn(manager, of: Fixture.defaultID)
                 let recovery = f.countRecoveryBegins(manager)
-                let recorder = f.makeRecorder(manager: manager, route: nil)
+                let recorder = f.makeRecorder(manager: manager)
                 try await f.wait(hold.entered)
                 try await f.awaitCatalogProjection(window)
                 let superseded = f.observeSupersession(manager)
@@ -274,7 +278,7 @@ import XCTest
                     let window = f.makeWindow()
                     let manager = window.workspaceManager
                     let hold = f.holdInitialResolution(manager)
-                    let recorder = f.makeRecorder(manager: manager, route: nil)
+                    let recorder = f.makeRecorder(manager: manager)
                     try await f.wait(hold.entered)
                     try await f.awaitCatalogProjection(window)
                     let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
@@ -327,8 +331,7 @@ import XCTest
                     await gate.wait()
                     return .fail
                 }
-                let route = f.makeRoute(for: window)
-                let recorder = f.makeRecorder(manager: manager, route: route)
+                let (route, recorder) = f.makeRecordedRoute(for: window)
                 let routeStart = recorder.routes.count
                 route.evaluateInitialRouteIfNeeded()
                 try await f.wait(entered)
@@ -336,12 +339,12 @@ import XCTest
                 gate.release()
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
-                try await f.acknowledgeRouteProbe(route)
+                try await f.acknowledgeRouteConsumption(recorder)
                 XCTAssertNil(manager.activeWorkspaceID)
                 XCTAssertEqual(route.rootRoute, .workspaceEntry)
 
                 _ = try await f.commitWorkspace(named: "Later user record", window: window)
-                try await f.acknowledgeRouteProbe(route)
+                try await f.acknowledgeRouteConsumption(recorder)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
                 XCTAssertEqual(route.rootRoute, .workspaceEntry)
                 f.assertNoUnsolicitedSelection(recorder, routeStart: routeStart, context: "failed startup recovery")
@@ -371,8 +374,8 @@ import XCTest
                 let user = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
                 f.project(manager, [user, system], dirty: [system.id])
                 XCTAssertNil(manager.activeWorkspaceID, "Dirty System is not eligible")
-                f.projectMetadata(manager, [user, system], canonicalSystemIDs: nil)
-                XCTAssertNil(manager.activeWorkspaceID, "Default empty canonical evidence fails closed")
+                f.projectMetadata(manager, [user, system], canonicalSystemIDs: [])
+                XCTAssertNil(manager.activeWorkspaceID, "Empty canonical evidence fails closed")
                 f.projectMetadata(manager, [user, system], canonicalSystemIDs: [system.id])
                 XCTAssertEqual(manager.activeWorkspaceID, system.id)
                 XCTAssertTrue(manager.hasEstablishedWorkspaceSelectionForTesting)
@@ -558,7 +561,7 @@ import XCTest
                         await gate.wait()
                         return failsStartup ? .fail : .proceed
                     }
-                    let route = f.makeRoute(for: window)
+                    let (route, routeRecorder) = f.makeRecordedRoute(for: window)
                     route.evaluateInitialRouteIfNeeded()
                     try await f.wait(entered)
                     try await f.awaitCatalogProjection(window)
@@ -578,7 +581,7 @@ import XCTest
                     gate.release()
                     await manager.awaitInitialWorkspaceActivationCompletion()
                     try await f.wait(restored)
-                    try await f.acknowledgeRouteProbe(route)
+                    try await f.acknowledgeRouteConsumption(routeRecorder)
                     try await f.acknowledgeWindowObservers(window)
                     XCTAssertEqual(restored.count, 1)
                     XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
@@ -611,13 +614,12 @@ import XCTest
                     entered.fire()
                     await gate.wait()
                 }
-                let route = f.makeRoute(for: window)
-                let recorder = f.makeRecorder(manager: manager, route: route)
+                let (route, recorder) = f.makeRecordedRoute(for: window)
                 let routeStart = recorder.routes.count
                 route.evaluateInitialRouteIfNeeded()
                 try await f.wait(entered)
                 try await f.awaitCatalogProjection(window)
-                try await f.acknowledgeRouteProbe(route)
+                try await f.acknowledgeRouteConsumption(recorder)
                 f.assertNoUnsolicitedSelection(recorder, routeStart: routeStart, context: "while created Default is gated")
 
                 let createdID = try XCTUnwrap(gatedID)
@@ -632,7 +634,7 @@ import XCTest
                 gate.release()
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
-                try await f.acknowledgeRouteProbe(route)
+                try await f.acknowledgeRouteConsumption(recorder)
                 XCTAssertEqual(manager.activeWorkspaceID, createdID)
                 XCTAssertEqual(manager.activeWorkspace?.isSystemWorkspace, true)
                 XCTAssertEqual(route.rootRoute, .workspaceEntry)
@@ -695,7 +697,7 @@ import XCTest
                     case .postPublication: f.holdHydrationSpawn(manager, of: Fixture.defaultID)
                     }
                     let recovery = f.countRecoveryBegins(manager)
-                    let recorder = f.makeRecorder(manager: manager, route: nil)
+                    let recorder = f.makeRecorder(manager: manager)
                     try await f.wait(hold.entered)
                     try await f.awaitCatalogProjection(window)
 
@@ -753,7 +755,7 @@ import XCTest
                     recoveryEntered.fire()
                     await recoveryGate.wait()
                 }
-                let recorder = f.makeRecorder(manager: manager, route: nil)
+                let recorder = f.makeRecorder(manager: manager)
                 try await f.wait(hydration.entered)
                 try await f.awaitCatalogProjection(window)
                 XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID, "startup published before recovery")
@@ -844,7 +846,8 @@ import XCTest
     private final class SelectionRecorder {
         private(set) var emittedIDs: [UUID?] = []
         private(set) var routes: [AppRootRoute] = []
-        private(set) var consumptions: [ContentViewModel.WorkspaceRouteConsumptionForTesting] = []
+        private(set) var consumedIDs: [UUID?] = []
+        private var consumptionWaiters: [(target: Int, signal: Signal)] = []
         private var cancellables: Set<AnyCancellable> = []
 
         init(manager: WorkspaceManagerViewModel, route: ContentViewModel?) {
@@ -855,13 +858,27 @@ import XCTest
             route.$rootRoute
                 .sink { [weak self] in self?.routes.append($0) }
                 .store(in: &cancellables)
-            route.setWorkspaceRouteConsumptionHandlerForTesting { [weak self] in
-                self?.consumptions.append($0)
+            route.setWorkspaceRouteConsumptionHandlerForTesting { [weak self] id in
+                guard let self else { return }
+                XCTAssertLessThan(consumedIDs.count, emittedIDs.count, "Route consumed without a matching active-ID emission")
+                consumedIDs.append(id)
+                let consumedCount = consumedIDs.count
+                let ready = consumptionWaiters.filter { consumedCount >= $0.target }
+                consumptionWaiters.removeAll { consumedCount >= $0.target }
+                ready.forEach { $0.signal.fire() }
             }
+        }
+
+        func signalWhenConsumed(through target: Int) -> Signal? {
+            guard consumedIDs.count < target else { return nil }
+            let signal = Signal("route consumed active-ID emissions through count \(target)")
+            consumptionWaiters.append((target, signal))
+            return signal
         }
 
         func detach() {
             cancellables.removeAll()
+            consumptionWaiters.removeAll()
         }
     }
 
@@ -934,6 +951,7 @@ import XCTest
         private(set) var runtime: MCPDomainRuntime!
         private let polling = CodexModelPollingService(client: EmptyModelClient())
         private var windows: [WindowState] = []
+        private var projectionObserversByWindowID: [Int: DomainWorkspaceProjectionObserver] = [:]
         private var tornDownWindowIDs: Set<Int> = []
         private var routes: [ContentViewModel] = []
         private var recorders: [SelectionRecorder] = []
@@ -1051,18 +1069,42 @@ import XCTest
                 codexModelPollingService: polling,
                 loadStoredAPISettingsDataOnInit: false
             )
+            guard let bridge = window.domainWorkspacePresentationBridgeForTesting else {
+                preconditionFailure("Window fixture requires a domain workspace presentation bridge")
+            }
+            projectionObserversByWindowID[window.windowID] = DomainWorkspaceProjectionObserver(bridge: bridge)
             windows.append(window)
             return window
         }
 
-        func makeRoute(for window: WindowState) -> ContentViewModel {
-            let route = ContentViewModel(state: window)
-            routes.append(route)
-            return route
+        func projectionObserver(for window: WindowState) -> DomainWorkspaceProjectionObserver {
+            guard let observer = projectionObserversByWindowID[window.windowID] else {
+                preconditionFailure("Window fixture is missing its projection observer")
+            }
+            return observer
         }
 
-        func makeRecorder(manager: WorkspaceManagerViewModel, route: ContentViewModel?) -> SelectionRecorder {
-            let recorder = SelectionRecorder(manager: manager, route: route)
+        func projectionState(
+            for window: WindowState
+        ) -> DomainWorkspacePresentationBridge.ProjectionObservationState {
+            guard let bridge = window.domainWorkspacePresentationBridgeForTesting else {
+                preconditionFailure("Window fixture is missing its projection bridge")
+            }
+            return bridge.projectionObservationStateForTesting
+        }
+
+        /// Constructs the route and installs its sole recorder synchronously, before any test yield
+        /// can let the route's initial RunLoop.main delivery run.
+        func makeRecordedRoute(for window: WindowState) -> (route: ContentViewModel, recorder: SelectionRecorder) {
+            let route = ContentViewModel(state: window)
+            let recorder = SelectionRecorder(manager: window.workspaceManager, route: route)
+            routes.append(route)
+            recorders.append(recorder)
+            return (route, recorder)
+        }
+
+        func makeRecorder(manager: WorkspaceManagerViewModel) -> SelectionRecorder {
+            let recorder = SelectionRecorder(manager: manager, route: nil)
             recorders.append(recorder)
             return recorder
         }
@@ -1164,9 +1206,9 @@ import XCTest
         }
 
         /// Acknowledges that a bridge waiter is registered (bounded; no sleeps).
-        func awaitPendingProjectionWaiter(_ window: WindowState) async throws {
+        func awaitPendingProjectionWaiter(_ observer: DomainWorkspaceProjectionObserver) async throws {
             for _ in 0 ..< 10000 {
-                if window.pendingDomainWorkspaceProjectionWaiterCountForTesting > 0 { return }
+                if observer.pendingWaiterCount > 0 { return }
                 await Task.yield()
             }
             releaseAllGates()
@@ -1176,7 +1218,7 @@ import XCTest
         /// Waits for a real bridge application through the runtime's current publication.
         func awaitCatalogProjection(_ window: WindowState) async throws {
             let catalog = await runtime.workspaceStore.snapshot()
-            let checkpoint = await window.waitForDomainWorkspaceProjectionForTesting(
+            let checkpoint = await projectionObserver(for: window).waitForProjection(
                 afterGeneration: 0,
                 through: catalog.publicationSequence,
                 timeout: .seconds(15)
@@ -1187,36 +1229,42 @@ import XCTest
             }
         }
 
-        /// A probe acknowledged after its enqueue proves every earlier route input was consumed.
-        func acknowledgeRouteProbe(_ route: ContentViewModel) async throws {
-            let token = UUID()
-            let acknowledged = Signal("route probe acknowledged")
-            route.setWorkspaceRouteProbeAcknowledgementHandlerForTesting { if $0 == token { acknowledged.fire() } }
-            route.enqueueWorkspaceRouteProbeForTesting(token: token)
-            defer { route.setWorkspaceRouteProbeAcknowledgementHandlerForTesting(nil) }
+        /// Captures the real active-ID emission count, then waits until the route subscription has
+        /// consumed every emission through that fixed target.
+        func acknowledgeRouteConsumption(_ recorder: SelectionRecorder) async throws {
+            let target = recorder.emittedIDs.count
+            if let signal = recorder.signalWhenConsumed(through: target) {
+                try await wait(signal)
+            }
+            XCTAssertGreaterThanOrEqual(recorder.consumedIDs.count, target)
+        }
+
+        /// WindowState's active-ID observer also schedules on RunLoop.main. Enqueueing directly on
+        /// that scheduler acknowledges all observer work scheduled before this call without adding
+        /// another route model or relying on a final-state-only wait.
+        func acknowledgeWindowObservers(_: WindowState) async throws {
+            let acknowledged = Signal("window active-ID observers drained")
+            RunLoop.main.schedule { acknowledged.fire() }
             try await wait(acknowledged)
         }
 
-        /// Window's own active-ID observer shares RunLoop.main scheduling; a route probe on a
-        /// throwaway route model subscribed later acknowledges that earlier scheduled work.
-        func acknowledgeWindowObservers(_ window: WindowState) async throws {
-            try await acknowledgeRouteProbe(makeRoute(for: window))
-        }
-
+        @discardableResult
         func assertNoUnsolicitedSelection(
             _ recorder: SelectionRecorder,
             routeStart: Int,
             context: String,
             file: StaticString = #filePath,
             line: UInt = #line
-        ) {
+        ) -> Bool {
             let nonSystemIDs = Set(seeds.filter { !$0.isSystemWorkspace }.map(\.id))
             let emitted = recorder.emittedIDs.compactMap(\.self).filter { nonSystemIDs.contains($0) }
             XCTAssertTrue(emitted.isEmpty, "\(context): unsolicited non-System emission \(emitted)", file: file, line: line)
-            let consumed = recorder.consumptions.compactMap(\.idActuallyRead).filter { nonSystemIDs.contains($0) }
+            let consumed = recorder.consumedIDs.compactMap(\.self).filter { nonSystemIDs.contains($0) }
             XCTAssertTrue(consumed.isEmpty, "\(context): route consumed non-System \(consumed)", file: file, line: line)
             let routes = recorder.routes.dropFirst(routeStart)
-            XCTAssertFalse(routes.contains(.main), "\(context): post-chooser .main publication \(Array(routes))", file: file, line: line)
+            let publishedMain = routes.contains(.main)
+            XCTAssertFalse(publishedMain, "\(context): post-chooser .main publication \(Array(routes))", file: file, line: line)
+            return emitted.isEmpty && consumed.isEmpty && !publishedMain
         }
 
         // MARK: Canonical updates
@@ -1281,29 +1329,22 @@ import XCTest
             )
         }
 
-        /// Metadata-only projection; unchanged digests. `nil` uses the fail-closed default.
+        /// Metadata-only projection with unchanged digests and explicit canonical System evidence.
         func projectMetadata(
             _ manager: WorkspaceManagerViewModel,
             _ models: [WorkspaceModel],
             dirty: Set<UUID> = [],
-            canonicalSystemIDs: Set<UUID>?
+            canonicalSystemIDs: Set<UUID>
         ) {
             let sequence = nextSequence()
             let revisions = revisions(models, dirty: dirty, sequence: sequence)
             let digests = Dictionary(uniqueKeysWithValues: models.map { ($0.id, "digest-\($0.id)") })
             let health = Dictionary(uniqueKeysWithValues: models.map { ($0.id, DomainAuthorityHealth.writable) })
-            if let canonicalSystemIDs {
-                manager.applyDomainAuthorityMetadataProjection(
-                    revisionsByWorkspaceID: revisions, digestsByWorkspaceID: digests, healthByWorkspaceID: health,
-                    catalogRevision: sequence, publicationSequence: sequence,
-                    canonicalSystemWorkspaceIDs: canonicalSystemIDs
-                )
-            } else {
-                manager.applyDomainAuthorityMetadataProjection(
-                    revisionsByWorkspaceID: revisions, digestsByWorkspaceID: digests, healthByWorkspaceID: health,
-                    catalogRevision: sequence, publicationSequence: sequence
-                )
-            }
+            manager.applyDomainAuthorityMetadataProjection(
+                revisionsByWorkspaceID: revisions, digestsByWorkspaceID: digests, healthByWorkspaceID: health,
+                catalogRevision: sequence, publicationSequence: sequence,
+                canonicalSystemWorkspaceIDs: canonicalSystemIDs
+            )
         }
 
         // MARK: Cleanup
@@ -1344,7 +1385,6 @@ import XCTest
             recorders.removeAll()
             for route in routes {
                 route.setWorkspaceRouteConsumptionHandlerForTesting(nil)
-                route.setWorkspaceRouteProbeAcknowledgementHandlerForTesting(nil)
             }
             routes.removeAll()
             for window in windows {
@@ -1365,6 +1405,7 @@ import XCTest
                 XCTAssertTrue(remaining.isEmpty, "Window roots must be unloaded")
             }
             windows.removeAll()
+            projectionObserversByWindowID.removeAll()
             for manager in managers {
                 await manager.debugDrainScheduledSaves()
                 manager.prepareForWindowClose()

@@ -7767,7 +7767,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         healthByWorkspaceID: [UUID: DomainAuthorityHealth],
         catalogRevision: UInt64,
         publicationSequence: UInt64,
-        canonicalSystemWorkspaceIDs: Set<UUID> = []
+        canonicalSystemWorkspaceIDs: Set<UUID>
     ) {
         guard publicationSequence >= lastDomainProjectionSequence else { return }
         lastDomainProjectionSequence = publicationSequence
@@ -7783,7 +7783,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             publicationSequence: publicationSequence
         )
         // A later no-digest publication must still let a failed-startup window converge on
-        // System. Established metadata-only behavior is unchanged. The empty default fails closed.
+        // System. Established metadata-only behavior is unchanged. Empty evidence fails closed.
         if !hasEstablishedWorkspaceSelection {
             reconcileProjectedWorkspaceSelection(
                 preferredActiveWorkspaceID: nil,

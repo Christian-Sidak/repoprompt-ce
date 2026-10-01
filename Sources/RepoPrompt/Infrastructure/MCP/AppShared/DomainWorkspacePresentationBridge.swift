@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import RepoPromptDomainRuntime
 
@@ -330,6 +331,9 @@ final class DomainWorkspacePresentationBridge {
     }
 
     func stop() {
+        #if DEBUG
+            let stoppedRunID = subscriptionRunID
+        #endif
         subscriptionRunID = nil
         subscriptionTask?.cancel()
         #if DEBUG
@@ -344,8 +348,8 @@ final class DomainWorkspacePresentationBridge {
         projectedModels.removeAll(keepingCapacity: false)
         #if DEBUG
             projectionCheckpoint = nil
-            for waiterID in Array(projectionWaiters.keys) {
-                resolveProjectionWaiter(waiterID, with: nil)
+            if let stoppedRunID {
+                projectionObservationSubject.send(.stopped(runID: stoppedRunID))
             }
         #endif
     }
@@ -363,24 +367,20 @@ final class DomainWorkspacePresentationBridge {
             let publicationSequence: UInt64
         }
 
-        private struct ProjectionWaiter {
+        struct ProjectionObservationState: Equatable {
             let runID: UUID?
-            let afterGeneration: UInt64
-            let publicationSequence: UInt64
-            let continuation: CheckedContinuation<ProjectionCheckpoint?, Never>
+            let generation: UInt64
+            let checkpoint: ProjectionCheckpoint?
+        }
 
-            func isSatisfied(by checkpoint: ProjectionCheckpoint) -> Bool {
-                checkpoint.runID == runID
-                    && checkpoint.generation > afterGeneration
-                    && checkpoint.publicationSequence >= publicationSequence
-            }
+        enum ProjectionObservationEvent: Equatable {
+            case applied(ProjectionCheckpoint)
+            case stopped(runID: UUID)
         }
 
         private var projectionCheckpoint: ProjectionCheckpoint?
         private var projectionGeneration: UInt64 = 0
-        private var projectionWaiters: [UUID: ProjectionWaiter] = [:]
-        /// Deadline tasks stay tracked until they actually exit so stop-and-join can join them.
-        private var projectionWaiterDeadlines: [UUID: Task<Void, Never>] = [:]
+        private let projectionObservationSubject = PassthroughSubject<ProjectionObservationEvent, Never>()
         private var retiredSubscriptionTasks: [Task<Void, Never>] = []
 
         /// Cancellation alone does not join a suspended projection into a fixture-owned manager.
@@ -392,82 +392,22 @@ final class DomainWorkspacePresentationBridge {
             for task in retired {
                 await task.value
             }
-            for deadline in Array(projectionWaiterDeadlines.values) {
-                await deadline.value
-            }
-        }
-
-        var pendingProjectionWaiterCountForTesting: Int {
-            projectionWaiters.count
         }
 
         var hasActiveSubscriptionForTesting: Bool {
             subscriptionTask != nil
         }
 
-        var projectionGenerationForTesting: UInt64 {
-            projectionGeneration
+        var projectionObservationStateForTesting: ProjectionObservationState {
+            ProjectionObservationState(
+                runID: subscriptionRunID,
+                generation: projectionGeneration,
+                checkpoint: projectionCheckpoint
+            )
         }
 
-        var projectionCheckpointForTesting: ProjectionCheckpoint? {
-            projectionCheckpoint
-        }
-
-        /// Returns the first checkpoint of the current incarnation with a generation after
-        /// `afterGeneration` that applied at least `through`, or nil on timeout/cancellation/stop.
-        /// Sequence zero is satisfied only by a real application.
-        func waitForProjectionForTesting(
-            afterGeneration: UInt64,
-            through publicationSequence: UInt64 = 0,
-            timeout: Duration = .seconds(5)
-        ) async -> ProjectionCheckpoint? {
-            let waiterID = UUID()
-            return await withTaskCancellationHandler {
-                await withCheckedContinuation { (continuation: CheckedContinuation<ProjectionCheckpoint?, Never>) in
-                    let waiter = ProjectionWaiter(
-                        runID: subscriptionRunID,
-                        afterGeneration: afterGeneration,
-                        publicationSequence: publicationSequence,
-                        continuation: continuation
-                    )
-                    // Register before checking so every exit resolves through one helper.
-                    projectionWaiters[waiterID] = waiter
-                    if Task.isCancelled || subscriptionRunID == nil {
-                        resolveProjectionWaiter(waiterID, with: nil)
-                        return
-                    }
-                    if let projectionCheckpoint, waiter.isSatisfied(by: projectionCheckpoint) {
-                        resolveProjectionWaiter(waiterID, with: projectionCheckpoint)
-                        return
-                    }
-                    projectionWaiterDeadlines[waiterID] = Task { @MainActor [weak self] in
-                        try? await Task.sleep(for: timeout)
-                        self?.resolveProjectionWaiter(waiterID, with: nil)
-                        self?.projectionWaiterDeadlines.removeValue(forKey: waiterID)
-                    }
-                }
-            } onCancel: {
-                Task { @MainActor [weak self] in
-                    self?.resolveProjectionWaiter(waiterID, with: nil)
-                }
-            }
-        }
-
-        func waitUntilProjected(
-            through publicationSequence: UInt64,
-            timeout: Duration = .seconds(5)
-        ) async -> Bool {
-            await waitForProjectionForTesting(
-                afterGeneration: 0,
-                through: publicationSequence,
-                timeout: timeout
-            ) != nil
-        }
-
-        private func resolveProjectionWaiter(_ waiterID: UUID, with checkpoint: ProjectionCheckpoint?) {
-            guard let waiter = projectionWaiters.removeValue(forKey: waiterID) else { return }
-            projectionWaiterDeadlines[waiterID]?.cancel()
-            waiter.continuation.resume(returning: checkpoint)
+        var projectionObservationPublisherForTesting: AnyPublisher<ProjectionObservationEvent, Never> {
+            projectionObservationSubject.eraseToAnyPublisher()
         }
 
         func suppressSelfEchoForTesting(_ event: DomainWorkspaceEvent) async -> Bool {
@@ -486,9 +426,7 @@ final class DomainWorkspacePresentationBridge {
                 publicationSequence: publicationSequence
             )
             projectionCheckpoint = checkpoint
-            for (waiterID, waiter) in projectionWaiters where waiter.isSatisfied(by: checkpoint) {
-                resolveProjectionWaiter(waiterID, with: checkpoint)
-            }
+            projectionObservationSubject.send(.applied(checkpoint))
         #endif
     }
 

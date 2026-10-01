@@ -547,33 +547,12 @@ class WindowState: ObservableObject {
             )
         }
 
+        var domainWorkspacePresentationBridgeForTesting: DomainWorkspacePresentationBridge? {
+            domainWorkspacePresentationBridge
+        }
+
         func joinDomainWorkspaceBridgeForTesting() async {
             await domainWorkspacePresentationBridge?.stopAndJoinForTesting()
-        }
-
-        var domainWorkspaceProjectionGenerationForTesting: UInt64 {
-            domainWorkspacePresentationBridge?.projectionGenerationForTesting ?? 0
-        }
-
-        var domainWorkspaceProjectionCheckpointForTesting: DomainWorkspacePresentationBridge.ProjectionCheckpoint? {
-            domainWorkspacePresentationBridge?.projectionCheckpointForTesting
-        }
-
-        func waitForDomainWorkspaceProjectionForTesting(
-            afterGeneration: UInt64,
-            through publicationSequence: UInt64 = 0,
-            timeout: Duration = .seconds(5)
-        ) async -> DomainWorkspacePresentationBridge.ProjectionCheckpoint? {
-            guard let domainWorkspacePresentationBridge else { return nil }
-            return await domainWorkspacePresentationBridge.waitForProjectionForTesting(
-                afterGeneration: afterGeneration,
-                through: publicationSequence,
-                timeout: timeout
-            )
-        }
-
-        var pendingDomainWorkspaceProjectionWaiterCountForTesting: Int {
-            domainWorkspacePresentationBridge?.pendingProjectionWaiterCountForTesting ?? 0
         }
 
         func restartDomainWorkspaceProjectionForTesting() {
