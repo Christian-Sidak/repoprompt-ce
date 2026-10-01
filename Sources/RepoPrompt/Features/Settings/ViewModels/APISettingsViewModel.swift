@@ -3359,7 +3359,7 @@ public class APISettingsViewModel: ObservableObject {
         applyCodexConnectionPhase(.testingAppServer)
 
         // Use an owned non-agent Codex client so health-check failures cannot poison chat or polling.
-        let provider = CodexCLIProvider(logCollector: collector)
+        let provider = CodexCLIProvider(logCollector: collector, perfRecorder: AIProviderFactory.perfRecorder)
         collector.append("Created Codex CLI provider for health check")
 
         do {

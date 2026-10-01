@@ -100,7 +100,13 @@ def mask_non_code(source: str) -> str:
     return ''.join(masked)
 
 
+def strip_bom(source: str) -> str:
+    """swiftc accepts a leading UTF-8 BOM; strip it so imports after it stay visible."""
+    return source[1:] if source.startswith('\ufeff') else source
+
+
 def scan_imports(source: str) -> list[tuple[int, str]]:
+    source = strip_bom(source)
     masked = mask_non_code(source)
     return [(source.count('\n', 0, match.start(1) if match.group(1) else match.start(2)) + 1,
              match.group(1) or match.group(2))

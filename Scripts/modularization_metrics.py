@@ -335,6 +335,15 @@ def regressions(current: Mapping[str, int], baseline: Mapping[str, int]) -> List
     return problems
 
 
+def baseline_raises(current: Mapping[str, int], baseline: Mapping[str, int]) -> List[str]:
+    """Every ratcheted or tracked value `update` would raise. Headroom applies to `check` only."""
+    return [
+        f"{name}: {baseline[name]} -> {current.get(name, 0)}"
+        for name in dict.fromkeys(("app_target_swift_lines",) + RATCHETED_METRICS + TRACKED_METRICS)
+        if name in baseline and current.get(name, 0) > baseline[name]
+    ]
+
+
 def improvements(current: Mapping[str, int], baseline: Mapping[str, int]) -> List[str]:
     return [
         f"{name}: {baseline[name]} -> {current[name]}"
@@ -484,7 +493,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if baseline_path.is_file() and not args.allow_regression:
-        problems = regressions(metrics, load_baseline(baseline_path))
+        baseline = load_baseline(baseline_path)
+        problems = regressions(metrics, baseline) + baseline_raises(metrics, baseline)
         if problems:
             print("refusing to raise baseline (use --allow-regression with justification):", file=sys.stderr)
             for problem in problems:

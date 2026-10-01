@@ -268,6 +268,18 @@ class CatalogTests(unittest.TestCase):
             (root / 'Tests/Imports.swift').write_text('/* unterminated')
             self.assertTrue(swift_imports.sources_import_module(root / 'Tests', 'Testing'))
 
+    def test_import_scanner_sees_imports_after_utf8_bom(self) -> None:
+        self.assertEqual(swift_imports.imported_modules('\ufeffimport AppKit\n'), ['AppKit'])
+        self.assertEqual(swift_imports.imported_modules('\ufeff@testable import Testing\n'), ['Testing'])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'Tests').mkdir()
+            (root / 'Tests/Bom.swift').write_text('\ufeffimport Testing\n', encoding='utf-8')
+            self.assertTrue(swift_imports.sources_import_module(root / 'Tests', 'Testing'))
+            self.assertTrue(artifact.sources_import_module(root / 'Tests', 'Testing'))
+            (root / 'Tests/Bom.swift').write_text('\ufeffimport AppKit\n', encoding='utf-8')
+            self.assertTrue(swift_imports.forbidden_ui_imports([root / 'Tests']))
+
     def test_all_module_selection_is_independent_of_incremental_base(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

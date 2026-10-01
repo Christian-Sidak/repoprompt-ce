@@ -118,6 +118,29 @@ class RatchetCommandTests(unittest.TestCase):
             )
             self.assertEqual(self.run_main("check", "--root", tmp, "--baseline", str(baseline)), 0)
 
+    def test_update_refuses_app_lines_growth_within_headroom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_fixture(root)
+            baseline = root / "ratchets.json"
+            self.assertEqual(self.run_main("update", "--root", tmp, "--baseline", str(baseline)), 0)
+            before = json.loads(baseline.read_text())["metrics"]["app_target_swift_lines"]
+            write(root, "Sources/RepoPrompt/Features/Chat/Growth.swift", "let growth = 0\n" * 1500)
+            # Within headroom: `check` passes, but `update` must not raise the baseline.
+            self.assertEqual(self.run_main("check", "--root", tmp, "--baseline", str(baseline)), 0)
+            self.assertEqual(self.run_main("update", "--root", tmp, "--baseline", str(baseline)), 1)
+            self.assertEqual(json.loads(baseline.read_text())["metrics"]["app_target_swift_lines"], before)
+            self.assertEqual(
+                self.run_main("update", "--root", tmp, "--baseline", str(baseline), "--allow-regression"), 0
+            )
+            self.assertEqual(json.loads(baseline.read_text())["metrics"]["app_target_swift_lines"], before + 1500)
+
+    def test_baseline_raises_covers_tracked_metrics(self) -> None:
+        baseline = {name: 5 for name in mm.RATCHETED_METRICS + mm.TRACKED_METRICS}
+        current = dict(baseline, tests_sleep_calls=6)
+        self.assertEqual(mm.baseline_raises(current, baseline), ["tests_sleep_calls: 5 -> 6"])
+        self.assertEqual(mm.baseline_raises(dict(baseline, tests_sleep_calls=4), baseline), [])
+
     def test_check_fails_without_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             make_fixture(Path(tmp))
