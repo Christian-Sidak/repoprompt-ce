@@ -366,19 +366,68 @@ import XCTest
                 XCTAssertEqual(manager.activeWorkspaceID, system.id)
             }
 
-            // Metadata-only publication (unchanged digests) still lets a never-established manager
-            // converge on System; the default empty canonical set fails closed.
-            try await Fixture.run(seeds: []) { f in
-                let manager = f.makeManager()
-                let system = Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true)
-                let user = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
-                f.project(manager, [user, system], dirty: [system.id])
-                XCTAssertNil(manager.activeWorkspaceID, "Dirty System is not eligible")
-                f.projectMetadata(manager, [user, system], canonicalSystemIDs: [])
-                XCTAssertNil(manager.activeWorkspaceID, "Empty canonical evidence fails closed")
-                f.projectMetadata(manager, [user, system], canonicalSystemIDs: [system.id])
-                XCTAssertEqual(manager.activeWorkspaceID, system.id)
+            // Unchanged-digest publication through the real bridge: a never-established manager
+            // converges on System via the metadata-only projection path, never on a user record.
+            try await Fixture.run { f in
+                // Dirty a user record before the window exists so its later save changes revisions
+                // without changing any document digest.
+                let author = DomainWorkspaceAuthorityClient(store: f.runtime.workspaceStore, windowID: -11281)
+                let seeded = await f.runtime.workspaceStore.workspaceSnapshot(Fixture.aardvarkID)
+                let before = try XCTUnwrap(seeded)
+                var edited = Fixture.model(id: Fixture.aardvarkID, name: "Aardvark")
+                edited.lastUsed = edited.lastUsed.addingTimeInterval(60)
+                let working = try await author.replaceWorking(
+                    edited,
+                    fileURL: f.workspaceURL(for: edited),
+                    expectedWorkspaceRevision: before.revisions.workingRevision
+                )
+                XCTAssertEqual(working.disposition, .applied, "\(working)")
+
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                let gate = f.makeGate()
+                let entered = Signal("startup reached resolution")
+                manager.setInitialDefaultResolutionHandlerForTesting {
+                    entered.fire()
+                    await gate.wait()
+                    return .fail
+                }
+                let (route, recorder) = f.makeRecordedRoute(for: window)
+                let routeStart = recorder.routes.count
+                route.evaluateInitialRouteIfNeeded()
+                try await f.wait(entered)
+                try await f.awaitCatalogProjection(window)
+                gate.release()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                await manager.awaitInitialized()
+                try await f.acknowledgeRouteConsumption(recorder)
+                XCTAssertNil(manager.activeWorkspaceID)
+                XCTAssertFalse(manager.hasEstablishedWorkspaceSelectionForTesting)
+                XCTAssertEqual(route.rootRoute, .workspaceEntry)
+
+                let catalogBefore = await f.runtime.workspaceStore.snapshot()
+                let dirty = try XCTUnwrap(catalogBefore.workspaces.first { $0.document.workspaceID == Fixture.aardvarkID })
+                XCTAssertNotNil(dirty.revisions.dirtyRevision)
+                let saved = await author.saveCommittedWorkingRevision(
+                    workspaceID: Fixture.aardvarkID,
+                    expectedWorkspaceRevision: dirty.revisions.workingRevision
+                )
+                XCTAssertEqual(saved.disposition, .applied, "\(saved)")
+                let catalogAfter = await f.runtime.workspaceStore.snapshot()
+                func digests(_ snapshot: DomainWorkspaceCatalogSnapshot) -> [UUID: String] {
+                    Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+                        ($0.document.workspaceID, $0.document.contentDigest)
+                    })
+                }
+                XCTAssertGreaterThan(catalogAfter.publicationSequence, catalogBefore.publicationSequence)
+                XCTAssertEqual(digests(catalogAfter), digests(catalogBefore), "Publication must be metadata-only")
+                try await f.awaitCatalogProjection(window)
+                try await f.acknowledgeRouteConsumption(recorder)
+
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
                 XCTAssertTrue(manager.hasEstablishedWorkspaceSelectionForTesting)
+                XCTAssertEqual(route.rootRoute, .workspaceEntry)
+                f.assertNoUnsolicitedSelection(recorder, routeStart: routeStart, context: "metadata-only recovery")
             }
         }
 
@@ -440,6 +489,8 @@ import XCTest
                 // Metadata entry point: canonical evidence must match a reconciled System model.
                 let manager = f.makeManager()
                 f.project(manager, [aardvark, system], dirty: [system.id])
+                f.projectMetadata(manager, [aardvark, system], canonicalSystemIDs: [])
+                XCTAssertNil(manager.activeWorkspaceID, "Empty canonical evidence fails closed")
                 f.projectMetadata(manager, [aardvark, system], canonicalSystemIDs: [aardvark.id])
                 XCTAssertNil(manager.activeWorkspaceID, "Canonical/reconciled classification mismatch")
                 f.projectMetadata(manager, [aardvark, system], canonicalSystemIDs: [system.id])
