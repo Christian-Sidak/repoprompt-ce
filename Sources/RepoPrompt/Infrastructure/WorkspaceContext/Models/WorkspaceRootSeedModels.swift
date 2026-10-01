@@ -3,6 +3,59 @@ import Foundation
 import RepoPromptInstrumentation
 import RepoPromptWorkspaceCore
 
+enum FileContentFreshnessPolicy {
+    /// Trust the existing file metadata/cache fast path.
+    case cachedMetadata
+    /// Validate disk metadata before trusting cached content; never return stale fallback on validation/load failure.
+    case validateDiskMetadata
+}
+
+/// Snapshot of file content plus a stable in-memory revision for search cache identity.
+struct FileSearchContentSnapshot {
+    let content: String?
+    let contentRevision: UInt64?
+    let modificationDate: Date
+    let isFresh: Bool
+}
+
+/// Every case carries only String, Bool, or Sendable WorkspaceRootRef values.
+extension WorkspaceLookupRootScope: @unchecked Sendable {}
+
+/// Immutable authority for exactly the roots selected by one lookup scope.
+/// The leases retain the captured catalog generations and fence session-root changes.
+struct WorkspaceContextRootSnapshot {
+    struct Root: Equatable {
+        let reference: WorkspaceRootRef
+        let lifetimeID: UUID
+        let catalogGeneration: UInt64
+    }
+
+    let scope: WorkspaceLookupRootScope
+    let roots: [Root]
+    private let catalogLease: WorkspaceSearchCatalogGenerationLease
+    private let lifetimeLease: WorkspaceSessionRootLifetimeSnapshot
+
+    init(
+        scope: WorkspaceLookupRootScope,
+        roots: [Root],
+        catalogLease: WorkspaceSearchCatalogGenerationLease,
+        lifetimeLease: WorkspaceSessionRootLifetimeSnapshot
+    ) {
+        self.scope = scope
+        self.roots = roots
+        self.catalogLease = catalogLease
+        self.lifetimeLease = lifetimeLease
+    }
+
+    var rootRefs: [WorkspaceRootRef] {
+        roots.map(\.reference)
+    }
+
+    func lifetimeIsCurrent() -> Bool {
+        lifetimeLease.isGenerationCurrent()
+    }
+}
+
 struct WorkspaceRootByteExactPathKey: Hashable, Comparable {
     let value: String
     private let bytes: [UInt8]
@@ -713,7 +766,7 @@ struct WorkspaceRootMaterializationHint: Equatable, @unchecked Sendable {
     }
 
     func validated(
-        matching binding: AgentSessionWorktreeBinding,
+        matching binding: WorkspaceSessionWorktreeBinding,
         sessionID: UUID,
         startupContext: WorktreeStartupContext?
     ) -> Self {
@@ -732,7 +785,7 @@ struct WorkspaceRootMaterializationHint: Equatable, @unchecked Sendable {
     }
 
     func fallbackReason(
-        matching binding: AgentSessionWorktreeBinding,
+        matching binding: WorkspaceSessionWorktreeBinding,
         sessionID: UUID,
         startupContext: WorktreeStartupContext?
     ) -> WorkspaceRootSeedFallbackReason? {

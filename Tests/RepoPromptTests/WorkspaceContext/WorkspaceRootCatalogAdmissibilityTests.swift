@@ -58,3 +58,41 @@ final class WorkspaceRootCatalogAdmissibilityTests: XCTestCase {
         }
     }
 }
+
+final class WorkspaceContextRootSnapshotTests: XCTestCase {
+    func testSnapshotIsSendableRootScopedAndFencedByRootChanges() async throws {
+        let firstURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let secondURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: firstURL, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondURL, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: firstURL)
+            try? FileManager.default.removeItem(at: secondURL)
+        }
+
+        let store = WorkspaceFileContextStore()
+        let first = try await store.loadRoot(path: firstURL.path)
+        let firstSnapshot = await store.rootContextSnapshot(scope: .visibleWorkspace)
+        let captured = try XCTUnwrap(firstSnapshot)
+        assertSendable(captured)
+        XCTAssertEqual(captured.rootRefs.map(\.id), [first.id])
+        let capturedIsCurrent = await store.isRootContextSnapshotCurrent(captured)
+        XCTAssertTrue(capturedIsCurrent)
+
+        let second = try await store.loadRoot(path: secondURL.path)
+        let secondSnapshot = await store.rootContextSnapshot(scope: .visibleWorkspace)
+        let updated = try XCTUnwrap(secondSnapshot)
+        XCTAssertEqual(Set(updated.rootRefs.map(\.id)), Set([first.id, second.id]))
+        XCTAssertEqual(captured.rootRefs.map(\.id), [first.id])
+        let oldIsCurrent = await store.isRootContextSnapshotCurrent(captured)
+        let updatedIsCurrent = await store.isRootContextSnapshotCurrent(updated)
+        XCTAssertFalse(oldIsCurrent)
+        XCTAssertTrue(updatedIsCurrent)
+
+        await store.unloadRoot(id: second.id)
+        let unloadedIsCurrent = await store.isRootContextSnapshotCurrent(updated)
+        XCTAssertFalse(unloadedIsCurrent)
+    }
+
+    private func assertSendable(_: some Sendable) {}
+}
