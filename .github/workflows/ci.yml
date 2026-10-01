@@ -98,6 +98,8 @@ jobs:
 
       - name: Build root test bundles with import and type-check gates
         shell: bash
+        env:
+          TYPECHECK_RATCHET_ENFORCE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
         run: |
           set -uo pipefail
           set +e

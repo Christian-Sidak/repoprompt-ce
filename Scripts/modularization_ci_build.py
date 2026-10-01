@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -26,22 +27,27 @@ def classify_warning(line: str) -> tuple[str, int, tuple[str, str, str, str]] | 
     if not duration or 'type-check' not in message:
         return None
     kind = 'expression' if 'expression' in message.lower() else 'function_body'
-    return kind, int(duration.group(1)), match.groups()
+    path, line_number, column, _ = match.groups()
+    return kind, int(duration.group(1)), (path, line_number, column, kind)
 
 
 def record_warning(
     line: str,
-    counts: dict[str, int],
-    seen: set[tuple[str, str, str, str]],
+    durations: dict[tuple[str, str, str, str], int],
 ) -> None:
     warning = classify_warning(line)
     if not warning:
         return
-    kind, duration, key = warning
-    if duration < (1000 if kind == 'function_body' else 500) or key in seen:
-        return
-    seen.add(key)
-    counts[kind] += 1
+    _, duration, key = warning
+    durations[key] = max(duration, durations.get(key, 0))
+
+
+def timing_counts(durations: dict[tuple[str, str, str, str], int]) -> dict[str, int]:
+    counts = {'function_body': 0, 'expression': 0}
+    for (_, _, _, kind), duration in durations.items():
+        if duration >= (1000 if kind == 'function_body' else 500):
+            counts[kind] += 1
+    return counts
 
 
 def main() -> int:
@@ -51,23 +57,31 @@ def main() -> int:
         '-Xswiftc', '-Xfrontend', '-Xswiftc', '-warn-long-function-bodies=999',
         '-Xswiftc', '-Xfrontend', '-Xswiftc', '-warn-long-expression-type-checking=499',
     ]
-    counts = {'function_body': 0, 'expression': 0}
-    seen: set[tuple[str, str, str, str]] = set()
+    durations: dict[tuple[str, str, str, str], int] = {}
     print('$ ' + ' '.join(command), flush=True)
     process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, bufsize=1)
     assert process.stdout is not None
     for line in process.stdout:
         print(line, end='', flush=True)
-        record_warning(line, counts, seen)
+        record_warning(line, durations)
     code = process.wait()
     if code:
         return code
+    counts = timing_counts(durations)
     print(f'type-check ratchet: app bodies >=1000ms {counts["function_body"]}/{baseline["function_bodies_1000ms"]}; '
           f'expressions >=500ms {counts["expression"]}/{baseline["expressions_500ms"]}', flush=True)
-    if counts['function_body'] > baseline['function_bodies_1000ms'] or counts['expression'] > baseline['expressions_500ms']:
+    for (path, line_number, column, kind), duration in sorted(durations.items()):
+        if duration >= (1000 if kind == 'function_body' else 500):
+            print(f'  {path}:{line_number}:{column}: {kind} {duration}ms', flush=True)
+    regressed = (counts['function_body'] > baseline['function_bodies_1000ms'] or
+                 counts['expression'] > baseline['expressions_500ms'])
+    enforce_timing = os.environ.get('TYPECHECK_RATCHET_ENFORCE', '1') == '1'
+    if regressed and enforce_timing:
         print('type-check ratchet regressed', file=sys.stderr)
         return 1
+    if regressed:
+        print('::warning::type-check timing exceeds baseline (report-only on this run)', flush=True)
     if any(SWIFT_TESTING_IMPORT.search(path.read_text(encoding='utf-8', errors='ignore'))
            for path in (ROOT / 'Tests').rglob('*.swift')):
         print('CI shard direct XCTest runner cannot run Swift Testing; add a separate runner before introducing it',

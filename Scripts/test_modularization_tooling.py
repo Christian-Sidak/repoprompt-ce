@@ -196,23 +196,26 @@ class CatalogTests(unittest.TestCase):
         warning = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'
         self.assertEqual(ci_build.classify_warning(warning), (
             'expression', 502,
-            ('Sources/RepoPrompt/App/X.swift', '3', '4', 'expression took 502ms to type-check'),
+            ('Sources/RepoPrompt/App/X.swift', '3', '4', 'expression'),
         ))
         self.assertIsNone(ci_build.classify_warning(warning.replace('Sources/RepoPrompt/', 'Sources/Core/')))
 
     def test_ci_typecheck_ratchet_deduplicates_reemitted_diagnostics(self) -> None:
         expression = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'
         function = '/checkout/Sources/RepoPrompt/App/X.swift:1:1: warning: getter took 1200ms to type-check'
-        counts = {'function_body': 0, 'expression': 0}
-        seen: set[tuple[str, str, str, str]] = set()
+        durations: dict[tuple[str, str, str, str], int] = {}
         for _ in range(25):
-            ci_build.record_warning(expression, counts, seen)
-            ci_build.record_warning(function, counts, seen)
-        self.assertEqual(counts, {'function_body': 1, 'expression': 1})
-        ci_build.record_warning(expression.replace('502ms', '505ms'), counts, seen)
-        ci_build.record_warning(expression.replace('502ms', '499ms'), counts, seen)
-        ci_build.record_warning(expression.replace('Sources/RepoPrompt/', 'Sources/Core/'), counts, seen)
-        self.assertEqual(counts, {'function_body': 1, 'expression': 2})
+            ci_build.record_warning(expression, durations)
+            ci_build.record_warning(function, durations)
+        ci_build.record_warning(expression.replace('502ms', '505ms'), durations)
+        ci_build.record_warning(expression.replace('502ms', '499ms'), durations)
+        ci_build.record_warning(expression.replace('Sources/RepoPrompt/', 'Sources/Core/'), durations)
+        self.assertEqual(ci_build.timing_counts(durations), {'function_body': 1, 'expression': 1})
+        self.assertEqual(durations[('Sources/RepoPrompt/App/X.swift', '3', '4', 'expression')], 505)
+
+        ci_build.record_warning(expression.replace(':3:4:', ':3:5:'), durations)
+        ci_build.record_warning(function.replace(':1:1:', ':2:1:'), durations)
+        self.assertEqual(ci_build.timing_counts(durations), {'function_body': 2, 'expression': 2})
 
 
 if __name__ == '__main__':
