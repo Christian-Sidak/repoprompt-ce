@@ -232,6 +232,17 @@ final class CodexNativeSessionController {
 
     private let perfRecorder: any AgentModePerfRecording
 
+    #if DEBUG
+        func debugRecordLifecyclePhaseForTesting() async {
+            await recordLifecyclePhase(
+                .runtimeResolution,
+                outcome: .succeeded,
+                startMS: perfRecorder.timestampMSIfEnabled(),
+                includeTransportGeneration: false
+            )
+        }
+    #endif
+
     private static let logger = Logger(
         subsystem: "com.repoprompt.agents",
         category: "CodexNativeSessionController"

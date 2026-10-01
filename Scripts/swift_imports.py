@@ -11,10 +11,10 @@ from pathlib import Path
 # Mask non-code text before matching; whitespace from comments is legal between
 # an import attribute/access modifier and `import` (including across lines).
 IMPORT = re.compile(
-    r'(?:^|;)[ \t]*(?:(?:@[A-Za-z_]\w*(?:\([^\n)]*\))?|'
-    r'(?:public|internal|private|fileprivate|package))[ \t]+)*'
-    r'import[ \t]+(?:(?:typealias|struct|class|enum|protocol|let|var|func)[ \t]+)?'
-    r'([A-Za-z_]\w*)\b',
+    r'(?:^|;)[ \t]*(?:(?:@[A-Za-z_]\w*(?:\([^)]*\))?|'
+    r'(?:public|internal|private|fileprivate|package))\s+)*'
+    r'import\s+(?:(?:typealias|struct|class|enum|protocol|let|var|func)\s+)?'
+    r'(?:`([A-Za-z_]\w*)`|([A-Za-z_]\w*)\b)',
     re.M,
 )
 UI_MODULES = frozenset({'AppKit', 'SwiftUI'})
@@ -102,12 +102,24 @@ def mask_non_code(source: str) -> str:
 
 def scan_imports(source: str) -> list[tuple[int, str]]:
     masked = mask_non_code(source)
-    return [(source.count('\n', 0, match.start(1)) + 1, match.group(1))
+    return [(source.count('\n', 0, match.start(1) if match.group(1) else match.start(2)) + 1,
+             match.group(1) or match.group(2))
             for match in IMPORT.finditer(masked)]
 
 
 def imported_modules(source: str) -> list[str]:
     return [module for _, module in scan_imports(source)]
+
+
+def sources_import_module(root: Path, module: str) -> bool:
+    """Fail closed when a test source cannot be read or classified."""
+    for path in root.rglob('*.swift'):
+        try:
+            if module in imported_modules(path.read_text(encoding='utf-8')):
+                return True
+        except (OSError, UnicodeError, SwiftImportScanError):
+            return True
+    return False
 
 
 def forbidden_ui_imports(roots: list[Path]) -> list[str]:

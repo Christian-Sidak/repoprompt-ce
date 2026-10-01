@@ -20,6 +20,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import ci_app_test_runner as runner  # noqa: E402
 import modularization_ci_artifact as artifact  # noqa: E402
+import swift_imports  # noqa: E402
 
 
 class InterpreterCompatibilityTests(unittest.TestCase):
@@ -73,6 +74,10 @@ class TransferredBuildTests(unittest.TestCase):
             resource.mkdir()
             (resource / 'resource').write_bytes(b'data')
             (products / 'unused.o').write_bytes(b'object')
+            for excluded in ('ModuleCache', 'RepoPromptApp.build', 'index/store'):
+                item = products / excluded
+                item.mkdir(parents=True)
+                (item / 'payload').write_bytes(b'intermediate')
             checkout = source / '.build/checkouts/example'
             checkout.mkdir(parents=True)
             (checkout / 'source.swift').write_text('not transferred')
@@ -84,6 +89,9 @@ class TransferredBuildTests(unittest.TestCase):
             copied_test.parent.mkdir(parents=True)
             copied_test.write_text('import XCTest\n')
             with tarfile.open(archive, 'r:gz') as stream:
+                self.assertFalse(any('ModuleCache' in member.name or
+                                     'RepoPromptApp.build' in member.name or
+                                     'index/store' in member.name for member in stream.getmembers()))
                 stream.extractall(copy, filter='data')
             self.assertTrue((copy / '.build/out/Products/Debug/RepoPromptTests.xctest/alias').is_symlink())
             self.assertFalse((copy / '.build/out/Products/Debug/unused.o').exists())
@@ -436,7 +444,7 @@ class ModuleExecutionTests(unittest.TestCase):
             "internal import Testing\n@Test func fails() { #expect(false) }\n"
         )
         for prefix in ("internal", "public", "@_exported"):
-            self.assertTrue(runner.SWIFT_TESTING_IMPORT.search(f"{prefix} import Testing\n"))
+            self.assertIn('Testing', swift_imports.imported_modules(f"{prefix} import Testing\n"))
         result, calls = self.run_mixed(statuses=[0, 1], listed=(), test_filter=None)
         self.assertEqual(result, 1)
         self.assertEqual([call[0][0] for call in calls], ["swift", "/tc/swiftpm-testing-helper"])

@@ -15,9 +15,9 @@ SUITE_DECLARATION = r'\b(?:class|struct|actor|enum)\s+{name}\b'
 
 def resolve(root: Path, filter_value: str) -> str | None:
     # Regex and method-only filters retain SwiftPM's aggregate semantics.
-    suite = filter_value.split('/', 1)[0]
-    if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', suite):
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*(?:/[A-Za-z_][A-Za-z_0-9]*)?', filter_value):
         return None
+    suite = filter_value.split('/', 1)[0]
     catalog = json.loads((root / 'Scripts/modularization/modules.json').read_text(encoding='utf-8'))
     owners = []
     for name, entry in catalog['modules'].items():

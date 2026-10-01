@@ -6,13 +6,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import tarfile
 from pathlib import Path
+from swift_imports import sources_import_module
 
 ROOT = Path(__file__).resolve().parent.parent
 METADATA = Path('.build/modularization')
-SWIFT_TESTING_IMPORT = re.compile(r'^\s*(?:@_exported\s+)?import\s+Testing\b', re.MULTILINE)
 
 
 def test_source_hashes(root: Path) -> dict[str, str]:
@@ -47,8 +46,7 @@ def validate(root: Path) -> Path:
         raise ValueError('CI artifact build/index attestations do not match checked-out app source bytes')
     if test_fingerprints != test_source_hashes(root):
         raise ValueError('CI artifact test sources do not match the built test bundles')
-    if any(SWIFT_TESTING_IMPORT.search(path.read_text(encoding='utf-8', errors='ignore'))
-           for path in (root / 'Tests').rglob('*.swift')):
+    if sources_import_module(root / 'Tests', 'Testing'):
         raise ValueError('CI shard direct XCTest runner cannot run Swift Testing; add a separate runner before introducing it')
     suites = {line.strip().split('/', 1)[0] for line in listing.splitlines() if '/' in line.strip()}
     if not suites:
@@ -71,7 +69,7 @@ def pack(root: Path, output: Path) -> int:
     members = [root / METADATA / name for name in
                ('app-source-sha256.json', 'index-check.json', 'ci-test-list.txt', 'test-source-sha256.json')]
     members += sorted(path for path in products.iterdir()
-                      if (path.is_dir() and path.suffix != '.dSYM')
+                      if (path.is_dir() and path.suffix in {'.xctest', '.bundle', '.framework'})
                       or (path.is_file() and path.suffix == '.dylib'))
     output.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(output, 'w:gz', compresslevel=1, dereference=False) as archive:

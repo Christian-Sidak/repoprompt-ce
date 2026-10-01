@@ -37,13 +37,14 @@ def select(root: Path, paths: list[str], catalog: dict) -> list[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--base', required=True)
+    parser.add_argument('--base')
+    parser.add_argument('--all', action='store_true')
     parser.add_argument('--head', default='HEAD')
     parser.add_argument('--root', type=Path, default=ROOT)
     args = parser.parse_args()
     root = args.root.resolve()
     catalog = json.loads((root / 'Scripts/modularization/modules.json').read_text(encoding='utf-8'))
-    if not args.base or set(args.base) == {'0'}:
+    if args.all or not args.base or set(args.base) == {'0'}:
         targets = select(root, ['Package.swift'], catalog)
     else:
         changed = subprocess.run(

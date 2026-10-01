@@ -132,8 +132,6 @@ jobs:
             .build
             Packages/RepoPromptAgentProviders/.build
           key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
-          compression-level: 0
-          if-no-files-found: error
 
   build-and-test:
     name: Test Root Shard ${{ matrix.shard }} (No Build)

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Mapping, Optional, Sequence, TextIO
 
 from modularization_ci_artifact import validate as validate_ci_artifact
+from swift_imports import sources_import_module
 
 XCTEST_BUNDLE_GLOB = "*.xctest"
 SANDBOX_MARKER_NAME = ".issue944-test-sandbox"
@@ -290,10 +291,6 @@ def execute_command(
         return 127
 
 
-SWIFT_TESTING_IMPORT = re.compile(
-    r"^\s*(?:(?:@\w+|public|internal|package|private|fileprivate)\s+)*"
-    r"import\s+(?:\w+\s+)?Testing\b", re.MULTILINE,
-)
 XCTEST_HELPER_RELATIVE_PATH = Path("libexec/swift/pm/swiftpm-xctest-helper")
 SWIFT_TESTING_HELPER_RELATIVE_PATH = Path("libexec/swift/pm/swiftpm-testing-helper")
 # Swift Testing's EXIT_NO_TESTS_FOUND (EX_UNAVAILABLE); `swift test` treats it as success.
@@ -305,13 +302,7 @@ def sources_import_swift_testing(directory: Path) -> bool:
     """Whether any Swift file under `directory` imports Testing; unreadable files count as yes."""
     if not directory.is_dir():
         return False
-    for path in directory.rglob("*.swift"):
-        try:
-            if SWIFT_TESTING_IMPORT.search(path.read_text(encoding="utf-8", errors="ignore")):
-                return True
-        except OSError:
-            return True
-    return False
+    return sources_import_module(directory, "Testing")
 
 
 def package_uses_swift_testing(root: Path) -> bool:

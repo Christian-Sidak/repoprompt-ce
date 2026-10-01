@@ -3556,6 +3556,7 @@ class OperationRegistry:
         "REPOPROMPT_DEBUG_CLI_INSTALL_PATH",
     ]
     BUILD_ENV_KEYS = [
+        "TYPECHECK_RATCHET_ENFORCE",
         "PATH",
         "DEVELOPER_DIR",
         "TOOLCHAINS",

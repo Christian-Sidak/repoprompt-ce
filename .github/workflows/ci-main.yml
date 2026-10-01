@@ -29,14 +29,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Select affected app-free test targets
+      - name: Select all app-free test targets
         id: select
         shell: bash
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
-          matrix="$(python3 Scripts/modularization_affected_tests.py --base "$BASE_SHA")"
+          matrix="$(python3 Scripts/modularization_affected_tests.py --all)"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           if [[ "$matrix" == '{"include":[]}' ]]; then
             echo 'has_modules=false' >> "$GITHUB_OUTPUT"

@@ -15,10 +15,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import modularization_affected_tests as affected  # noqa: E402
 import modularization_ci_build as ci_build  # noqa: E402
+import modularization_ci_artifact as artifact  # noqa: E402
 import modularization_modules as modules  # noqa: E402
 import modularization_test_target as target  # noqa: E402
 import generate_xcode_workspace as xcode_workspace  # noqa: E402
 import swift_imports  # noqa: E402
+import conductor  # noqa: E402
 
 
 def fixture(root: Path) -> tuple[dict, dict]:
@@ -187,10 +189,102 @@ class CatalogTests(unittest.TestCase):
             (root / 'Tests/CoreTests/FeatureTests.swift').write_text('final class FeatureTests {}\n')
             (root / 'Tests/RepoPromptTests/AppTests.swift').write_text('final class AppTests {}\n')
             self.assertEqual(target.resolve(root, 'FeatureTests/testOne'), 'CoreTests')
+            self.assertIsNone(target.resolve(root, 'FeatureTests/.*|OtherTests/.*'))
+            self.assertIsNone(target.resolve(root, 'FeatureTests/test.*'))
             self.assertIsNone(target.resolve(root, 'AppTests'))
             self.assertIsNone(target.resolve(root, 'Feature.*'))
             self.assertEqual(affected.select(root, ['Sources/Core/Core.swift'], catalog), ['CoreTests'])
             self.assertEqual(affected.select(root, ['Package.swift'], catalog), ['CoreTests'])
+
+    def test_conductor_passes_timing_policy_to_ci_child(self) -> None:
+        registry = conductor.OperationRegistry(SCRIPT_DIR.parent)
+        with mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0'}):
+            snapshot = registry.client_env_snapshot()
+        self.assertEqual(snapshot['TYPECHECK_RATCHET_ENFORCE'], '0')
+        argv, _, _, env, _ = registry.prepare({
+            'operation': 'ci-build-tests', 'args': {}, 'env': snapshot,
+        })
+        self.assertEqual(Path(argv[1]).name, 'modularization_ci_build.py')
+        self.assertEqual(env['TYPECHECK_RATCHET_ENFORCE'], '0')
+
+    def test_enforced_ratchet_cleans_before_build(self) -> None:
+        class BuildProcess:
+            stdout = iter(['Build complete! (0.1s)\n'])
+
+            def wait(self) -> int:
+                return 0
+
+        listing = subprocess.CompletedProcess([], 0, stdout='RepoPromptTests.Example/testOne\n')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / 'baseline.json'
+            baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
+                                                          'expressions_500ms': 0}}))
+            with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch.object(ci_build.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 0), listing]) as run, \
+                    mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
+                    mock.patch.object(ci_build, 'sources_import_module', return_value=False), \
+                    mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}):
+                self.assertEqual(ci_build.main(), 0)
+                self.assertEqual(run.call_args_list[0].args[0], ['swift', 'package', 'clean'])
+
+    def test_report_only_ratchet_keeps_regressed_diagnostic_visible(self) -> None:
+        class BuildProcess:
+            stdout = iter(['/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check\n'])
+
+            def wait(self) -> int:
+                return 0
+
+        listing = subprocess.CompletedProcess([], 0, stdout='RepoPromptTests.Example/testOne\n')
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            baseline = root / 'baseline.json'
+            baseline.write_text(json.dumps({'typecheck': {'function_bodies_1000ms': 0,
+                                                          'expressions_500ms': 0}}))
+            with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch.object(ci_build.subprocess, 'run', return_value=listing) as run, \
+                    mock.patch.object(ci_build.subprocess, 'Popen', return_value=BuildProcess()), \
+                    mock.patch.object(ci_build, 'sources_import_module', return_value=False), \
+                    mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '0'}):
+                self.assertEqual(ci_build.main(), 0)
+                self.assertEqual(run.call_count, 1)
+
+    def test_import_scanner_handles_backticks_multiline_attributes_and_testing(self) -> None:
+        source = ('import `AppKit`\n@_spi(\n Private\n) import `Testing`\n'
+                  'internal import /* module */ Testing\n'
+                  'let fake = "import Testing"\n// import Testing\n')
+        self.assertEqual(swift_imports.imported_modules(source), ['AppKit', 'Testing', 'Testing'])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'Tests').mkdir()
+            (root / 'Tests/Imports.swift').write_text(source)
+            self.assertTrue(swift_imports.sources_import_module(root / 'Tests', 'Testing'))
+            self.assertTrue(artifact.sources_import_module(root / 'Tests', 'Testing'))
+            self.assertTrue(swift_imports.forbidden_ui_imports([root / 'Tests']))
+            for import_line in ('@preconcurrency import Testing', 'internal import Testing',
+                                'import /* module */ Testing', 'import `Testing`'):
+                (root / 'Tests/Imports.swift').write_text(import_line + '\n')
+                self.assertTrue(swift_imports.sources_import_module(root / 'Tests', 'Testing'))
+            (root / 'Tests/Imports.swift').write_text('/* unterminated')
+            self.assertTrue(swift_imports.sources_import_module(root / 'Tests', 'Testing'))
+
+    def test_all_module_selection_is_independent_of_incremental_base(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, catalog = fixture(root)
+            self.assertEqual(affected.select(root, ['Package.swift'], catalog), ['CoreTests'])
+            result = subprocess.run([sys.executable, str(SCRIPT_DIR / 'modularization_affected_tests.py'),
+                                     '--all', '--root', str(root)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), {'include': [{'module': 'CoreTests'}]})
+
+    def test_workflow_uses_full_main_module_coverage_and_supported_cache_inputs(self) -> None:
+        main = (SCRIPT_DIR.parent / '.github/workflows/ci-main.yml').read_text()
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        self.assertIn('modularization_affected_tests.py --all', main)
+        cache_save = ci.split('uses: actions/cache/save@v6', 1)[1].split('\n      - name:', 1)[0]
+        self.assertNotIn('compression-level:', cache_save)
+        self.assertNotIn('if-no-files-found:', cache_save)
 
     def test_ci_typecheck_warning_classification(self) -> None:
         warning = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'
@@ -199,6 +293,8 @@ class CatalogTests(unittest.TestCase):
             ('Sources/RepoPrompt/App/X.swift', '3', '4', 'expression'),
         ))
         self.assertIsNone(ci_build.classify_warning(warning.replace('Sources/RepoPrompt/', 'Sources/Core/')))
+        colored = warning.replace('warning:', '\x1b[1;33mwarning: \x1b[1;39m')
+        self.assertEqual(ci_build.classify_warning(colored), ci_build.classify_warning(warning))
 
     def test_ci_typecheck_ratchet_deduplicates_reemitted_diagnostics(self) -> None:
         expression = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'
