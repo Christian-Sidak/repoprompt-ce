@@ -134,7 +134,7 @@ jobs:
           key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
 
   build-and-test:
-    name: Test Root Shard ${{ matrix.shard }} (No Build)
+    name: Test Root Shard (No Build)
     needs: build-test-bundles
     runs-on: macos-26
     timeout-minutes: 30

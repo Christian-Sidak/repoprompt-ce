@@ -81,6 +81,7 @@ struct RepoPromptSwiftUIApp: App {
         AgentSessionDataService.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
         AgentSessionDataService.shared.installPerfRecorder(AppAgentModePerfRecorder())
         AgentRunCoordinator.shared.installPerfRecorder(AppAgentModePerfRecorder())
+        AIProviderFactory.installPerfRecorder(AppAgentModePerfRecorder())
         AgentSessionDeletionRegistry.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
         AgentSessionLinkRuntimeBridge.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
 

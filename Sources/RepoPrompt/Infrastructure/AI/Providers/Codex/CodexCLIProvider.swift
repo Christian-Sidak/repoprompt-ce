@@ -114,7 +114,7 @@ final class CodexCLIProvider: AIProvider {
         logCollector: CLIProcessLogCollector? = nil,
         appServerReadyHook: (() async throws -> Void)? = nil,
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
-        perfRecorder: any AgentModePerfRecording = AppAgentModePerfRecorder(),
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         sessionControllerFactory: ((Set<String>, TimeInterval) -> CodexSessionControlling)? = nil
     ) {
         self.workingDirectory = workingDirectory

@@ -1,6 +1,15 @@
 import Foundation
+import RepoPromptInstrumentation
 
 class AIProviderFactory {
+    /// Installed once by the app composition root; Infrastructure must not construct
+    /// the app-side recorder itself (that would be a wrong-way edge into Features).
+    private static let perfRecorderSlot = AgentModePerfRecorderBox()
+
+    static func installPerfRecorder(_ recorder: any AgentModePerfRecording) {
+        perfRecorderSlot.install(recorder)
+    }
+
     static func createProvider(
         for providerType: AIProviderType,
         keyManager: KeyManager,
@@ -82,7 +91,7 @@ class AIProviderFactory {
             return ClaudeCodeProvider()
         case .codex:
             // Standard non-agent Codex chat owns a fresh app-server client per request.
-            return CodexCLIProvider()
+            return CodexCLIProvider(perfRecorder: perfRecorderSlot.snapshot())
         case .openCode:
             return OpenCodeCLIProvider()
         case .cursor:
