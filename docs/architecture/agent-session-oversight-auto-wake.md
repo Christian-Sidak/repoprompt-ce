@@ -393,8 +393,11 @@ manufacture it, global MCP disable remains absolute, and the disabled-tool setti
 catalog advertisement. Reachability never supplies outbound or inverse operation authority; the
 service authorizes each direction independently.
 
-An authorized request appends one immutable occurrence identity to separate, observer-local attention
-storage. A hard enqueue-time cap refuses excess attention rather than evicting an occurrence, and
+After inverse authorization, the bridge awaits the existing observer-scoped authoritative projection
+refresh before revalidating the proof and enqueuing. This repairs a missing or lagging observer-local
+baseline without fabricating a grant or a one-lane reducer; all exact endpoint, eligibility, membership
+revision, and generation fences remain after the refresh. An authorized request then appends one
+immutable occurrence identity to separate, observer-local attention storage. A hard enqueue-time cap refuses excess attention rather than evicting an occurrence, and
 attention neither evicts nor consumes the reducer's coalesced status intervals. Publication lets the
 occurrence ride a natural observer turn or, if every hard admission gate permits, start an Auto-wake
 through its exact lane. Exact purposeful attention may bypass master and per-lane routine selection and
@@ -710,13 +713,14 @@ absorbed into that record rather than duplicated.
 ### A returned catalog can get stuck saying the tool is gone
 
 One projection state cannot heal itself: the *returned* catalog says `agent_session_link` is absent
-while the link authority says that exact endpoint holds a live outbound grant. It is produced by
+while the link authority says that exact endpoint holds a live grant in either direction. It is produced by
 ordinary code. `notifyToolListChangedForAgentSession` republishes the observation with the returned
-presence **preserved** and outbound presence recomputed, so a grant restored against a live run whose
+presence **preserved** and any-link presence recomputed, so a grant restored against a live run whose
 client has not re-read `tools/list` lands on exactly `hasAgentSessionLink == false` plus
-`hasActiveOutboundLink == true`. For any established run `agentSessionLinkPromptContext` then fails
-closed, and the only admission exception — the `session.runID == nil` cold bootstrap — is unreachable
-while that run identity persists. Auto-wake is blocked behind a projection nothing else will fix.
+`hasAnyActiveLink == true`. For outbound observers, `agentSessionLinkPromptContext` then fails closed
+and the `session.runID == nil` cold-bootstrap exception is unreachable while that run identity persists.
+An inbound-only created lane instead loses access to inverse `request_attention`. The repair uses
+any-link membership, while prompt readiness and observer operations remain strictly outbound-only.
 
 The repair is Codex-only, bounded to **one controller replacement per repair cycle**, and made of
 parts that already existed:
@@ -768,7 +772,7 @@ A cycle is closed by exactly five paths, all of which mean it is *over* rather t
 | Close path | Where |
 | --- | --- |
 | Exact current positive catalog (`hasAgentSessionLink == true`) | projection reconciler |
-| Exact outbound loss (`hasActiveOutboundLink == false`) | projection reconciler |
+| Exact any-link loss (`hasAnyActiveLink == false`) | projection reconciler |
 | Provider switch away from `.codexExec` | `handleProviderSwitch` |
 | `agent_session_link` disabled when the cycle is spent | repair entrypoint |
 | Stranded consumed run (`codexController == nil`, `runID != nil`) after its retirement | repair entrypoint |

@@ -486,7 +486,8 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
                 runID: runID,
                 routeToken: routeToken,
                 projectionRevision: runCatalogRevision,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             ),
             to: endpoint
         )

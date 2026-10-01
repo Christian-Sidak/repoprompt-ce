@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSecureStorage
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -204,7 +205,8 @@ final class MonitorInventoryPublisher {
                         runID: runID,
                         routeToken: routeToken,
                         projectionRevision: revision,
-                        hasAgentSessionLink: true
+                        hasAgentSessionLink: true,
+                        hasAnyActiveLink: true
                     ),
                     to: endpoint
                 )
@@ -775,6 +777,73 @@ final class AgentSessionLinkCodexPromptAdapterTests: XCTestCase {
     }
 
     // MARK: Start
+
+    func testCodexDedicatedContinuationNoteUsesDirectTurnAndExactProviderBytes() async throws {
+        let fixture = try makeFixture()
+        fixture.session.beginRunAttempt(source: "test.codex.prime")
+        _ = await fixture.coordinator.sendCodexNativeMessage(
+            session: fixture.session, text: "prime", attachments: []
+        )
+        fixture.session.runState = .idle
+        fixture.session.beginRunAttempt(source: "test.codex.selfNote")
+        let binding = try XCTUnwrap(fixture.session.persistentSessionBindingIdentity)
+        let owner = try AgentSelfCompactOwner(
+            windowID: 1, workspaceID: UUID(), tabID: fixture.tabID,
+            sessionID: binding.sessionID, persistentBindingGeneration: binding.generation,
+            bindingTransitionGeneration: fixture.session.bindingTransitionGeneration,
+            runID: XCTUnwrap(fixture.session.runID),
+            runAttemptID: XCTUnwrap(fixture.session.activeRunAttemptID)
+        )
+        let note = "resume βeta\nwithout edits"
+        var state = AgentSelfCompactState()
+        _ = state.reserve(note: note, idempotencyKey: "codex-native-note", owner: owner)
+        state.active?.phase = .dispatchingNote
+        state.active?.compactProviderConversation = fixture.session.codexConversationID
+        let dispatchID = try AgentSelfCompactionDispatchID(
+            requestID: XCTUnwrap(state.active?.id), stage: .note
+        )
+        fixture.session.selfCompactState = state
+        let declaration = try XCTUnwrap(
+            DomainAgentSessionWaitingOn(summary: "CI artifact", declaredAt: Date(timeIntervalSince1970: 50))
+        )
+        let handoff = AgentModeViewModel.PendingHandoffState(
+            payload: "keep staged handoff",
+            createdAt: Date(timeIntervalSince1970: 7),
+            sourceItemID: UUID()
+        )
+        let workflow = AgentWorkflowDefinition(
+            customID: UUID(), displayName: "Keep workflow", template: "keep"
+        )
+        let attachment = AgentImageAttachment(
+            source: .localFile(path: "/tmp/self-compact-keep.png"),
+            title: "self-compact-keep.png"
+        )
+        fixture.session.oversight.waitingOn = declaration
+        fixture.session.pendingHandoff = handoff
+        fixture.session.lastUserMessageAt = Date(timeIntervalSince1970: 9)
+        fixture.session.draftText = "unsent draft"
+        fixture.session.selectedWorkflow = workflow
+        fixture.session.pendingImageAttachments = [attachment]
+        await fixture.inventory.publishCodex(revision: 1, targetCount: 1)
+
+        let outcome = await fixture.coordinator.sendCodexNativeMessage(
+            session: fixture.session,
+            text: AgentSelfCompactNoteEnvelope.frame(note),
+            attachments: [],
+            selfCompactDispatchID: dispatchID
+        )
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(fixture.controller.startedTurns.last, AgentSelfCompactNoteEnvelope.frame(note))
+        XCTAssertTrue(fixture.controller.steeredTurns.isEmpty)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .noteAccepted)
+        XCTAssertEqual(fixture.session.oversight.waitingOn, declaration)
+        XCTAssertEqual(fixture.session.pendingHandoff, handoff)
+        XCTAssertEqual(fixture.session.lastUserMessageAt, Date(timeIntervalSince1970: 9))
+        XCTAssertEqual(fixture.session.draftText, "unsent draft")
+        XCTAssertEqual(fixture.session.selectedWorkflow, workflow)
+        XCTAssertEqual(fixture.session.pendingImageAttachments, [attachment])
+        XCTAssertFalse(fixture.controller.startedTurns.contains { $0.contains("keep staged handoff") })
+    }
 
     func testInitialStartCarriesExactlyOneSupplementThenGoesQuiet() async throws {
         let fixture = try makeFixture()
@@ -1828,7 +1897,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     runID: runID,
                     routeToken: routeToken,
                     projectionRevision: 1,
-                    hasAgentSessionLink: true
+                    hasAgentSessionLink: true,
+                    hasAnyActiveLink: true
                 ),
                 to: endpoint
             )
@@ -1884,7 +1954,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                     runID: runID,
                     routeToken: routeToken,
                     projectionRevision: 1,
-                    hasAgentSessionLink: true
+                    hasAgentSessionLink: true,
+                    hasAnyActiveLink: true
                 ),
                 to: endpoint
             )
@@ -1952,7 +2023,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 runID: runID,
                 routeToken: routeToken,
                 projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(readyProjection, to: endpoint)
             let published = await manager.debugPublishRunCatalogObservation(
@@ -2109,7 +2181,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 runID: runID,
                 routeToken: routeToken,
                 projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(readyProjection, to: endpoint)
             _ = await manager.debugPublishRunCatalogObservation(
@@ -2198,7 +2271,8 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
                 runID: runID,
                 routeToken: routeToken,
                 projectionRevision: unready.projectionRevision + 1,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             )
             fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(expectedReady, to: endpoint)
             let ready = await manager.debugPublishRunCatalogObservation(
@@ -2267,6 +2341,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
     private(set) var startOrResumeExistingSessionIDs: [String?] = []
     private var rejectResume = false
     private var turnInFlight = false
+    private var failSendAfterRecord = false
 
     func setTurnInFlight(_ value: Bool) {
         turnInFlight = value
@@ -2274,6 +2349,10 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
     func setRejectResume(_ value: Bool) {
         rejectResume = value
+    }
+
+    func setFailSendAfterRecord(_ value: Bool) {
+        failSendAfterRecord = value
     }
 
     private var stream: AsyncStream<NativeAgentRuntimeEvent>?
@@ -2324,6 +2403,7 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
+        if failSendAfterRecord { throw NativeAgentRuntimeControllerError.processNotRunning }
         return UUID()
     }
 

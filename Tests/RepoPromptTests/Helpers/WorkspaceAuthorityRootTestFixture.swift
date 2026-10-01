@@ -2,6 +2,7 @@ import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSecureStorage
 import XCTest
 
 #if DEBUG

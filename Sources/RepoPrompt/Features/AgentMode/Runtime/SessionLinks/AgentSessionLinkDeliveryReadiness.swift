@@ -55,6 +55,12 @@ enum AgentSessionLinkDeliveryReadiness {
         /// another observer must not `send` into it any more than into an active run — otherwise the
         /// wake and the send race for the same terminal boundary.
         var pendingOversightAutoWake: Bool = false
+        /// An in-flight self-compaction owns the next provider boundary.
+        var pendingSelfCompact: Bool = false
+        /// Narrower than `pendingSelfCompact`: RepoPrompt itself owns an unsent self-compaction
+        /// dispatch. Only this refuses managed Stop; the caller's originating turn, a parked note,
+        /// and a note whose send already started remain stoppable.
+        var selfCompactBlocksManagedStop: Bool = false
         /// A binding-qualified managed stop owns this target until cleanup releases its gate.
         var stopInProgress: Bool = false
         /// A fire-and-forget ACP compaction may still be running in the provider's background, where
@@ -87,6 +93,8 @@ enum AgentSessionLinkDeliveryReadiness {
             pendingACPSteeringCount: Int,
             pendingClaudeSteeringCount: Int,
             pendingOversightAutoWake: Bool = false,
+            pendingSelfCompact: Bool = false,
+            selfCompactBlocksManagedStop: Bool = false,
             stopInProgress: Bool = false,
             backgroundCompactionSettling: Bool = false,
             hasWaitingPrompt: Bool,
@@ -112,6 +120,8 @@ enum AgentSessionLinkDeliveryReadiness {
             self.pendingACPSteeringCount = pendingACPSteeringCount
             self.pendingClaudeSteeringCount = pendingClaudeSteeringCount
             self.pendingOversightAutoWake = pendingOversightAutoWake
+            self.pendingSelfCompact = pendingSelfCompact
+            self.selfCompactBlocksManagedStop = selfCompactBlocksManagedStop
             self.stopInProgress = stopInProgress
             self.backgroundCompactionSettling = backgroundCompactionSettling
             self.hasWaitingPrompt = hasWaitingPrompt
@@ -229,6 +239,7 @@ enum AgentSessionLinkDeliveryReadiness {
             || snapshot.pendingACPSteeringCount > 0
             || snapshot.pendingClaudeSteeringCount > 0
             || snapshot.pendingOversightAutoWake
+            || snapshot.pendingSelfCompact
             || snapshot.stopInProgress
             || snapshot.backgroundCompactionSettling
             || snapshot.hasWaitingPrompt

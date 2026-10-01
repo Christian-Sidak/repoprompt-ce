@@ -137,6 +137,12 @@ struct AgentSessionLinkMCPToolService {
         case "steer":
             try validateAllowedKeys(args, op: op, allowed: Self.steerKeys)
             return try await executeSteer(args: args)
+        case "create_lane":
+            try validateAllowedKeys(args, op: op, allowed: Self.createLaneKeys)
+            return try await executeCreateLane(args: args)
+        case "retire_lane":
+            try validateAllowedKeys(args, op: op, allowed: Self.retireLaneKeys)
+            return try await executeRetireLane(args: args)
         case "stop":
             try validateAllowedKeys(args, op: op, allowed: Self.stopKeys)
             return try await executeStop(args: args)
@@ -155,7 +161,7 @@ struct AgentSessionLinkMCPToolService {
     /// advertised `op` enum they are teaching.
     static let supportedOperationsSentence =
         "Use list, poll, wait, read, send, cancel_pending_send, compact, set_waiting_on, snooze_auto_wake, "
-            + "request_attention, respond, steer, or stop."
+            + "request_attention, respond, steer, stop, create_lane, or retire_lane."
 
     private func executeSetWaitingOn(args: [String: Value]) async throws -> Value {
         let endpoint = try await resolveCallerEndpointIdentity()
@@ -399,7 +405,11 @@ struct AgentSessionLinkMCPToolService {
             return .object(payload)
         case let .blocked(failure):
             switch failure {
-            case .endpointInvalidated, .linkRevoked, .managementRevoked:
+            case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
+                 .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
+                 .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
+                 .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
+                 .endpointPostWindow, .endpointPostReadiness, .linkRevoked, .managementRevoked:
                 throw Self.denialError(targetSessionID: targetSessionID)
             case .shuttingDown:
                 throw MCPError.internalError("RepoPrompt is shutting down.")
@@ -407,7 +417,7 @@ struct AgentSessionLinkMCPToolService {
                 return .object([
                     "result": .string("target_busy"),
                     "session_id": .string(targetSessionID.uuidString),
-                    "reason": .string(failure.rawValue)
+                    "reason": .string(failure.wireResult)
                 ])
             }
         case .indeterminate:
@@ -509,6 +519,92 @@ struct AgentSessionLinkMCPToolService {
 
     // MARK: - list
 
+    /// The bridge owns authority and sequencing; this surface owns only parsing and receipts.
+    private func executeCreateLane(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        if let refusal = await bridge.laneCreationCallerPreflight(observerEndpoint) {
+            if refusal == .denied { throw Self.unavailableError }
+            return AgentSessionLaneMCPToolService.refusal(refusal.rawValue)
+        }
+        let key = try Self.parseIdempotencyKey(args["idempotency_key"], op: "create_lane")
+        let role: String?
+        if let value = args["role"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane role must be a string.")
+            }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard AgentModelCatalog.TaskLabelKind(rawValue: normalized) != nil else {
+                let roles = AgentModelCatalog.TaskLabelKind.allCases.map(\.rawValue).joined(separator: ", ")
+                throw MCPError.invalidParams("agent_session_link create_lane role must be one of: \(roles).")
+            }
+            role = normalized
+        } else {
+            role = nil
+        }
+        let sessionName: String?
+        if let value = args["session_name"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane session_name must be a string.")
+            }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, normalized.utf8.count <= 120 else {
+                throw MCPError.invalidParams("agent_session_link create_lane session_name must be 1–120 UTF-8 bytes.")
+            }
+            sessionName = normalized
+        } else {
+            sessionName = nil
+        }
+        let message = try args["message"].map { try Self.parseMessage($0, op: "create_lane") }
+        let workflowReference = try AgentWorkflowReference.parse(args: args)
+        guard message != nil || workflowReference == nil else {
+            throw MCPError.invalidParams("agent_session_link create_lane workflow requires message.")
+        }
+        let workspaceSelector: String?
+        if let value = args["workspace"] {
+            guard case let .string(raw) = value else {
+                throw MCPError.invalidParams("agent_session_link create_lane workspace must be a name or UUID string.")
+            }
+            workspaceSelector = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard workspaceSelector?.isEmpty == false else {
+                throw MCPError.invalidParams("agent_session_link create_lane workspace must not be empty.")
+            }
+        } else {
+            workspaceSelector = nil
+        }
+        let callerWindow = try requireTargetWindow()
+        let receipt = await bridge.createLane(
+            observerEndpoint: observerEndpoint,
+            request: AgentSessionLaneCreateRequest(
+                idempotencyKey: key,
+                role: role,
+                sessionName: sessionName,
+                workspaceSelector: workspaceSelector,
+                message: message,
+                workflowReference: workflowReference
+            ),
+            resolveDestination: {
+                AgentSessionLaneMCPToolService.resolveDestination(
+                    workspaceSelector: workspaceSelector, callerWindow: callerWindow
+                ).map { (windowID: $0.windowID, workspaceID: $0.workspaceID) }
+            }
+        )
+        if receipt.reason == .denied { throw Self.unavailableError }
+        return AgentSessionLaneMCPToolService.render(receipt)
+    }
+
+    private func executeRetireLane(args: [String: Value]) async throws -> Value {
+        let observerEndpoint = try await resolveCallerEndpointIdentity()
+        let targetSessionID = try Self.parseSingleSessionID(args["session_id"], op: "retire_lane")
+        let outcome = await bridge.retireLane(
+            observerEndpoint: observerEndpoint,
+            targetSessionID: targetSessionID
+        )
+        if case .notRetired(_, .denied) = outcome {
+            throw Self.denialError(targetSessionID: targetSessionID)
+        }
+        return AgentSessionLaneMCPToolService.render(outcome)
+    }
+
     private func executeList(args: [String: Value]) async throws -> Value {
         let observerEndpoint = try await resolveCallerEndpointIdentity()
         let inventory: DomainAgentSessionLinkInventory
@@ -545,6 +641,10 @@ struct AgentSessionLinkMCPToolService {
         }
 
         let page = inventory.items.dropFirst(offset).prefix(maxItems)
+        let createdByYou = Set(
+            bridge.laneAnnotatedPromptInventory(inventory).items
+                .filter(\.createdByYou).map(\.targetSessionID)
+        )
         let nextOffset = offset + page.count
         let hasMore = nextOffset < inventory.items.count
 
@@ -557,7 +657,8 @@ struct AgentSessionLinkMCPToolService {
                     "session_id": .string(item.targetSessionID.uuidString),
                     "name": AgentMCPToolHelpers.stringOrNull(item.displayName),
                     "capabilities": .array(item.capabilityNames.map { .string($0) }),
-                    "managed": .bool(item.capabilities.contains(.manage))
+                    "managed": .bool(item.capabilities.contains(.manage)),
+                    "created_by_you": .bool(createdByYou.contains(item.targetSessionID))
                 ])
             }),
             "has_more": .bool(hasMore),
@@ -1499,6 +1600,11 @@ struct AgentSessionLinkMCPToolService {
     /// Deliberately no workflow, delivery mode, or queue flag: a steer is one instruction delivered
     /// now, into whatever the target is doing, under its own current settings.
     static let steerKeys: Set<String> = ["op", "session_id", "message", "idempotency_key"]
+    static let createLaneKeys: Set<String> = [
+        "op", "idempotency_key", "role", "session_name", "workspace", "message",
+        "workflow_id", "workflow_name"
+    ]
+    static let retireLaneKeys: Set<String> = ["op", "session_id"]
     static let stopKeys: Set<String> = ["op", "session_id", "idempotency_key"]
     // The caller still comes only from server-owned run routing. `observer_session_id` is a selector
     // over that caller's exact inbound grants, never a caller identity or an authority claim.
@@ -2019,12 +2125,13 @@ enum AgentSessionLinkResponseRenderer {
         targetSessionID: UUID
     ) -> Value {
         var payload: [String: Value] = [
-            "result": .string(failure.rawValue),
+            "result": .string(failure.wireResult),
             "session_id": .string(targetSessionID.uuidString),
             "accepted": .bool(false),
             "retryable": .bool(failure.isRetryable),
             "detail": .string(compactFailureDetail(failure))
         ]
+        if let subreason = failure.subreason { payload["subreason"] = .string(subreason) }
         if failure.isDeliveryIndeterminate {
             payload["accepted_unknown"] = .bool(true)
         }
@@ -2042,7 +2149,12 @@ enum AgentSessionLinkResponseRenderer {
             "The overseen session could not be saved and the rollback could not be confirmed, so it is "
                 + "unknown whether the request was recorded. No compaction was started and this "
                 + "idempotency_key is spent. Read the session before requesting again."
-        case .endpointInvalidated, .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
+        case .endpointInvalidated, .endpointHost, .endpointProbeHost, .endpointSession, .endpointObserver,
+             .endpointTarget, .endpointWindow, .endpointClaim, .endpointWorkspace,
+             .endpointMissingWorkspace, .endpointReadiness, .endpointStopFence,
+             .endpointPostSession, .endpointPostObserver, .endpointPostTarget,
+             .endpointPostWindow, .endpointPostReadiness,
+             .targetLoading, .targetNotIdle, .shuttingDown, .notSupported,
              .noProviderSession, .managementRevoked, .targetAwaitingInteraction, .targetBusy, .targetStopped,
              .steerUnavailable, .steerNotAccepted, .steerUnconfirmed:
             failure.message
@@ -2079,12 +2191,13 @@ enum AgentSessionLinkResponseRenderer {
         targetSessionID: UUID
     ) -> Value {
         var payload: [String: Value] = [
-            "result": .string(failure.rawValue),
+            "result": .string(failure.wireResult),
             "session_id": .string(targetSessionID.uuidString),
             "delivered": .bool(false),
             "retryable": .bool(failure.isRetryable),
             "detail": .string(failure.message)
         ]
+        if let subreason = failure.subreason { payload["subreason"] = .string(subreason) }
         if failure.isDeliveryIndeterminate {
             // `delivered` stays the conservative `false` — no receipt exists — while this flag
             // carries the fact the observer must act on: the row may nonetheless be on disk, so it

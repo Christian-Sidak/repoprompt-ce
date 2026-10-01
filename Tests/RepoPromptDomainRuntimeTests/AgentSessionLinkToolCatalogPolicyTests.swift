@@ -40,7 +40,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
             [
                 "list", "poll", "wait", "read", "send", "cancel_pending_send", "compact",
                 "set_waiting_on", "snooze_auto_wake", "request_attention",
-                "respond", "steer", "stop"
+                "respond", "steer", "stop", "create_lane", "retire_lane"
             ]
         )
         XCTAssertEqual(schema["required"]?.arrayValue?.compactMap(\.stringValue), ["op"])
@@ -118,7 +118,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     func testManagementOperationsAreAdmittedAndAdvertisedWithTheirManageGate() throws {
-        for operation in ["respond", "steer", "stop"] {
+        for operation in ["respond", "steer", "stop", "create_lane", "retire_lane"] {
             XCTAssertEqual(
                 MCPDomainToolCatalog.operationIdentity(for: toolName, input: .value(operation)),
                 MCPDomainToolOperationIdentity(canonicalTool: toolName, normalizedOperation: operation)
@@ -225,7 +225,7 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
     }
 
     func testAttentionRequestUsesTheSameDirectionalToolAndOnlyItsInverseGrant() throws {
-        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, 28)
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definitions.count, MCPDomainToolCatalog.orderedToolNames.count)
         XCTAssertEqual(
             MCPDomainCanonicalToolDefinitions.definitions.map(\.name).filter { $0 == toolName }.count,
             1
@@ -463,6 +463,17 @@ final class AgentSessionLinkToolCatalogPolicyTests: XCTestCase {
         XCTAssertEqual(again.inputSchema, current.inputSchema)
         XCTAssertEqual(again.annotations, current.annotations)
         XCTAssertEqual(again.isEnabledByDefault, current.isEnabledByDefault)
+    }
+
+    func testPreviousCompactDefinitionMigratesThroughOuterLaneStage() throws {
+        let previous = MCPDomainCanonicalToolDefinitions.test_agentSessionLinkPreviousCompactDefinition()
+        let migrated = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(previous)
+        let current = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+        XCTAssertEqual(migrated.description, current.description)
+        XCTAssertEqual(migrated.inputSchema, current.inputSchema)
+        let again = MCPDomainCanonicalToolDefinitions.test_canonicalizeAgentSessionLink(migrated)
+        XCTAssertEqual(again.description, current.description)
+        XCTAssertEqual(again.inputSchema, current.inputSchema)
     }
 
     /// An exact revision-4 Snooze pair is a supported historical input. Both owned anchors advance

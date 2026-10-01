@@ -154,6 +154,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             .monitorRespond: .manage,
             .monitorSteer: .manage,
             .monitorStop: .manage,
+            .monitorRetireLane: .manage
         ]
         for operation in targetBearingMonitorOperations {
             guard let capability = expected[operation] else {
@@ -238,7 +239,9 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             DomainAgentSessionTargetOperation.monitorList.requiredMonitorCapability,
             "a targetless operation must not demand an arbitrary target's capability"
         )
-        for operation in DomainAgentSessionTargetOperation.allCases where operation != .monitorList {
+        for operation in DomainAgentSessionTargetOperation.allCases
+            where operation != .monitorList && operation != .monitorCreateLane
+        {
             XCTAssertFalse(operation.isObserverScoped, "\(operation.rawValue)")
         }
     }
@@ -333,6 +336,7 @@ final class DomainAgentSessionOperationAuthorizerTests: XCTestCase {
             [
                 "agent_session_link.list", "agent_session_link.poll", "agent_session_link.wait",
                 "agent_session_link.read", "agent_session_link.send",
+                "agent_session_link.create_lane", "agent_session_link.retire_lane",
                 "agent_session_link.snooze_auto_wake", "agent_session_link.compact",
                 "agent_session_link.respond",
 "agent_session_link.steer", "agent_session_link.stop"

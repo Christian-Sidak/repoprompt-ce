@@ -2,6 +2,18 @@ import Foundation
 
 // MARK: - Provider control commands
 
+/// Immutable identity carried to the final provider input seam. A pipeline start is not an
+/// acknowledgment that the bytes reached the provider.
+struct AgentSelfCompactionDispatchID: Equatable {
+    enum Stage: Equatable {
+        case compact
+        case note
+    }
+
+    let requestID: UUID
+    let stage: Stage
+}
+
 /// A provider-native maintenance command that RepoPrompt itself constructs, bound to the exact
 /// provider conversation it was admitted for.
 ///
@@ -21,15 +33,18 @@ struct AgentProviderControlCommand: Equatable {
     /// The provider conversation the command was admitted for. It runs only against exactly this
     /// conversation; a fresh-start fallback or any other conversation refuses it.
     let expectedProviderConversation: String
+    let selfCompactDispatchID: AgentSelfCompactionDispatchID?
 
     static func compact(
         expectedBinding: AgentPersistentSessionBindingIdentity,
-        expectedProviderConversation: String
+        expectedProviderConversation: String,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil
     ) -> AgentProviderControlCommand {
         AgentProviderControlCommand(
             kind: .compact,
             expectedBinding: expectedBinding,
-            expectedProviderConversation: expectedProviderConversation
+            expectedProviderConversation: expectedProviderConversation,
+            selfCompactDispatchID: selfCompactDispatchID
         )
     }
 
@@ -100,10 +115,13 @@ struct AgentDirectRunStartOptions: Equatable {
     /// effort packaging, because any of those would turn a native command into inert prose.
     var providerControlCommand: AgentProviderControlCommand?
 
+    /// One dedicated continuation-note turn; never an ordinary user send or a fallback queue item.
+    var selfCompactDispatchID: AgentSelfCompactionDispatchID?
+
     /// Captured at producer scheduling time so a prior Stop cannot bless deferred work.
     var stopFence: AgentRunStartStopFence?
     var skipsUserAugmentation: Bool {
-        isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil
+        isLaneUpdate || periodicWakeID != nil || providerControlCommand != nil || selfCompactDispatchID != nil
     }
 
     var isLaneUpdate: Bool {
@@ -128,7 +146,18 @@ struct AgentDirectRunStartOptions: Equatable {
 
     /// Options for one overseer-requested provider control command.
     static func providerControl(_ command: AgentProviderControlCommand) -> AgentDirectRunStartOptions {
-        AgentDirectRunStartOptions(ignoresPendingHandoff: true, providerControlCommand: command)
+        AgentDirectRunStartOptions(
+            ignoresPendingHandoff: true,
+            providerControlCommand: command,
+            selfCompactDispatchID: command.selfCompactDispatchID
+        )
+    }
+
+    static func selfCompactNote(requestID: UUID) -> AgentDirectRunStartOptions {
+        AgentDirectRunStartOptions(
+            ignoresPendingHandoff: true,
+            selfCompactDispatchID: .init(requestID: requestID, stage: .note)
+        )
     }
 
     /// Options for one automatic lane-update follow-up.

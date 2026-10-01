@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptInstrumentation
 
 // MARK: - Agent Tab Session
 
@@ -12,6 +13,7 @@ import Foundation
 @MainActor
 final class AgentTabSession: ObservableObject {
     let tabID: UUID
+    let perfRecorder: any AgentModePerfRecording
     private var suppressSourceItemsChanged = false
 
     /// Canonical runtime source-item suffix. Coordinators and tests mutate this list,
@@ -910,6 +912,7 @@ final class AgentTabSession: ObservableObject {
             contextCountVouchRevision &+= 1
             if vouchedContextCount == nil { vouchedContextCountConfidence = nil }
             noteContextVouchTransition(from: oldValue, to: vouchedContextCount)
+            selfCompactNativeCompletion?.noteVouchedContextCount(vouchedContextCount?.tokens)
         }
     }
 
@@ -1217,6 +1220,40 @@ final class AgentTabSession: ObservableObject {
     /// Cleared only after the provider accepts the turn.
     var pendingHandoff: AgentModeViewModel.PendingHandoffState = .init()
 
+    /// Session-owned self-compaction state. No restored attempt is executable.
+    var selfCompactState = AgentSelfCompactState() {
+        didSet {
+            if oldValue != selfCompactState { isDirty = true }
+            noteMonitorObservationInputsChanged()
+        }
+    }
+
+    var selfCompactPersistenceWarning = false
+
+    /// Runtime-only fence: a same-key MCP retry cannot claim a scheduled receipt until the
+    /// original reservation's required save has completed.
+    var selfCompactAdmissionPendingID: UUID?
+
+    /// Runtime-only owner/exclusivity fence, rechecked at provider-bound send seams after startup awaits.
+    /// A restored attempt has no executable fence and cannot resume dispatch.
+    var selfCompactDispatchIsCurrent: (@MainActor () -> Bool)?
+
+    @MainActor
+    func selfCompactNoteDispatchIsCurrent(_ dispatchID: AgentSelfCompactionDispatchID) -> Bool {
+        guard selfCompactDispatchIsCurrent?() != false else {
+            selfCompactNativeCompletion?.cancelUnattemptedNoteIfOwnerLost(dispatchID)
+            return false
+        }
+        return true
+    }
+
+    /// Runtime-only timer and note worker; persisted state is deliberately inert on restore.
+    var selfCompactNativeCompletion: AgentSelfCompactNativeCompletionCoordinator?
+
+    /// Transcript item IDs present when an ACP self-compact command was issued. Rows added after
+    /// this set are the command turn. Not persisted.
+    var selfCompactACPCommandItemIDs: Set<UUID>?
+
     var isProviderSelectionLocked: Bool {
         hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
     }
@@ -1240,6 +1277,7 @@ final class AgentTabSession: ObservableObject {
     private(set) var persistenceMutationGeneration: UInt64 = 0
     var saveRequestGeneration: UInt64 = 0
     var parentSessionID: UUID?
+    var createdByOverseerSessionID: UUID?
     var hasLoadedPersistedState: Bool = false {
         didSet {
             if oldValue != hasLoadedPersistedState {
@@ -1296,8 +1334,9 @@ final class AgentTabSession: ObservableObject {
         return result
     }
 
-    init(tabID: UUID) {
+    init(tabID: UUID, perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()) {
         self.tabID = tabID
+        self.perfRecorder = perfRecorder
         // The lifecycle facade owns terminal-commit phase state, so bridge it into the explicit
         // oversight change channel from that authority.
         runLifecycle.onTerminalCommitPhaseChange = { [weak self] in
@@ -1321,6 +1360,15 @@ final class AgentTabSession: ObservableObject {
     /// instruction, applyEditsReview, MCP control, run cancellation) remain
     /// on the VM and are called separately by each teardown path.
     func cancelEphemeralRuntimeState() {
+        selfCompactNativeCompletion?.cancelRuntimeWork()
+        selfCompactNativeCompletion = nil
+        // Without its worker, an active request could never settle and would hold overseer delivery,
+        // Auto-wake, and managed Stop until relaunch. Settle or park it before the worker is gone.
+        var selfCompact = selfCompactState
+        if selfCompact.releaseForRuntimeTeardown() {
+            selfCompactState = selfCompact
+        }
+        selfCompactACPCommandItemIDs = nil
         derivedTranscriptRefreshTask?.cancel()
         derivedTranscriptRefreshTask = nil
         pendingDerivedTranscriptRefreshReason = nil
@@ -1562,18 +1610,18 @@ final class AgentTabSession: ObservableObject {
             attemptID: attemptID
         )
         #if DEBUG
-            AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")
-            AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started.source.\(source)")
-            AgentModePerfDiagnostics.event(
+            perfRecorder.increment("run.lifecycle.attempt.started")
+            perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")
+            perfRecorder.event(
                 "run.lifecycle.attemptStarted",
                 tabID: tabID,
                 fields: [
                     "source": source,
-                    "attemptID": AgentModePerfDiagnostics.shortID(ownership.attemptID),
-                    "bindingGeneration": AgentModePerfDiagnostics.shortID(ownership.binding.generation),
-                    "persistentBindingGeneration": AgentModePerfDiagnostics.shortID(ownership.binding.persistentBindingGeneration),
+                    "attemptID": perfRecorder.shortID(ownership.attemptID),
+                    "bindingGeneration": perfRecorder.shortID(ownership.binding.generation),
+                    "persistentBindingGeneration": perfRecorder.shortID(ownership.binding.persistentBindingGeneration),
                     "bindingTransitionGeneration": String(ownership.binding.bindingTransitionGeneration),
-                    "persistentSessionID": AgentModePerfDiagnostics.shortID(ownership.binding.persistentSessionID)
+                    "persistentSessionID": perfRecorder.shortID(ownership.binding.persistentSessionID)
                 ]
             )
         #endif
@@ -1645,14 +1693,14 @@ final class AgentTabSession: ObservableObject {
 
     private func recordRunAttemptEnded(_ ownership: AgentRunOwnership, source: String) {
         #if DEBUG
-            AgentModePerfDiagnostics.increment("run.lifecycle.attempt.ended")
-            AgentModePerfDiagnostics.increment("run.lifecycle.attempt.ended.source.\(source)")
-            AgentModePerfDiagnostics.event(
+            perfRecorder.increment("run.lifecycle.attempt.ended")
+            perfRecorder.increment("run.lifecycle.attempt.ended.source.\(source)")
+            perfRecorder.event(
                 "run.lifecycle.attemptEnded",
                 tabID: tabID,
                 fields: [
                     "source": source,
-                    "attemptID": AgentModePerfDiagnostics.shortID(ownership.attemptID)
+                    "attemptID": perfRecorder.shortID(ownership.attemptID)
                 ]
             )
         #endif
@@ -1667,11 +1715,11 @@ final class AgentTabSession: ObservableObject {
             switch result {
             case .accepted:
                 if kind == .stageTransition {
-                    AgentModePerfDiagnostics.increment("run.lifecycle.stage.\(stage.rawValue)", tabID: tabID)
+                    perfRecorder.increment("run.lifecycle.stage.\(stage.rawValue)", tabID: tabID)
                 }
             case let .rejected(reason):
-                AgentModePerfDiagnostics.increment("run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
-                AgentModePerfDiagnostics.event(
+                perfRecorder.increment("run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
+                perfRecorder.event(
                     "run.lifecycle.progressRejected",
                     tabID: tabID,
                     fields: ["reason": reason.rawValue, "kind": kind.rawValue, "stage": stage.rawValue]

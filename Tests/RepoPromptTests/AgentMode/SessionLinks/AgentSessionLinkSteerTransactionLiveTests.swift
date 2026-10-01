@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSecureStorage
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
@@ -365,7 +366,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
             }
         )
 
-        XCTAssertEqual(outcome, .blocked(.endpointInvalidated))
+        XCTAssertEqual(outcome, .blocked(.endpointPostTarget))
         XCTAssertTrue(fixture.session.items.isEmpty)
         XCTAssertTrue(fixture.session.pendingClaudeSteeringInstructions.isEmpty)
     }

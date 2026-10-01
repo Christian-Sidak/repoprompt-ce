@@ -36,6 +36,12 @@ struct AgentRunTerminalSessionBinding {
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult
         let startFollowUpRun: @MainActor (AgentRunPendingInstruction) -> Void
+        /// Post-publication, post-successor terminal observation; provider work must be deferred.
+        var onSelfCompactTerminalSettled: @MainActor (
+            AgentRunTerminalCommitRevision,
+            AgentRunTerminalPublicationResult,
+            @escaping @MainActor () -> Bool
+        ) -> Void = { _, _, _ in }
     }
 
     let tabID: UUID

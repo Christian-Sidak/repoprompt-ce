@@ -229,10 +229,12 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             render: AgentSessionLinkPrompts.rendered
         ))
         XCTAssertEqual(reOwed.laneGuidanceMode, .full)
-        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 12 supersedes"))
-        XCTAssertEqual(reOwed.inventoryGuidanceRevision, 7)
+        XCTAssertTrue(reOwed.fragment.contains("Guidance revision 13 supersedes"))
+        XCTAssertEqual(reOwed.inventoryGuidanceRevision, 8)
         XCTAssertTrue(reOwed.fragment.contains("`compact`"))
         XCTAssertTrue(reOwed.fragment.contains("`stop`"))
+        XCTAssertTrue(reOwed.fragment.contains("`create_lane`"))
+        XCTAssertTrue(reOwed.fragment.contains("`retire_lane`"))
         // The rule revision 10 restates: a context taught it may only observe — and that may have
         // refused its own user on that basis — is told outright what replaced it.
         XCTAssertTrue(reOwed.fragment.contains("including anything said earlier in this conversation"))
@@ -1435,6 +1437,78 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             for: reserved.observerEndpoint,
             reason: .settingDisabled
         )
+    }
+
+    func testParkedAttentionWakePreparesAfterExecutionLocationCancellation() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.runState = .running
+        let attention = Self.attentionRequest(0)
+        try publishLane(
+            fixture, linkSetRevision: 1, queueRevision: 1,
+            targetIndices: [], laneIndices: [0], attentionRequests: [attention]
+        )
+        try await AsyncTestWait.waitUntil("the attention wake to park behind the active run") {
+            await MainActor.run { fixture.session.oversight.pendingAutoWake?.phase == .awaitingSettlement }
+        }
+        let parked = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        // Exercise the production preparation seam without launching a provider after settlement.
+        parked.task?.cancel()
+        let reservationFence = AgentRunStartStopFence(session: fixture.session)
+        fixture.session.isChangingExecutionLocation = true
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .executionLocationChange, origin: .internalLifecycle
+        )
+        fixture.session.runState = .idle
+        let runID = try XCTUnwrap(fixture.session.runID)
+        XCTAssertTrue(fixture.session.clearRunID(ifCurrent: runID))
+        fixture.session.isChangingExecutionLocation = false
+
+        XCTAssertFalse(reservationFence.permitsStart(of: fixture.session))
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.wakeID, parked.wakeID)
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkObserverEndpoint(tabID: fixture.tabID), parked.observerEndpoint)
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session, dispatchID: .autoWake(wakeID: parked.wakeID)
+        ))
+        XCTAssertEqual(try XCTUnwrap(claim.passive).receipt.deliveredAttentionOccurrences, [attention.occurrence])
+        let options = try XCTUnwrap(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(
+            wakeID: parked.wakeID, endpoint: parked.observerEndpoint
+        ))
+        let dispatchFence = try XCTUnwrap(options.stopFence)
+        XCTAssertEqual(options.laneUpdateWakeID, parked.wakeID)
+        XCTAssertTrue(dispatchFence.permitsStart(of: fixture.session))
+        XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.phase, .preparingDispatch)
+
+        // A cancellation after preparation must still invalidate the producer, never re-stamp it.
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .executionLocationChange, origin: .internalLifecycle
+        )
+        XCTAssertFalse(dispatchFence.permitsStart(of: fixture.session))
+        XCTAssertNil(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(
+            wakeID: parked.wakeID, endpoint: parked.observerEndpoint
+        ))
+    }
+
+    func testExplicitStopCannotPrepareAParkedAttentionWake() async throws {
+        let fixture = try makeFixture()
+        try publishInventory(fixture, revision: 1)
+        fixture.session.runState = .running
+        try publishLane(
+            fixture, linkSetRevision: 1, queueRevision: 1,
+            targetIndices: [], laneIndices: [0], attentionRequests: [Self.attentionRequest(0)]
+        )
+        try await AsyncTestWait.waitUntil("the attention wake to park before Stop") {
+            await MainActor.run { fixture.session.oversight.pendingAutoWake?.phase == .awaitingSettlement }
+        }
+        let parked = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        fixture.viewModel.prepareAgentRunCancellation(
+            session: fixture.session, intent: .userStop, origin: .explicitStop
+        )
+        fixture.session.runState = .idle
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertNil(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(
+            wakeID: parked.wakeID, endpoint: parked.observerEndpoint
+        ))
     }
 
     func testUserStopRetractsOnlyPreDispatchAutoWakePhases() throws {
@@ -4625,7 +4699,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                         connectionLifecycleGeneration: 1
                     ),
                     projectionRevision: 1,
-                    hasAgentSessionLink: true
+                    hasAgentSessionLink: true,
+                    hasAnyActiveLink: true
                 ),
                 to: endpoint
             )
@@ -4672,7 +4747,8 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 connectionLifecycleGeneration: 1
             ),
             projectionRevision: revision,
-            hasAgentSessionLink: hasAgentSessionLink
+            hasAgentSessionLink: hasAgentSessionLink,
+            hasAnyActiveLink: true
         )
         fixture.viewModel.agentSessionLinkPublishRunCatalogProjection(projection, to: endpoint)
         return projection

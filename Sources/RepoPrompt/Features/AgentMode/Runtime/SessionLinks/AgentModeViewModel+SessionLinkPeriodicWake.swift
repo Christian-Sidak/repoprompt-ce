@@ -41,6 +41,7 @@ extension AgentModeViewModel {
     func agentSessionLinkPeriodicPreparationIsUnblocked(_ session: TabSession) -> Bool {
         !session.terminalCommitInProgress && !session.bindingTransitionInProgress
             && !session.isChangingExecutionLocation && !session.isPreparingInitialWorktree
+            && !session.selfCompactState.blocksAutomaticWake
             && session.pendingInstructions.isEmpty && session.pendingACPSteeringInstructions.isEmpty
             && session.pendingClaudeSteeringInstructions.isEmpty
             && session.pendingAskUser == nil && session.pendingUserInputRequest == nil

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 
 struct ClaudeCodeCLIModelSelection: Equatable {
     let modelArgument: String?

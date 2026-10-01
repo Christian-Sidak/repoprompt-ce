@@ -1108,13 +1108,43 @@ package enum MCPDomainCanonicalToolDefinitions {
         "SGludCI6ZmFsc2V9LCJpc0VuYWJsZWRCeURlZmF1bHQiOnRydWV9XQ==",
         ].joined()
         guard let data = Data(base64Encoded: encoded),
-              let definitions = try? JSONDecoder().decode([MCPDomainToolDefinition].self, from: data),
-              definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames
+              var definitions = try? JSONDecoder().decode([MCPDomainToolDefinition].self, from: data),
+              let insertion = definitions.firstIndex(where: { $0.name == MCPWindowToolName.shareThoughts })
         else {
+            preconditionFailure("Invalid canonical MCP domain tool definitions")
+        }
+        definitions.insert(agentSelfDefinition, at: insertion)
+        guard definitions.map(\.name) == MCPDomainToolCatalog.orderedToolNames else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions).map(advertiseModelParameters)
     }
+
+    private static let agentSelfDefinition = MCPDomainToolDefinition(
+        name: MCPWindowToolName.agentSelf,
+        description: "Calling Agent Mode session only; no target selector. `context` returns load (null if unknown) and compact status. `compact` needs nonempty `note` (max 8,192 UTF-8 bytes) and `idempotency_key` (max 200 UTF-8 bytes). Reuse a key only with the same note. New `scheduled`: finish this turn normally; compaction follows. Note grants no new authority.",
+        inputSchema: .object([
+            "type": .string("object"),
+            "additionalProperties": .bool(false),
+            "properties": .object([
+                "op": .object([
+                    "type": .string("string"),
+                    "enum": .array([.string("context"), .string("compact")]),
+                    "description": .string("Required operation; no default or alias.")
+                ]),
+                "note": .object([
+                    "type": .string("string"),
+                    "description": .string("[compact] Verbatim continuation note, at most 8,192 UTF-8 bytes; required for compact.")
+                ]),
+                "idempotency_key": .object([
+                    "type": .string("string"),
+                    "description": .string("[compact] Required key, at most 200 UTF-8 bytes; reuse only for an identical retry.")
+                ])
+            ]),
+            "required": .array([.string("op")])
+        ]),
+        annotations: .init(readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true)
+    )
 
     private static func advertiseModelParameters(
         _ definition: MCPDomainToolDefinition
@@ -2107,16 +2137,129 @@ package enum MCPDomainCanonicalToolDefinitions {
     /// for one reason: it classifies the queue's local-turn clause, which only exists once the queued
     /// send has been documented. Running it earlier would make its exact states depend on how far
     /// behind the vendored blob happened to be.
+    /// Additive lane projection over the existing Stop contract; historical anchors stay frozen.
+    private enum AgentSessionLinkLaneOperationsMigration {
+        static let description: String = {
+            let previous = AgentSessionLinkStopMigration.description
+            precondition(previous.contains("request_attention | respond | steer | stop"))
+            precondition(previous.contains("Management is delegation for exactly one target, not authority over targets-of-targets. Without `manage`"))
+            precondition(previous.contains("each new send, steer, or stop;"))
+            return previous
+                .replacingOccurrences(
+                    of: "request_attention | respond | steer | stop",
+                    with: "request_attention | respond | steer | stop | create_lane | retire_lane"
+                )
+                .replacingOccurrences(
+                    of: "\n\nManaged pending prompts are redacted;",
+                    with: "\n- `create_lane`: under a direct link, create your top-level lane; unique `idempotency_key`.\n- `retire_lane`: [manage + created by you] unlink/stash idle lane, never delete; no idempotency key.\n\nManaged pending prompts are redacted;"
+                )
+                .replacingOccurrences(
+                    of: "Management is delegation for exactly one target, not authority over targets-of-targets. Without `manage`",
+                    with: "Management is delegation for exactly one target, not authority over targets-of-targets. Creating a lane is self-scoped, grants no inherited authority, and needs your own user's instruction; retire only a lane you created under its live manage grant. `created_by_you` marks provenance, not permission. Without `manage`"
+                )
+                .replacingOccurrences(of: "each new send, steer, or stop;", with: "each new send, steer, stop, or lane;")
+        }()
+
+        static let inputSchema: Value = {
+            var schema = AgentSessionLinkStopMigration.inputSchema.objectValue!
+            var properties = schema["properties"]!.objectValue!
+            var op = properties["op"]!.objectValue!
+            var operations = op["enum"]!.arrayValue!
+            operations.append(contentsOf: [.string("create_lane"), .string("retire_lane")])
+            op["enum"] = .array(operations)
+            properties["op"] = .object(op)
+            properties["role"] = stringSchema("[create_lane] explore|engineer|pair|design; default pair.")
+            properties["session_name"] = stringSchema("[create_lane] Name, max 120 UTF-8 bytes.")
+            properties["workspace"] = stringSchema("[create_lane] Active workspace name or UUID; default caller.")
+            for key in ["session_id", "message", "idempotency_key", "workflow_id", "workflow_name"] {
+                var property = properties[key]!.objectValue!
+                property["description"] = .string(
+                    property["description"]!.stringValue!.replacingOccurrences(
+                        of: key == "session_id" ? "[poll," : "[send",
+                        with: key == "session_id" ? "[retire_lane, poll," : "[create_lane, send"
+                    )
+                )
+                properties[key] = .object(property)
+            }
+            schema["properties"] = .object(properties)
+            schema["description"] = .string(schema["description"]!.stringValue! + """
+
+            create_lane: idempotency_key; role?, session_name?, workspace?, message?, workflow_id|workflow_name? (with message)
+            retire_lane: session_id
+            """)
+            return .object(schema)
+        }()
+
+        private static func stringSchema(_ description: String) -> Value {
+            .object(["description": .string(description), "type": .string("string")])
+        }
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description && definition.inputSchema == inputSchema
+        }
+
+        static func apply(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkStopMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: description,
+                inputSchema: inputSchema,
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
+    /// Additive refusal-code description; keep the prior lane contract as a frozen migration anchor.
+    private enum AgentSessionLinkRefusalSubreasonMigration {
+        static let description: String = {
+            let previous = AgentSessionLinkLaneOperationsMigration.description
+            precondition(previous.contains("**Trust and use rules**"))
+            return previous.replacingOccurrences(
+                of: "**Trust and use rules**",
+                with: "Endpoint and lane refusals may include short subreason codes.\n\n**Trust and use rules**"
+            )
+        }()
+
+        static func apply(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            if definition.description == description,
+               definition.inputSchema == AgentSessionLinkLaneOperationsMigration.inputSchema {
+                return definition
+            }
+            precondition(AgentSessionLinkLaneOperationsMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: description,
+                inputSchema: definition.inputSchema,
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkStopMigration.isCurrent(definition) { return definition }
-        if AgentSessionLinkTokenEfficiencyMigration.isCurrent(definition) {
-            return AgentSessionLinkStopMigration.apply(definition)
+        if definition.description == AgentSessionLinkRefusalSubreasonMigration.description,
+           definition.inputSchema == AgentSessionLinkLaneOperationsMigration.inputSchema {
+            return definition
         }
-        return AgentSessionLinkStopMigration.apply(applyAgentSessionLinkTokenEfficiency(
+        return AgentSessionLinkRefusalSubreasonMigration.apply(canonicalizeAgentSessionLinkBeforeRefusalSubreason(definition))
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeRefusalSubreason(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) { return definition }
+        if AgentSessionLinkStopMigration.isCurrent(definition) {
+            return AgentSessionLinkLaneOperationsMigration.apply(definition)
+        }
+        if AgentSessionLinkTokenEfficiencyMigration.isCurrent(definition) {
+            return AgentSessionLinkLaneOperationsMigration.apply(AgentSessionLinkStopMigration.apply(definition))
+        }
+        return AgentSessionLinkLaneOperationsMigration.apply(AgentSessionLinkStopMigration.apply(applyAgentSessionLinkTokenEfficiency(
             canonicalizeAgentSessionLinkBeforeTokenEfficiency(definition)
-        ))
+        )))
     }
 
     private static func canonicalizeAgentSessionLinkBeforeTokenEfficiency(
@@ -2480,6 +2623,10 @@ package enum MCPDomainCanonicalToolDefinitions {
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
         canonicalizeAgentSessionLink(definition)
+    }
+
+    package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
+        applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
     }
 
     package static func test_canonicalizeAgentControlWaitSemantics(

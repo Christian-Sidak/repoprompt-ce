@@ -2,6 +2,7 @@ import Combine
 import Foundation
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSecureStorage
 import XCTest
 
 // Overseer compaction on ACP sessions.
@@ -502,6 +503,71 @@ final class AgentSessionLinkACPCompactRunnerTests: XCTestCase {
         fixture.session.runState = .idle
         await run(fixture, message: "acp follow-up")
         XCTAssertFalse(fixture.session.isSettlingACPBackgroundCompaction)
+    }
+
+    func testSelfCompactPreparationRefusalAfterPipelineStartSettlesTheBoundAttempt() async throws {
+        let fixture = try makeFixture()
+        await run(fixture, message: "acp initial")
+        let controller = try XCTUnwrap(fixture.session.acpController)
+        fixture.session.runState = .idle
+        let owner = AgentSelfCompactOwner(
+            windowID: 1, workspaceID: UUID(), tabID: fixture.session.tabID,
+            sessionID: fixture.binding.sessionID,
+            persistentBindingGeneration: fixture.binding.generation,
+            bindingTransitionGeneration: fixture.session.bindingTransitionGeneration,
+            runID: UUID(), runAttemptID: UUID()
+        )
+        var attempt = AgentSelfCompactAttempt(
+            idempotencyKey: "acp-preparation-refusal", note: "recoverable continuation",
+            owner: owner, phase: .awaitingCompactTurn
+        )
+        attempt.admittedSupport = .acpAdvertisedCommand
+        fixture.session.selfCompactState = AgentSelfCompactState(active: attempt)
+        let coordinator = AgentSelfCompactNativeCompletionCoordinator(
+            load: { fixture.session.selfCompactState },
+            store: { fixture.session.selfCompactState = $0 },
+            isCurrentOwner: { _ in true },
+            dispatchNote: { _, _ in XCTFail("Failed command must not send the note")
+                return false
+            }
+        )
+        fixture.session.selfCompactNativeCompletion = coordinator
+        await controller.test_rejectNextTurnPreparation()
+        let command = AgentProviderControlCommand.compact(
+            expectedBinding: fixture.binding,
+            expectedProviderConversation: ACPCompactFixtures.sessionID,
+            selfCompactDispatchID: .init(requestID: attempt.id, stage: .compact)
+        )
+        let recorder = AgentRunStartOutcomeRecorder()
+        _ = await fixture.harness.service.startRun(
+            tabID: fixture.session.tabID, session: fixture.session,
+            initialUserMessage: command.providerText, initialMessageForRun: command.providerText,
+            attachments: [], providerControlCommand: command, startOutcome: recorder
+        )
+        let ownership = try XCTUnwrap(fixture.session.activeRunOwnership)
+        let runID = try XCTUnwrap(fixture.session.runID)
+        XCTAssertTrue(recorder.outcome.didStart, "The pipeline was accepted before preparation")
+        await fixture.session.agentTask?.value
+        XCTAssertEqual(try ACPCompactFixtures.loggedPrompts(at: fixture.promptLog).count, 1)
+        XCTAssertEqual(fixture.session.runState, .failed)
+        XCTAssertEqual(fixture.session.selfCompactState.active?.compactRunID, runID)
+        XCTAssertEqual(fixture.session.selfCompactState.active?.compactRunAttemptID, ownership.attemptID)
+        let revision = AgentRunTerminalCommitRevision(
+            commitID: UUID(), ownership: ownership, terminalState: .failed,
+            failureReason: nil, expectedRunID: runID,
+            sourceItemsRevision: fixture.session.sourceItemsRevision,
+            assistantDeltaFlushGeneration: fixture.session.assistantDeltaFlushGeneration,
+            providerDrainGeneration: fixture.session.providerTerminalDrainGeneration,
+            mcpPublicationEnvelope: nil, successorKind: nil, providerSuccessorID: nil
+        )
+        coordinator.compactTurnSettled(
+            revision: revision, publication: .accepted(successorEpoch: nil),
+            teardownSettled: { true }, assistantOrToolRowCount: 0
+        )
+        XCTAssertNil(fixture.session.selfCompactState.active)
+        XCTAssertEqual(fixture.session.selfCompactState.latest?.outcome, .failed)
+        XCTAssertFalse(fixture.session.selfCompactState.blocksOverseerDelivery)
+        XCTAssertFalse(fixture.session.selfCompactState.blocksAutomaticWake)
     }
 
     func testARefusalAfterARebindSendsNothingAndKeepsTheLiveSession() async throws {

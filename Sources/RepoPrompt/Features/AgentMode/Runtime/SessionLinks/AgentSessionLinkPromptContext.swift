@@ -26,6 +26,7 @@ struct AgentSessionLinkPromptInventoryItem: Hashable {
     let targetSessionID: UUID
     let displayName: String?
     let capabilityNames: [String]
+    let createdByYou: Bool
     /// Hidden exact-grant identity used only to fence passive attention delivery.
     ///
     /// It is never rendered. Fixtures may omit it, but an attention request then fails closed rather
@@ -36,7 +37,8 @@ struct AgentSessionLinkPromptInventoryItem: Hashable {
         targetSessionID: UUID,
         displayName: String?,
         capabilityNames: [String],
-        reference: DomainAgentSessionLinkReference? = nil
+        reference: DomainAgentSessionLinkReference? = nil,
+        createdByYou: Bool = false
     ) {
         self.targetSessionID = targetSessionID
         // Re-normalized here rather than trusted from the authority: the renderer's byte budget is
@@ -47,6 +49,7 @@ struct AgentSessionLinkPromptInventoryItem: Hashable {
         )
         self.capabilityNames = capabilityNames.sorted()
         self.reference = reference
+        self.createdByYou = createdByYou
     }
 }
 
@@ -71,7 +74,10 @@ struct AgentSessionLinkPromptInventory: Hashable {
         self.items = items.sorted { $0.targetSessionID.uuidString < $1.targetSessionID.uuidString }
     }
 
-    init(_ inventory: DomainAgentSessionLinkInventory) {
+    init(
+        _ inventory: DomainAgentSessionLinkInventory,
+        createdByYou: (UUID) -> Bool = { _ in false }
+    ) {
         self.init(
             observerSessionID: inventory.sessionID,
             linkSetRevision: inventory.linkSetRevision,
@@ -83,7 +89,8 @@ struct AgentSessionLinkPromptInventory: Hashable {
                     reference: DomainAgentSessionLinkReference(
                         linkID: item.linkID,
                         generation: item.generation
-                    )
+                    ),
+                    createdByYou: createdByYou(item.targetSessionID)
                 )
             }
         )

@@ -363,7 +363,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
         guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointHost)
         }
         return await window.agentModeViewModel.agentSessionLinkPerformSend(
             to: candidate,
@@ -385,7 +385,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
         guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointHost)
         }
         return await window.agentModeViewModel.agentSessionLinkPerformSteer(
             to: candidate,
@@ -406,7 +406,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) async -> AgentSessionLinkStopTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
         guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointHost)
         }
         return await window.agentModeViewModel.agentSessionLinkPerformStop(
             to: candidate,
@@ -456,7 +456,7 @@ extension WindowStatesManager: AgentSessionLinkEndpointHost {
     ) async -> AgentSessionLinkSendTransactionOutcome {
         guard !isTerminating else { return .blocked(.shuttingDown) }
         guard let window = window(withID: candidate.windowID), !window.isClosing else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointHost)
         }
         return await window.agentModeViewModel.agentSessionLinkPerformCompact(
             to: candidate,
