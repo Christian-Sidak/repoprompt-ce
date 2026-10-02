@@ -1246,16 +1246,9 @@ protocol WorkspaceStartupEventRecording: Sendable {
 }
 
 extension WorktreeStartupFeatureFlags {
-    /// Standalone stores use the same operational default as app-composed stores.
-    static func standaloneOperationalDefault(defaults: UserDefaults = .standard) -> Self {
-        #if DEBUG
-            return Self(
-                observeDiffSeededWorktreeStartup: defaults.object(forKey: observeDefaultsKey) as? Bool ?? true,
-                serveDiffSeededWorktreeStartup: defaults.object(forKey: serveDefaultsKey) as? Bool ?? true
-            )
-        #else
-            return Self(observeDiffSeededWorktreeStartup: true, serveDiffSeededWorktreeStartup: true)
-        #endif
+    /// A standalone store has no application preferences domain.
+    static func standaloneOperationalDefault() -> Self {
+        Self(observeDiffSeededWorktreeStartup: true, serveDiffSeededWorktreeStartup: true)
     }
 }
 
@@ -1273,13 +1266,13 @@ enum WorkspaceContextStartupInstrumentation {
 
     private static let storage = Storage()
 
-    static func install(_ recorder: any WorkspaceStartupEventRecording) {
+    static func install(_ recorder: (any WorkspaceStartupEventRecording)?) {
         storage.lock.lock()
         storage.recorder = recorder
         storage.lock.unlock()
     }
 
-    private static func currentRecorder() -> (any WorkspaceStartupEventRecording)? {
+    static func currentRecorder() -> (any WorkspaceStartupEventRecording)? {
         storage.lock.lock()
         defer { storage.lock.unlock() }
         return storage.recorder

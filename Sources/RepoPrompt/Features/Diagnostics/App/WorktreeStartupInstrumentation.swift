@@ -17,7 +17,14 @@ struct AppWorktreeStartupPhaseEventSink: WorktreeStartupPhaseEventSink {
 
 extension WorktreeStartupFeatureFlags {
     static func current(defaults: UserDefaults = .standard) -> Self {
-        standaloneOperationalDefault(defaults: defaults)
+        #if DEBUG
+            return Self(
+                observeDiffSeededWorktreeStartup: defaults.object(forKey: observeDefaultsKey) as? Bool ?? true,
+                serveDiffSeededWorktreeStartup: defaults.object(forKey: serveDefaultsKey) as? Bool ?? true
+            )
+        #else
+            return .standaloneOperationalDefault()
+        #endif
     }
 }
 

@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptInstrumentation
 import XCTest
 
 final class WorkspaceRootCatalogAdmissibilityTests: XCTestCase {
@@ -59,6 +60,68 @@ final class WorkspaceRootCatalogAdmissibilityTests: XCTestCase {
     }
 }
 
+#if DEBUG
+    final class WorkspaceStartupPolicyTests: XCTestCase {
+        func testStandaloneAdmissionFollowsPolicyWithOrWithoutRecorder() async throws {
+            let originalRecorder = WorkspaceContextStartupInstrumentation.currentRecorder()
+            defer { WorkspaceContextStartupInstrumentation.install(originalRecorder) }
+            let fixture = try ReviewGitRepositoryFixture(name: #function)
+            defer { fixture.cleanup() }
+
+            let enabled = WorktreeStartupFeatureFlags(
+                observeDiffSeededWorktreeStartup: true,
+                serveDiffSeededWorktreeStartup: true
+            )
+            let disabled = WorktreeStartupFeatureFlags(
+                observeDiffSeededWorktreeStartup: false,
+                serveDiffSeededWorktreeStartup: false
+            )
+            let cases: [(name: String, recorderPresent: Bool, policy: WorktreeStartupFeatureFlags?, admitted: Bool)] = [
+                ("default-absent", false, nil, true),
+                ("default-present", true, nil, true),
+                ("enabled-absent", false, enabled, true),
+                ("enabled-present", true, enabled, true),
+                ("disabled-absent", false, disabled, false),
+                ("disabled-present", true, disabled, false)
+            ]
+
+            for testCase in cases {
+                WorkspaceContextStartupInstrumentation.install(
+                    testCase.recorderPresent ? AppWorkspaceStartupEventRecorder() : nil
+                )
+                XCTAssertEqual(
+                    WorkspaceContextStartupInstrumentation.currentRecorder() != nil,
+                    testCase.recorderPresent,
+                    testCase.name
+                )
+                let rootURL = try fixture.makeRepository(
+                    named: testCase.name,
+                    files: ["Source.swift": "struct PolicyFixture {}\n"]
+                )
+                let store = if let policy = testCase.policy {
+                    WorkspaceFileContextStore(
+                        startupFeatureFlags: policy,
+                        codemapGraphIndexBuildLaunchPolicyForTesting: .disabled
+                    )
+                } else {
+                    WorkspaceFileContextStore(codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+                }
+                let root = try await store.loadRoot(path: rootURL.path, kind: .sessionWorktree)
+                let result = await store.automaticReusableSnapshotAdmissionResultForTesting(rootID: root.id)
+                if testCase.admitted {
+                    guard case .some(.admitted) = result else {
+                        XCTFail("\(testCase.name): expected admitted automatic observation, got \(String(describing: result))")
+                        continue
+                    }
+                } else {
+                    XCTAssertNil(result, "\(testCase.name): disabled policy must skip automatic admission")
+                }
+                await store.unloadRoot(id: root.id)
+            }
+        }
+    }
+#endif
+
 final class WorkspaceContextRootSnapshotTests: XCTestCase {
     func testSnapshotIsSendableRootScopedAndFencedByRootChanges() async throws {
         let firstURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -111,6 +174,24 @@ final class WorkspaceContextRootSnapshotTests: XCTestCase {
         XCTAssertFalse(snapshot.lifetimeIsCurrent())
         let reloadedValue = await store.rootContextSnapshot()
         XCTAssertTrue(try XCTUnwrap(reloadedValue).lifetimeIsCurrent())
+    }
+
+    func testStoreTeardownRevokesDetachedSnapshotLifetime() async throws {
+        let url = try makeRoot(fileName: "Teardown.swift")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var store: WorkspaceFileContextStore? = WorkspaceFileContextStore(
+            codemapGraphIndexBuildLaunchPolicyForTesting: .disabled
+        )
+        weak var weakStore = store
+        _ = try await store?.loadRoot(path: url.path)
+        let snapshotValue = await store?.rootContextSnapshot()
+        let snapshot = try XCTUnwrap(snapshotValue)
+        XCTAssertTrue(snapshot.lifetimeIsCurrent())
+
+        store = nil
+        XCTAssertNil(weakStore)
+        XCTAssertFalse(snapshot.lifetimeIsCurrent())
+        XCTAssertEqual(snapshot.catalog.files.map(\.name), ["Teardown.swift"])
     }
 
     func testUnrelatedSessionWorktreeChurnDoesNotRevokePrimarySnapshot() async throws {

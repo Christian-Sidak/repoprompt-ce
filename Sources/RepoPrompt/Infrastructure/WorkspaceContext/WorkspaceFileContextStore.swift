@@ -3288,6 +3288,11 @@ actor WorkspaceFileContextStore {
     private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
     private let unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy
     private let startupFeatureFlags: WorktreeStartupFeatureFlags
+    #if DEBUG
+        private var automaticReusableSnapshotAdmissionResultsByRootIDForTesting: [
+            UUID: WorkspaceRootReusableSnapshotCoordinator.ObservationResult
+        ] = [:]
+    #endif
     private var scopedIngressBarrierFlightStatesByRootID: [UUID: ScopedIngressBarrierRootFlightState] = [:]
     private var completedScopedIngressBarrierCutsByRootID: [UUID: ScopedIngressBarrierCompletedCut] = [:]
     private var nextScopedIngressBarrierToken: UInt64 = 0
@@ -3450,6 +3455,9 @@ actor WorkspaceFileContextStore {
     #endif
 
     deinit {
+        for token in rootLifetimeTokensByID.values {
+            token.revoke()
+        }
         #if os(macOS)
             searchContentMemoryPressureSource.cancel()
         #endif
@@ -11530,10 +11538,13 @@ actor WorkspaceFileContextStore {
         if root.kind == .sessionWorktree,
            startupFeatureFlags.observeDiffSeededWorktreeStartup
         {
-            _ = try? await admitReusableSnapshotForLoadedRoot(
+            let observation = try? await admitReusableSnapshotForLoadedRoot(
                 rootID: root.id,
                 expectedStandardizedPath: root.standardizedFullPath
             )
+            #if DEBUG
+                automaticReusableSnapshotAdmissionResultsByRootIDForTesting[root.id] = observation
+            #endif
         }
         let rootEpoch = WorkspaceCodemapRootEpoch(
             rootID: root.id,
@@ -11556,6 +11567,14 @@ actor WorkspaceFileContextStore {
         #endif
         return root
     }
+
+    #if DEBUG
+        func automaticReusableSnapshotAdmissionResultForTesting(
+            rootID: UUID
+        ) -> WorkspaceRootReusableSnapshotCoordinator.ObservationResult? {
+            automaticReusableSnapshotAdmissionResultsByRootIDForTesting[rootID]
+        }
+    #endif
 
     /// Constructs fresh target-local IDs and records for a pending seeded root.
     /// No source-worktree record, metadata, descriptor, or cache is reused.
@@ -11758,6 +11777,9 @@ actor WorkspaceFileContextStore {
             }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             rootLifetimeTokensByID.removeValue(forKey: rootID)?.revoke()
+            #if DEBUG
+                automaticReusableSnapshotAdmissionResultsByRootIDForTesting.removeValue(forKey: rootID)
+            #endif
             invalidateRootSeedSearchShadow(rootID: rootID)
             let rootEpoch = WorkspaceCodemapRootEpoch(
                 rootID: rootID,
