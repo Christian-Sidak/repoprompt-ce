@@ -744,6 +744,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
+
+    /// Materializes the lazy run service so its terminal-commit barrier is installed before a
+    /// run that bypasses `runService.startRun` (overseer native compaction) reaches settlement.
+    func ensureRunServiceMaterializedForRunStart() {
+        _ = runService
+    }
+
     private let sessionLifecycleAuthority = AgentSessionLifecycleAuthority()
     var modelRouterSettingsStore: GlobalSettingsStore = .shared
     var modelRouterRuntime: AgentTaskRouterRuntime?
