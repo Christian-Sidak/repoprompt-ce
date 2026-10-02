@@ -38,8 +38,9 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}-
             ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-
 
-      - name: Cache checksum-verified SwiftPM binary artifacts
-        uses: actions/cache@v6
+      - name: Restore checksum-verified SwiftPM binary artifacts
+        id: binaries-cache
+        uses: actions/cache/restore@v6
         with:
           path: |
             .build/artifacts
@@ -161,6 +162,18 @@ jobs:
           name: root-build-${{ github.run_id }}
           path: root-build.tar.gz
           retention-days: 1
+
+      # Keep binary artifacts main-scoped too; PRs restore without saving their own caches.
+      - name: Save checksum-verified SwiftPM binary artifacts (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.binaries-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            .build/artifacts
+            .build/swiftbuild/artifacts
+            Packages/RepoPromptAgentProviders/.build/artifacts
+            ~/Library/Caches/org.swift.swiftpm/artifacts
+          key: ${{ steps.binaries-cache.outputs.cache-primary-key }}
 
       # Save the compiled cache only from main, so PR runs restore a warm, main-built cache
       # (PR-scoped caches would evict it). One key per main commit keeps it current.
