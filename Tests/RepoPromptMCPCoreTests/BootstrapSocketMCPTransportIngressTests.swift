@@ -47,6 +47,51 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
         await transport.disconnect()
     }
 
+    func testInjectedOverflowUsesConfiguredCapacityAndIgnoresStaleToken() async throws {
+        let pair = try makeSocketPair()
+        defer { Darwin.close(pair[1]) }
+        let transport = try BootstrapSocketMCPTransport(connectedFD: pair[0], receiveBufferCapacity: 3)
+        await transport.debugHoldReaderTerminalCallback()
+        await transport.debugHoldReaderCancellationCallback()
+        try await transport.connect()
+
+        // A stale identity must leave ingress and the adopted connection live.
+        await transport.debugDeliverReceiveOverflow(token: 2)
+        try await transport.connect()
+        let frames = numberedFrames(count: 3)
+        try writeFrames(frames, to: pair[1])
+        XCTAssertEqual(shutdown(pair[1], SHUT_WR), 0)
+        await transport.debugWaitForHeldReaderTerminalCallback()
+        let pending = await transport.debugIngressTeardownCounts()
+        XCTAssertEqual(pending.finalized, 0)
+        XCTAssertEqual(pending.closed, 0)
+
+        // Exactly capacity frames means no real overflow error can mask the
+        // injected callback's configured-capacity diagnostic.
+        await transport.debugDeliverReceiveOverflow(token: 1)
+        var observed: [Data] = []
+        var terminalError: Error?
+        do {
+            for try await frame in await transport.receive() {
+                observed.append(frame)
+            }
+        } catch { terminalError = error }
+        XCTAssertEqual(observed, frames)
+        XCTAssertEqual(
+            terminalError as? BootstrapSocketReceiveBufferOverflowError,
+            BootstrapSocketReceiveBufferOverflowError(capacity: 3)
+        )
+        await transport.debugDeliverReaderCancellation(token: 1)
+        await transport.debugDeliverReceiveOverflow(token: 2)
+        let settled = await transport.debugIngressTeardownCounts()
+        XCTAssertEqual(settled.finalized, 1)
+        XCTAssertEqual(settled.closed, 1)
+        try waitForPeerShutdown(pair[1])
+        await transport.debugReleaseReaderTerminalCallbacks()
+        await transport.debugReleaseReaderCancellationCallbacks()
+        await transport.disconnect()
+    }
+
     func testEOFFirstKeepsOverflowAndSettlesReaderExactlyOnce() async throws {
         try await assertDelayedTeardown(overflowFirst: false)
     }

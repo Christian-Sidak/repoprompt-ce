@@ -37,7 +37,7 @@ final class BootstrapSocketMCPIngressGate: @unchecked Sendable {
     }
 
     private let lock = NSLock()
-    private let capacity: Int
+    fileprivate let capacity: Int
     private var isTerminal = false
     private var overflowError: BootstrapSocketReceiveBufferOverflowError?
 
@@ -465,7 +465,7 @@ public actor BootstrapSocketMCPTransport: Transport {
 
         func debugDeliverReceiveOverflow(token: UInt64) {
             handleReceiveBufferOverflow(
-                BootstrapSocketReceiveBufferOverflowError(capacity: 1024),
+                BootstrapSocketReceiveBufferOverflowError(capacity: ingressGate.capacity),
                 from: ReaderIdentity(fd: socketFD, token: token)
             )
         }
