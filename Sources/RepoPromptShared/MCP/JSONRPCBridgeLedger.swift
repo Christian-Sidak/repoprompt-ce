@@ -492,6 +492,7 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
     public let responseInDeliveryCount: Int
     public let cancellationTombstoneCount: Int
     public let retiredClientCancellationCount: Int
+    public let retiredServerCancellationCount: Int
     public let recentCompletionCount: Int
     public let pendingTransactionCount: Int
     public let replayableClientRequestCount: Int
@@ -662,11 +663,11 @@ public actor JSONRPCBridgeLedger {
     private var nextRequestOrdinal: UInt64 = 0
     private var active: [RequestKey: RequestState] = [:]
     private var tombstones: [RequestKey: Tombstone] = [:]
-    // Cancellation does not prove that a backend handler has physically settled.
-    // Retain exact client IDs for the backend generation, separately from the
-    // short-lived tombstones used for reverse-direction connection cleanup.
-    // The union of both stores shares maximumCancellationTombstones; no eviction.
-    private var retiredClientCancellations: [RequestKey: RequestMetadata] = [:]
+    // Cancellation does not prove physical handler settlement. Client request
+    // retirements last for the backend generation; server request retirements
+    // last for this ledger/host connection, which survives backend replacement.
+    // The union with TTL tombstones shares one hard capacity; no eviction.
+    private var retiredCancellations: [RequestKey: RequestMetadata] = [:]
     private var pendingTransactions: [UUID: PendingTransaction] = [:]
     private var recentCompletions: [RequestKey] = []
     private var hasForwardedProtocolFrame = false
@@ -693,7 +694,7 @@ public actor JSONRPCBridgeLedger {
             throw failTerminal("reconnection_attempted_with_unreplayable_work")
         }
         connectionGeneration &+= 1
-        retiredClientCancellations.removeAll()
+        retiredCancellations = retiredCancellations.filter { $0.key.direction == .serverToClient }
         tombstones = tombstones.filter { $0.key.direction == .serverToClient }
         emit(phase: "connection_started", direction: nil, messages: [], prepared: nil, terminalReason: nil)
         return connectionGeneration
@@ -757,7 +758,7 @@ public actor JSONRPCBridgeLedger {
                     continue
                 }
                 let key = RequestKey(direction: direction, id: id)
-                if tombstones[key] != nil || retiredClientCancellations[key] != nil {
+                if tombstones[key] != nil || retiredCancellations[key] != nil {
                     throw failTerminal("cancelled_id_reuse", preferredError: .cancelledIDReuse(direction, id))
                 }
                 guard Self.activeRequestCount(in: simulatedActive) < configuration.maximumActiveRequests else {
@@ -848,7 +849,7 @@ public actor JSONRPCBridgeLedger {
                         tool: tombstone.tool,
                         requestOrdinal: tombstone.ordinal
                     ))
-                } else if let retired = retiredClientCancellations[key] {
+                } else if let retired = retiredCancellations[key] {
                     discardedMessageIndices.insert(messageIndex)
                     operations.append(.discardedTombstoneResponse(key))
                     messages.append(JSONRPCBridgeMessageMetadata(
@@ -877,7 +878,7 @@ public actor JSONRPCBridgeLedger {
             case let .invalidClientMessage(id):
                 if let id, id != .null {
                     let key = RequestKey(direction: direction, id: id)
-                    if tombstones[key] != nil || retiredClientCancellations[key] != nil {
+                    if tombstones[key] != nil || retiredCancellations[key] != nil {
                         throw failTerminal("cancelled_id_reuse", preferredError: .cancelledIDReuse(direction, id))
                     }
                     guard Self.activeRequestCount(in: simulatedActive) < configuration.maximumActiveRequests else {
@@ -982,7 +983,7 @@ public actor JSONRPCBridgeLedger {
 
         var committedActive = active
         var committedTombstones = tombstones
-        var committedRetirements = retiredClientCancellations
+        var committedRetirements = retiredCancellations
         var committedCompletions = recentCompletions
 
         for operation in transaction.operations {
@@ -1050,9 +1051,7 @@ public actor JSONRPCBridgeLedger {
                         preferredError: .tombstoneCapacityExceeded(configuration.maximumCancellationTombstones)
                     )
                 }
-                if key.direction == .clientToServer {
-                    committedRetirements[key] = cancellationMetadata
-                }
+                committedRetirements[key] = cancellationMetadata
                 committedTombstones[key] = Tombstone(
                     expiresAt: now + configuration.cancellationTombstoneTTL,
                     ordinal: cancellationMetadata.ordinal,
@@ -1067,7 +1066,7 @@ public actor JSONRPCBridgeLedger {
 
         active = committedActive
         tombstones = committedTombstones
-        retiredClientCancellations = committedRetirements
+        retiredCancellations = committedRetirements
         recentCompletions = committedCompletions
         hasForwardedProtocolFrame = true
         purgeExpiredTombstones(now: now)
@@ -1217,7 +1216,8 @@ public actor JSONRPCBridgeLedger {
             activeRequestCount: Self.activeRequestCount(in: active),
             responseInDeliveryCount: active.values.filter(\.isResponseInDelivery).count,
             cancellationTombstoneCount: tombstones.count,
-            retiredClientCancellationCount: retiredClientCancellations.count,
+            retiredClientCancellationCount: retiredCancellations.keys.count(where: { $0.direction == .clientToServer }),
+            retiredServerCancellationCount: retiredCancellations.keys.count(where: { $0.direction == .serverToClient }),
             recentCompletionCount: recentCompletions.count,
             pendingTransactionCount: pendingTransactions.count,
             replayableClientRequestCount: Self.replayableClientRequestCount(in: active),
@@ -1241,11 +1241,12 @@ public actor JSONRPCBridgeLedger {
             let metadata = state.metadata
             guard Self.cancellationRetentionCount(
                 tombstones: tombstones,
-                retirements: retiredClientCancellations
+                retirements: retiredCancellations
             ) < configuration.maximumCancellationTombstones else {
                 _ = failTerminal("cancellation_tombstone_capacity_exceeded")
                 return
             }
+            retiredCancellations[key] = metadata
             tombstones[key] = Tombstone(
                 expiresAt: now + configuration.cancellationTombstoneTTL,
                 ordinal: metadata.ordinal,

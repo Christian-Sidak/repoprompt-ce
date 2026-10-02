@@ -3,6 +3,7 @@ import Foundation
 import Logging
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest
 
@@ -308,7 +309,9 @@ final class UnixSocketMCPTransportCancellationTests: XCTestCase {
         }
     }
 
-    private func frame(_ string: String) -> Data { Data((string + "\n").utf8) }
+    private func frame(_ string: String) -> Data {
+        Data((string + "\n").utf8)
+    }
 
     private func write(_ data: Data, to fd: Int32) throws {
         let count = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, $0.count) }
@@ -345,6 +348,7 @@ private actor CancellationSettlementGate {
         if released { return }
         await withCheckedContinuation { waiter = $0 }
     }
+
     func release() {
         released = true
         waiter?.resume()
@@ -363,12 +367,20 @@ private actor CancellationObservedTransport: Transport {
         self.completedSend = completedSend
         self.unrelatedSend = unrelatedSend
     }
+
     func connect() async throws {
         try await transport.connect()
         stream = await transport.receive()
     }
-    func disconnect() async { await transport.disconnect() }
-    func receive() -> AsyncThrowingStream<Data, Error> { stream }
+
+    func disconnect() async {
+        await transport.disconnect()
+    }
+
+    func receive() -> AsyncThrowingStream<Data, Error> {
+        stream
+    }
+
     func send(_ frame: Data) async throws {
         try await transport.send(frame)
         if JSONRPCBridgeFrameInspector.inspectPermissively(frame, direction: .serverToClient).contains(where: { $0.id == .number(7) }) {
@@ -377,5 +389,107 @@ private actor CancellationObservedTransport: Transport {
         if JSONRPCBridgeFrameInspector.inspectPermissively(frame, direction: .serverToClient).contains(where: { $0.id == .string("7") }) {
             unrelatedSend.fulfill()
         }
+    }
+}
+
+final class MCPClientCancellationOwnershipTests: XCTestCase {
+    func testMixedBatchPreservesExactStringIDNullErrorAndNotification() throws {
+        let ledger = MCPExecutionWatchdogResponseLedger()
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(frame(#"{"id":7,"method":"tools/list"}"#)))
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(frame(#"{"id":"7","method":"tools/list"}"#)))
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(frame(#"{"method":"notifications/cancelled","params":{"requestId":7}}"#)))
+        let batch = frame(#"[{"id":7,"result":{}},{"id":"7","result":{}},{"id":null,"error":{"code":-32600,"message":"Invalid Request"}},{"method":"notifications/progress","params":{"progress":1}}]"#)
+        guard case let .frame(prepared) = ledger.prepareServerFrameForDelivery(batch) else {
+            return XCTFail("Only the cancelled numeric response may be removed")
+        }
+        let metadata = JSONRPCBridgeFrameInspector.inspectPermissively(prepared.data, direction: .serverToClient)
+        XCTAssertEqual(metadata.filter { $0.kind == .response }.compactMap(\.id), [.string("7"), .null])
+        XCTAssertEqual(metadata.filter { $0.kind == .notification }.map(\.method), ["notifications/progress"])
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(frame(#"{"method":"notifications/cancelled","params":{"requestId":99}}"#)))
+        guard case .frame = ledger.prepareServerFrameForDelivery(frame(#"{"id":99,"result":{}}"#)) else {
+            return XCTFail("Unknown cancellation cannot authorize blanket response suppression")
+        }
+    }
+
+    func testRetentionCapacityFailsClosedWithoutEviction() throws {
+        let ledger = MCPExecutionWatchdogResponseLedger(maximumCancelledRequestIDs: 1)
+        for id in [7, 8] {
+            XCTAssertTrue(try ledger.recordAcceptedClientFrame(frame("{\"id\":\(id),\"method\":\"tools/list\"}")))
+        }
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(frame(#"{"method":"notifications/cancelled","params":{"requestId":7}}"#)))
+        XCTAssertThrowsError(try ledger.recordAcceptedClientFrame(frame(#"{"method":"notifications/cancelled","params":{"requestId":8}}"#))) {
+            XCTAssertEqual($0 as? MCPClientCancellationOwnershipError, .retentionCapacityExceeded(1))
+        }
+        XCTAssertThrowsError(try ledger.recordAcceptedClientFrame(frame(#"{"id":9,"method":"tools/list"}"#))) {
+            XCTAssertEqual($0 as? MCPClientCancellationOwnershipError, .retentionCapacityExceeded(1))
+        }
+        guard case let .suppressed(phase, _) = ledger.prepareServerFrameForDelivery(frame(#"{"id":7,"result":{}}"#)) else {
+            return XCTFail("Capacity failure cannot let a previous cancelled response escape")
+        }
+        XCTAssertEqual(phase, "client_cancellation_ownership_failure")
+    }
+
+    func testSameGenerationReuseIsRefusedButResetFencesOldIngress() throws {
+        let ledger = MCPExecutionWatchdogResponseLedger(maximumCancelledRequestIDs: 1)
+        let oldGeneration = ledger.currentGeneration
+        let request = frame(#"{"id":7,"method":"tools/list"}"#)
+        let cancellation = frame(#"{"method":"notifications/cancelled","params":{"requestId":7}}"#)
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(request, expectedGeneration: oldGeneration))
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(cancellation, expectedGeneration: oldGeneration))
+        XCTAssertThrowsError(try ledger.recordAcceptedClientFrame(request, expectedGeneration: oldGeneration)) {
+            XCTAssertEqual($0 as? MCPClientCancellationOwnershipError, .cancelledIDReuse(.number(7)))
+        }
+        ledger.reset()
+        let generation = ledger.currentGeneration
+        XCTAssertNotEqual(generation, oldGeneration)
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(request, expectedGeneration: generation))
+        XCTAssertFalse(try ledger.recordAcceptedClientFrame(cancellation, expectedGeneration: oldGeneration))
+        guard case .frame = ledger.prepareServerFrameForDelivery(frame(#"{"id":7,"result":{}}"#)) else {
+            return XCTFail("Old ingress cannot cancel the fresh generation's reused ID")
+        }
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(cancellation, expectedGeneration: generation))
+        guard case .suppressed = ledger.prepareServerFrameForDelivery(frame(#"{"id":7,"result":{}}"#)) else {
+            return XCTFail("Reset must restore bounded capacity, not disable cancellation ownership")
+        }
+    }
+
+    func testCancellationBeforeWatchdogSealRetiresOnlyItsExactID() throws {
+        let ledger = MCPExecutionWatchdogResponseLedger()
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(frame(#"[{"id":7,"method":"tools/list"},{"id":"7","method":"tools/list"}]"#)))
+        XCTAssertTrue(try ledger.recordAcceptedClientFrame(frame(#"{"method":"notifications/cancelled","params":{"requestId":7}}"#)))
+        ledger.seal()
+        XCTAssertEqual(ledger.takeOutstandingRequestIDsAfterSeal(), [.string("7")])
+        guard case let .suppressed(phase, _) = ledger.prepareServerFrameForDelivery(frame(#"{"id":7,"result":{}}"#)) else {
+            return XCTFail("A cancelled response remains suppressed after terminal sealing")
+        }
+        XCTAssertEqual(phase, "watchdog_late_response_suppressed")
+    }
+
+    func testDeliveryTrackerCancellationPreservesStringIDAndRejectsStaleIngress() async {
+        let tracker = MCPDomainResponseDeliveryTracker()
+        let oldGeneration = tracker.currentGeneration
+        let request = frame(#"{"id":7,"method":"tools/list"}"#)
+        let cancellation = frame(#"{"method":"notifications/cancelled","params":{"requestId":7}}"#)
+        tracker.recordAcceptedClientFrame(request)
+        tracker.recordAcceptedClientFrame(frame(#"{"id":"7","method":"tools/list"}"#))
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 2)
+        tracker.recordAcceptedClientFrame(cancellation)
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+        tracker.recordAcceptedClientFrame(frame(#"{"method":"notifications/cancelled","params":{"requestId":99}}"#))
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+        tracker.recordDeliveredServerFrame(frame(#"{"id":"7","result":{}}"#))
+        let drained = await tracker.waitUntilDrained()
+        XCTAssertTrue(drained)
+        tracker.reset()
+        tracker.recordAcceptedClientFrame(request, expectedGeneration: tracker.currentGeneration)
+        tracker.recordAcceptedClientFrame(cancellation, expectedGeneration: oldGeneration)
+        XCTAssertEqual(tracker.snapshot().pendingRequestCount, 1)
+        tracker.recordAcceptedClientFrame(cancellation, expectedGeneration: tracker.currentGeneration)
+        let cancelledDrain = await tracker.waitUntilDrained()
+        XCTAssertTrue(cancelledDrain)
+    }
+
+    private func frame(_ json: String) -> Data {
+        Data((json + "\n").utf8)
     }
 }

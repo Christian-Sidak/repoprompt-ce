@@ -91,6 +91,14 @@ final class JSONRPCBridgeCancellationTests: XCTestCase {
         XCTAssertNil(snapshot.terminalReason)
         XCTAssertEqual(snapshot.cancellationTombstoneCount, 1)
         XCTAssertEqual(snapshot.retiredClientCancellationCount, 0)
+        XCTAssertEqual(snapshot.retiredServerCancellationCount, 1)
+        let expiredHostResponse = try await ledger.prepare(frame: response("7"), direction: .clientToServer, now: 32)
+        XCTAssertEqual(expiredHostResponse.disposition, .discardCancelledResponse)
+        try await ledger.commit(expiredHostResponse, now: 32)
+        let expired = await ledger.snapshot(now: 32)
+        XCTAssertNil(expired.terminalReason)
+        XCTAssertEqual(expired.cancellationTombstoneCount, 0)
+        XCTAssertEqual(expired.retiredServerCancellationCount, 1)
     }
 
     func testUnknownCancellationDoesNotAuthorizeUnknownResponse() async throws {
@@ -179,8 +187,90 @@ final class JSONRPCBridgeCancellationTests: XCTestCase {
         XCTAssertEqual(final.activeRequestCount, 0)
     }
 
-    private func forward(_ frame: Data, through ledger: JSONRPCBridgeLedger, at time: TimeInterval) async throws {
-        let prepared = try await ledger.prepare(frame: frame, direction: .clientToServer, now: time)
+    func testLateServerCancelledResponsePreservesUnrelatedExactStringIDAfterExpiry() async throws {
+        let ledger = JSONRPCBridgeLedger()
+        _ = try await ledger.beginConnection()
+        try await forward(request("7"), direction: .serverToClient, through: ledger, at: 0)
+        try await forward(request(#""7""#), direction: .serverToClient, through: ledger, at: 0)
+        try await forward(cancel("7"), direction: .serverToClient, through: ledger, at: 1)
+        let late = try await ledger.prepare(frame: response("7"), direction: .clientToServer, now: 32)
+        XCTAssertEqual(late.disposition, .discardCancelledResponse)
+        XCTAssertNil(late.deliveryFrame)
+        try await ledger.commit(late, now: 32)
+        let remaining = await ledger.snapshot(now: 32)
+        XCTAssertNil(remaining.terminalReason)
+        XCTAssertEqual(remaining.activeRequestCount, 1)
+        let unrelated = try await ledger.prepare(frame: response(#""7""#), direction: .clientToServer, now: 32)
+        XCTAssertEqual(unrelated.disposition, .forward)
+        try await ledger.commit(unrelated, now: 32)
+        let final = await ledger.snapshot(now: 32)
+        XCTAssertEqual(final.activeRequestCount, 0)
+        XCTAssertNil(final.terminalReason)
+    }
+
+    func testLateServerCancelledResponseSurvivesBackendRotation() async throws {
+        let ledger = JSONRPCBridgeLedger()
+        _ = try await ledger.beginConnection()
+        try await forward(request("7"), direction: .serverToClient, through: ledger, at: 0)
+        try await forward(cancel("7"), direction: .serverToClient, through: ledger, at: 1)
+        _ = try await ledger.beginConnection()
+        try await forward(request(#""7""#), through: ledger, at: 2)
+        let late = try await ledger.prepare(frame: response("7"), direction: .clientToServer, now: 32)
+        XCTAssertEqual(late.disposition, .discardCancelledResponse)
+        try await ledger.commit(late, now: 32)
+        let remaining = await ledger.snapshot(now: 32)
+        XCTAssertNil(remaining.terminalReason)
+        XCTAssertEqual(remaining.activeRequestCount, 1)
+        let unrelated = try await ledger.prepare(frame: response(#""7""#), direction: .serverToClient, now: 32)
+        try await ledger.commit(unrelated, now: 32)
+        let final = await ledger.snapshot(now: 32)
+        XCTAssertEqual(final.activeRequestCount, 0)
+        XCTAssertNil(final.terminalReason)
+    }
+
+    func testServerCancelledIDCannotBeReusedAfterExpiryOrBackendRotation() async throws {
+        let ledger = JSONRPCBridgeLedger()
+        _ = try await ledger.beginConnection()
+        try await forward(request("7"), direction: .serverToClient, through: ledger, at: 0)
+        try await forward(cancel("7"), direction: .serverToClient, through: ledger, at: 1)
+        _ = try await ledger.beginConnection()
+        do {
+            _ = try await ledger.prepare(frame: request("7"), direction: .serverToClient, now: 32)
+            XCTFail("The previous host handler can still settle after the backend rotates")
+        } catch {
+            XCTAssertEqual(error as? JSONRPCBridgeLedgerError, .cancelledIDReuse(.serverToClient, .number(7)))
+        }
+    }
+
+    func testHostRetirementSharesCapacityAndSurvivesBackendReset() async throws {
+        let ledger = JSONRPCBridgeLedger(configuration: .init(maximumCancellationTombstones: 1))
+        _ = try await ledger.beginConnection()
+        try await forward(request("7"), direction: .serverToClient, through: ledger, at: 0)
+        try await forward(cancel("7"), direction: .serverToClient, through: ledger, at: 1)
+        let retained = await ledger.snapshot(now: 32)
+        XCTAssertEqual(retained.cancellationTombstoneCount, 0)
+        XCTAssertEqual(retained.retiredServerCancellationCount, 1)
+        _ = try await ledger.beginConnection()
+        try await forward(request("8"), through: ledger, at: 32)
+        do {
+            try await forward(cancel("8"), through: ledger, at: 32)
+            XCTFail("Backend rotation must not free host retirement capacity or evict it")
+        } catch {
+            XCTAssertEqual(error as? JSONRPCBridgeLedgerError, .tombstoneCapacityExceeded(1))
+        }
+        let failed = await ledger.snapshot(now: 32)
+        XCTAssertEqual(failed.retiredServerCancellationCount, 1)
+        XCTAssertEqual(failed.retiredClientCancellationCount, 0)
+        XCTAssertEqual(failed.terminalReason, "cancellation_tombstone_capacity_exceeded")
+    }
+
+    private func forward(
+        _ frame: Data,
+        direction: JSONRPCBridgeDirection = .clientToServer,
+        through ledger: JSONRPCBridgeLedger,
+        at time: TimeInterval
+    ) async throws {
+        let prepared = try await ledger.prepare(frame: frame, direction: direction, now: time)
         try await ledger.commit(prepared, now: time)
     }
 
