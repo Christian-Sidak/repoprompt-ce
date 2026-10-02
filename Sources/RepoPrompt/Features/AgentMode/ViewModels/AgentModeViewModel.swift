@@ -10977,7 +10977,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         activeWorkflow: nativePreparedTurn.bubbleWorkflow,
                         nativePreparedTurn: nativePreparedTurn,
                         codexAttemptID: codexAttemptID,
-                        autoEffortAudit: submittedAutoEffortAudit
+                        autoEffortAudit: submittedAutoEffortAudit,
+                        isLocalComposerInput: false
                     )
                 }
                 return submitUserTurn(
@@ -10985,7 +10986,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     tabID: session.tabID,
                     codexAttemptID: codexAttemptID,
                     autoEffortSelection: submittedAutoEffortSelection,
-                    autoEffortAudit: submittedAutoEffortAudit
+                    autoEffortAudit: submittedAutoEffortAudit,
+                    isLocalComposerInput: false
                 )
             }
             switch submission {
@@ -16515,7 +16517,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         rawDraftText: String? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
-        routerAudit: AgentAutomationTurnAudit.Feature? = nil
+        routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        isLocalComposerInput: Bool = true
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -16648,7 +16651,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     routerAudit: routerAudit,
                     restorationSelectedWorkflow: activeWorkflow,
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-                    stopFence: stopFence
+                    stopFence: stopFence,
+                    isLocalComposerInput: isLocalComposerInput
                 )
             }
             return .submitted
@@ -16668,7 +16672,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             autoEffortAudit: autoEffortAudit,
             routerAudit: routerAudit,
             restorationSelectedWorkflow: activeWorkflow,
-            restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration
+            restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
+            isLocalComposerInput: isLocalComposerInput
         )
     }
 
@@ -16694,7 +16699,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
-        stopFence: AgentRunStartStopFence
+        stopFence: AgentRunStartStopFence,
+        isLocalComposerInput: Bool = true
     ) async {
         guard sessions[tabID] === originalSession,
               originalSession.persistentSessionBindingIdentity == originalBinding
@@ -16754,7 +16760,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             routerAudit: routerAudit,
             restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
-            stopFence: stopFence
+            stopFence: stopFence,
+            isLocalComposerInput: isLocalComposerInput
         )
     }
 
@@ -17210,7 +17217,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         restorationSelectedWorkflow: AgentWorkflowDefinition? = nil,
         restorationSelectedWorkflowMutationGeneration: UInt64? = nil,
         managedTurn: AgentSessionLinkManagedTurn? = nil,
-        stopFence: AgentRunStartStopFence? = nil
+        stopFence: AgentRunStartStopFence? = nil,
+        isLocalComposerInput: Bool = true
     ) -> UserTurnSubmissionResult {
         guard stopFence?.permitsStart(of: session) ?? true else {
             return .blocked(message: "This scheduled run was cancelled by Stop.")
@@ -17318,6 +17326,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
+        if managedTurn == nil, isLocalComposerInput,
+           let endpoint = agentSessionLinkObserverEndpoint(tabID: tabID)
+        {
+            session.observerWaitRelease = (
+                session.runID, session.activeRunAttemptID,
+                AgentSessionLinkRuntimeBridge.shared.acceptLocalInput(for: endpoint)
+            )
+        }
         managedTurn?.sink.noteAppended(itemID: userItem.id)
         let routerConfiguration = modelRouterSettingsStore.modelRouterConfiguration()
         let defaultRouterAudit = AgentAutomationTurnAudit.Feature(
@@ -18275,8 +18291,24 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor, .antigravity:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec, .grokBuild, .devin:
-            return text
+            // These transports deliver pixels natively but no file path, so the agent could not
+            // otherwise name the image in ask_oracle `images`.
+            return renderAttachmentPathNote(text: text, attachments: attachments)
         }
+    }
+
+    static let attachmentPathNoteHeader =
+        "Attached image files (to share one with the Oracle, pass its path in ask_oracle `images`):"
+
+    private func renderAttachmentPathNote(text: String, attachments: [AgentImageAttachment]) -> String {
+        let paths = attachments.compactMap { attachment -> String? in
+            guard case let .localFile(path) = attachment.source else { return nil }
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard !paths.isEmpty else { return text }
+        let note = ([Self.attachmentPathNoteHeader] + paths.map { "- \($0)" }).joined(separator: "\n")
+        return text.isEmpty ? note : text + "\n\n" + note
     }
 
     private func renderAtPathAttachmentMessage(text: String, attachments: [AgentImageAttachment]) -> String {
