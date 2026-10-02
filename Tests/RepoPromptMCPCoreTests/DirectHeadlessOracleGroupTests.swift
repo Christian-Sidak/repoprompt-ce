@@ -232,7 +232,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         }
     }
 
-    func testDeletedContinuationAfterPlanningRetainsRosterConflictError() async throws {
+    func testDeletedContinuationAfterPlanningReportsMissingContinuation() async throws {
         let fixture = try Fixture(name: "deleted-after-planning")
         defer { fixture.cleanup() }
         let service = fixture.service()
@@ -282,7 +282,9 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
             )
             XCTFail("Expected deleted continuation to fail")
         } catch {
-            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .rosterConflict)
+            XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .continuationMissing)
+            XCTAssertTrue(DirectHeadlessMCPService.wireMessage(for: error).hasPrefix("oracle_continuation_missing:"))
+            XCTAssertEqual(try fixture.calls().count, 2, "Deleted continuation must not launch another provider")
         }
     }
 
