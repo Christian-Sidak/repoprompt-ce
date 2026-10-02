@@ -78,7 +78,6 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
         } else {
             await transport.debugDeliverReaderEOF(token: 1)
         }
-        try waitForPeerShutdown(pair[1])
         var observed: [Data] = []
         var terminalError: Error?
         do {
@@ -112,6 +111,9 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
         let settled = await transport.debugIngressTeardownCounts()
         XCTAssertEqual(settled.finalized, 1)
         XCTAssertEqual(settled.closed, 1)
+        // Cancellation owns the physical close. Peer EOF is observable only
+        // after that held, matching-identity finalizer has closed the descriptor.
+        try waitForPeerShutdown(pair[1])
         XCTAssertEqual(settled.staleTerminal, 2)
         XCTAssertEqual(settled.staleCancellation, 2)
         await transport.debugReleaseReaderTerminalCallbacks()
