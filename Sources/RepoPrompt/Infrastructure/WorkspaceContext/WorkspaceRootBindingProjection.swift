@@ -1238,12 +1238,25 @@ enum WorkspaceStartupDiagnosticEvent {
 
 protocol WorkspaceStartupEventRecording: Sendable {
     func record(_ event: WorkspaceStartupDiagnosticEvent)
-    var currentFeatureFlags: WorktreeStartupFeatureFlags { get }
     #if DEBUG
         var currentBenchmarkMetricTag: WorkspaceBenchmarkMetricTag? {
             get
         }
     #endif
+}
+
+extension WorktreeStartupFeatureFlags {
+    /// Standalone stores use the same operational default as app-composed stores.
+    static func standaloneOperationalDefault(defaults: UserDefaults = .standard) -> Self {
+        #if DEBUG
+            return Self(
+                observeDiffSeededWorktreeStartup: defaults.object(forKey: observeDefaultsKey) as? Bool ?? true,
+                serveDiffSeededWorktreeStartup: defaults.object(forKey: serveDefaultsKey) as? Bool ?? true
+            )
+        #else
+            return Self(observeDiffSeededWorktreeStartup: true, serveDiffSeededWorktreeStartup: true)
+        #endif
+    }
 }
 
 enum WorkspaceContextStartupInstrumentation {
@@ -1274,10 +1287,6 @@ enum WorkspaceContextStartupInstrumentation {
 
     private static func emit(_ event: WorkspaceStartupDiagnosticEvent) {
         currentRecorder()?.record(event)
-    }
-
-    static var currentFeatureFlags: WorktreeStartupFeatureFlags {
-        currentRecorder()?.currentFeatureFlags ?? WorktreeStartupFeatureFlags()
     }
 
     static func record(

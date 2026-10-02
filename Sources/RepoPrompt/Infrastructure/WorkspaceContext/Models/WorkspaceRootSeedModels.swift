@@ -22,8 +22,8 @@ struct FileSearchContentSnapshot {
 extension WorkspaceLookupRootScope: @unchecked Sendable {}
 
 /// Immutable authority for exactly the roots selected by one lookup scope.
-/// The leases retain the captured catalog generations and fence session-root changes.
-struct WorkspaceContextRootSnapshot {
+/// The catalog is immutable; root tokens revoke detached reads when a captured root unloads.
+struct WorkspaceContextRootSnapshot: @unchecked Sendable {
     struct Root: Equatable {
         let reference: WorkspaceRootRef
         let lifetimeID: UUID
@@ -32,27 +32,46 @@ struct WorkspaceContextRootSnapshot {
 
     let scope: WorkspaceLookupRootScope
     let roots: [Root]
-    private let catalogLease: WorkspaceSearchCatalogGenerationLease
-    private let lifetimeLease: WorkspaceSessionRootLifetimeSnapshot
+    let catalog: WorkspaceSearchCatalogSnapshot
+    private let lifetimeTokens: [WorkspaceContextRootLifetimeToken]
 
     init(
         scope: WorkspaceLookupRootScope,
         roots: [Root],
-        catalogLease: WorkspaceSearchCatalogGenerationLease,
-        lifetimeLease: WorkspaceSessionRootLifetimeSnapshot
+        catalog: WorkspaceSearchCatalogSnapshot,
+        lifetimeTokens: [WorkspaceContextRootLifetimeToken]
     ) {
         self.scope = scope
         self.roots = roots
-        self.catalogLease = catalogLease
-        self.lifetimeLease = lifetimeLease
+        self.catalog = catalog
+        self.lifetimeTokens = lifetimeTokens
     }
 
     var rootRefs: [WorkspaceRootRef] {
         roots.map(\.reference)
     }
 
+    /// Checks captured roots only. The store checks scope membership and catalog freshness.
     func lifetimeIsCurrent() -> Bool {
-        lifetimeLease.isGenerationCurrent()
+        lifetimeTokens.allSatisfy(\.isCurrent)
+    }
+}
+
+/// A root-local revocation handle. The store invalidates it before removing the root.
+final class WorkspaceContextRootLifetimeToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+
+    var isCurrent: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return valid
+    }
+
+    func revoke() {
+        lock.lock()
+        valid = false
+        lock.unlock()
     }
 }
 

@@ -2101,6 +2101,7 @@ actor WorkspaceFileContextStore {
             guard let state = rootStatesByID[rootID] else {
                 throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
             }
+            rootLifetimeTokensByID.updateValue(WorkspaceContextRootLifetimeToken(), forKey: rootID)?.revoke()
             rootStatesByID[rootID] = RootState(
                 lifetimeID: UUID(),
                 root: state.root,
@@ -2233,6 +2234,7 @@ actor WorkspaceFileContextStore {
         ) -> UUID? {
             guard let state = rootStatesByID[rootID] else { return nil }
             let replacementLifetimeID = UUID()
+            rootLifetimeTokensByID.updateValue(WorkspaceContextRootLifetimeToken(), forKey: rootID)?.revoke()
             rootStatesByID[rootID] = RootState(
                 lifetimeID: replacementLifetimeID,
                 root: state.root,
@@ -3042,6 +3044,7 @@ actor WorkspaceFileContextStore {
     }
 
     private let sessionRootLifetimeClock = WorkspaceSessionRootLifetimeClock()
+    private var rootLifetimeTokensByID: [UUID: WorkspaceContextRootLifetimeToken] = [:]
     private var rootStatesByID: [UUID: RootState] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
@@ -3284,6 +3287,7 @@ actor WorkspaceFileContextStore {
     private var seededAuthorityReconciliationTasksByRootID: [UUID: Task<Void, Never>] = [:]
     private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
     private let unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy
+    private let startupFeatureFlags: WorktreeStartupFeatureFlags
     private var scopedIngressBarrierFlightStatesByRootID: [UUID: ScopedIngressBarrierRootFlightState] = [:]
     private var completedScopedIngressBarrierCutsByRootID: [UUID: ScopedIngressBarrierCompletedCut] = [:]
     private var nextScopedIngressBarrierToken: UInt64 = 0
@@ -3298,6 +3302,7 @@ actor WorkspaceFileContextStore {
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
             debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
             unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
+            startupFeatureFlags: WorktreeStartupFeatureFlags = .standaloneOperationalDefault(),
             enableCatalogShardShadowValidation: Bool = true,
             codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
                 try CodeMapArtifactRuntime.processWide()
@@ -3337,6 +3342,7 @@ actor WorkspaceFileContextStore {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
             self.unloadTerminationPolicy = unloadTerminationPolicy
+            self.startupFeatureFlags = startupFeatureFlags
             self.codemapRuntimeProvider = codemapRuntimeProvider
             self.codemapLocalGitClassificationProbe = codemapLocalGitClassificationProbe
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
@@ -3373,6 +3379,7 @@ actor WorkspaceFileContextStore {
         init(
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
             unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
+            startupFeatureFlags: WorktreeStartupFeatureFlags = .standaloneOperationalDefault(),
             codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
                 try CodeMapArtifactRuntime.processWide()
             },
@@ -3409,6 +3416,7 @@ actor WorkspaceFileContextStore {
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.unloadTerminationPolicy = unloadTerminationPolicy
+            self.startupFeatureFlags = startupFeatureFlags
             self.codemapRuntimeProvider = codemapRuntimeProvider
             self.codemapLocalGitClassificationProbe = codemapLocalGitClassificationProbe
             self.codemapGitEligibilityProbe = codemapGitEligibilityProbe
@@ -6022,6 +6030,7 @@ actor WorkspaceFileContextStore {
                     commit(pending.indexes)
                     rootIDsByStandardizedPath[pending.standardizedPath] = root.id
                     rootStatesByID[root.id] = pending.state
+                    rootLifetimeTokensByID.updateValue(WorkspaceContextRootLifetimeToken(), forKey: root.id)?.revoke()
                     rootLoadConfigurationsByPath[pending.standardizedPath] = pending.loadConfiguration
                     rootLoadOrder.append(root.id)
                     appliedIndexGenerationsByRootID[root.id] = 0
@@ -11498,6 +11507,7 @@ actor WorkspaceFileContextStore {
         }
         rootIDsByStandardizedPath[root.standardizedFullPath] = root.id
         rootStatesByID[root.id] = state
+        rootLifetimeTokensByID.updateValue(WorkspaceContextRootLifetimeToken(), forKey: root.id)?.revoke()
         completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
         rootLoadOrder.append(root.id)
         appliedIndexGenerationsByRootID[root.id] = 0
@@ -11518,7 +11528,7 @@ actor WorkspaceFileContextStore {
             kind: .rootLoaded
         ))
         if root.kind == .sessionWorktree,
-           WorkspaceContextStartupInstrumentation.currentFeatureFlags.observeDiffSeededWorktreeStartup
+           startupFeatureFlags.observeDiffSeededWorktreeStartup
         {
             _ = try? await admitReusableSnapshotForLoadedRoot(
                 rootID: root.id,
@@ -11747,6 +11757,7 @@ actor WorkspaceFileContextStore {
                 sessionRootLifetimeClock.advance()
             }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
+            rootLifetimeTokensByID.removeValue(forKey: rootID)?.revoke()
             invalidateRootSeedSearchShadow(rootID: rootID)
             let rootEpoch = WorkspaceCodemapRootEpoch(
                 rootID: rootID,
@@ -20919,26 +20930,83 @@ actor WorkspaceFileContextStore {
     func rootContextSnapshot(scope: WorkspaceLookupRootScope = .visibleWorkspace) -> WorkspaceContextRootSnapshot? {
         guard rootScopeAvailability(scope) == .available else { return nil }
         let selectedRoots = rootsForPathLookup(scope: scope)
-        let roots = selectedRoots.compactMap { root -> WorkspaceContextRootSnapshot.Root? in
-            guard let state = rootStatesByID[root.id] else { return nil }
-            return WorkspaceContextRootSnapshot.Root(
+        var roots: [WorkspaceContextRootSnapshot.Root] = []
+        var lifetimeTokens: [WorkspaceContextRootLifetimeToken] = []
+        roots.reserveCapacity(selectedRoots.count)
+        lifetimeTokens.reserveCapacity(selectedRoots.count)
+        for root in selectedRoots {
+            guard let state = rootStatesByID[root.id],
+                  let token = rootLifetimeTokensByID[root.id],
+                  let key = rootCatalogShardKey(for: root),
+                  key.lifetimeID == state.lifetimeID
+            else { return nil }
+            roots.append(WorkspaceContextRootSnapshot.Root(
                 reference: WorkspaceRootRef(id: root.id, name: root.name, fullPath: root.standardizedFullPath),
                 lifetimeID: state.lifetimeID,
-                catalogGeneration: catalogGenerationsByRootID[root.id] ?? 0
+                catalogGeneration: key.topologyGeneration
+            ))
+            lifetimeTokens.append(token)
+        }
+        let requirement: WorkspaceSearchCatalogAccessRequirement = .recordsAndPathIndexes
+        let generation = scopedSnapshotGeneration(
+            scope: scope,
+            validationToken: searchCatalogSnapshotValidationToken(scope: scope)
+        )
+        let preparedShards = prepareAndPublishRootCatalogShardBatch(
+            for: selectedRoots,
+            requirement: requirement
+        )
+        let matchingShards = preparedShards.flatMap { shards -> [RootCatalogShard]? in
+            guard shards.count == selectedRoots.count,
+                  zip(selectedRoots, shards).allSatisfy({ root, shard in
+                      shard.key == rootCatalogShardKey(for: root) && shard.pathSearchIndex != nil
+                  })
+            else { return nil }
+            return shards
+        }
+        let catalog: WorkspaceSearchCatalogSnapshot = if let shards = matchingShards {
+            composeSearchCatalogSnapshot(
+                rootScope: scope,
+                generation: generation,
+                roots: selectedRoots,
+                shards: shards,
+                requirement: requirement
+            )
+        } else {
+            // Retention or retag failure may leave no publishable shard. Retain a complete
+            // immutable catalog instead of claiming a partially covered generation.
+            buildAuthoritativeSearchCatalogSnapshot(
+                rootScope: scope,
+                generation: generation,
+                roots: selectedRoots,
+                requirement: requirement
             )
         }
-        guard roots.count == selectedRoots.count else { return nil }
+        guard catalog.roots.map(\.id) == selectedRoots.map(\.id),
+              catalog.rootPathIndexes.count == selectedRoots.count,
+              zip(catalog.rootPathIndexes, roots).allSatisfy({ index, root in
+                  index.identity.rootID == root.reference.id
+                      && index.identity.lifetimeID == root.lifetimeID
+                      && index.identity.topologyGeneration == root.catalogGeneration
+              })
+        else { return nil }
         return WorkspaceContextRootSnapshot(
             scope: scope,
             roots: roots,
-            catalogLease: WorkspaceSearchCatalogGenerationLease(
-                retaining: selectedRoots.compactMap { publishedRootCatalogShardsByRootID[$0.id] }
-            ),
-            lifetimeLease: sessionRootLifetimeClock.snapshot(
-                physicalRootPaths: selectedRoots.map(\.standardizedFullPath)
-            )
+            catalog: catalog,
+            lifetimeTokens: lifetimeTokens
         )
     }
+
+    #if DEBUG
+        func evictPublishedRootCatalogShardForTesting(rootID: UUID) {
+            publishedRootCatalogShardsByRootID.removeValue(forKey: rootID)
+        }
+
+        func advanceRootCatalogGenerationWithoutRetagForTesting(rootID: UUID) {
+            catalogGenerationsByRootID[rootID, default: 0] &+= 1
+        }
+    #endif
 
     func isRootContextSnapshotCurrent(_ snapshot: WorkspaceContextRootSnapshot) -> Bool {
         guard snapshot.lifetimeIsCurrent(), rootScopeAvailability(snapshot.scope) == .available else { return false }
