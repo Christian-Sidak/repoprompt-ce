@@ -417,18 +417,22 @@ enum PersistentFolderOpenResolution {
 }
 
 @MainActor
-private final class PendingPersistentWorkspaceCreation {
-    let workspaceID: UUID
+final class PendingPersistentWorkspaceCreation {
+    let workspace: WorkspaceModel
+    var workspaceID: UUID {
+        workspace.id
+    }
+
     let operationID: UUID
     private let creationTask: Task<DomainCommandOutcome, Error>
     private var joinWaiters: [UUID: CheckedContinuation<DomainCommandOutcome, Error>] = [:]
 
-    init(
-        workspaceID: UUID,
+    fileprivate init(
+        workspace: WorkspaceModel,
         operationID: UUID,
         creationTask: Task<DomainCommandOutcome, Error>
     ) {
-        self.workspaceID = workspaceID
+        self.workspace = workspace
         self.operationID = operationID
         self.creationTask = creationTask
     }
@@ -457,6 +461,21 @@ private final class PendingPersistentWorkspaceCreation {
                 self?.cancelJoin(waiterID)
             }
         }
+    }
+
+    /// The retained task, not a later catalog/local-model lookup, is the creation receipt.
+    func publishedWorkspace() async throws -> WorkspaceModel {
+        let outcome = try await join()
+        guard WorkspaceManagerViewModel.isSuccessfulDomainOutcome(outcome) else {
+            throw DomainWorkspaceAuthorityOperationError(outcome: outcome)
+        }
+        guard outcome.operationID == operationID,
+              outcome.workspace?.document.workspaceID == workspaceID
+        else {
+            throw PersistentWorkspaceCreationError.unexpectedOutcome(workspaceID, operationID)
+        }
+        try Task.checkCancellation()
+        return workspace
     }
 
     private func finishJoin(
@@ -503,6 +522,23 @@ final class PendingPersistentWorkspacePublication: Equatable {
 
     func join() async throws -> DomainCommandOutcome {
         try await creation.join()
+    }
+}
+
+private enum PersistentWorkspaceCreationError: LocalizedError {
+    case authorityUnavailable
+    case missingHandle(UUID)
+    case unexpectedOutcome(UUID, UUID)
+
+    var errorDescription: String? {
+        switch self {
+        case .authorityUnavailable:
+            "Persistent workspace creation authority is unavailable."
+        case let .missingHandle(workspaceID):
+            "Workspace \(workspaceID) has no expected authority creation handle."
+        case let .unexpectedOutcome(workspaceID, operationID):
+            "Workspace \(workspaceID) creation operation \(operationID) returned an unexpected authority identity."
+        }
     }
 }
 
@@ -1162,6 +1198,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         /// Observes explicit root assignment before persistence or lifecycle work can suspend.
         var rootEditDidApplyHandlerForTesting: (@MainActor (UUID, WorkspaceSaveSource) async -> Void)?
 
+        /// Per-instance creation fault/suspension seam; never replaces a successful authority outcome.
+        var persistentWorkspaceCreationWillExecuteHandlerForTesting:
+            (@MainActor (UUID, UUID) async throws -> Void)?
         private var workspaceSavePreparationDidFinishHandlerForTesting:
             (@Sendable (UUID, URL, Int) async -> Void)?
         private var workspaceSaveAfterAuthoritySnapshotHandlerForTesting:
@@ -4610,14 +4649,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         for workspace: WorkspaceModel,
         operationID: UUID,
         creationTask: Task<DomainCommandOutcome, Error>
-    ) {
+    ) -> PendingPersistentWorkspaceCreation? {
         if let existing = pendingPersistentWorkspaceCreationsByWorkspaceID[workspace.id] {
             // A live creation retains ownership of the workspace identity until it completes.
-            guard existing.operationID == operationID else { return }
-            return
+            guard existing.operationID == operationID else { return nil }
+            return existing
         }
         let creation = PendingPersistentWorkspaceCreation(
-            workspaceID: workspace.id,
+            workspace: workspace,
             operationID: operationID,
             creationTask: creationTask
         )
@@ -4642,6 +4681,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 creation: creation
             )
         }
+        return creation
     }
 
     private func removePendingPersistentWorkspacePublications(operationID: UUID) {
@@ -4656,7 +4696,25 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @discardableResult
     func createWorkspace(name: String, repoPaths: [String], ephemeral: Bool = false, savedInLibrary: Bool = true) -> WorkspaceModel {
+        beginWorkspaceCreation(name: name, repoPaths: repoPaths, ephemeral: ephemeral, savedInLibrary: savedInLibrary).workspace
+    }
+
+    /// Capture the exact creation in the same actor turn, before notifications or any await.
+    /// Legacy/UI callers keep their synchronous model API; authority callers cannot use it as a receipt.
+    func createPersistentWorkspace(name: String, repoPaths: [String], savedInLibrary: Bool = true) throws -> PendingPersistentWorkspaceCreation {
+        guard domainWorkspaceAuthorityClient != nil else {
+            throw PersistentWorkspaceCreationError.authorityUnavailable
+        }
+        let started = beginWorkspaceCreation(name: name, repoPaths: repoPaths, ephemeral: false, savedInLibrary: savedInLibrary)
+        guard let creation = started.creation else {
+            throw PersistentWorkspaceCreationError.missingHandle(started.workspace.id)
+        }
+        return creation
+    }
+
+    private func beginWorkspaceCreation(name: String, repoPaths: [String], ephemeral: Bool, savedInLibrary: Bool) -> (workspace: WorkspaceModel, creation: PendingPersistentWorkspaceCreation?) {
         var newWorkspace = WorkspaceModel(name: name, repoPaths: repoPaths, isSavedWorkspace: savedInLibrary)
+        var retainedCreation: PendingPersistentWorkspaceCreation?
 
         // Mark as ephemeral if needed
         newWorkspace.isEphemeral = ephemeral
@@ -4667,6 +4725,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             let creationTask = Task<DomainCommandOutcome, Error> { @MainActor [self] in
                 defer { removePendingPersistentWorkspacePublications(operationID: operationID) }
                 do {
+                    #if DEBUG
+                        try await persistentWorkspaceCreationWillExecuteHandlerForTesting?(newWorkspace.id, operationID)
+                    #endif
                     _ = try ensureWorkspaceDirectoryExists(for: newWorkspace)
                     let result = try await persistWorkspaceThroughDomainAuthority(
                         newWorkspace,
@@ -4696,7 +4757,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                     throw error
                 }
             }
-            registerPendingPersistentWorkspacePublications(
+            retainedCreation = registerPendingPersistentWorkspacePublications(
                 for: newWorkspace,
                 operationID: operationID,
                 creationTask: creationTask
@@ -4752,10 +4813,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
         }
 
-        return newWorkspace
+        return (newWorkspace, retainedCreation)
     }
 
-    /// Wait for the target's own creation before taking the window's switch lease.
+    /// Drain creation for teardown only. This nonthrowing API does not authorize activation.
     func finishWorkspaceCreation(workspaceIDs: Set<UUID>) async {
         for workspaceID in workspaceIDs {
             if let creation = pendingPersistentWorkspaceCreationsByWorkspaceID[workspaceID] {
@@ -4763,6 +4824,22 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
             await workspaceCreationTasksByID[workspaceID]?.value
         }
+    }
+
+    private func workspaceCreationBarrierResult(workspaceID: UUID) async -> WorkspaceSwitchResult? {
+        if let creation = pendingPersistentWorkspaceCreationsByWorkspaceID[workspaceID] {
+            do {
+                _ = try await creation.publishedWorkspace()
+            } catch {
+                let message = "Workspace \(creation.workspaceID) creation operation \(creation.operationID) did not complete successfully: \(error.localizedDescription)"
+                return error is CancellationError ? .cancelled(message) : .blocked(message)
+            }
+        }
+        await workspaceCreationTasksByID[workspaceID]?.value
+        guard !Task.isCancelled else {
+            return .cancelled("Workspace switch to \(workspaceID) was cancelled before activation.")
+        }
+        return nil
     }
 
     // MARK: - Switch
@@ -5174,7 +5251,9 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
-        await finishWorkspaceCreation(workspaceIDs: [newWorkspace.id])
+        if let creationResult = await workspaceCreationBarrierResult(workspaceID: newWorkspace.id) {
+            return userVisibleWorkspaceSwitchResult(creationResult)
+        }
         let currentBeforeAdmission = workspace(withID: newWorkspace.id)
         if newWorkspace.consolidatedIntoWorkspaceID != nil
             || currentBeforeAdmission?.consolidatedIntoWorkspaceID != nil
@@ -5771,7 +5850,9 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard deletionToken?.isActive ?? true else {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
         }
-        await finishWorkspaceCreation(workspaceIDs: [newWorkspace.id])
+        if let creationResult = await workspaceCreationBarrierResult(workspaceID: newWorkspace.id) {
+            return creationResult
+        }
         guard deletionToken?.isActive ?? true else {
             return .cancelled("Workspace switch to \"\(newWorkspace.name)\" was cancelled because deletion teardown timed out.")
         }
@@ -7046,7 +7127,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    private static func isSuccessfulDomainOutcome(_ outcome: DomainCommandOutcome) -> Bool {
+    fileprivate static func isSuccessfulDomainOutcome(_ outcome: DomainCommandOutcome) -> Bool {
         outcome.disposition == .applied
             || outcome.disposition == .unchanged
             || outcome.disposition == .deduplicated
