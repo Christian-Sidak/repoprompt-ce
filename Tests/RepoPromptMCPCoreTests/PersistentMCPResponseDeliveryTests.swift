@@ -37,6 +37,22 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         XCTAssertEqual(frames, [])
     }
 
+    func testPreparedCancellationDoesNotRetireReplayUntilForwarded() async throws {
+        let replayState = MCPOutstandingRequestReplayState()
+        let request = line(#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#)
+        let cancellation = line(#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#)
+        let recordedRequest = try await replayState.recordPreparedClientRequestFrame(request)
+        XCTAssertTrue(recordedRequest)
+        let recordedCancellation = try await replayState.recordPreparedClientRequestFrame(cancellation)
+        XCTAssertFalse(recordedCancellation)
+        let beforeForward = await replayState.replayFrames()
+        XCTAssertEqual(beforeForward.count, 1)
+        assertJSONLineEqual(beforeForward[0], request)
+        await replayState.recordForwardedClientFrame(cancellation)
+        let afterForward = await replayState.replayFrames()
+        XCTAssertEqual(afterForward, [])
+    }
+
     func testOutstandingReplayStateIgnoresClientResponseForAppOriginatedIDCollision() async {
         let replayState = MCPOutstandingRequestReplayState()
         let hostRequest = line(#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"README.md"}}}"#)

@@ -491,6 +491,7 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
     public let activeRequestCount: Int
     public let responseInDeliveryCount: Int
     public let cancellationTombstoneCount: Int
+    public let retiredClientCancellationCount: Int
     public let recentCompletionCount: Int
     public let pendingTransactionCount: Int
     public let replayableClientRequestCount: Int
@@ -534,6 +535,7 @@ public enum JSONRPCBridgeLedgerError: Swift.Error, Equatable, CustomStringConver
     case activeCapacityExceeded(Int)
     case tombstoneCapacityExceeded(Int)
     case invalidTransaction
+    case staleConnectionGeneration(expected: UInt64, actual: UInt64)
     case injectedFault(JSONRPCBridgeDirection, JSONRPCBridgeID?)
 
     public var description: String {
@@ -546,6 +548,7 @@ public enum JSONRPCBridgeLedgerError: Swift.Error, Equatable, CustomStringConver
         case let .activeCapacityExceeded(limit): "active JSON-RPC request limit exceeded (\(limit))"
         case let .tombstoneCapacityExceeded(limit): "JSON-RPC cancellation tombstone limit exceeded (\(limit))"
         case .invalidTransaction: "invalid or completed JSON-RPC bridge transaction"
+        case let .staleConnectionGeneration(expected, actual): "stale JSON-RPC backend generation \(expected); current generation is \(actual)"
         case let .injectedFault(direction, id): "injected JSON-RPC bridge write failure direction=\(direction.rawValue) id=\(id?.description ?? "none")"
         }
     }
@@ -659,6 +662,11 @@ public actor JSONRPCBridgeLedger {
     private var nextRequestOrdinal: UInt64 = 0
     private var active: [RequestKey: RequestState] = [:]
     private var tombstones: [RequestKey: Tombstone] = [:]
+    // Cancellation does not prove that a backend handler has physically settled.
+    // Retain exact client IDs for the backend generation, separately from the
+    // short-lived tombstones used for reverse-direction connection cleanup.
+    // The union of both stores shares maximumCancellationTombstones; no eviction.
+    private var retiredClientCancellations: [RequestKey: RequestMetadata] = [:]
     private var pendingTransactions: [UUID: PendingTransaction] = [:]
     private var recentCompletions: [RequestKey] = []
     private var hasForwardedProtocolFrame = false
@@ -685,15 +693,32 @@ public actor JSONRPCBridgeLedger {
             throw failTerminal("reconnection_attempted_with_unreplayable_work")
         }
         connectionGeneration &+= 1
+        retiredClientCancellations.removeAll()
+        tombstones = tombstones.filter { $0.key.direction == .serverToClient }
         emit(phase: "connection_started", direction: nil, messages: [], prepared: nil, terminalReason: nil)
         return connectionGeneration
+    }
+
+    /// A stale backend cannot borrow an ID reused by the next backend. Reject
+    /// before touching current work, without terminalizing the new generation.
+    public func validateConnectionGeneration(_ expected: UInt64) throws {
+        guard expected == connectionGeneration else {
+            throw JSONRPCBridgeLedgerError.staleConnectionGeneration(
+                expected: expected,
+                actual: connectionGeneration
+            )
+        }
     }
 
     public func prepare(
         frame: Data,
         direction: JSONRPCBridgeDirection,
+        expectedConnectionGeneration: UInt64? = nil,
         now: TimeInterval = Date().timeIntervalSinceReferenceDate
     ) throws -> JSONRPCBridgePreparedFrame {
+        if let expectedConnectionGeneration {
+            try validateConnectionGeneration(expectedConnectionGeneration)
+        }
         guard terminalReason == nil else {
             throw JSONRPCBridgeLedgerError.terminal(terminalReason ?? "unknown")
         }
@@ -732,7 +757,7 @@ public actor JSONRPCBridgeLedger {
                     continue
                 }
                 let key = RequestKey(direction: direction, id: id)
-                if tombstones[key] != nil {
+                if tombstones[key] != nil || retiredClientCancellations[key] != nil {
                     throw failTerminal("cancelled_id_reuse", preferredError: .cancelledIDReuse(direction, id))
                 }
                 guard Self.activeRequestCount(in: simulatedActive) < configuration.maximumActiveRequests else {
@@ -823,6 +848,16 @@ public actor JSONRPCBridgeLedger {
                         tool: tombstone.tool,
                         requestOrdinal: tombstone.ordinal
                     ))
+                } else if let retired = retiredClientCancellations[key] {
+                    discardedMessageIndices.insert(messageIndex)
+                    operations.append(.discardedTombstoneResponse(key))
+                    messages.append(JSONRPCBridgeMessageMetadata(
+                        kind: .response,
+                        id: id,
+                        method: retired.method,
+                        tool: retired.tool,
+                        requestOrdinal: retired.ordinal
+                    ))
                 } else {
                     throw failTerminal("unknown_response_id", preferredError: .unknownResponse(direction, id))
                 }
@@ -842,7 +877,7 @@ public actor JSONRPCBridgeLedger {
             case let .invalidClientMessage(id):
                 if let id, id != .null {
                     let key = RequestKey(direction: direction, id: id)
-                    if tombstones[key] != nil {
+                    if tombstones[key] != nil || retiredClientCancellations[key] != nil {
                         throw failTerminal("cancelled_id_reuse", preferredError: .cancelledIDReuse(direction, id))
                     }
                     guard Self.activeRequestCount(in: simulatedActive) < configuration.maximumActiveRequests else {
@@ -947,6 +982,7 @@ public actor JSONRPCBridgeLedger {
 
         var committedActive = active
         var committedTombstones = tombstones
+        var committedRetirements = retiredClientCancellations
         var committedCompletions = recentCompletions
 
         for operation in transaction.operations {
@@ -1005,11 +1041,17 @@ public actor JSONRPCBridgeLedger {
                     cancellationMetadata = state.metadata
                     committedActive.removeValue(forKey: key)
                 }
-                guard committedTombstones.count < configuration.maximumCancellationTombstones else {
+                guard Self.cancellationRetentionCount(
+                    tombstones: committedTombstones,
+                    retirements: committedRetirements
+                ) < configuration.maximumCancellationTombstones else {
                     throw failTerminal(
                         "cancellation_tombstone_capacity_exceeded",
                         preferredError: .tombstoneCapacityExceeded(configuration.maximumCancellationTombstones)
                     )
+                }
+                if key.direction == .clientToServer {
+                    committedRetirements[key] = cancellationMetadata
                 }
                 committedTombstones[key] = Tombstone(
                     expiresAt: now + configuration.cancellationTombstoneTTL,
@@ -1025,6 +1067,7 @@ public actor JSONRPCBridgeLedger {
 
         active = committedActive
         tombstones = committedTombstones
+        retiredClientCancellations = committedRetirements
         recentCompletions = committedCompletions
         hasForwardedProtocolFrame = true
         purgeExpiredTombstones(now: now)
@@ -1147,6 +1190,16 @@ public actor JSONRPCBridgeLedger {
         return false
     }
 
+    /// Validates and applies a socket-originated terminal control in one actor turn.
+    @discardableResult
+    public func terminalizeConnection(
+        reason: String,
+        expectedConnectionGeneration: UInt64
+    ) throws -> String {
+        try validateConnectionGeneration(expectedConnectionGeneration)
+        return terminalizeConnection(reason: reason)
+    }
+
     @discardableResult
     public func terminalizeConnection(reason: String) -> String {
         if let terminalReason {
@@ -1164,6 +1217,7 @@ public actor JSONRPCBridgeLedger {
             activeRequestCount: Self.activeRequestCount(in: active),
             responseInDeliveryCount: active.values.filter(\.isResponseInDelivery).count,
             cancellationTombstoneCount: tombstones.count,
+            retiredClientCancellationCount: retiredClientCancellations.count,
             recentCompletionCount: recentCompletions.count,
             pendingTransactionCount: pendingTransactions.count,
             replayableClientRequestCount: Self.replayableClientRequestCount(in: active),
@@ -1173,12 +1227,22 @@ public actor JSONRPCBridgeLedger {
         )
     }
 
+    private static func cancellationRetentionCount(
+        tombstones: [RequestKey: Tombstone],
+        retirements: [RequestKey: RequestMetadata]
+    ) -> Int {
+        Set(tombstones.keys).union(retirements.keys).count
+    }
+
     private func abandonServerOriginatedRequests(now: TimeInterval) {
         guard !active.isEmpty else { return }
         let abandoned = active.filter { key, _ in key.direction == .serverToClient }
         for (key, state) in abandoned {
             let metadata = state.metadata
-            guard tombstones.count < configuration.maximumCancellationTombstones else {
+            guard Self.cancellationRetentionCount(
+                tombstones: tombstones,
+                retirements: retiredClientCancellations
+            ) < configuration.maximumCancellationTombstones else {
                 _ = failTerminal("cancellation_tombstone_capacity_exceeded")
                 return
             }
@@ -1529,10 +1593,11 @@ public enum JSONRPCBridgeDelivery {
         direction: JSONRPCBridgeDirection,
         ledger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule? = nil,
+        expectedConnectionGeneration: UInt64? = nil,
         now: TimeInterval = Date().timeIntervalSinceReferenceDate,
         writer: @escaping @Sendable (Data) async throws -> Void
     ) async throws -> JSONRPCBridgePreparedFrame {
-        let prepared = try await ledger.prepare(frame: frame, direction: direction, now: now)
+        let prepared = try await ledger.prepare(frame: frame, direction: direction, expectedConnectionGeneration: expectedConnectionGeneration, now: now)
         guard let deliveryFrame = prepared.deliveryFrame else {
             try await ledger.commit(prepared, now: now)
             return prepared
