@@ -199,7 +199,7 @@ final class MCPStdioFrameWriteTests: XCTestCase {
             configuration: .init(responseSendTimeout: .seconds(5))
         )
         let deadline = StdioManualDeadline()
-        await server.setResponseSendDeadlineSleepForTesting { try await deadline.sleep() }
+        await server.setResponseSendDeadlineSleepForTesting { _ in try await deadline.sleep() }
         try await server.start(transport: transport)
         try fixture.write(Data(#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#.utf8) + Data([10]))
         await sink.waitUntilBlocked()
@@ -438,7 +438,7 @@ private actor StdioManualDeadline {
     func sleep() async throws {
         let token = UUID()
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
                 } else {
