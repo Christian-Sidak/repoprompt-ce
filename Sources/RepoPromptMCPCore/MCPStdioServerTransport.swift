@@ -36,6 +36,8 @@ actor MCPStdioServerTransport: Transport {
     private let terminalState = MCPStdioTerminalState()
     private let maximumQueuedWrites: Int
     private let writeGateObserver: (@Sendable (WriteGateEvent) -> Void)?
+    private let beforeSealReaderTeardownForTesting: (@Sendable () async -> Void)?
+    private let readEOFObserverForTesting: (@Sendable () -> Void)?
     private var writeOwnerActive = false
     private var writeWaiters: [(token: UUID, continuation: CheckedContinuation<Void, Error>)] = []
     private var writeSealed: TerminalError?
@@ -50,6 +52,8 @@ actor MCPStdioServerTransport: Transport {
         outputSink: (any MCPStdioOutputSink)? = nil,
         maximumQueuedWrites: Int = 64,
         writeGateObserver: (@Sendable (WriteGateEvent) -> Void)? = nil,
+        beforeSealReaderTeardownForTesting: (@Sendable () async -> Void)? = nil,
+        readEOFObserverForTesting: (@Sendable () -> Void)? = nil,
         pollIntervalMilliseconds: Int32 = 100,
         readBackpressureStallTimeout: Duration = .seconds(5),
         writeStallTimeout: Duration = .seconds(5),
@@ -61,6 +65,8 @@ actor MCPStdioServerTransport: Transport {
     ) {
         self.maximumQueuedWrites = max(1, maximumQueuedWrites)
         self.writeGateObserver = writeGateObserver
+        self.beforeSealReaderTeardownForTesting = beforeSealReaderTeardownForTesting
+        self.readEOFObserverForTesting = readEOFObserverForTesting
         self.stdinFD = stdinFD
         self.outputSink = outputSink ?? MCPStdioFileDescriptorOutputSink(
             descriptor: stdoutFD, pollIntervalMilliseconds: pollIntervalMilliseconds
@@ -95,6 +101,7 @@ actor MCPStdioServerTransport: Transport {
         let parentPIDProvider = parentPIDProvider
         let deliveryTracker = deliveryTracker
         let terminalState = terminalState
+        let readEOFObserverForTesting = readEOFObserverForTesting
         let maximumInboundFrameBytes = maximumInboundFrameBytes
         let maximumBufferedFrames = maximumBufferedFrames
         let readBackpressureStallTimeout = readBackpressureStallTimeout
@@ -108,8 +115,7 @@ actor MCPStdioServerTransport: Transport {
                         initial: initialParentPID,
                         current: currentParentPID
                     )
-                    await terminalState.record(terminal)
-                    captured.finish(throwing: terminal)
+                    terminalState.record(terminal, finishing: captured)
                     return
                 }
                 var descriptor = pollfd(fd: stdinFD, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)
@@ -122,20 +128,18 @@ actor MCPStdioServerTransport: Transport {
                         continue
                     }
                     let terminal = TerminalError.stdinPoll(errno: errno)
-                    await terminalState.record(terminal)
-                    captured.finish(throwing: terminal)
+                    terminalState.record(terminal, finishing: captured)
                     return
                 }
                 let count = read(stdinFD, &buffer, buffer.count)
                 if count == 0 {
                     if pending.isEmpty {
-                        await terminalState.record(.stdinEOF)
-                        captured.finish()
+                        terminalState.record(.stdinEOF, finishing: captured)
                     } else {
                         let terminal = TerminalError.stdinTruncatedFrame(bytes: pending.count)
-                        await terminalState.record(terminal)
-                        captured.finish(throwing: terminal)
+                        terminalState.record(terminal, finishing: captured)
                     }
+                    readEOFObserverForTesting?()
                     return
                 }
                 if count < 0 {
@@ -143,8 +147,7 @@ actor MCPStdioServerTransport: Transport {
                         continue
                     }
                     let terminal = TerminalError.stdinRead(errno: errno)
-                    await terminalState.record(terminal)
-                    captured.finish(throwing: terminal)
+                    terminalState.record(terminal, finishing: captured)
                     return
                 }
                 pending.append(buffer, count: count)
@@ -153,8 +156,7 @@ actor MCPStdioServerTransport: Transport {
                         bytes: pending.count,
                         maximum: maximumInboundFrameBytes
                     )
-                    await terminalState.record(terminal)
-                    captured.finish(throwing: terminal)
+                    terminalState.record(terminal, finishing: captured)
                     return
                 }
                 while let newline = pending.firstIndex(of: 0x0A) {
@@ -165,8 +167,7 @@ actor MCPStdioServerTransport: Transport {
                             bytes: frame.count,
                             maximum: maximumInboundFrameBytes
                         )
-                        await terminalState.record(terminal)
-                        captured.finish(throwing: terminal)
+                        terminalState.record(terminal, finishing: captured)
                         return
                     }
                     if !frame.isEmpty {
@@ -188,8 +189,7 @@ actor MCPStdioServerTransport: Transport {
                                             frameBytes: data.count,
                                             maximumBufferedFrames: maximumBufferedFrames
                                         )
-                                        await terminalState.record(terminal)
-                                        captured.finish(throwing: terminal)
+                                        terminalState.record(terminal, finishing: captured)
                                         return
                                     }
                                 } else {
@@ -208,8 +208,7 @@ actor MCPStdioServerTransport: Transport {
                     }
                 }
             }
-            await terminalState.record(.cancelled)
-            captured.finish(throwing: TerminalError.cancelled)
+            terminalState.record(.cancelled, finishing: captured)
         }
     }
 
@@ -221,8 +220,7 @@ actor MCPStdioServerTransport: Transport {
         if let ownedReadTask {
             await ownedReadTask.value
         }
-        await terminalState.record(.cancelled)
-        continuation?.finish()
+        terminalState.record(.cancelled, finishing: continuation)
         continuation = nil
         stream = nil
         deliveryTracker.close()
@@ -341,15 +339,18 @@ actor MCPStdioServerTransport: Transport {
         guard writeSealed == nil else { return }
         // Seal before any actor suspension; neither a queued nor a resumed owner can append bytes.
         writeSealed = terminal
+        // Claim and finish before effects can wake other tasks or observe the sealed writer.
+        // Read EOF/cancellation races on the detached reader through this same authority.
+        terminalState.record(terminal, finishing: continuation)
         writableTask?.cancel()
         let waiters = writeWaiters
         writeWaiters.removeAll()
         waiters.forEach { $0.continuation.resume(throwing: terminal) }
         writeGateObserver?(.sealed)
         deliveryTracker.close()
-        await terminalState.record(terminal)
+        // Nil in production: holds the boundary after terminal ownership, before reader teardown.
+        await beforeSealReaderTeardownForTesting?()
         readTask?.cancel()
-        continuation?.finish(throwing: terminal)
     }
 
     func receive() -> AsyncThrowingStream<Data, Error> {
@@ -357,7 +358,7 @@ actor MCPStdioServerTransport: Transport {
     }
 
     func terminalError() async -> TerminalError? {
-        await terminalState.value()
+        terminalState.value()
     }
 
     func waitForDeliveryDrain(timeout: Duration) async -> Bool {
@@ -383,28 +384,45 @@ actor MCPStdioServerTransport: Transport {
     }
 }
 
-private actor MCPStdioTerminalState {
+/// The detached reader and actor-owned writer share one synchronous terminal authority.
+/// All mutable state is protected by `lock`; claiming and finishing are one critical section.
+private final class MCPStdioTerminalState: @unchecked Sendable {
+    private let lock = NSLock()
     private var terminal: MCPStdioServerTransport.TerminalError?
     private var waiters: [CheckedContinuation<MCPStdioServerTransport.TerminalError, Never>] = []
 
-    func record(_ value: MCPStdioServerTransport.TerminalError) {
-        guard terminal == nil else { return }
-        terminal = value
-        let pending = waiters
-        waiters.removeAll()
+    func record(
+        _ value: MCPStdioServerTransport.TerminalError,
+        finishing continuation: AsyncThrowingStream<Data, Error>.Continuation?
+    ) {
+        let pending: [CheckedContinuation<MCPStdioServerTransport.TerminalError, Never>] = lock.withLock {
+            guard terminal == nil else { return [] }
+            terminal = value
+            if value == .stdinEOF {
+                continuation?.finish()
+            } else {
+                continuation?.finish(throwing: value)
+            }
+            let pending = waiters
+            waiters.removeAll()
+            return pending
+        }
         pending.forEach { $0.resume(returning: value) }
     }
 
     func value() -> MCPStdioServerTransport.TerminalError? {
-        terminal
+        lock.withLock { terminal }
     }
 
     func wait() async -> MCPStdioServerTransport.TerminalError {
-        if let terminal {
-            return terminal
-        }
-        return await withCheckedContinuation { continuation in
-            waiters.append(continuation)
+        await withCheckedContinuation { continuation in
+            lock.withLock {
+                if let terminal {
+                    continuation.resume(returning: terminal)
+                } else {
+                    waiters.append(continuation)
+                }
+            }
         }
     }
 }

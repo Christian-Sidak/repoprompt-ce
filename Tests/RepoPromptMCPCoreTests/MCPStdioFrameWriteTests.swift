@@ -74,6 +74,122 @@ final class MCPStdioFrameWriteTests: XCTestCase {
         await transport.disconnect()
     }
 
+    func testFirstWriteFailureSurvivesDisconnectAndCleanReadTermination() async throws {
+        for disconnectWhileTeardownIsSuspended in [true, false] {
+            let sink = try ScriptedStdioSink(prefixBytes: 8)
+            let fixture = try StdioInputFixture()
+            let publication = StdioSealTeardownGate()
+            let readEOF = StdioReadEOFSignal()
+            let transport = MCPStdioServerTransport(
+                stdinFD: fixture.readDescriptor, outputSink: sink,
+                writeGateObserver: { event in
+                    if case .enqueued = event { sink.recordQueued() }
+                },
+                beforeSealReaderTeardownForTesting: { await publication.suspend() },
+                readEOFObserverForTesting: { Task { await readEOF.signal() } }
+            )
+            try await transport.connect()
+            let stream = await transport.receive()
+            let frame = Data(#"{"id":7,"result":{}}"#.utf8)
+            let expected = MCPStdioServerTransport.TerminalError.stdoutWrite(
+                errno: ETIMEDOUT, bytesWritten: 8, totalBytes: frame.count + 1
+            )
+            let owner = Task { try await transport.send(frame) }
+            await sink.waitUntilBlocked()
+            let queued = Task { try await transport.send(Data(#"{"id":"7"}"#.utf8)) }
+            await sink.waitUntilQueued(1)
+            sink.failWait(errno: ETIMEDOUT)
+            await publication.waitUntilSuspended()
+            await assertFailure(queued, expected)
+            if disconnectWhileTeardownIsSuspended {
+                await transport.disconnect()
+            } else {
+                try fixture.closeWriter()
+                // Receive is already finished by stdout; wait for the reader's actual EOF attempt.
+                await readEOF.wait()
+            }
+            var streamError: Error?
+            do {
+                for try await _ in stream {
+                    XCTFail("No input frames were written")
+                }
+            } catch { streamError = error }
+            XCTAssertEqual(streamError as? MCPStdioServerTransport.TerminalError, expected)
+            let recorded = await transport.terminalError()
+            let waited = await transport.waitUntilTerminal()
+            XCTAssertEqual(recorded, expected)
+            XCTAssertEqual(waited, expected)
+            await publication.release()
+            await assertFailure(owner, expected)
+            let afterPublication = await transport.terminalError()
+            XCTAssertEqual(afterPublication, expected)
+            sink.open()
+            await assertFailure(Task { try await transport.send(Data(#"{"id":"late"}"#.utf8)) }, expected)
+            XCTAssertEqual(try sink.readWire(), Data(frame.prefix(8)))
+            await transport.disconnect()
+        }
+    }
+
+    func testReadErrorBeforeWriteFailureRemainsFirstTerminalControl() async throws {
+        let sink = try ScriptedStdioSink(prefixBytes: 8)
+        let fixture = try StdioInputFixture()
+        let transport = MCPStdioServerTransport(stdinFD: fixture.readDescriptor, outputSink: sink)
+        try await transport.connect()
+        let stream = await transport.receive()
+        let incomplete = Data(#"{"id":7"#.utf8)
+        try fixture.write(incomplete)
+        try fixture.closeWriter()
+        let expected = MCPStdioServerTransport.TerminalError.stdinTruncatedFrame(bytes: incomplete.count)
+        do {
+            for try await _ in stream {
+                XCTFail("Incomplete input cannot be delivered")
+            }
+            XCTFail("Read error must fail receive")
+        } catch { XCTAssertEqual(error as? MCPStdioServerTransport.TerminalError, expected) }
+        let before = await transport.waitUntilTerminal()
+        XCTAssertEqual(before, expected)
+        let frame = Data(#"{"id":8,"result":{}}"#.utf8)
+        let owner = Task { try await transport.send(frame) }
+        await sink.waitUntilBlocked()
+        sink.failWait(errno: ETIMEDOUT)
+        await assertFailure(owner, .stdoutWrite(errno: ETIMEDOUT, bytesWritten: 8, totalBytes: frame.count + 1))
+        await transport.disconnect()
+        let recorded = await transport.terminalError()
+        let waited = await transport.waitUntilTerminal()
+        XCTAssertEqual(recorded, expected)
+        XCTAssertEqual(waited, expected)
+        XCTAssertEqual(try sink.readWire(), Data(frame.prefix(8)))
+    }
+
+    func testCleanEOFBeforeWriteFailureRemainsFirstTerminalControl() async throws {
+        let sink = try ScriptedStdioSink(prefixBytes: 8)
+        let fixture = try StdioInputFixture()
+        let transport = MCPStdioServerTransport(stdinFD: fixture.readDescriptor, outputSink: sink)
+        try await transport.connect()
+        let stream = await transport.receive()
+        try fixture.closeWriter()
+        for try await _ in stream {
+            XCTFail("No input frames were written")
+        }
+        let before = await transport.waitUntilTerminal()
+        XCTAssertEqual(before, .stdinEOF)
+        let frame = Data(#"{"id":8,"result":{}}"#.utf8)
+        let owner = Task { try await transport.send(frame) }
+        await sink.waitUntilBlocked()
+        sink.failWait(errno: ETIMEDOUT)
+        let writeError = MCPStdioServerTransport.TerminalError.stdoutWrite(
+            errno: ETIMEDOUT, bytesWritten: 8, totalBytes: frame.count + 1
+        )
+        await assertFailure(owner, writeError)
+        await assertFailure(Task { try await transport.send(Data(#"{"id":"late"}"#.utf8)) }, writeError)
+        await transport.disconnect()
+        let recorded = await transport.terminalError()
+        let waited = await transport.waitUntilTerminal()
+        XCTAssertEqual(recorded, .stdinEOF)
+        XCTAssertEqual(waited, .stdinEOF)
+        XCTAssertEqual(try sink.readWire(), Data(frame.prefix(8)))
+    }
+
     func testZeroByteCancellationHandsOffWithoutSealing() async throws {
         let sink = try ScriptedStdioSink(prefixBytes: 0)
         let transport = MCPStdioServerTransport(
@@ -411,7 +527,7 @@ private final class ScriptedStdioSink: MCPStdioOutputSink, @unchecked Sendable {
 }
 
 private final class StdioInputFixture {
-    private let descriptors: [Int32]
+    private var descriptors: [Int32]
     var readDescriptor: Int32 {
         descriptors[0]
     }
@@ -427,7 +543,13 @@ private final class StdioInputFixture {
         guard count == data.count else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
     }
 
-    deinit { descriptors.forEach { _ = close($0) } }
+    func closeWriter() throws {
+        guard descriptors[1] >= 0 else { return }
+        guard Darwin.close(descriptors[1]) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        descriptors[1] = -1
+    }
+
+    deinit { descriptors.filter { $0 >= 0 }.forEach { _ = close($0) } }
 }
 
 /// Exercises the pinned SDK's existing deadline hook without waiting on wall time.
@@ -465,5 +587,49 @@ private actor StdioManualDeadline {
 
     private func cancel(_ token: UUID) {
         sleepers.removeValue(forKey: token)?.resume(throwing: CancellationError())
+    }
+}
+
+/// Parks outbound teardown after terminal ownership; no timer or scheduler-order assumption.
+private actor StdioSealTeardownGate {
+    private var suspended = false
+    private var released = false
+    private var owner: CheckedContinuation<Void, Never>?
+    private var observers: [CheckedContinuation<Void, Never>] = []
+
+    func suspend() async {
+        suspended = true
+        observers.forEach { $0.resume() }
+        observers.removeAll()
+        guard !released else { return }
+        await withCheckedContinuation { owner = $0 }
+    }
+
+    func waitUntilSuspended() async {
+        guard !suspended else { return }
+        await withCheckedContinuation { observers.append($0) }
+    }
+
+    func release() {
+        released = true
+        owner?.resume()
+        owner = nil
+    }
+}
+
+/// Signals the detached reader's EOF record attempt, independently of receive completion.
+private actor StdioReadEOFSignal {
+    private var observed = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        observed = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+
+    func wait() async {
+        guard !observed else { return }
+        await withCheckedContinuation { waiters.append($0) }
     }
 }
