@@ -192,178 +192,8 @@ final class MCPServerViewModel: ObservableObject {
         let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot
     }
 
-    struct FrozenFileToolAuthority {
-        let lookupContext: WorkspaceLookupContext
-        let rootCatalogSnapshot: WorkspaceRootCatalogSnapshot
-        var canonicalRoots: Set<WorkspaceRootRef> {
-            Set(rootCatalogSnapshot.primaryRoots)
-        }
-
-        let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot?
-        let sourceIdentity: AgentWorkspaceLookupContextIdentity?
-
-        @MainActor
-        static func capture(
-            lookupContext: WorkspaceLookupContext,
-            rootCatalogSnapshot: WorkspaceRootCatalogSnapshot,
-            store: WorkspaceFileContextStore,
-            sourceIdentity: AgentWorkspaceLookupContextIdentity? = nil
-        ) async throws -> FrozenFileToolAuthority {
-            try Task.checkCancellation()
-            let lifetime: WorkspaceSessionRootLifetimeSnapshot?
-            if let projection = lookupContext.bindingProjection {
-                guard Set(projection.visibleLogicalRootRefs) == Set(rootCatalogSnapshot.primaryRoots) else {
-                    throw FileToolAuthorityFailure.mismatchedProjection
-                }
-                lifetime = await store.sessionBoundRootScopeValidationSnapshot(
-                    lookupContext.rootScope,
-                    expectedPhysicalRoots: projection.physicalRootRefs
-                )
-            } else {
-                lifetime = nil
-            }
-            let canonicalRoots = Set(rootCatalogSnapshot.primaryRoots)
-            guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
-                throw FileToolAuthorityFailure.mismatchedProjection
-            }
-            try Task.checkCancellation()
-            if lookupContext.bindingProjection != nil, lifetime == nil {
-                throw FileToolAuthorityFailure.worktreeScopeUnavailable
-            }
-            if let lifetime, await !(lifetime.isCurrent()) {
-                throw FileToolAuthorityFailure.worktreeScopeUnavailable
-            }
-            return FrozenFileToolAuthority(
-                lookupContext: lookupContext,
-                rootCatalogSnapshot: rootCatalogSnapshot,
-                sessionRootLifetimeSnapshot: lifetime,
-                sourceIdentity: sourceIdentity
-            )
-        }
-
-        @MainActor
-        func validate(
-            workspaceManager: WorkspaceManagerViewModel,
-            store: WorkspaceFileContextStore
-        ) async throws {
-            guard rootCatalogSnapshot.workspaceID == rootCatalogSnapshot.ticket.workspaceID else {
-                throw FileToolAuthorityFailure.superseded
-            }
-            do {
-                try workspaceManager.validateWorkspaceSearchReadiness(
-                    rootCatalogSnapshot.ticket,
-                    admission: .rootCatalog
-                )
-            } catch {
-                throw FileToolAuthorityFailure.superseded
-            }
-            guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
-                throw FileToolAuthorityFailure.mismatchedProjection
-            }
-            if lookupContext.bindingProjection != nil {
-                guard let sessionRootLifetimeSnapshot else {
-                    throw FileToolAuthorityFailure.worktreeScopeUnavailable
-                }
-                guard await sessionRootLifetimeSnapshot.isCurrent() else {
-                    throw FileToolAuthorityFailure.worktreeScopeUnavailable
-                }
-            }
-        }
-
-        @MainActor
-        func performIfCurrent(
-            workspaceManager: WorkspaceManagerViewModel,
-            operation: @MainActor () throws -> Void
-        ) throws -> Bool {
-            if let projection = lookupContext.bindingProjection {
-                guard Set(projection.visibleLogicalRootRefs) == Set(rootCatalogSnapshot.primaryRoots) else {
-                    throw FileToolAuthorityFailure.mismatchedProjection
-                }
-            }
-
-            var operationError: Error?
-            do {
-                try workspaceManager.validateWorkspaceSearchReadiness(
-                    rootCatalogSnapshot.ticket,
-                    admission: .rootCatalog
-                )
-            } catch {
-                return false
-            }
-            if lookupContext.bindingProjection != nil {
-                guard let sessionRootLifetimeSnapshot else { return false }
-                let performed = sessionRootLifetimeSnapshot.performIfGenerationCurrent {
-                    do {
-                        try operation()
-                    } catch {
-                        operationError = error
-                    }
-                }
-                if let operationError { throw operationError }
-                return performed
-            } else {
-                try operation()
-                return true
-            }
-        }
-
-        func hasSameRoutingAuthority(as other: FrozenFileToolAuthority) -> Bool {
-            guard sourceIdentity == other.sourceIdentity,
-                  lookupContext == other.lookupContext,
-                  rootCatalogSnapshot == other.rootCatalogSnapshot,
-                  canonicalRoots == other.canonicalRoots
-            else {
-                return false
-            }
-            switch (sessionRootLifetimeSnapshot, other.sessionRootLifetimeSnapshot) {
-            case (nil, nil):
-                return true
-            case let (lhs?, _?):
-                return lhs.isGenerationCurrent()
-            default:
-                return false
-            }
-        }
-    }
-
-    enum FileToolAuthorityFailure: LocalizedError, Equatable {
-        case unavailable
-        case timedOut
-        case superseded
-        case mismatchedProjection
-        case worktreeScopeUnavailable
-
-        static let retryAfterMilliseconds = 1000
-
-        var errorCode: String {
-            switch self {
-            case .unavailable: "workspace_authority_unavailable"
-            case .timedOut: "workspace_authority_timeout"
-            case .superseded: "workspace_authority_superseded"
-            case .mismatchedProjection: "workspace_authority_mismatch"
-            case .worktreeScopeUnavailable: "worktree_scope_unavailable"
-            }
-        }
-
-        var errorDescription: String? {
-            switch self {
-            case .unavailable:
-                "The resolved workspace file authority is unavailable. No canonical checkout was used."
-            case .timedOut:
-                "The workspace root catalog did not become ready in time. No canonical checkout was used."
-            case .superseded:
-                "Workspace authority changed while the file request was resolving. No canonical checkout was used."
-            case .mismatchedProjection:
-                "The workspace root catalog no longer matches the loaded roots. No canonical checkout was used."
-            case .worktreeScopeUnavailable:
-                "The bound worktree scope is unavailable. No canonical checkout was used."
-            }
-        }
-
-        var retryable: Bool {
-            true
-        }
-    }
+    typealias FrozenFileToolAuthority = MCPFrozenFileToolAuthority
+    typealias FileToolAuthorityFailure = MCPFileToolAuthorityFailure
 
     enum FileToolLookupResolutionFailure: Error, Equatable {
         case authority(FileToolAuthorityFailure)
@@ -578,6 +408,7 @@ final class MCPServerViewModel: ObservableObject {
     private let oracleVM: OracleViewModel
     let workspaceManager: WorkspaceManagerViewModel?
     let selectionCoordinator: WorkspaceSelectionCoordinator?
+    private let validateInvocation: MCPToolInvocationValidator
     let gitArtifactAdvertisementRegistry = MCPGitArtifactAdvertisementRegistry()
     var agentWorktreeBindingStateProvider: (@MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState)?
     var agentWorktreeBindingStateResolver: (@MainActor (UUID, UUID?) async -> AgentSessionWorktreeBindingState)?
@@ -721,6 +552,15 @@ final class MCPServerViewModel: ObservableObject {
             ToolResultDTOs.SelectionReply
         ) -> Void)?
         private var beforeAgentRunWaiterWakeForTesting: (@MainActor @Sendable (UUID, UUID) async -> Void)?
+        private var debugBeforeDomainReadContextResolutionForTesting:
+            (@MainActor @Sendable (ToolInvocationContext) async -> Void)?
+
+        @MainActor
+        func setBeforeDomainReadContextResolutionForTesting(
+            _ handler: (@MainActor @Sendable (ToolInvocationContext) async -> Void)?
+        ) {
+            debugBeforeDomainReadContextResolutionForTesting = handler
+        }
 
         func setOracleChatSendOverrideForTesting(_ override: MCPOracleToolService.SendChat?) {
             oracleChatSendOverrideForTesting = override
@@ -742,12 +582,44 @@ final class MCPServerViewModel: ObservableObject {
             beforeAgentRunWaiterWakeForTesting = hook
         }
 
+        /// Explicit DEBUG-only local compatibility entry; never used by network adapters.
+        private func trustedLocalInvocationForTesting(toolName: String) async -> ToolInvocationContext {
+            let metadata: MCPRequestMetadata
+            if let override = requestMetadataOverrideForTesting {
+                metadata = override
+            } else if let invocation = MCPInvocationContextBridge.current {
+                metadata = invocation.metadata
+            } else {
+                // Test fixtures intentionally establish legacy routing scopes. Capture their
+                // evidence here, then label it local explicitly rather than trusting nil ingress.
+                let connectionID = ServerNetworkManager.currentConnectionID
+                let tabHint = ServerNetworkManager.currentTabContextHint
+                let explicitHint = ServerNetworkManager.currentExplicitWindowRoutingHint
+                let clientName = await ServerNetworkManager.shared.currentClientIdentifier()
+                let selectedWindowID = await ServerNetworkManager.shared.currentConnectionWindowID()
+                let purpose: MCPRunPurpose? = if let connectionID {
+                    await ServerNetworkManager.shared.runPurpose(for: connectionID)
+                } else { nil }
+                metadata = MCPRequestMetadata(
+                    connectionID: connectionID, clientName: clientName, windowID: selectedWindowID,
+                    runPurpose: purpose, tabContextHint: tabHint, explicitWindowRoutingHint: explicitHint
+                )
+            }
+            return ToolInvocationContext.trustedLocal(toolName: toolName, metadata: metadata)
+        }
+
         func executeAgentRunForTesting(args: [String: Value]) async throws -> Value {
-            try await agentRunToolService.execute(args: args)
+            let context = await trustedLocalInvocationForTesting(toolName: MCPWindowToolName.agentRun)
+            return try await MCPInvocationContextBridge.withInvocation(context) {
+                try await agentRunToolService.execute(args: args)
+            }
         }
 
         func executeAskOracleForTesting(args: [String: Value]) async throws -> Value {
-            try await oracleToolService.executeAskOracle(args: args)
+            let context = await trustedLocalInvocationForTesting(toolName: MCPWindowToolName.askOracle)
+            return try await MCPInvocationContextBridge.withInvocation(context) {
+                try await oracleToolService.executeAskOracle(args: args, invocationContext: context)
+            }
         }
 
         func resolveAgentSessionLifecycleMutationTargetForTesting(
@@ -800,7 +672,7 @@ final class MCPServerViewModel: ObservableObject {
             oracleChatLogToolName: MCPWindowToolName.oracleChatLog,
             promptVM: promptVM,
             oracleVM: oracleVM,
-            captureRequestMetadata: { [self] in await captureRequestMetadata() },
+            liveRunPurpose: { connectionID in await ServerNetworkManager.shared.runPurpose(for: connectionID) },
             resolveTabContextSnapshot: { [self] metadata in
                 try resolveTabContextSnapshot(
                     from: metadata,
@@ -1417,15 +1289,17 @@ final class MCPServerViewModel: ObservableObject {
     @Published var isApprovalOverlayVisible: Bool = false
 
     @MainActor
-    private lazy var windowToolRuntime = MCPAppToolBinder(windowID: windowID) { [weak self] name, freshnessPolicy, args, implementation in
+    private lazy var windowToolRuntime = MCPAppToolBinder(windowID: windowID) { [weak self, service = self.service, windowID = self.windowID] name, freshnessPolicy, args, implementation in
         guard let self else {
             throw MCPError.internalError("Window deallocated while executing \(name)")
         }
-        return try await runTool(name, freshnessPolicy: freshnessPolicy) { [weak self] in
+        // Capture the one app-binding ingress before runTool or provider work can suspend.
+        let invocationContext = try service.captureInvocationContext(toolName: name, expectedWindowID: windowID)
+        return try await runTool(name, freshnessPolicy: freshnessPolicy, invocationContext: invocationContext) { [weak self] in
             guard let self else {
                 throw MCPError.internalError("Window deallocated during \(name)")
             }
-            return try await implementation(MCPAppToolInvocation(toolName: name, windowID: windowID), args)
+            return try await implementation(MCPAppToolInvocation(toolName: name, windowID: windowID, context: invocationContext), args)
         }
     }
 
@@ -1435,31 +1309,34 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_utils") }
             return try await oracleToolService.executeOracleUtils(args: args)
         },
-        executeAskOracle: { [weak self] args in
+        executeAskOracle: { [weak self, service = self.service, windowID = self.windowID] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing ask_oracle") }
-            let metadata = await captureRequestMetadata()
+            let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.askOracle, expectedWindowID: windowID)
+            let metadata = invocationContext.metadata
             try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
                 try await self.drainReadFileAutoSelection(
                     metadata: metadata,
                     requirement: .mirroredSelectionAndMetrics
                 )
             }
-            return try await oracleToolService.executeAskOracle(args: args)
+            return try await oracleToolService.executeAskOracle(args: args, invocationContext: invocationContext)
         },
-        executeOracleSend: { [weak self] args in
+        executeOracleSend: { [weak self, service = self.service, windowID = self.windowID] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_send") }
-            let metadata = await captureRequestMetadata()
+            let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.oracleSend, expectedWindowID: windowID)
+            let metadata = invocationContext.metadata
             try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
                 try await self.drainReadFileAutoSelection(
                     metadata: metadata,
                     requirement: .mirroredSelectionAndMetrics
                 )
             }
-            return try await oracleToolService.executeOracleSend(args: args)
+            return try await oracleToolService.executeOracleSend(args: args, invocationContext: invocationContext)
         },
-        executeOracleChatLog: { [weak self] args in
+        executeOracleChatLog: { [weak self, service = self.service, windowID = self.windowID] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing oracle_chat_log") }
-            return try await oracleToolService.executeOracleChatLog(args: args)
+            let invocationContext = try service.captureInvocationContext(toolName: MCPWindowToolName.oracleChatLog, expectedWindowID: windowID)
+            return try await oracleToolService.executeOracleChatLog(args: args, invocationContext: invocationContext)
         },
         executeAgentExplore: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing agent_explore") }
@@ -1493,8 +1370,8 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while resolving tab context") }
             return try await requireCurrentTabContext(toolName: toolName)
         },
-        requireAgentModeConnection: { toolName in
-            guard let connectionID = ServerNetworkManager.currentConnectionID else {
+        requireAgentModeConnection: { invocationContext, toolName in
+            guard let connectionID = invocationContext.connectionID else {
                 throw MCPError.invalidParams("\(toolName) requires an active MCP connection")
             }
             let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
@@ -1502,6 +1379,17 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.invalidParams("\(toolName) is only available during agent mode runs")
             }
             return connectionID
+        },
+        liveRunPurpose: { connectionID in
+            await ServerNetworkManager.shared.runPurpose(for: connectionID)
+        },
+        supportsProgressNotifications: { connectionID in
+            await ServerNetworkManager.shared.supportsProgressNotifications(connectionID: connectionID)
+        },
+        sendHeartbeatProgress: { connectionID, tool, stage, message in
+            await ServerNetworkManager.shared.sendProgress(
+                for: connectionID, tool: tool, kind: .heartbeat, stage: stage, message: message
+            )
         },
         resolveAgentModeTabID: { [weak self] args, connectionID, intent in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving agent mode tab") }
@@ -2091,9 +1979,16 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else {
                 throw MCPError.internalError("Window deallocated while resolving \(toolName) context")
             }
+            let invocationContext = try MCPInvocationContextBridge.require(toolName: toolName)
+            #if DEBUG
+                if let hook = await debugBeforeDomainReadContextResolutionForTesting {
+                    await hook(invocationContext)
+                }
+            #endif
             return try await resolveDomainReadContext(
                 toolName: toolName,
-                requirement: requirement
+                requirement: requirement,
+                invocationContext: invocationContext
             )
         },
         refreshContext: { [domainRoutingCoordinator] handle in
@@ -2116,6 +2011,9 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else {
                 throw MCPError.internalError("Window deallocated while executing \(toolName)")
             }
+            // Capture before the app-context/MainActor lookup. Read-context IDs and host
+            // invocation IDs are distinct; retain both rather than substituting one for the other.
+            let invocationContext = try MCPInvocationContextBridge.require(toolName: toolName)
             let appContext = await domainReadAppExecutionContext(for: context)
             let executionServer: MCPServerViewModel
             if let appContext {
@@ -2146,7 +2044,7 @@ final class MCPServerViewModel: ObservableObject {
                 )
             case "oracle_chat_log":
                 let oracleExecutionServer: MCPServerViewModel
-                if let targetWindowID = ServerNetworkManager.currentToolDispatchAuthorization?
+                if let targetWindowID = invocationContext.dispatchAuthorization?
                     .windowIdentity?.windowID
                 {
                     guard let targetServer = await MainActor.run(body: {
@@ -3086,7 +2984,14 @@ final class MCPServerViewModel: ObservableObject {
         domainWorkspaceAuthorityClient: DomainWorkspaceAuthorityClient? = nil,
         domainReadSideEffectCoordinator: DomainReadSideEffectCoordinator? = nil,
         domainReadRuntimeIdentity: DomainRuntimeIdentity? = nil,
-        applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
+        applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
+        validateInvocation: @escaping MCPToolInvocationValidator = { context, windowID, serverIdentity in
+            await ServerNetworkManager.shared.validateToolInvocationContext(
+                context,
+                expectedWindowID: windowID,
+                expectedServerViewModelIdentity: serverIdentity
+            )
+        }
     ) {
         self.service = service
         self.perfRecorder = perfRecorder
@@ -3114,6 +3019,7 @@ final class MCPServerViewModel: ObservableObject {
             domainReadFallbackRuntimeIdentity = fallbackIdentity
         }
         self.applyEditsApprovalStore = applyEditsApprovalStore
+        self.validateInvocation = validateInvocation
 
         scheduleDomainWindowRegistration(
             activeWorkspaceID: workspaceManager.activeWorkspaceID,
@@ -3722,6 +3628,7 @@ final class MCPServerViewModel: ObservableObject {
     private func runTool<T>(
         _ name: String,
         freshnessPolicy: MCPToolFreshnessPolicy,
+        invocationContext: ToolInvocationContext,
         body: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         #if DEBUG || EDIT_FLOW_PERF
@@ -3779,7 +3686,7 @@ final class MCPServerViewModel: ObservableObject {
         // Eagerly attempt to bind any queued tab context for this connection
         // This ensures non-tab-scoped tools (like get_file_tree, file_search) can
         // trigger context binding, preventing "live mode" drift in parallel runs
-        let metadata = await captureRequestMetadata()
+        let metadata = invocationContext.metadata
         let resolvedContext = try? resolveTabContextSnapshot(
             from: metadata,
             toolName: name
@@ -3815,15 +3722,9 @@ final class MCPServerViewModel: ObservableObject {
         let toolToken = UUID()
         let capturedConnectionID = metadata.connectionID
         let serverViewModelIdentity = ObjectIdentifier(self)
-        let dispatchAuthorization = ServerNetworkManager.currentToolDispatchAuthorization
-        if let dispatchAuthorization {
-            guard await ServerNetworkManager.shared.validateToolDispatchAuthorization(
-                dispatchAuthorization,
-                expectedWindowID: windowID,
-                expectedServerViewModelIdentity: serverViewModelIdentity
-            ) else {
-                throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
-            }
+        let validateInvocation = validateInvocation
+        guard await validateInvocation(invocationContext, windowID, serverViewModelIdentity) else {
+            throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
         }
         EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolSetup, runToolSetupState)
 
@@ -3856,14 +3757,8 @@ final class MCPServerViewModel: ObservableObject {
         let task = Task {
             await startGate.wait()
             try Task.checkCancellation()
-            if let dispatchAuthorization {
-                guard await ServerNetworkManager.shared.validateToolDispatchAuthorization(
-                    dispatchAuthorization,
-                    expectedWindowID: windowID,
-                    expectedServerViewModelIdentity: serverViewModelIdentity
-                ) else {
-                    throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
-                }
+            guard await validateInvocation(invocationContext, windowID, serverViewModelIdentity) else {
+                throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
             }
             return try await ServerNetworkManager.withConnectionID(capturedConnectionID) {
                 EditFlowPerf.lifecycleEvent(
@@ -3877,7 +3772,11 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
                         try await AgentSelfMCPCallOrigin.$current.withValue(selfCallOrigin) {
-                            try await body()
+                            // Explicitly captured before this Task/start-gate hop; compatibility
+                            // helpers project this same packet rather than a successor live route.
+                            try await MCPInvocationContextBridge.withInvocation(invocationContext) {
+                                try await body()
+                            }
                         }
                     }
                     EditFlowPerf.lifecycleEvent(
@@ -3922,13 +3821,7 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
-        if let dispatchAuthorization,
-           await !(ServerNetworkManager.shared.validateToolDispatchAuthorization(
-               dispatchAuthorization,
-               expectedWindowID: windowID,
-               expectedServerViewModelIdentity: serverViewModelIdentity
-           ))
-        {
+        if await !validateInvocation(invocationContext, windowID, serverViewModelIdentity) {
             task.cancel()
             await startGate.open()
             await MainActor.run {
@@ -4545,6 +4438,7 @@ final class MCPServerViewModel: ObservableObject {
         interval: Duration = .seconds(30),
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
+        let invocationContext = try service.captureInvocationContext(toolName: tool)
         guard let connectionID else {
             return try await operation()
         }
@@ -4555,20 +4449,24 @@ final class MCPServerViewModel: ObservableObject {
 
         return try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {
-                try await operation()
+                try await MCPInvocationContextBridge.withInvocation(invocationContext) {
+                    try await operation()
+                }
             }
             group.addTask {
-                while !Task.isCancelled {
-                    try await Task.sleep(for: interval)
-                    await ServerNetworkManager.shared.sendProgress(
-                        for: connectionID,
-                        tool: tool,
-                        kind: .heartbeat,
-                        stage: stage,
-                        message: message
-                    )
+                try await MCPInvocationContextBridge.withInvocation(invocationContext) {
+                    while !Task.isCancelled {
+                        try await Task.sleep(for: interval)
+                        await ServerNetworkManager.shared.sendProgress(
+                            for: connectionID,
+                            tool: tool,
+                            kind: .heartbeat,
+                            stage: stage,
+                            message: message
+                        )
+                    }
+                    throw CancellationError()
                 }
-                throw CancellationError()
             }
             let result = try await group.next()!
             group.cancelAll()
@@ -7663,6 +7561,113 @@ private extension WorkspaceCodemapStructureExecutionPhase {
         case .freeze: .getCodeStructureFreeze
         case .render: .getCodeStructureRender
         case .assembly: .getCodeStructureAssembly
+        }
+    }
+}
+
+extension MCPFrozenFileToolAuthority {
+    @MainActor
+    static func capture(
+        lookupContext: WorkspaceLookupContext,
+        rootCatalogSnapshot: WorkspaceRootCatalogSnapshot,
+        store: WorkspaceFileContextStore,
+        sourceIdentity: AgentWorkspaceLookupContextIdentity? = nil
+    ) async throws -> MCPFrozenFileToolAuthority {
+        try Task.checkCancellation()
+        let lifetime: WorkspaceSessionRootLifetimeSnapshot?
+        if let projection = lookupContext.bindingProjection {
+            guard Set(projection.visibleLogicalRootRefs) == Set(rootCatalogSnapshot.primaryRoots) else {
+                throw MCPFileToolAuthorityFailure.mismatchedProjection
+            }
+            lifetime = await store.sessionBoundRootScopeValidationSnapshot(
+                lookupContext.rootScope,
+                expectedPhysicalRoots: projection.physicalRootRefs
+            )
+        } else {
+            lifetime = nil
+        }
+        let canonicalRoots = Set(rootCatalogSnapshot.primaryRoots)
+        guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
+            throw MCPFileToolAuthorityFailure.mismatchedProjection
+        }
+        try Task.checkCancellation()
+        if lookupContext.bindingProjection != nil, lifetime == nil {
+            throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable
+        }
+        if let lifetime, await !(lifetime.isCurrent()) {
+            throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable
+        }
+        return MCPFrozenFileToolAuthority(
+            lookupContext: lookupContext,
+            rootCatalogSnapshot: rootCatalogSnapshot,
+            sessionRootLifetimeSnapshot: lifetime,
+            sourceIdentity: sourceIdentity
+        )
+    }
+
+    @MainActor
+    func validate(
+        workspaceManager: WorkspaceManagerViewModel,
+        store: WorkspaceFileContextStore
+    ) async throws {
+        guard rootCatalogSnapshot.workspaceID == rootCatalogSnapshot.ticket.workspaceID else {
+            throw MCPFileToolAuthorityFailure.superseded
+        }
+        do {
+            try workspaceManager.validateWorkspaceSearchReadiness(
+                rootCatalogSnapshot.ticket,
+                admission: .rootCatalog
+            )
+        } catch {
+            throw MCPFileToolAuthorityFailure.superseded
+        }
+        guard await Set(store.rootRefs(scope: .visibleWorkspace)) == canonicalRoots else {
+            throw MCPFileToolAuthorityFailure.mismatchedProjection
+        }
+        if lookupContext.bindingProjection != nil {
+            guard let sessionRootLifetimeSnapshot else {
+                throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable
+            }
+            guard await sessionRootLifetimeSnapshot.isCurrent() else {
+                throw MCPFileToolAuthorityFailure.worktreeScopeUnavailable
+            }
+        }
+    }
+
+    @MainActor
+    func performIfCurrent(
+        workspaceManager: WorkspaceManagerViewModel,
+        operation: @MainActor () throws -> Void
+    ) throws -> Bool {
+        if let projection = lookupContext.bindingProjection {
+            guard Set(projection.visibleLogicalRootRefs) == Set(rootCatalogSnapshot.primaryRoots) else {
+                throw MCPFileToolAuthorityFailure.mismatchedProjection
+            }
+        }
+
+        var operationError: Error?
+        do {
+            try workspaceManager.validateWorkspaceSearchReadiness(
+                rootCatalogSnapshot.ticket,
+                admission: .rootCatalog
+            )
+        } catch {
+            return false
+        }
+        if lookupContext.bindingProjection != nil {
+            guard let sessionRootLifetimeSnapshot else { return false }
+            let performed = sessionRootLifetimeSnapshot.performIfGenerationCurrent {
+                do {
+                    try operation()
+                } catch {
+                    operationError = error
+                }
+            }
+            if let operationError { throw operationError }
+            return performed
+        } else {
+            try operation()
+            return true
         }
     }
 }

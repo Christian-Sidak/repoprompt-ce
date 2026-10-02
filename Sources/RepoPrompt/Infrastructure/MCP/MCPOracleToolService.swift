@@ -4,9 +4,9 @@ import RepoPromptDomainRuntime
 
 @MainActor
 struct MCPOracleToolService {
-    typealias RequestMetadata = MCPServerViewModel.RequestMetadata
-    typealias ResolvedTabContextSnapshot = MCPServerViewModel.ResolvedTabContextSnapshot
-    typealias TabContextSnapshot = MCPServerViewModel.TabContextSnapshot
+    typealias RequestMetadata = MCPRequestMetadata
+    typealias ResolvedTabContextSnapshot = MCPResolvedTabContextSnapshot
+    typealias TabContextSnapshot = MCPTabContextSnapshot
     typealias ChatSendOperation = @Sendable () async throws -> [String: Value]
     typealias SendChat = @MainActor @Sendable (
         _ args: [String: Value],
@@ -29,7 +29,7 @@ struct MCPOracleToolService {
     let oracleChatLogToolName: String
     let promptVM: PromptViewModel
     let oracleVM: OracleViewModel
-    let captureRequestMetadata: () async -> RequestMetadata
+    let liveRunPurpose: MCPAppPhysicalCapabilityAdapters.LiveRunPurpose
     let resolveTabContextSnapshot: (RequestMetadata) throws -> ResolvedTabContextSnapshot
     let requireCurrentTabContext: (String) async throws -> TabContextSnapshot
     let stabilizedVirtualContext: StabilizedVirtualContext
@@ -63,8 +63,8 @@ struct MCPOracleToolService {
         }
     }
 
-    func executeOracleChatLog(args: [String: Value]) async throws -> Value {
-        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+    func executeOracleChatLog(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
+        guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("oracle_chat_log requires an active MCP connection")
         }
 
@@ -116,7 +116,7 @@ struct MCPOracleToolService {
 
     // MARK: - ask_oracle (agent-mode only)
 
-    func executeAskOracle(args: [String: Value]) async throws -> Value {
+    func executeAskOracle(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
         let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "export_response"]
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
@@ -129,7 +129,7 @@ struct MCPOracleToolService {
 
         try validateCommonOracleArgs(args)
 
-        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+        guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
         }
 
@@ -290,7 +290,7 @@ struct MCPOracleToolService {
 
     // MARK: - oracle_send
 
-    func executeOracleSend(args: [String: Value]) async throws -> Value {
+    func executeOracleSend(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
         let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "export_response"]
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
@@ -325,9 +325,9 @@ struct MCPOracleToolService {
         case let .continuation(chatID): chatID
         }
 
-        let connectionID = ServerNetworkManager.currentConnectionID
+        let connectionID = invocationContext.connectionID
         let runPurpose: MCPRunPurpose = if let connectionID {
-            await ServerNetworkManager.shared.runPurpose(for: connectionID)
+            await liveRunPurpose(connectionID)
         } else {
             .unknown
         }
@@ -336,7 +336,7 @@ struct MCPOracleToolService {
         } else {
             nil
         }
-        let metadata = await captureRequestMetadata()
+        let metadata = invocationContext.metadata
         let resolvedContext = try resolveTabContextSnapshot(metadata)
         var tabContext: OracleViewModel.OracleSendTabContext? = nil
 

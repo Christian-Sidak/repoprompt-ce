@@ -908,7 +908,7 @@ final class WindowRoutingService: Service {
         )
     }
 
-    private static func bindingKindString(_ kind: MCPServerViewModel.ConnectionBindingSnapshot.BindingKind) -> String {
+    private static func bindingKindString(_ kind: MCPConnectionBindingSnapshot.BindingKind) -> String {
         switch kind {
         case .tabContext:
             "tab_context"
@@ -917,8 +917,8 @@ final class WindowRoutingService: Service {
         }
     }
 
-    private static func unboundBindingSnapshot() -> MCPServerViewModel.ConnectionBindingSnapshot {
-        MCPServerViewModel.ConnectionBindingSnapshot(
+    private static func unboundBindingSnapshot() -> MCPConnectionBindingSnapshot {
+        MCPConnectionBindingSnapshot(
             windowID: nil,
             tabID: nil,
             workspaceID: nil,
@@ -930,7 +930,7 @@ final class WindowRoutingService: Service {
         )
     }
 
-    private static func bindContextBindingSummary(from snapshot: MCPServerViewModel.ConnectionBindingSnapshot) -> MCPBindContextBindingSummary {
+    private static func bindContextBindingSummary(from snapshot: MCPConnectionBindingSnapshot) -> MCPBindContextBindingSummary {
         MCPBindContextBindingSummary(
             bindingKind: bindingKindString(snapshot.bindingKind),
             windowID: snapshot.windowID,
@@ -954,7 +954,7 @@ final class WindowRoutingService: Service {
         return "Bound to window \(windowID) but no workspace is loaded. Use manage_workspaces action='switch' to load a workspace."
     }
 
-    private func currentBindingSnapshot(for connectionID: UUID?) async -> MCPServerViewModel.ConnectionBindingSnapshot {
+    private func currentBindingSnapshot(for connectionID: UUID?) async -> MCPConnectionBindingSnapshot {
         guard let connectionID else {
             return Self.unboundBindingSnapshot()
         }
@@ -976,7 +976,7 @@ final class WindowRoutingService: Service {
            let selectedWindow = windows.first(where: { $0.windowID == selectedWindowID })
         {
             let workspace = selectedWindow.workspaceManager.activeWorkspace
-            return MCPServerViewModel.ConnectionBindingSnapshot(
+            return MCPConnectionBindingSnapshot(
                 windowID: selectedWindowID,
                 tabID: nil,
                 workspaceID: workspace?.id,
@@ -1779,7 +1779,8 @@ final class WindowRoutingService: Service {
         windowID: Int?,
         createIfMissing: Bool,
         tabName: String?,
-        connectionID: UUID?
+        connectionID: UUID?,
+        invocationContext: ToolInvocationContext
     ) async throws -> WorkingDirsBindResolution {
         let windows = windowStates.allWindows
         if let windowID, !windows.contains(where: { $0.windowID == windowID }) {
@@ -1817,7 +1818,7 @@ final class WindowRoutingService: Service {
             creationNameHint: tabName,
             existingWorkspaces: existingWorkspaces
         )
-        let clientID = await networkMgr.currentClientIdentifier() ?? "unknown-client"
+        let clientID = invocationContext.metadata.clientName ?? "unknown-client"
         let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
             clientID: clientID,
             workspaceName: workspaceName,
@@ -1893,7 +1894,7 @@ final class WindowRoutingService: Service {
         _ target: ResolvedBindTarget,
         connectionID: UUID,
         clientName: String?,
-        expectedFileAuthority: MCPServerViewModel.FrozenFileToolAuthority? = nil,
+        expectedFileAuthority: MCPFrozenFileToolAuthority? = nil,
         currentness: BindTargetCurrentness = .activeTab
     ) async throws -> Bool {
         guard let targetWindow = windowStates.allWindows.first(where: { $0.windowID == target.windowID }) else {
@@ -1987,7 +1988,7 @@ final class WindowRoutingService: Service {
     }
 
     private func connectionBindingMatchesTarget(
-        _ binding: MCPServerViewModel.ConnectionBindingSnapshot,
+        _ binding: MCPConnectionBindingSnapshot,
         target: ResolvedBindTarget
     ) -> Bool {
         binding.windowID == target.windowID
@@ -2026,7 +2027,7 @@ final class WindowRoutingService: Service {
             tabID: UUID,
             repoPaths: [String],
             connectionID: UUID,
-            authority: MCPServerViewModel.FrozenFileToolAuthority
+            authority: MCPFrozenFileToolAuthority
         ) async throws -> Bool {
             try await bindTarget(
                 ResolvedBindTarget(
@@ -2096,7 +2097,7 @@ final class WindowRoutingService: Service {
     private func ensureWorkingDirsRootProjectionIsLoaded(
         _ target: ResolvedBindTarget,
         requestedRoots: [String]
-    ) async throws -> MCPServerViewModel.FrozenFileToolAuthority {
+    ) async throws -> MCPFrozenFileToolAuthority {
         let window = try resolveWindowForBinding(windowID: target.windowID)
         let resolution = try await window.mcpServer.resolveFileToolAuthority(
             tabID: target.tabID,
@@ -2123,7 +2124,7 @@ final class WindowRoutingService: Service {
 
     private func ensureBindTargetFileAuthority(
         _ target: ResolvedBindTarget
-    ) async throws -> MCPServerViewModel.FrozenFileToolAuthority {
+    ) async throws -> MCPFrozenFileToolAuthority {
         let window = try resolveWindowForBinding(windowID: target.windowID)
         return try await window.mcpServer.resolveFileToolAuthority(
             tabID: target.tabID,
@@ -2230,9 +2231,10 @@ final class WindowRoutingService: Service {
                 guard let self else {
                     throw MCPError.internalError("Service unavailable")
                 }
+                let invocationContext = try MCPInvocationContextBridge.require(toolName: MCPGlobalToolName.bindContext)
 
                 let request = try Self.parseBindContextRequest(args)
-                let connectionID = await networkMgr.currentConnectionUUID()
+                let connectionID = invocationContext.connectionID
 
                 switch request.op {
                 case .list:
@@ -2262,7 +2264,7 @@ final class WindowRoutingService: Service {
                     guard let connectionID else {
                         throw MCPError.internalError("No active connection context")
                     }
-                    let clientName = await networkMgr.currentClientIdentifier()
+                    let clientName = invocationContext.metadata.clientName
                     do {
                         switch request.matchKind {
                         case .contextID:
@@ -2295,7 +2297,8 @@ final class WindowRoutingService: Service {
                                 windowID: request.windowID,
                                 createIfMissing: request.createIfMissing,
                                 tabName: request.tabName,
-                                connectionID: connectionID
+                                connectionID: connectionID,
+                                invocationContext: invocationContext
                             )
 
                             let tabTarget = try await MainActor.run {
@@ -2441,6 +2444,7 @@ final class WindowRoutingService: Service {
                 guard let self else {
                     throw MCPError.internalError("Service unavailable")
                 }
+                let invocationContext = try MCPInvocationContextBridge.require(toolName: MCPGlobalToolName.manageWorkspaces)
 
                 guard let action = args["action"]?.stringValue?.lowercased() else {
                     throw MCPError.invalidParams("Missing or invalid 'action' parameter")
@@ -2662,7 +2666,7 @@ final class WindowRoutingService: Service {
                     }
 
                     // Get client ID for approval
-                    let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
+                    let clientID = invocationContext.metadata.clientName ?? "unknown-client"
 
                     // Request approval
                     let approvalResult = await WorkspaceApprovalManager.shared.requestCreateWorkspaceApproval(
@@ -2855,7 +2859,7 @@ final class WindowRoutingService: Service {
                     }
 
                     // Get client ID for approval
-                    let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
+                    let clientID = invocationContext.metadata.clientName ?? "unknown-client"
 
                     // Request approval
                     let approvalResult = await WorkspaceApprovalManager.shared.requestDeleteWorkspaceApproval(
@@ -2971,7 +2975,7 @@ final class WindowRoutingService: Service {
                     try Self.validateAddFolderWorkspace(workspace)
 
                     // Get client ID for approval
-                    let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
+                    let clientID = invocationContext.metadata.clientName ?? "unknown-client"
 
                     // Request approval
                     let approvalResult = await WorkspaceApprovalManager.shared.requestAddFolderApproval(
@@ -3085,7 +3089,7 @@ final class WindowRoutingService: Service {
                     }
 
                     // Get client ID for approval
-                    let clientID = await routingService.networkMgr.currentClientIdentifier() ?? "unknown-client"
+                    let clientID = invocationContext.metadata.clientName ?? "unknown-client"
 
                     // Request approval
                     let approvalResult = await WorkspaceApprovalManager.shared.requestRemoveFolderApproval(
@@ -3123,7 +3127,7 @@ final class WindowRoutingService: Service {
 
                 case "list_tabs":
                     let targetWindow = try await routingService.resolveTargetWindow(windowID: args["window_id"]?.intValue)
-                    let connectionID = await routingService.networkMgr.currentConnectionUUID()
+                    let connectionID = invocationContext.connectionID
                     let (workspace, activeTabID, tabs, boundTabID): (WorkspaceModel?, UUID?, [ComposeTabState], UUID?) = await MainActor.run {
                         let workspace = targetWindow.workspaceManager.activeWorkspace
                         return (
@@ -3160,8 +3164,8 @@ final class WindowRoutingService: Service {
 
                     let targetWindow = try await routingService.resolveTargetWindow(windowID: args["window_id"]?.intValue)
                     let shouldFocus = args["focus"]?.boolValue ?? false
-                    let connectionID = await routingService.networkMgr.currentConnectionUUID()
-                    let clientName = await routingService.networkMgr.currentClientIdentifier()
+                    let connectionID = invocationContext.connectionID
+                    let clientName = invocationContext.metadata.clientName
                     let (workspace, tabs): (WorkspaceModel?, [ComposeTabState]) = await MainActor.run {
                         let workspace = targetWindow.workspaceManager.activeWorkspace
                         return (workspace, workspace?.composeTabs ?? [])
@@ -3197,8 +3201,8 @@ final class WindowRoutingService: Service {
 
                 case "create_tab":
                     let targetWindow = try await routingService.resolveTargetWindow(windowID: args["window_id"]?.intValue)
-                    let connectionID = await routingService.networkMgr.currentConnectionUUID()
-                    let clientName = await routingService.networkMgr.currentClientIdentifier()
+                    let connectionID = invocationContext.connectionID
+                    let clientName = invocationContext.metadata.clientName
                     let mode = args["mode"]?.stringValue?.lowercased() ?? "blank"
                     let shouldBind = args["bind"]?.boolValue ?? true
                     let shouldFocus = args["focus"]?.boolValue ?? false
@@ -3282,7 +3286,7 @@ final class WindowRoutingService: Service {
 
                     let targetWindow = try await routingService.resolveTargetWindow(windowID: args["window_id"]?.intValue)
                     let allowActive = args["allow_active"]?.boolValue ?? false
-                    let connectionID = await routingService.networkMgr.currentConnectionUUID()
+                    let connectionID = invocationContext.connectionID
                     let (workspace, activeTabID, tabs, boundTabID): (WorkspaceModel?, UUID?, [ComposeTabState], UUID?) = await MainActor.run {
                         let workspace = targetWindow.workspaceManager.activeWorkspace
                         return (

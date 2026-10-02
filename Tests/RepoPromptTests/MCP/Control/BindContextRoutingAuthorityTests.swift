@@ -186,6 +186,31 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
     }
 
     #if DEBUG
+        @MainActor
+        func testMaterializedWindowBindingWithoutInvocationContextFailsClosedWithDiagnostic() async throws {
+            let window = makeWindowInstance()
+            addTeardownBlock { @MainActor in await window.tearDown() }
+            let tools = await window.mcpServer.windowMCPTools
+            let tool = try XCTUnwrap(tools.first { $0.name == "workspace_context" })
+            let diagnostics = PR4InvocationDiagnosticRecorder()
+            let executionCountBefore = window.mcpServer.test_activeToolExecutionCount()
+
+            // Invoke the production materialized binding, not require() in isolation.
+            // No network packet and no trusted-local scope may manufacture authority.
+            await MCPInvocationContextBridge.$current.withValue(nil) {
+                await MCPInvocationContextBridge.$diagnosticSink.withValue({ diagnostics.record($0) }) {
+                    do {
+                        _ = try await tool(["op": .string("snapshot")])
+                        XCTFail("An unscoped window binding must not enter its provider")
+                    } catch {
+                        XCTAssertEqual(error as? MCPInvocationContextFailure, .missingExpectedContext)
+                    }
+                }
+            }
+            XCTAssertEqual(diagnostics.snapshot(), [.missingExpectedContext])
+            XCTAssertEqual(window.mcpServer.test_activeToolExecutionCount(), executionCountBefore)
+        }
+
         private func toolText(_ result: (content: [MCP.Tool.Content], isError: Bool?)) -> String {
             result.content.compactMap { content -> String? in
                 if case let .text(text, _, _) = content { return text }
@@ -322,6 +347,19 @@ final class BindContextRoutingAuthorityTests: XCTestCase {
 }
 
 #if DEBUG
+    private final class PR4InvocationDiagnosticRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var failures: [MCPInvocationContextFailure] = []
+
+        func record(_ failure: MCPInvocationContextFailure) {
+            lock.withLock { failures.append(failure) }
+        }
+
+        func snapshot() -> [MCPInvocationContextFailure] {
+            lock.withLock { failures }
+        }
+    }
+
     private struct ProductionMCPConnection {
         let client: Client
         let connectionID: UUID

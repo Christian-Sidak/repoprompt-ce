@@ -1009,3 +1009,112 @@ claim.
 This in-place C1/C2 slice removes WorkspaceContext, Search, and CodeMap's outbound references to Features, view models, and MCP implementation files. S8 now uses file search projections and feature-side path adapters; S9 stores selection values in WorkspaceContext and receives neutral workspace/tab values from the workspace manager; S17 uses neutral prompt/workspace values and a search-readiness contract. Startup and debug diagnostics use injected recorders from `WindowStateComposition`, following the PR 2 instrumentation contract pattern. The read-only, root-scoped `WorkspaceContextRootSnapshot` retains catalog and lifetime leases and has a Sendable/currentness contract test. No files or package targets move in this PR.
 
 Compiler-index readiness baseline on 101 files: 55 outbound target files, 168 outbound file edges, 1,040 symbols. The final index and validation tickets are recorded in `/tmp/rpce-pr-reviews/pr3-impl.md` for this worktree. FileSystem/VCS and other Infrastructure remain for subsequent milestones.
+
+
+## PR 4 MCP server prep — bounded source handoff (2026-10-02)
+
+Base/current fetched origin/main at start: `61ab8b285fa5a9281587ec9712404bfe7b5c528f`;
+clean isolated `modularization/pr4-mcp-server-seams`, zero ahead/behind at fetch.
+No fast-forward was needed. Published claims and frozen interfaces are in
+`/tmp/rpce-pr-reviews/pr4-{claims,interfaces}.md` (scratch coordination artifacts).
+
+### Split map and preserved owners
+
+- **S5 values:** single approved `MCPInvocationContext.swift`; nested compatibility
+  aliases remain in existing VM extensions. Snapshot defaults, mutable value-copy
+  behavior, revision/generation values, root projection and lifetime equality are
+  unchanged. Live MainActor capture/validate and synchronous atomic
+  `performIfGenerationCurrent` remain in the existing main VM extension.
+- **S6 app ingress:** manager captures connection/tool/invocation/window evidence;
+  TaskLocal bridges only the unchanged DomainRuntime args-only binding. Binder/VM
+  synchronously capture before suspension, pass the same explicit provider packet,
+  and revalidate exact connection/catalog/window ownership at the existing gates.
+  Oracle, control, AskUser and ContextBuilder receive context or injected app
+  purpose/progress callbacks. A missing or mismatched packet throws; DEBUG uses an
+  injected redacted existing adapter sink. Explicit local test compatibility never
+  becomes network authorization.
+- **D3 policy projection:** `MCPToolAdmissionPolicy.clientPolicySnapshot` is the
+  original app mapping, consumed at the four existing dispatch/catalog sites.
+  Admission-decision and settlement-result aliases refer to the existing domain
+  types. No callback ordering, permit registry, cancellation, settlement lease,
+  delivery fence or wire-ID/replay ownership moves.
+- **DomainRuntime/MCPCore/CLI/headless:** untouched. No file moves or new targets.
+  Only one approved new source file; no new test files or ratchet increases.
+
+### Actual async boundaries
+
+Manager resolved operation explicitly receives the packet through the existing
+watchdog/provider closures, scopes its diagnostic sink and packet around host
+invocation, and preserves the host's structured Task and existing security scopes.
+The VM captures before runTool, carries the packet through its start-gated Task,
+and reestablishes the bridge immediately around the provider. Heartbeat task-group
+children explicitly retain/reestablish the captured packet. Global window tools
+capture before MainActor and approval awaits; their helpers receive the packet or
+captured identity values. Domain reads retain the host packet alongside (not in
+place of) the separate DomainRead invocation identity. Continuation-only start,
+idle, connection and file-resolution waiters carry existing exact tokens/results
+and do not discover new routing authority on resume. No request-authority
+DispatchQueue or detached hop was found in these integration-owned app adapters.
+
+### Authorization qualification
+
+The retained nonthrowing metadata helper is **not an authorization boundary**.
+An absent metadata value can classify as administrative in compatibility code.
+Safety depends on strict mandatory network binder/read ingress and preserving the
+scoped explicit packet across the structured Host Task, runTool/start gate and
+heartbeat. Carrier-free MCPService getters return nil rather than looking up a
+live successor connection/client/window. Independent Sol production-caller audit
+found no audited contextless production adapter entry; parent spot-checked the
+complete inventory. Do not turn fixture compatibility into network authorization.
+
+### Local v8 validation evidence (dedicated validator)
+
+| Check | Conductor ticket / accounting | Result |
+| --- | --- | --- |
+| Exact network/context regressions | `b41db62d-a832-4197-9b6b-5f93c2577b36` | PASS: 6 executed, 6 passed |
+| Affected source suites | `e0a24bd2-8275-47e9-95a9-ab867070e9cb` | PASS: 195 executed, 195 passed |
+| Exact repaired fixture regressions, v8 | `4dd2173c-3cc0-48f7-8caa-a6a20d1992d0` | PASS: 11 executed, 11 passed |
+| Three repaired suites, v8 | `776e86c5-912c-4b83-9063-8f4e2a9f1161` | PASS: 78 executed, 78 passed |
+| Broad frozen-source run, v8 | `c6cb5b47-e9e3-4aad-8f6c-42285c5a1296` | PASS: 4,142 executed; 4,140 passed; 0 failed; 2 skipped |
+| DomainRuntime / MCPCore in broad-v8 | Same broad ticket, per-module identities | PASS: 268 / 66 respectively |
+| Final v8 formatter | `590321dc-e976-44fa-b196-3a12c56e2c64` | Completed, exit 0 |
+| Final v8 lint | `d4f0eb5e-966f-4d29-850d-217e8794caf9` | Completed, exit 0 |
+| Final v8 guardrails | `0c4a4894-3072-44a9-8c82-678c7ca61965` | Completed, exit 0; ratchets unchanged |
+
+Identity counts, raw logs, original failures and freeze evidence remain under
+`/tmp/rpce-pr-reviews/pr4-local-receipts/`. The v8 all-Swift/source manifest covers
+1,849 files; validator and precommit checks found drift `[]`. Integration preserves
+that manifest and makes documentation-only changes after the tested freeze. These
+checks are validator execution evidence, not claims of integration-run tests.
+
+The earlier broad-v7 ticket `b5b53855-287c-4f24-85c9-fe2d3c4219c9` remains a
+**FAILED** historical receipt: 4,142 executed, 4,129 passed, 11 failed, 2 skipped.
+The complete source/receipt audit classified all 11 as test-only direct materialized
+adapter fixtures missing the mandatory carrier. Overseer approved only mechanical
+matching trusted-local scopes at those same entries, retaining prerequisite drains,
+physical race/collision/cancellation gates and all assertions. The exact 11 and the
+broader v8 run now provide the rerun evidence; source triage alone was not a pass.
+The extra CancellationError in the first file-actions method was a repeat-validation
+obligation, not discarded. Its exact method passes in v8.
+
+Mechanical fixture adaptations are enumerated in the scratch PR draft and audit:
+ContextBuilderSelectionPrerequisiteTests (3 methods),
+MCPSelectionPrerequisiteErrorTests (4), MCPReadMutationPathContractTests (4), existing
+OracleGroupBoundary service fixture and the single ContentReadCancellationTests
+constructor near original line 435. The protected final-materialization/rollback
+regression near original line 850 is unchanged. Hoisted-type references in existing
+authority/recovery tests are mechanical; no new test files or ratchet increases.
+
+### Ref provenance and remaining acceptance
+
+The tested branch remains based on `61ab8b285fa5a9281587ec9712404bfe7b5c528f`.
+Immediately before local commit, an explicit fetch found current origin/main
+`64b9352eec13e0252500d429f64ca9d1dd5e49fd` (four commits ahead of the tested base).
+No rebase, merge, stash, history rewrite or source mutation integrates that newer
+main here. Current-main integration and revalidation require separate coordination.
+
+**NOT_RUN:** final-head `make dev-build` debug package, live CE MCP E2E (approval,
+denial, multiwindow, cancellation, replay), and headless initialize/list/read-only
+runtime checks. Dedicated validator owns these next gates. Live lifecycle requires
+separate explicit overseer approval. Local commit authorization is not push/PR or
+lifecycle authorization; no integration engineer builds/tests/formatter were run.
