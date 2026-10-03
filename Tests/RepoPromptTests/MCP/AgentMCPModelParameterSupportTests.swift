@@ -1,9 +1,15 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 final class AgentMCPModelParameterSupportTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testCursorDefinitionsPreserveExactWireIdentifiersAndChoices() {
         let definitions = AgentMCPModelParameterSupport.definitions(agent: .cursor, modelRaw: "grok-4.6")
 

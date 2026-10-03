@@ -1,7 +1,13 @@
+import RepoPromptSettingsCore
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 final class CursorLocalModelCatalogTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testCatalogPublishesReleaseGatedCursorModelsInProductOrder() {
         XCTAssertEqual(
             CursorAIModelCatalog.options.prefix(4).map(\.rawValue),

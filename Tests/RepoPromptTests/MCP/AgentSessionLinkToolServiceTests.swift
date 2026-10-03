@@ -4,6 +4,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import RepoPromptShared
 import XCTest
 
@@ -12,6 +13,11 @@ import XCTest
 /// freshly fenced managed poll/wait may carry a redacted pending interaction.
 @MainActor
 final class AgentSessionLinkToolServiceTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testWaitPreservesLegacyTimeoutRangeWithLocalInputCancellation() async throws {
         let fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
@@ -2240,7 +2246,9 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             ])
         }
         for _ in 0 ..< 400 {
-            if await fixture.authority.snapshot().parkedWaiterCount == 1 { break }
+            if await fixture.authority.snapshot().parkedWaiterCount == 1 {
+                break
+            }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         let parked = await fixture.authority.snapshot().parkedWaiterCount
@@ -2291,7 +2299,9 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             ])
         }
         for _ in 0 ..< 400 {
-            if await fixture.authority.snapshot().parkedWaiterCount == 1 { break }
+            if await fixture.authority.snapshot().parkedWaiterCount == 1 {
+                break
+            }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         let parked = await fixture.authority.snapshot().parkedWaiterCount
@@ -3406,6 +3416,11 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
 #if DEBUG
     @MainActor
     final class MCPSetModelTransportTests: XCTestCase {
+        override func setUp() {
+            super.setUp()
+            GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        }
+
         func testCapturedRequestUsesOnlyInstalledRoutingAndRejectsColdContextWithoutRepair() async throws {
             try await withFixture { fixture in
                 try await self.exerciseInstalledRouting(fixture, checkPermissions: false)

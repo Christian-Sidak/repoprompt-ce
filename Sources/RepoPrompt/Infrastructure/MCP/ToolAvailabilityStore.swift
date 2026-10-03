@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import Logging
 import MCP // For ServerNetworkManager.broadcastToolListChanged()
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Shared runtime & persistence layer for per-tool enable/disable flags.

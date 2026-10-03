@@ -3,8 +3,11 @@ import Darwin
 import Foundation
 import OSLog
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptPersistence
 import RepoPromptProcess
+import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
 enum GitPrefixControlEvidenceCacheMode {

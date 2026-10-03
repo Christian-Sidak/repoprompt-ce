@@ -1,6 +1,8 @@
 import CoreServices
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 struct WorkspaceRootCreationFSEvent: Equatable {
     let path: String

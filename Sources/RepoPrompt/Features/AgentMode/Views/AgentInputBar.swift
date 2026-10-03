@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  AgentInputBar.swift
 //  RepoPrompt
@@ -1544,15 +1546,14 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
+    @ViewBuilder
     private var imageDropOutline: some View {
-        Group {
-            if isImageDropTargeted {
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
-                    .foregroundColor(.accentColor)
-                    .padding(.horizontal, 2)
-                    .padding(.bottom, Self.footerHeight)
-            }
+        if isImageDropTargeted {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
+                .foregroundColor(.accentColor)
+                .padding(.horizontal, 2)
+                .padding(.bottom, Self.footerHeight)
         }
     }
 

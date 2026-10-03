@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Release-gated Cursor model metadata used by Agent Mode UI and MCP surfaces.
 ///

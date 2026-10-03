@@ -1,10 +1,17 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
+import RepoPromptVCS
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 @MainActor
 final class MCPWorkspaceScopedCursorModelParameterTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testFixtureRootsUseUniqueUUIDPaths() throws {
         let first = try makeFixture()
         defer { first.cleanup() }

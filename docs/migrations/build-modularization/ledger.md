@@ -1149,3 +1149,74 @@ denial, multiwindow, cancellation, replay), and headless initialize/list/read-on
 runtime checks. Dedicated validator owns these next gates. Live lifecycle requires
 separate explicit overseer approval. Local commit authorization is not push/PR or
 lifecycle authorization; no integration engineer builds/tests/formatter were run.
+
+## PR5 — B1–B4 platform extraction (2026-10-04)
+
+Base: `3fbf7d0d41a4fe04c1bc701327afd297ccaeaf74`, branch
+`modularization/pr5-platform`. Three disjoint Sol engineers owned FileSystem,
+VCS, and SettingsCore; the coordinator owned Persistence, manifests, app
+composition, and integration. PR6 WorkspaceContext extraction is not included.
+
+- **B1:** FileSystem owns watchers/FSEvents, ignore compilation and neutral
+  matching contracts, content reads, seed-plan reading, and the generic injected
+  disk writer. App metrics/recording, settings policy, authenticated seed-plan
+  adapters, and workspace write policy remain app-owned.
+- **B2:** VCS owns app-free repository/worktree queries and reusable parsers and
+  values. GitService and feature-dependent receipt/presentation authority stay
+  app-owned; no full GitService rewrite.
+- **B3:** Persistence owns CodeMapArtifacts and DurableArtifacts plus canonical
+  selection contribution values. App source-snapshot verification adapters retain
+  the original raw-byte/OID/digest guards. Presets remain deferred.
+- **B4:** SettingsCore owns the document, file store, neutral values and store,
+  including `.shared` compatibility and immutable global-ignore settings.
+  Application catalogs, notification mapping, UI normalization and bootstrap stay
+  app-owned. Persisted keys and compatibility literals are unchanged.
+
+`Sources/RepoPromptShared`, `Sources/RepoPromptDomainRuntime`,
+`Sources/RepoPromptMCP`, and the frozen prototype are untouched. Reliability
+transport/bootstrap/Exec-reporting repairs are not absorbed. Contributor overlaps
+in GitService/receipts stay at their original app paths; moved root-manifest and
+settings fixes require path reconciliation against their exact contributor heads,
+not blanket deferral or unreviewed cherry-picks.
+
+### Executed receipts
+
+| Boundary | Conductor ticket | Actual result |
+| --- | --- | --- |
+| App product | `231c341a-3c12-4eff-9f80-22d8565dee0b` | PASS |
+| MCP product | `f9e08926-d451-4d47-a78f-c50ceb82bb79` | PASS |
+| Content reads + compatibility goldens | `9fdd0a5c-051d-499d-8316-e3e768aababa` | 40 tests, zero failures |
+| Final platform owners + focused app integration | `deb667b5-66db-44cc-8c87-aa59a4bc0ec5` | 61 owning tests + 97 app tests, zero failures |
+| Event-bridge fixture regressions | `30f34235-741b-414c-829e-ffd576050374` | 12 tests, zero failures |
+| Broad final Swift source validation | `46a276bf-e38f-40ff-9ed0-fab61ce555a0` | 4,399 tests, four skipped, zero failures; 14 targets |
+| Pinned formatter + strict lint | `a4c64972-916f-4805-b49d-896de7145a2d` | PASS; 0/1,632 files require formatting |
+
+Guardrails passed, including 36 target rows, placement, dependency edges, licenses,
+headless fences and 15 metrics tests. Nested-sandbox SwiftPM manifest evaluation
+failed first; the approved unsandboxed guardrail invocation passed. This is a
+validation-environment receipt, not a source defect.
+
+Historical failed receipts are retained: focused content reads
+`010cf4d8-a793-450b-905f-0480a165f5a1` and broad
+`e89816c4-9ff6-454e-9933-a90beb1d0317`. The former exposed lost host TaskLocal
+attribution across the existing detached read worker; a captured app-owned
+attribution adapter restores the original tag without new tasks, locks or unsafe
+annotations. Its final-materialization gate failure remains unattributed despite
+subsequent focused and broad passes; it is not labeled inherited. The latter
+exposed three app test hosts bypassing startup notification-bridge installation;
+explicit fixture adapters repaired delivery without weakening any assertions.
+
+Disk-writer injection preserves independent selection keys when incoming records
+are nil, and normalization writeback uses the manager's injected writer. Regression
+coverage pins both contracts. No timeout widening, retry sleeps, authorization
+weakening or assertion removal was used to repair failures.
+
+The four gated metrics tighten to 16 files over 5,000 lines, 47 over 2,000,
+326 app-testable imports and 89 app static shared declarations. App line count
+remains advisory; its numeric baseline and headroom are unchanged. Tracked sleep
+count growth (59 to 64) is disclosed, not silently baselined upward.
+
+**NOT_RUN:** debug packaging, visible-app lifecycle, live CE MCP acceptance and
+paid provider calls. No timing benchmark is claimed; conductor execution/queue
+and global-wait accounting are available in the ticket logs. Exact-head hosted
+checks and fresh milestone Astra review remain publication gates.

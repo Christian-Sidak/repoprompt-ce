@@ -1,10 +1,16 @@
 import Foundation
 import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 @MainActor
 final class CursorModelParameterSelectionTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testChoiceResolutionPreservesExactWireValuesAndRejectsCaseCollisions() {
         let definition = ACPModelParameterDefinition(
             kind: .speed,
@@ -1037,7 +1043,9 @@ final class CursorModelParameterSelectionTests: XCTestCase {
                 if let match = registrations[baseline...].last(where: { $0.key.canonicalBaseModelRaw == canonical }) {
                     return match.id
                 }
-                if Date() >= deadline { throw RegistrationTimeout() }
+                if Date() >= deadline {
+                    throw RegistrationTimeout()
+                }
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
         }
@@ -1337,11 +1345,15 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         struct ConditionTimeout: Error {}
         let deadline = Date().addingTimeInterval(TimeInterval(seconds))
         while Date() < deadline {
-            if condition() { return }
+            if condition() {
+                return
+            }
             await Task.yield()
             try? await Task.sleep(nanoseconds: 5_000_000)
         }
-        if condition() { return }
+        if condition() {
+            return
+        }
         XCTFail("Timed out after \(seconds)s waiting for composer observation condition.")
         throw ConditionTimeout()
     }
