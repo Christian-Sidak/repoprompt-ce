@@ -187,32 +187,28 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         )
 
         let overlay = WorkspaceCodemapLiveOverlay()
-        let cleanupGate = CodemapSiblingEventGate(name: "Beta last-retain cleanup")
-        let applyGate = CodemapSiblingEventGate(name: "Beta withdrawal graph apply")
-        let cleanupTickets = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
-        let observedBetaRootIDs = CodemapLockedValues<UUID>()
+        let pendingGate = CodemapSiblingEventGate(name: "Beta pending graph apply")
+        let readyGate = CodemapSiblingEventGate(name: "Beta following graph apply")
         let fixture = try CodemapStoreFixture(
             name: #function,
             overlay: overlay,
             selectionGraphFactory: .init { rootEpoch in
                 WorkspaceCodemapSelectionGraph(
                     rootEpoch: rootEpoch,
-                    applyBuildHook: { await applyGate.holdIfArmed(rootID: rootEpoch.rootID) }
+                    applyBuildHook: {
+                        if await pendingGate.holdIfArmed(rootID: rootEpoch.rootID) { return }
+                        _ = await readyGate.holdIfArmed(rootID: rootEpoch.rootID)
+                    }
                 )
             },
             forbidCodeMapGitProcesses: true
         )
-        let store = fixture.makeProductionStore(codemapCancellationCleanupHook: { ticket in
-            guard observedBetaRootIDs.values.contains(ticket.rootEpoch.rootID) else { return }
-            cleanupTickets.append(ticket)
-            await applyGate.arm(rootID: ticket.rootEpoch.rootID)
-            await cleanupGate.holdIfArmed(rootID: ticket.rootEpoch.rootID)
-        })
+        let store = fixture.makeProductionStore()
         let loadedAlpha = try await store.loadRoot(path: alphaRoot.path)
         let loadedBeta = try await store.loadRoot(path: betaRoot.path)
         addTeardownBlock {
-            await cleanupGate.release()
-            await applyGate.release()
+            await pendingGate.release()
+            await readyGate.release()
             await store.unloadRoot(id: loadedAlpha.id)
             await store.unloadRoot(id: loadedBeta.id)
             await fixture.shutdown()
@@ -266,7 +262,8 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
 
         let betaRetains = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
         let presentationTickets = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
-        let pinnedDuringPresentation = CodemapLockedValues<WorkspaceCodemapGraphPinnedSnapshot>()
+        await pendingGate.arm(rootID: loadedBeta.id)
+        await readyGate.arm(rootID: loadedBeta.id)
         let presentationTask = Task {
             try await WorkspaceCodemapPresentationCoordinator(store: store)
                 .withPresentation(
@@ -289,37 +286,29 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
                         let joinedCount = await store.codemapArtifactDemandRetainCountForTesting(ticket)
                         XCTAssertEqual(joinedCount, 2)
                     }
-                    let replacedAlpha = try await snapshotAfterOverlayPublication(
-                        engine: engine, overlay: overlay, rootEpoch: alphaAccounting.rootEpoch
-                    )
-                    let beta = try await snapshotAfterOverlayPublication(
-                        engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
-                    )
-                    pinnedDuringPresentation.append(beta)
-                    traceSiblingSnapshot("owned", beta, ticket: betaTicket, retainCount: retainBeta ? 2 : 1)
-                    observedBetaRootIDs.append(loadedBeta.id)
-                    await cleanupGate.arm(rootID: loadedBeta.id)
-                    return (structure, replacedAlpha)
+                    return structure
                 }
         }
 
-        if !retainBeta {
-            await fulfillment(of: [cleanupGate.entered], timeout: 10)
-            let ticket = try XCTUnwrap(cleanupTickets.values.last)
-            let retainCount = await store.codemapArtifactDemandRetainCountForTesting(ticket)
-            XCTAssertEqual(retainCount, 0)
-            let beforeRemoval = try await requireReadySnapshot(engine: engine, rootEpoch: betaAccounting.rootEpoch)
-            traceSiblingSnapshot("last-retain-cleanup-gated", beforeRemoval, ticket: ticket, retainCount: retainCount)
-            await cleanupGate.release()
-            await fulfillment(of: [applyGate.entered], timeout: 10)
-            let beforeApply = try await requireReadySnapshot(engine: engine, rootEpoch: betaAccounting.rootEpoch)
-            traceSiblingSnapshot("withdrawal-apply-gated", beforeApply, ticket: ticket, retainCount: 0)
-            await applyGate.release()
-            _ = try await snapshotAfterOverlayPublication(
-                engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
-            )
+        await fulfillment(of: [pendingGate.entered], timeout: 10)
+        let maybeBetaGraph = await engine.selectionGraph(rootEpoch: betaAccounting.rootEpoch)
+        let betaGraph = try XCTUnwrap(maybeBetaGraph)
+        let pendingAccounting = await betaGraph.incrementalAccounting()
+        print("SIBLING_SCHEDULE capturedPending=\(pendingAccounting.observedGeneration) initial=\(initialBeta.snapshot.appliedGeneration)")
+        let structure = try await presentationTask.value
+        await pendingGate.release()
+        await fulfillment(of: [readyGate.entered], timeout: 10)
+        let intermediate = try await requireReadySnapshot(engine: engine, rootEpoch: betaAccounting.rootEpoch)
+        let ticket = try XCTUnwrap(presentationTickets.values.last)
+        let count = await store.codemapArtifactDemandRetainCountForTesting(ticket)
+        traceSiblingSnapshot("pending-committed-following-gated", intermediate, ticket: ticket, retainCount: count)
+        XCTAssertEqual(intermediate.snapshot.appliedGeneration, pendingAccounting.observedGeneration)
+        guard case .pending = intermediate.snapshot.slotsByFileID[betaFile.id]?.state else {
+            await readyGate.release()
+            throw GraphWaitError.snapshotPending
         }
-        let (structure, replacedAlpha) = try await presentationTask.value
+        if retainBeta { await readyGate.release() }
+        let replacedAlpha = try await requireReadySnapshot(engine: engine, rootEpoch: alphaAccounting.rootEpoch)
         XCTAssertEqual(structure.coverage, .complete)
         let alphaText = try XCTUnwrap(structure.renderedEntriesByFileID[alphaFile.id]?.text)
         let betaText = try XCTUnwrap(structure.renderedEntriesByFileID[betaFile.id]?.text)
@@ -340,9 +329,13 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         )
         XCTAssertNil(replacedAlpha.snapshot.nodesByFileID[betaFile.id])
 
-        let untouchedBeta = try await snapshotAfterOverlayPublication(
-            engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
-        )
+        let untouchedBeta: WorkspaceCodemapGraphPinnedSnapshot = if retainBeta {
+            try await snapshotAfterOverlayPublication(
+                engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
+            )
+        } else {
+            try await requireReadySnapshot(engine: engine, rootEpoch: betaAccounting.rootEpoch)
+        }
         let presentationTicket = try XCTUnwrap(presentationTickets.values.last)
         let finalRetainCount = await store.codemapArtifactDemandRetainCountForTesting(presentationTicket)
         traceSiblingSnapshot("final", untouchedBeta, ticket: presentationTicket, retainCount: finalRetainCount)
@@ -351,26 +344,20 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         XCTAssertTrue(untouchedBeta.snapshot.coverage.isComplete)
         XCTAssertNil(untouchedBeta.snapshot.nodesByFileID[alphaFile.id])
         XCTAssertEqual(fixture.codeMapGitProcessAttempts.values, [])
-        // An immutable pin remains valid even when the latest graph withdraws the live demand.
-        let pinnedBeta = try XCTUnwrap(pinnedDuringPresentation.values.last)
-        XCTAssertEqual(definitions(in: pinnedBeta, fileID: betaFile.id), ["BetaOnlyProps"])
-        XCTAssertTrue(pinnedBeta.snapshot.coverage.isComplete)
-
+        await readyGate.release()
         if let retained = betaRetains.values.last {
-            let releaseTask = Task { await store.cancelCodemapArtifactDemand(retained) }
-            await fulfillment(of: [cleanupGate.entered], timeout: 10)
-            let count = await store.codemapArtifactDemandRetainCountForTesting(retained)
-            XCTAssertEqual(count, 0)
-            await cleanupGate.release()
-            await fulfillment(of: [applyGate.entered], timeout: 10)
-            await applyGate.release()
-            let released = await releaseTask.value
+            let released = await store.cancelCodemapArtifactDemand(retained)
             XCTAssertTrue(released)
-            let afterRelease = try await snapshotAfterOverlayPublication(
-                engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
-            )
-            traceSiblingSnapshot("control-last-retain-released", afterRelease, ticket: retained, retainCount: 0)
         }
+        let afterRelease = try await snapshotAfterOverlayPublication(
+            engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
+        )
+        traceSiblingSnapshot("last-retain-released", afterRelease, ticket: ticket, retainCount: 0)
+        XCTAssertEqual(definitions(in: afterRelease, fileID: betaFile.id), ["BetaOnlyProps"])
+        XCTAssertTrue(afterRelease.snapshot.coverage.isComplete)
+        XCTAssertNil(afterRelease.snapshot.nodesByFileID[alphaFile.id])
+        XCTAssertEqual(definitions(in: initialBeta, fileID: betaFile.id), ["BetaOnlyProps"])
+        XCTAssertTrue(initialBeta.snapshot.coverage.isComplete)
     }
 
     func testFilesystemAuthorityReplacementAndReloadRejectStaleCompletions() async throws {
@@ -1168,14 +1155,15 @@ private actor CodemapSiblingEventGate {
         self.rootID = rootID
     }
 
-    func holdIfArmed(rootID: UUID) async {
-        guard self.rootID == rootID, !consumed else { return }
+    func holdIfArmed(rootID: UUID) async -> Bool {
+        guard self.rootID == rootID, !consumed else { return false }
         consumed = true
         entered.fulfill()
         await withCheckedContinuation { continuation in
             if released { continuation.resume() }
             else { self.continuation = continuation }
         }
+        return true
     }
 
     func release() {
