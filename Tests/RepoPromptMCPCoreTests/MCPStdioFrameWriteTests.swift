@@ -5,6 +5,30 @@ import Foundation
 import XCTest
 
 final class MCPStdioFrameWriteTests: XCTestCase {
+    func testScriptedSinkReportsSyscallFailureWithoutNegativeWriteCounts() throws {
+        let frame = Data(#"{"id":7}"#.utf8)
+        for failInitialPrefix in [true, false] {
+            let sink = try ScriptedStdioSink(prefixBytes: 2)
+            if !failInitialPrefix {
+                let prefixResult = frame.withUnsafeBytes { sink.write($0) }
+                guard case .wrote(2) = prefixResult else {
+                    XCTFail("Expected a successful two-byte prefix")
+                    continue
+                }
+                sink.open()
+            }
+            sink.failNextWriteWithBadDescriptor()
+            let bytes = failInitialPrefix ? frame : Data(frame.dropFirst(2))
+            let result = bytes.withUnsafeBytes { sink.write($0) }
+            if case let .failed(code) = result {
+                XCTAssertEqual(code, EBADF)
+            } else {
+                XCTFail("Expected EBADF instead of a negative write count: \(result)")
+            }
+            XCTAssertEqual(try sink.readWire(), failInitialPrefix ? Data() : Data(frame.prefix(2)))
+        }
+    }
+
     func testConcurrentSendCannotAppendInsideBlockedFrame() async throws {
         let sink = try ScriptedStdioSink(prefixBytes: 8)
         let transport = MCPStdioServerTransport(
@@ -380,6 +404,7 @@ private final class ScriptedStdioSink: MCPStdioOutputSink, @unchecked Sendable {
     private var wrotePrefix = false
     private var opened = false
     private var written = 0
+    private var failNextWrite = false
     private var blocked = false
     private var blockedWaiters: [CheckedContinuation<Void, Never>] = []
     private var writableWaiter: CheckedContinuation<MCPStdioWritableResult, Never>?
@@ -405,21 +430,34 @@ private final class ScriptedStdioSink: MCPStdioOutputSink, @unchecked Sendable {
         if !wrotePrefix {
             wrotePrefix = true
             firstPrefix = Data(bytes.prefix(prefixBytes))
-            let count = Darwin.write(descriptors[1], bytes.baseAddress, prefixBytes)
-            written += max(0, count)
+            let count = writePipe(bytes, count: prefixBytes)
+            guard count >= 0 else { return .failed(errno) }
+            written += count
             return prefixBytes == 0 ? .wouldBlock : .wrote(count)
         }
         if !opened, bytes.first != UInt8(ascii: "{") {
             return .wouldBlock
         }
-        let count = Darwin.write(descriptors[1], bytes.baseAddress, bytes.count)
-        written += max(0, count)
+        let count = writePipe(bytes, count: bytes.count)
+        guard count >= 0 else { return .failed(errno) }
+        written += count
         if !opened {
             secondWrote = true
             secondWriteWaiter?.resume()
             secondWriteWaiter = nil
         }
         return .wrote(count)
+    }
+
+    /// Called under the sink lock; -1 deterministically yields EBADF without touching owned descriptors.
+    private func writePipe(_ bytes: UnsafeRawBufferPointer, count: Int) -> Int {
+        let descriptor = failNextWrite ? -1 : descriptors[1]
+        failNextWrite = false
+        return Darwin.write(descriptor, bytes.baseAddress, count)
+    }
+
+    func failNextWriteWithBadDescriptor() {
+        lock.withLock { failNextWrite = true }
     }
 
     func awaitWritable() async -> MCPStdioWritableResult {
