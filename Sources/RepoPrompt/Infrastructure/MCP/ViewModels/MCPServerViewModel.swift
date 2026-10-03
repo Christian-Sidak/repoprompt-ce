@@ -1172,6 +1172,21 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private var dashboardSubscriptionID: UUID?
 
+    /// Task that iterates this window's own MCP state stream. Cancelled in
+    /// `stopServiceObservation()` during window teardown and in `deinit` so a
+    /// closed window's subscription — and this view model — are released.
+    private var stateObservationTask: Task<Void, Never>?
+
+    /// Set by `stopServiceObservation()` during window teardown; prevents a
+    /// late `updateDashboardSubscriptionIfNeeded()` from re-arming the
+    /// dashboard loop (which holds `self`) while teardown is in flight.
+    private var serviceObservationStopped = false
+
+    deinit {
+        stateObservationTask?.cancel()
+        dashboardTask?.cancel()
+    }
+
     enum DashboardConsumer: Hashable {
         case toolbarPopover
         case statusView
@@ -3052,13 +3067,6 @@ final class MCPServerViewModel: ObservableObject {
         // Observe external client events from disk
         observeExternalEvents()
 
-        // ⬇️ NEW: Initialise local published properties with current service snapshot
-        Task { [weak self] in
-            guard let self else { return }
-            let snap = await self.service.currentState()
-            await apply(snap) // @MainActor method
-        }
-
         workspaceManager.$workspaces
             .dropFirst()
             .sink { [weak self] workspaces in
@@ -3079,17 +3087,36 @@ final class MCPServerViewModel: ObservableObject {
 
     // MARK: – Private helpers
 
-    /// Listens to `service.stateStream` and updates UI state.
-    /// Runs once during init, so no cancellation handling needed.
+    /// Listens to this window's own MCP state stream and updates UI state.
+    /// The per-subscriber stream ends via `stopServiceObservation()` during
+    /// window teardown (or task cancellation from `deinit`), so the loop does
+    /// not retain this view model for the life of the process.
     private func observeService() {
-        Task { [weak self] in
-            guard let self else { return }
-
-            for await snapshot in service.stateStream {
+        stateObservationTask = Task { [weak self, service = self.service] in
+            let (subscriptionID, stream) = await service.subscribeToStateUpdates()
+            defer {
+                Task { [service] in
+                    await service.unsubscribeFromStateUpdates(id: subscriptionID)
+                }
+            }
+            for await snapshot in stream {
+                guard !Task.isCancelled else { break }
                 // Hop back to the main actor for all UI/state mutations
-                await apply(snapshot)
+                await self?.apply(snapshot)
             }
         }
+    }
+
+    /// Ends this window's MCP state subscription. Called from
+    /// `WindowState.tearDown()` so the stream finishes and the observation
+    /// loop releases this view model; `deinit` cancels the task as a backstop.
+    /// The dashboard subscription is stopped too: its loop also holds `self`,
+    /// so leaving it running would keep the view model alive after close.
+    func stopServiceObservation() {
+        serviceObservationStopped = true
+        stateObservationTask?.cancel()
+        stateObservationTask = nil
+        stopDashboardUpdatesSubscription(clearSnapshot: true)
     }
 
     /// Observes external client error events written to disk by the CLI
@@ -3137,12 +3164,13 @@ final class MCPServerViewModel: ObservableObject {
         }
 
         // Request user attention if app is not active
-        if snap.pendingClientID != nil, !NSApp.isActive {
+        if snap.pendingClientID != nil, NSApp?.isActive == false {
             NSApp.requestUserAttention(.criticalRequest)
         }
 
         if shouldObserveDashboardUpdates {
             let latestDashboard = await service.dashboardSnapshot()
+            guard !Task.isCancelled else { return }
             dashboard = latestDashboard
         } else if !windowToolsEnabled {
             dashboard = nil
@@ -3457,7 +3485,7 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func startDashboardUpdatesIfNeeded() {
-        guard shouldObserveDashboardUpdates, dashboardTask == nil else { return }
+        guard !serviceObservationStopped, shouldObserveDashboardUpdates, dashboardTask == nil else { return }
 
         let taskID = UUID()
         dashboardTaskID = taskID
@@ -3492,7 +3520,8 @@ final class MCPServerViewModel: ObservableObject {
 
             let initialSnap = await service.dashboardSnapshot()
             await MainActor.run {
-                guard self.shouldObserveDashboardUpdates else { return }
+                guard !Task.isCancelled, self.dashboardTaskID == taskID,
+                      self.shouldObserveDashboardUpdates else { return }
                 self.dashboard = initialSnap
             }
 
@@ -3502,7 +3531,8 @@ final class MCPServerViewModel: ObservableObject {
                 let snap = await service.dashboardSnapshot()
                 mcpServerViewModelDebugLog("Dashboard snapshot fetched with \(snap.connections.count) connection(s)")
                 await MainActor.run {
-                    guard self.shouldObserveDashboardUpdates else { return }
+                    guard !Task.isCancelled, self.dashboardTaskID == taskID,
+                          self.shouldObserveDashboardUpdates else { return }
                     self.dashboard = snap
                 }
             }

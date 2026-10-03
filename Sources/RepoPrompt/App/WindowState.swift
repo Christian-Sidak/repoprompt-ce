@@ -2573,6 +2573,7 @@ class WindowState: ObservableObject {
         // memory and prevent stale windows from multiplying catalog snapshot work.
         domainWorkspacePresentationBridge?.stop()
         await mcpServer.unregisterDomainRoutingWindow()
+        mcpServer.stopServiceObservation()
 
         // App-level termination already coordinates agent/session and MCP shutdown.
         // Skip duplicate per-window teardown work on quit so close latency stays bounded.
