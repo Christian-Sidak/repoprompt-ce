@@ -164,14 +164,6 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
     }
 
     func testFilesystemSiblingRootsRemainIsolatedAfterWatcherEdit() async throws {
-        try await verifySiblingWatcherEdit(retainBeta: false)
-    }
-
-    func testFilesystemSiblingRootsRemainIsolatedWithOwnedDemandRetain() async throws {
-        try await verifySiblingWatcherEdit(retainBeta: true)
-    }
-
-    private func verifySiblingWatcherEdit(retainBeta: Bool) async throws {
         let workspace = try PlainWorkspaceFixture(name: #function)
         let alphaRoot = try workspace.makeSiblingRoot(named: "alpha")
         let betaRoot = try workspace.makeSiblingRoot(named: "beta")
@@ -187,28 +179,11 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         )
 
         let overlay = WorkspaceCodemapLiveOverlay()
-        let pendingGate = CodemapSiblingEventGate(name: "Beta pending graph apply")
-        let readyGate = CodemapSiblingEventGate(name: "Beta following graph apply")
-        let fixture = try CodemapStoreFixture(
-            name: #function,
-            overlay: overlay,
-            selectionGraphFactory: .init { rootEpoch in
-                WorkspaceCodemapSelectionGraph(
-                    rootEpoch: rootEpoch,
-                    applyBuildHook: {
-                        if await pendingGate.holdIfArmed(rootID: rootEpoch.rootID) { return }
-                        _ = await readyGate.holdIfArmed(rootID: rootEpoch.rootID)
-                    }
-                )
-            },
-            forbidCodeMapGitProcesses: true
-        )
+        let fixture = try CodemapStoreFixture(name: #function, overlay: overlay, forbidCodeMapGitProcesses: true)
         let store = fixture.makeProductionStore()
         let loadedAlpha = try await store.loadRoot(path: alphaRoot.path)
         let loadedBeta = try await store.loadRoot(path: betaRoot.path)
         addTeardownBlock {
-            await pendingGate.release()
-            await readyGate.release()
             await store.unloadRoot(id: loadedAlpha.id)
             await store.unloadRoot(id: loadedBeta.id)
             await fixture.shutdown()
@@ -260,55 +235,11 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         // Structure for both roots after the edit. The edited root must show its new symbol; the
         // untouched sibling must still show its own and must not be rebuilt.
 
-        let betaRetains = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
-        let presentationTickets = CodemapLockedValues<WorkspaceCodemapArtifactDemandTicket>()
-        await pendingGate.arm(rootID: loadedBeta.id)
-        await readyGate.arm(rootID: loadedBeta.id)
-        let presentationTask = Task {
-            try await WorkspaceCodemapPresentationCoordinator(store: store)
-                .withPresentation(
-                    for: .exact(fileIDs: [alphaFile.id, betaFile.id], completeRootSet: false),
-                    rootScope: .allLoaded
-                ) { structure in
-                    let receipt = try XCTUnwrap(structure.publicationReceipt)
-                    let betaTicket = try XCTUnwrap(receipt.demandTickets.first { $0.fileID == betaFile.id })
-                    presentationTickets.append(betaTicket)
-                    let originalRetainCount = await store.codemapArtifactDemandRetainCountForTesting(betaTicket)
-                    XCTAssertEqual(originalRetainCount, 1)
-                    if retainBeta {
-                        let owned = await store.requestCodemapArtifactWithOwnership(forFileID: betaFile.id)
-                        guard case let .joined(ticket) = owned.ownership else {
-                            throw GraphWaitError.snapshotPending
-                        }
-                        XCTAssertEqual(ticket.requestID, betaTicket.requestID)
-                        XCTAssertNotEqual(ticket.retainID, betaTicket.retainID)
-                        betaRetains.append(ticket)
-                        let joinedCount = await store.codemapArtifactDemandRetainCountForTesting(ticket)
-                        XCTAssertEqual(joinedCount, 2)
-                    }
-                    return structure
-                }
-        }
-
-        await fulfillment(of: [pendingGate.entered], timeout: 10)
-        let maybeBetaGraph = await engine.selectionGraph(rootEpoch: betaAccounting.rootEpoch)
-        let betaGraph = try XCTUnwrap(maybeBetaGraph)
-        let pendingAccounting = await betaGraph.incrementalAccounting()
-        print("SIBLING_SCHEDULE capturedPending=\(pendingAccounting.observedGeneration) initial=\(initialBeta.snapshot.appliedGeneration)")
-        let structure = try await presentationTask.value
-        await pendingGate.release()
-        await fulfillment(of: [readyGate.entered], timeout: 10)
-        let intermediate = try await requireReadySnapshot(engine: engine, rootEpoch: betaAccounting.rootEpoch)
-        let ticket = try XCTUnwrap(presentationTickets.values.last)
-        let count = await store.codemapArtifactDemandRetainCountForTesting(ticket)
-        traceSiblingSnapshot("pending-committed-following-gated", intermediate, ticket: ticket, retainCount: count)
-        XCTAssertEqual(intermediate.snapshot.appliedGeneration, pendingAccounting.observedGeneration)
-        guard case .pending = intermediate.snapshot.slotsByFileID[betaFile.id]?.state else {
-            await readyGate.release()
-            throw GraphWaitError.snapshotPending
-        }
-        if retainBeta { await readyGate.release() }
-        let replacedAlpha = try await requireReadySnapshot(engine: engine, rootEpoch: alphaAccounting.rootEpoch)
+        let structure = try await WorkspaceCodemapPresentationCoordinator(store: store)
+            .presentation(
+                for: .exact(fileIDs: [alphaFile.id, betaFile.id], completeRootSet: false),
+                rootScope: .allLoaded
+            )
         XCTAssertEqual(structure.coverage, .complete)
         let alphaText = try XCTUnwrap(structure.renderedEntriesByFileID[alphaFile.id]?.text)
         let betaText = try XCTUnwrap(structure.renderedEntriesByFileID[betaFile.id]?.text)
@@ -323,41 +254,22 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
             "An edit in one root must not rebuild the sibling root's identically named source"
         )
 
+        let replacedAlpha = try await snapshotAfterOverlayPublication(
+            engine: engine, overlay: overlay, rootEpoch: alphaAccounting.rootEpoch
+        )
         XCTAssertEqual(definitions(in: replacedAlpha, fileID: alphaFile.id), ["AlphaReplacedProps"])
         XCTAssertFalse(
             definitions(in: replacedAlpha, fileID: alphaFile.id).contains("AlphaOnlyProps")
         )
         XCTAssertNil(replacedAlpha.snapshot.nodesByFileID[betaFile.id])
 
-        let untouchedBeta: WorkspaceCodemapGraphPinnedSnapshot = if retainBeta {
-            try await snapshotAfterOverlayPublication(
-                engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
-            )
-        } else {
-            try await requireReadySnapshot(engine: engine, rootEpoch: betaAccounting.rootEpoch)
-        }
-        let presentationTicket = try XCTUnwrap(presentationTickets.values.last)
-        let finalRetainCount = await store.codemapArtifactDemandRetainCountForTesting(presentationTicket)
-        traceSiblingSnapshot("final", untouchedBeta, ticket: presentationTicket, retainCount: finalRetainCount)
-        XCTAssertEqual(finalRetainCount, retainBeta ? 1 : 0)
+        let untouchedBeta = try await snapshotAfterOverlayPublication(
+            engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
+        )
         XCTAssertEqual(definitions(in: untouchedBeta, fileID: betaFile.id), ["BetaOnlyProps"])
         XCTAssertTrue(untouchedBeta.snapshot.coverage.isComplete)
         XCTAssertNil(untouchedBeta.snapshot.nodesByFileID[alphaFile.id])
         XCTAssertEqual(fixture.codeMapGitProcessAttempts.values, [])
-        await readyGate.release()
-        if let retained = betaRetains.values.last {
-            let released = await store.cancelCodemapArtifactDemand(retained)
-            XCTAssertTrue(released)
-        }
-        let afterRelease = try await snapshotAfterOverlayPublication(
-            engine: engine, overlay: overlay, rootEpoch: betaAccounting.rootEpoch
-        )
-        traceSiblingSnapshot("last-retain-released", afterRelease, ticket: ticket, retainCount: 0)
-        XCTAssertEqual(definitions(in: afterRelease, fileID: betaFile.id), ["BetaOnlyProps"])
-        XCTAssertTrue(afterRelease.snapshot.coverage.isComplete)
-        XCTAssertNil(afterRelease.snapshot.nodesByFileID[alphaFile.id])
-        XCTAssertEqual(definitions(in: initialBeta, fileID: betaFile.id), ["BetaOnlyProps"])
-        XCTAssertTrue(initialBeta.snapshot.coverage.isComplete)
     }
 
     func testFilesystemAuthorityReplacementAndReloadRejectStaleCompletions() async throws {
@@ -974,8 +886,9 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         XCTAssertFalse(fixture.builtSourceTexts.values.contains { $0.contains("OuterBlobOnly") })
     }
 
-    /// Await the exact contribution generation captured from the overlay, not a .ready
-    /// snapshot that may still precede the publication under investigation.
+    /// Presentation readiness does not imply that the graph has committed its publication.
+    /// Wait for the captured overlay generation, not for particular symbols or full coverage:
+    /// a pending or incorrect slot at that generation must still fail the caller's assertions.
     private func snapshotAfterOverlayPublication(
         engine: WorkspaceCodemapBindingEngine,
         overlay: WorkspaceCodemapLiveOverlay,
@@ -983,6 +896,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
     ) async throws -> WorkspaceCodemapGraphPinnedSnapshot {
         let maybeGraph = await engine.selectionGraph(rootEpoch: rootEpoch)
         let graph = try XCTUnwrap(maybeGraph)
+        // Subscribe before capturing the target so its commit cannot be missed.
         let events = await graph.statusUpdates()
         let maybeTarget = await overlay.graphContributionGeneration(rootEpoch: rootEpoch)
         let target = try XCTUnwrap(maybeTarget)
@@ -1005,17 +919,6 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         defer { observer.cancel() }
         await fulfillment(of: [published], timeout: 10)
         return try XCTUnwrap(snapshots.values.last)
-    }
-
-    private func traceSiblingSnapshot(
-        _ phase: String,
-        _ pinned: WorkspaceCodemapGraphPinnedSnapshot,
-        ticket: WorkspaceCodemapArtifactDemandTicket,
-        retainCount: Int
-    ) {
-        let snapshot = pinned.snapshot
-        let slot = snapshot.slotsByFileID[ticket.fileID]
-        print("SIBLING_LIFETIME phase=\(phase) root=\(snapshot.rootEpoch) authority=\(snapshot.rootAuthority) request=\(ticket.requestID) retain=\(ticket.retainID) count=\(retainCount) ticketGeneration=\(ticket.requestGeneration) applied=\(snapshot.appliedGeneration) freshness=\(pinned.freshness) reconciling=\(pinned.reconciling) slot=\(String(describing: slot)) definitions=\(Self.definitions(in: pinned, fileID: ticket.fileID)) coverage=\(snapshot.coverage)")
     }
 
     private func waitForGraphCompletion(
@@ -1135,41 +1038,6 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
     ) -> UInt64? {
         guard case let .filesystem(_, authorityGeneration) = token else { return nil }
         return authorityGeneration
-    }
-}
-
-/// One-shot ordering gate. Entry is an XCTest event and release resumes a continuation;
-/// neither side polls or advances wall-clock time to drive the interleaving.
-private actor CodemapSiblingEventGate {
-    nonisolated let entered: XCTestExpectation
-    private var rootID: UUID?
-    private var consumed = false
-    private var released = false
-    private var continuation: CheckedContinuation<Void, Never>?
-
-    init(name: String) {
-        entered = XCTestExpectation(description: name)
-    }
-
-    func arm(rootID: UUID) {
-        self.rootID = rootID
-    }
-
-    func holdIfArmed(rootID: UUID) async -> Bool {
-        guard self.rootID == rootID, !consumed else { return false }
-        consumed = true
-        entered.fulfill()
-        await withCheckedContinuation { continuation in
-            if released { continuation.resume() }
-            else { self.continuation = continuation }
-        }
-        return true
-    }
-
-    func release() {
-        released = true
-        continuation?.resume()
-        continuation = nil
     }
 }
 

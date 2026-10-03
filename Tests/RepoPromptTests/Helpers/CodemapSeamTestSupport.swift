@@ -54,7 +54,6 @@ final class CodemapStoreFixture: @unchecked Sendable {
     private let runtimeTracker: CodemapRuntimeTracker
     private let runtimeProvider: CodeMapArtifactRuntimeProvider
     private let codeMapGitService: GitService
-    private let selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory
 
     init(
         name: String,
@@ -62,7 +61,6 @@ final class CodemapStoreFixture: @unchecked Sendable {
         enginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
         graphPullPause: WorkspaceCodemapGraphPullPause = .production,
         overlay: WorkspaceCodemapLiveOverlay = WorkspaceCodemapLiveOverlay(),
-        selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
         forbidCodeMapGitProcesses: Bool = false,
         beforeArtifactBuild: @escaping @Sendable (String) async -> Void = { _ in }
     ) throws {
@@ -141,7 +139,6 @@ final class CodemapStoreFixture: @unchecked Sendable {
                         sourceReader: registry.makeValidatedSourceReaderClient(),
                         catalogClient: registry.makeBindingCatalogClient(),
                         overlay: overlay,
-                        selectionGraphFactory: selectionGraphFactory,
                         policy: enginePolicy,
                         graphPullPause: graphPullPause
                     )
@@ -156,7 +153,6 @@ final class CodemapStoreFixture: @unchecked Sendable {
         self.runtimeTracker = runtimeTracker
         self.runtimeProvider = runtimeProvider
         self.codeMapGitService = codeMapGitService
-        self.selectionGraphFactory = selectionGraphFactory
     }
 
     deinit {
@@ -176,18 +172,13 @@ final class CodemapStoreFixture: @unchecked Sendable {
 
     /// Store that admits roots through the production local proof and Git preflight, sharing the
     /// fixture's instrumented Git service with the engine's Code Map collaborators.
-    func makeProductionStore(
-        nonGitCodeMapsEnabled: Bool = true,
-        codemapCancellationCleanupHook: @escaping @Sendable (WorkspaceCodemapArtifactDemandTicket) async -> Void = { _ in }
-    ) -> WorkspaceFileContextStore {
+    func makeProductionStore(nonGitCodeMapsEnabled: Bool = true) -> WorkspaceFileContextStore {
         let runtimeProvider = runtimeProvider
         return WorkspaceFileContextStore(
             codemapRuntimeProvider: { try runtimeProvider.runtime() },
             codemapLocalGitClassificationProbe: .production,
             codemapGitEligibilityProbe: .production(gitService: codeMapGitService),
-            nonGitCodeMapsEnabled: nonGitCodeMapsEnabled,
-            selectionGraphFactory: selectionGraphFactory,
-            codemapCancellationCleanupHook: codemapCancellationCleanupHook
+            nonGitCodeMapsEnabled: nonGitCodeMapsEnabled
         )
     }
 
