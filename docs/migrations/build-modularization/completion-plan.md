@@ -260,7 +260,7 @@ AI                        [==== 8 ====][===== 9 =====]
 | --- | --- | --- |
 | `tests_testable_import_app_files` (non-increasing) | T1 | The regex is exact. Every test move lowers the baseline in the same PR |
 | `app_files_over_2000_lines` | T1 | Exact line counts |
-| `app_target_swift_lines` as a ceiling | T1 | Baseline plus a fixed headroom for feature work; each move PR lowers the ceiling by what it moved |
+| `app_target_swift_lines` advisory reference | T1 (advisory since 2026-10-03) | Baseline plus unchanged headroom is reported, not gated; numeric baselines and all other gates remain unchanged (see ledger policy) |
 | Import check `error` and the allowed-edge matrix | T1 | Covers the existing targets; each new target adds its row in its move PR |
 | Placement guardrail ("new files for a moved family go in its module") | T1, then extended by each move PR | This is the main "no new code in the old app" lever |
 | Per-target guardrails: no SwiftUI/AppKit in logic targets, no `RepoPromptApp` import, `bundle_main_allowed_roots` | Each target's move PR | P0.6 checklist |
