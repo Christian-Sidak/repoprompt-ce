@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptProcess
 
@@ -6,6 +7,23 @@ final class CodexCLIProvider: AIProvider {
     private struct StreamAttemptFailure: Error {
         let underlying: Error
         let emittedOutput: Bool
+    }
+
+    /// Codex's app server only accepts image file paths, so request-scoped images are staged.
+    private static func stageImages(_ images: [AITransientImage]) async throws -> OracleTransientImageStaging? {
+        do {
+            return try await OracleTransientImageStaging.stage(images)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Codex could not securely stage Oracle image input in temporary storage."
+            )
+        }
+    }
+
+    private static func attachments(for staging: OracleTransientImageStaging?) -> [AgentImageAttachment] {
+        staging?.files.map { AgentImageAttachment(source: .localFile(path: $0.path), title: $0.title) } ?? []
     }
 
     private struct ReconciledTerminalTurn: Equatable {
@@ -139,7 +157,8 @@ final class CodexCLIProvider: AIProvider {
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let baseInstructions = buildBaseInstructions(from: aiMessage)
-        let prompt = buildPrompt(from: aiMessage)
+        let transientImages = aiMessage.transientImages
+        let prompt = promptAppendingImageTitles(buildPrompt(from: aiMessage), images: transientImages)
         let requestedModelIdentifier = modelIdentifier(for: model)
         let fallbackReasoningEffort = model.defaultReasoningEffort
         let serviceTier = model.codexServiceTier
@@ -157,9 +176,12 @@ final class CodexCLIProvider: AIProvider {
                 }
 
                 do {
+                    let imageStaging = try await Self.stageImages(transientImages)
+                    defer { imageStaging?.cleanup() }
                     try await streamViaAppServer(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
+                        images: Self.attachments(for: imageStaging),
                         requestedModelIdentifier: requestedModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
@@ -312,6 +334,7 @@ final class CodexCLIProvider: AIProvider {
     private func streamViaAppServer(
         baseInstructions: String,
         prompt: String,
+        images: [AgentImageAttachment],
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
@@ -336,6 +359,7 @@ final class CodexCLIProvider: AIProvider {
                     try await runSingleStreamAttempt(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
+                        images: images,
                         requestedModelIdentifier: activeModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
@@ -431,6 +455,7 @@ final class CodexCLIProvider: AIProvider {
     private func runSingleStreamAttempt(
         baseInstructions: String,
         prompt: String,
+        images: [AgentImageAttachment],
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
@@ -472,7 +497,7 @@ final class CodexCLIProvider: AIProvider {
                 )
                 let turnReceipt = try await controller.startUserTurn(
                     text: prompt,
-                    images: [],
+                    images: images,
                     model: selection.model,
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
@@ -1029,6 +1054,12 @@ final class CodexCLIProvider: AIProvider {
 
     private func buildBaseInstructions(from aiMessage: AIMessage) -> String {
         aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func promptAppendingImageTitles(_ prompt: String, images: [AITransientImage]) -> String {
+        let titles = images.compactMap(\.titleAnnotation)
+        guard !titles.isEmpty else { return prompt }
+        return ([prompt] + titles).filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
     private func buildPrompt(from aiMessage: AIMessage) -> String {

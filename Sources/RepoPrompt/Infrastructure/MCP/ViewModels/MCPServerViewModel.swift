@@ -2638,6 +2638,7 @@ final class MCPServerViewModel: ObservableObject {
     /// continuation is cleaned up and a `CancellationError` is thrown.
     @MainActor
     func awaitNoActiveToolExecutions(runID: UUID) async throws {
+        try Task.checkCancellation()
         // Fast path: already idle
         let executions = activeToolExecutionIDsByRunID[runID]
         if executions == nil || executions!.isEmpty {
@@ -2655,7 +2656,7 @@ final class MCPServerViewModel: ObservableObject {
                 // Double-check under the same MainActor turn — tools may have
                 // drained between the fast-path check and here.
                 let stillActive = activeToolExecutionIDsByRunID[runID]
-                if stillActive == nil || stillActive!.isEmpty {
+                if Task.isCancelled || stillActive == nil || stillActive!.isEmpty {
                     steeringDebugLog("[AgentRunSteeringWake] MCP idle wait drained before parking runID=\(runID) waiterID=\(waiterID)")
                     continuation.resume()
                     return
@@ -3813,6 +3814,17 @@ final class MCPServerViewModel: ObservableObject {
             mcpServerViewModelDebugLog("runTool '\(name)' bound context for tab=\(context.tabID) runID=\(context.runID?.uuidString ?? "nil")")
         }
 
+        // Freeze the observer's input generation at the first synchronous route snapshot.
+        // Later routing awaits must not borrow a rebound endpoint's generation.
+        let waitCallOrigin: DomainAgentSessionLinkWaitInput? = if name == MCPWindowToolName.agentSessionLink,
+                                                                  let context = resolvedContext?.snapshot,
+                                                                  let window = try? requireTargetWindow(),
+                                                                  let endpoint = window.agentModeViewModel.agentSessionLinkObserverEndpoint(tabID: context.tabID)
+        {
+            AgentSessionLinkRuntimeBridge.shared.captureWaitInput(for: endpoint)
+        } else {
+            nil
+        }
         let shouldTrackActiveTool = await shouldTrackActiveTool(for: metadata)
         let executionRunID = modelOnly ? modelRoute?.runID
             : await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext)
@@ -3902,7 +3914,9 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
                         try await AgentSelfMCPCallOrigin.$current.withValue(selfCallOrigin) {
-                            try await body()
+                            try await AgentSessionLinkWaitCallOrigin.$current.withValue(waitCallOrigin) {
+                                try await body()
+                            }
                         }
                     }
                     EditFlowPerf.lifecycleEvent(

@@ -326,6 +326,7 @@ actor ACPAgentSessionController {
     private var didEmitTerminal = false
     private var eventStreamFinished = false
     private var loadSessionSupported = false
+    private var promptImagesSupported = false
     private var discoveredSessionModels: ACPDiscoveredSessionModels?
     private var sessionModelConfigOptionID: String?
     /// True when the provider conforms to `ACPDirectSessionModelProvider` and the session
@@ -563,6 +564,7 @@ actor ACPAgentSessionController {
         guard state == .idle else {
             throw ControllerError.invalidState(expected: "idle", actual: state)
         }
+        promptImagesSupported = false
         state = .launching
         log("Launching ACP transport")
         diagnose(.phaseStarted("launch"))
@@ -689,6 +691,11 @@ actor ACPAgentSessionController {
 
         let capabilities = initializeResponse["agentCapabilities"] as? [String: Any] ?? [:]
         loadSessionSupported = capabilities["loadSession"] as? Bool ?? false
+        let promptCapabilities = capabilities["promptCapabilities"] as? [String: Any]
+        let imageCapability = promptCapabilities?["image"] as? NSNumber
+        promptImagesSupported = imageCapability.map {
+            CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue
+        } ?? false
 
         state = .openingSession
         log("Opening ACP session")
@@ -799,8 +806,18 @@ actor ACPAgentSessionController {
         log("Submitting ACP prompt")
         diagnose(.phaseStarted("prompt"))
         let response: [String: Any]
+        var refusedUnsupportedImages = false
         do {
             let promptRequest = effectivePromptRunRequest(override: overrideRunRequest)
+            if case let .message(message) = payload,
+               !promptImagesSupported,
+               !message.transientImages.isEmpty || !promptRequest.attachments.isEmpty
+            {
+                refusedUnsupportedImages = true
+                throw AIProviderError.invalidConfiguration(
+                    detail: "The connected ACP provider did not advertise image input. Retry without images or use an image-capable provider."
+                )
+            }
             let promptBlocks: [[String: Any]] = switch payload {
             case let .message(message):
                 try provider.buildPromptBlocks(for: message, request: promptRequest)
@@ -861,6 +878,11 @@ actor ACPAgentSessionController {
                 }
             #endif
             settlePromptTurn(promptTurnID, result: .failure(error))
+            // Local admission refused before construction or transport; the connection is intact.
+            if refusedUnsupportedImages {
+                if state == .promptRunning { state = .sessionOpen }
+                throw error
+            }
             if error is CancellationError {
                 throw error
             }
@@ -1696,6 +1718,7 @@ actor ACPAgentSessionController {
         state = .closing
         recentDevinToolCalls.removeAll()
         recentDevinToolCallIDs.removeAll()
+        promptImagesSupported = false
         log("Shutting down ACP controller")
 
         await cancelPrompt()
@@ -2208,6 +2231,7 @@ actor ACPAgentSessionController {
 
         failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
         failPendingRequests(with: ControllerError.transportClosed)
+        promptImagesSupported = false
         state = .failed
         await clearExpectedAgentPIDIfNeeded()
         await cleanupLaunchArtifacts()
@@ -2228,6 +2252,7 @@ actor ACPAgentSessionController {
 
         failAllPromptSettlementWaiters(with: ControllerError.transportClosed)
         failPendingRequests(with: ControllerError.transportClosed)
+        promptImagesSupported = false
         state = .failed
         await clearExpectedAgentPIDIfNeeded()
         await cleanupLaunchArtifacts()

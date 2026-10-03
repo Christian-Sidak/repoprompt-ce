@@ -278,6 +278,14 @@ fence releases the uncommitted reservation without delivery.
 
 ### Inspecting and answering prompts
 
+Accepted local composer input advances
+an in-memory generation for the exact observer endpoint and cancels its older waits, including
+requests delayed between routing and admission. New-generation waits may park in the same run.
+Authority release precedes Claude/ACP's MCP-idle gate and Codex's steering drain. This affects
+neither managed/cross-session input nor mutations or child providers. A route snapshot just after
+the input bump may still park. Cancellation uses the
+existing result with metadata-only `wake_reason: local_user_input` and re-fenced survivor rows.
+
 Managed `poll` and `wait` may return the target's current pending approval, permission, MCP
 elicitation, or question beside the sanitized snapshot, with free text through the oversight redactor
 and one-time option labels verbatim. Restricted links never receive a prompt body; a single prompt

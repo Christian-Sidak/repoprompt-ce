@@ -23,6 +23,165 @@ final class OracleCancellationAuthorityTests: XCTestCase {
         try await assertCancellationPreservesAuthority(.explicit, pauseReload: true, reloadWhileStreaming: true)
     }
 
+    func testImagePreparationPublicationOwnership() async throws {
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9342, deferredInitialAgentSystemWorkspaceRefresh: true, sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        let oracle = composition.oracleViewModel
+        defer {
+            oracle.oracleImageThumbnailsForTesting = nil
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            composition.workspaceManager.prepareForWindowClose()
+            oracle.sessions = []
+        }
+        composition.apiSettingsViewModel.openAIApiKey = "test-key"
+        composition.apiSettingsViewModel.isOpenAIKeyValid = true
+        await oracle.startNewChatSession()
+        let sessionID = try XCTUnwrap(oracle.currentSessionID)
+        let original = AITransientImage(bytes: Data([1, 2, 3]), mediaType: .png, title: "original")
+        var gates: [CheckedContinuation<[AIChatImageAttachment], Error>] = []
+        var sent: [AIMessage] = []
+        oracle.oracleImageThumbnailsForTesting = { _ in
+            try await withCheckedThrowingContinuation { gates.append($0) }
+        }
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, _ in
+            sent.append(message)
+            return (UUID(), AsyncThrowingStream { continuation in
+                continuation.yield(ChatStreamOutput(text: "done", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+                continuation.finish()
+            })
+        }
+        func begin(_ text: String, scope: ContextBuilderOracleLaneScope? = nil) -> Task<UUID?, Never> {
+            Task { await oracle.sendMessage(
+                text,
+                sessionID: sessionID,
+                overrideModel: .gpt54Mini,
+                oracleTransientImages: [original],
+                contextBuilderScope: scope
+            ) }
+        }
+        func waitForGate(_ count: Int) async throws {
+            try await AsyncTestWait.waitUntil("thumbnail preparation \(count)") { gates.count == count }
+        }
+        func waitForCompletion(_ id: UUID, in target: UUID) async throws {
+            try await AsyncTestWait.waitUntil("prepared image send completion") {
+                !oracle.isSessionStreaming(target) && oracle.messagesSnapshot(for: target).contains {
+                    $0.id == id && $0.isFinalized && $0.content == "done"
+                }
+            }
+        }
+
+        let cancelled = begin("cancelled")
+        try await waitForGate(1)
+        cancelled.cancel()
+        gates[0].resume(returning: [])
+        let cancelledResult = await cancelled.value
+        XCTAssertNil(cancelledResult)
+
+        let group = ContextBuilderOracleGroupSupervision()
+        let revoked = begin("revoked", scope: group.makeLane(sessionID: sessionID))
+        try await waitForGate(2)
+        group.cancel()
+        gates[1].resume(returning: [])
+        let revokedResult = await revoked.value
+        XCTAssertNil(revokedResult)
+        XCTAssertTrue(oracle.messagesSnapshot(for: sessionID).isEmpty)
+        XCTAssertTrue(sent.isEmpty)
+
+        let older = begin("older")
+        try await waitForGate(3)
+        let newer = begin("newer")
+        try await waitForGate(4)
+        gates[2].resume(returning: [])
+        let olderResult = await older.value
+        XCTAssertNil(olderResult)
+        // An obsolete preparation must not clear the newer owner's token.
+        gates[3].resume(returning: [])
+        let newerResult = await newer.value
+        XCTAssertNotNil(newerResult)
+        if let newerResult { try await waitForCompletion(newerResult, in: sessionID) }
+
+        let beforeText = begin("before text")
+        try await waitForGate(5)
+        let textResult = await oracle.sendMessage("text successor", sessionID: sessionID, overrideModel: .gpt54Mini)
+        if let textResult { try await waitForCompletion(textResult, in: sessionID) }
+        gates[4].resume(returning: [])
+        let beforeTextResult = await beforeText.value
+        XCTAssertNil(beforeTextResult)
+
+        let explicitlyCancelled = begin("explicit cancel")
+        try await waitForGate(6)
+        await oracle.cancelAIResponse(in: sessionID)
+        gates[5].resume(returning: [])
+        let explicitResult = await explicitlyCancelled.value
+        XCTAssertNil(explicitResult)
+
+        let reset = begin("reset")
+        try await waitForGate(7)
+        await oracle.cancelAllActiveSessionStreams()
+        gates[6].resume(returning: [])
+        let resetResult = await reset.value
+        XCTAssertNil(resetResult)
+
+        let background = begin("background")
+        try await waitForGate(8)
+        await oracle.startNewChatSession()
+        gates[7].resume(returning: [])
+        let backgroundResult = await background.value
+        XCTAssertNotNil(backgroundResult)
+        if let backgroundResult { try await waitForCompletion(backgroundResult, in: sessionID) }
+
+        let obsolete = begin("obsolete")
+        try await waitForGate(9)
+        let latest = begin("latest")
+        try await waitForGate(10)
+        gates[9].resume(returning: [])
+        let latestResult = await latest.value
+        XCTAssertNotNil(latestResult)
+        if let latestResult { try await waitForCompletion(latestResult, in: sessionID) }
+        gates[8].resume(returning: [])
+        let obsoleteResult = await obsolete.value
+        XCTAssertNil(obsoleteResult)
+
+        XCTAssertEqual(
+            oracle.messagesSnapshot(for: sessionID).filter(\.isUser).map(\.content),
+            ["newer", "text successor", "background", "latest"]
+        )
+        XCTAssertTrue(oracle.messagesSnapshot(for: sessionID).filter(\.isUser).allSatisfy(\.imageAttachments.isEmpty))
+
+        let deleted = begin("deleted")
+        try await waitForGate(11)
+        oracle.purgeSessionStorage(sessionID)
+        gates[10].resume(returning: [])
+        let deletedResult = await deleted.value
+        XCTAssertNil(deletedResult)
+        XCTAssertTrue(oracle.messagesSnapshot(for: sessionID).isEmpty)
+        XCTAssertEqual(
+            sent.map { $0.conversationMessages.last?.content ?? "" },
+            ["newer", "text successor", "background", "latest"].map { "<user_instructions>\n\($0)\n</user_instructions>" }
+        )
+        XCTAssertEqual(sent.first?.transientImages.first?.bytes, original.bytes)
+        XCTAssertEqual(sent.last?.transientImages.first?.bytes, original.bytes)
+
+        // Exercise real preview failure through sendMessage, not just the ordering override.
+        oracle.oracleImageThumbnailsForTesting = nil
+        let visibleSessionID = try XCTUnwrap(oracle.currentSessionID)
+        let placeholder = await oracle.sendMessage(
+            "unavailable preview",
+            sessionID: visibleSessionID,
+            overrideModel: .gpt54Mini,
+            oracleTransientImages: [original]
+        )
+        let placeholderID = try XCTUnwrap(placeholder)
+        try await waitForCompletion(placeholderID, in: visibleSessionID)
+        XCTAssertEqual(sent.count, 5)
+        XCTAssertEqual(sent.last?.transientImages.first?.bytes, original.bytes)
+        let previews = try XCTUnwrap(oracle.messagesSnapshot(for: visibleSessionID).first(where: \.isUser)?.imageAttachments)
+        XCTAssertEqual(previews.count, 1)
+        XCTAssertTrue(previews[0].thumbnailData.isEmpty)
+    }
+
     private enum CancellationKind: Equatable {
         case explicit
         case transport

@@ -213,6 +213,17 @@
     }
   },
   "moved_families": {
+    "DomainProviderContent": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Models/AgentAttachments.swift",
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/AgentAttachmentStore.swift",
+        "Sources/RepoPrompt/Features/Chat/Services/AIChatImageAttachmentThumbnails.swift",
+        "Sources/RepoPrompt/Features/Prompt/Models/PromptAssemblyBuilder.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPPromptContentBuilder.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AgentMessage.swift"
+      ]
+    },
     "FoundationConcurrency": {
       "owner": "RepoPromptFoundation",
       "former_app_roots": [

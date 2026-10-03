@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import SwiftUI
 
@@ -419,6 +420,7 @@ actor MessageFinalisationHub {
 }
 
 private struct SessionRunState {
+    var pendingImagePreparationID: UUID?
     var activeQueryId: UUID?
     var activeStreamId: ChatStreamID?
     var isStreaming: Bool {
@@ -1083,6 +1085,8 @@ class OracleViewModel: ObservableObject {
             id: ChatStreamID,
             stream: AsyncThrowingStream<ChatStreamOutput, Error>
         )
+
+        var oracleImageThumbnailsForTesting: (@MainActor ([AITransientImage]) async throws -> [AIChatImageAttachment])?
 
         var oracleReviewPackagingTraceObserverForTesting:
             OracleReviewPackagingTraceContext.Observer?
@@ -2489,6 +2493,7 @@ class OracleViewModel: ObservableObject {
                 timestamp: Date(),
                 sequenceIndex: msg.sequenceIndex,
                 allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
+                imageAttachments: msg.imageAttachments.isEmpty ? nil : msg.imageAttachments,
                 promptTokens: msg.promptTokens,
                 completionTokens: msg.completionTokens,
                 cost: msg.cost,
@@ -3039,6 +3044,7 @@ class OracleViewModel: ObservableObject {
                 timestamp: Date(),
                 sequenceIndex: msg.sequenceIndex,
                 allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
+                imageAttachments: msg.imageAttachments.isEmpty ? nil : msg.imageAttachments,
                 promptTokens: msg.promptTokens,
                 completionTokens: msg.completionTokens,
                 cost: msg.cost,
@@ -3235,6 +3241,7 @@ class OracleViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
+        oracleTransientImages: [AITransientImage] = [],
         completionPolicy: OracleResponseCompletionPolicy = .interactive,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
@@ -3265,12 +3272,48 @@ class OracleViewModel: ObservableObject {
         ensureSessionStorage(targetSessionID)
 
         // Create the user message
+        // Only suspend when images are attached so the text-only path keeps
+        // creating the user message synchronously on the main actor.
+        let preparationID = oracleTransientImages.isEmpty ? nil : UUID()
+        runStateBySession[targetSessionID]?.pendingImagePreparationID = preparationID
+        defer {
+            if let preparationID,
+               runStateBySession[targetSessionID]?.pendingImagePreparationID == preparationID
+            {
+                runStateBySession[targetSessionID]?.pendingImagePreparationID = nil
+            }
+        }
+        let imageAttachments: [AIChatImageAttachment]
+        do {
+            if oracleTransientImages.isEmpty {
+                imageAttachments = []
+            } else {
+                #if DEBUG
+                    if let override = oracleImageThumbnailsForTesting {
+                        imageAttachments = try await override(oracleTransientImages)
+                    } else {
+                        imageAttachments = try await AIChatImageAttachment.thumbnails(from: oracleTransientImages)
+                    }
+                #else
+                    imageAttachments = try await AIChatImageAttachment.thumbnails(from: oracleTransientImages)
+                #endif
+            }
+        } catch {
+            return nil
+        }
+        guard !Task.isCancelled, contextBuilderScope?.isLive != false,
+              preparationID == nil || runStateBySession[targetSessionID]?.pendingImagePreparationID == preparationID
+        else { return nil }
+        if preparationID != nil {
+            runStateBySession[targetSessionID]?.pendingImagePreparationID = nil
+        }
         let userId = UUID()
         let userMessage = AIChatMessage(
             id: userId,
             content: newUserMessage,
             isUser: true,
-            sequenceIndex: nextSequenceIndex(for: targetSessionID)
+            sequenceIndex: nextSequenceIndex(for: targetSessionID),
+            imageAttachments: imageAttachments
         )
         withSessionMessages(targetSessionID) { msgs in
             msgs.append(userMessage)
@@ -3367,7 +3410,7 @@ class OracleViewModel: ObservableObject {
                     throw CancellationError()
                 }
 
-                let aiMessage: AIMessage
+                var aiMessage: AIMessage
                 if let overrideAIMessage = overrideAIMessage.flatMap({
                     self.validatedOverrideAIMessage(
                         $0,
@@ -3403,6 +3446,9 @@ class OracleViewModel: ObservableObject {
                         lookupContextOverride: lookupContextOverride,
                         reviewGitContextOverride: reviewGitContextOverride
                     )
+                }
+                if !oracleTransientImages.isEmpty {
+                    aiMessage.transientImages = oracleTransientImages
                 }
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
@@ -4048,6 +4094,7 @@ class OracleViewModel: ObservableObject {
         cleanupOwnerIsCurrent: (@MainActor () -> Bool)? = nil
     ) async {
         guard cleanupOwnerIsCurrent?() != false else { return }
+        runStateBySession[sessionID]?.pendingImagePreparationID = nil
         if let query = runStateBySession[sessionID]?.activeQueryId, let scope = contextBuilderScopes[query] {
             await scope.cancelAndDrain()
             return
@@ -4148,6 +4195,10 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func cancelAllActiveSessionStreams(cleanupOwnerIsCurrent: (@MainActor () -> Bool)? = nil) async {
+        guard cleanupOwnerIsCurrent?() != false else { return }
+        for sessionID in Array(runStateBySession.keys) {
+            runStateBySession[sessionID]?.pendingImagePreparationID = nil
+        }
         let activeSessions = Array(streamingSessions)
         for sessionID in activeSessions {
             guard cleanupOwnerIsCurrent?() != false else { return }
@@ -4163,7 +4214,8 @@ class OracleViewModel: ObservableObject {
             isFinalized: true,
             sequenceIndex: stored.sequenceIndex,
             allowedFilePaths: stored.allowedFilePaths ?? [],
-            modelName: stored.modelName
+            modelName: stored.modelName,
+            imageAttachments: stored.imageAttachments ?? []
         )
 
         let tokenInfo = ChatTokenInfo(
