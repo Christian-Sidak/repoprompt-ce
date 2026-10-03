@@ -11,10 +11,42 @@ import XCTest
 /// two-window add/revoke/status flows are deterministic without constructing windows.
 @MainActor
 final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
+    func testBindingInvalidationRetiresInputStateEvenWithoutOversightLinks() async {
+        let fixture = makeFixture()
+        let endpoint = fixture.observer.domainEndpoint
+        let release = fixture.bridge.acceptLocalInput(for: endpoint)
+        fixture.host.candidates.removeAll { $0.domainEndpoint == endpoint }
+        await fixture.bridge.invalidateBinding(windowID: endpoint.windowID, tabID: endpoint.tabID)
+        await release.value // A pending forward must not recreate state after retirement.
+        XCTAssertEqual(fixture.bridge.captureWaitInput(for: endpoint).generation, 0)
+    }
+
     // MARK: - Fake host
 
     private final class FakeEndpointHost: AgentSessionLinkEndpointHost {
         var candidates: [AgentSessionLinkEndpointCandidate] = []
+        var beforeModelFence: (() async -> Void)?
+        var afterModelFence: (() async -> Void)?
+        var modelMutationCount = 0
+
+        func agentSessionLinkModelCandidate(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionLinkEndpointCandidate? {
+            candidates.first { $0.domainEndpoint == endpoint }
+        }
+
+        func agentSessionLinkPerformSetModel(
+            to _: AgentSessionLinkEndpointCandidate, modelID: String,
+            liveness: @escaping AgentSessionLinkSendLivenessProbe,
+            reauthorize: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkModelOutcome {
+            await beforeModelFence?()
+            let commit = await reauthorize()
+            guard commit == .committed else { return .blocked(commit.refusal) }
+            await afterModelFence?()
+            guard liveness().permitsDelivery else { return .blocked(.endpointInvalidated) }
+            modelMutationCount += 1
+            return .accepted(.init(modelID: modelID, modelRaw: "test", reasoningEffortRaw: nil, changed: true))
+        }
+
         var laneCandidate: AgentSessionLinkEndpointCandidate?
         var laneCreationOutcome: AgentSessionLaneHostCreationOutcome?
         var laneCreationCount = 0
@@ -3969,6 +4001,49 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             1,
             "A duplicate retry must never reach the target transaction again"
         )
+    }
+
+    func testSetModelValidatesOriginalLeaseInsideHostHopWithoutCandidateSweep() async throws {
+        for revokeBeforeFence in [true, false] {
+            let fixture = makeFixture()
+            _ = await addLink(fixture)
+            let resolved = await fixture.bridge.authorizeTarget(
+                operation: .monitorSetModel, observerEndpoint: fixture.observer.domainEndpoint,
+                targetSessionID: fixture.target.sessionID
+            )
+            let target = try XCTUnwrap(resolved.success)
+            let referenceValue = await linkReference(fixture)
+            let reference = try XCTUnwrap(referenceValue)
+            let revoke: () async -> Void = {
+                _ = await fixture.authority.revoke(linkID: reference.linkID, generation: reference.generation, reason: .userRequested)
+            }
+            if revokeBeforeFence { fixture.host.beforeModelFence = revoke }
+            else { fixture.host.afterModelFence = revoke }
+            let reads = fixture.host.candidateReadCount
+            let result = await fixture.bridge.setModel(target: target, modelID: "claudeCode:test")
+            if revokeBeforeFence {
+                guard case .blocked(.linkRevoked) = result else { return XCTFail("Original lease must fail at final host hop") }
+            } else {
+                guard case .accepted = result else { return XCTFail("Already-authorized synchronous commit must settle") }
+            }
+            XCTAssertEqual(fixture.host.modelMutationCount, revokeBeforeFence ? 0 : 1)
+            XCTAssertEqual(fixture.host.candidateReadCount, reads, "set_model must use exact memory lookups, not sweep endpoints")
+        }
+    }
+
+    func testSetModelPostFenceEndpointReplacementCannotMutate() async throws {
+        let fixture = makeFixture()
+        _ = await addLink(fixture)
+        let resolved = await fixture.bridge.authorizeTarget(
+            operation: .monitorSetModel, observerEndpoint: fixture.observer.domainEndpoint,
+            targetSessionID: fixture.target.sessionID
+        )
+        let target = try XCTUnwrap(resolved.success)
+        fixture.host.afterModelFence = { fixture.host.candidates.removeAll { $0.sessionID == fixture.target.sessionID } }
+        guard case .blocked(.endpointInvalidated) = await fixture.bridge.setModel(target: target, modelID: "claudeCode:test") else {
+            return XCTFail("Endpoint lost during the final hop must fail closed")
+        }
+        XCTAssertEqual(fixture.host.modelMutationCount, 0)
     }
 
     // MARK: - Compaction

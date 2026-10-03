@@ -222,7 +222,8 @@ extension AgentModeViewModel {
         tabID: UUID,
         sessionID: UUID,
         tabName: String,
-        isWindowClosing: Bool
+        isWindowClosing: Bool,
+        includeLocation: Bool = true
     ) -> AgentSessionLinkEndpointCandidate? {
         guard let session = sessions[tabID],
               let identity = agentSessionLifecycleIdentity(tabID: tabID, expectedSessionID: sessionID),
@@ -230,10 +231,26 @@ extension AgentModeViewModel {
         else {
             return nil
         }
+        return agentSessionLinkCandidate(
+            session: session, identity: identity, tabName: tabName,
+            providerDisplayName: session.selectedAgent.displayName,
+            isWindowClosing: isWindowClosing, includeLocation: includeLocation
+        )
+    }
+
+    func agentSessionLinkCandidate(
+        session: TabSession,
+        identity: AgentSessionLifecycleAuthority.Identity,
+        tabName: String,
+        providerDisplayName: String,
+        isWindowClosing: Bool,
+        includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        guard let sessionID = identity.sessionID else { return nil }
         return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: identity.workspaceID,
-            tabID: tabID,
+            tabID: identity.tabID,
             sessionID: sessionID,
             persistentBindingGeneration: identity.persistentBindingGeneration,
             bindingTransitionGeneration: identity.bindingTransitionGeneration,
@@ -252,13 +269,13 @@ extension AgentModeViewModel {
                 taskLabelKind: session.mcpControlContext?.taskLabelKind
             ),
             displayName: tabName,
-            providerDisplayName: session.selectedAgent.displayName,
+            providerDisplayName: providerDisplayName,
             // Resolved here, in the endpoint's own window, because only this window knows both its
             // worktree bindings and its workspace. UI only; never enters an agent-facing payload.
-            locationLabel: AgentMonitorLocationLabelFormatter.label(
-                worktreeLabel: primaryExecutionWorktreeIndicator(forTabID: tabID)?.label,
+            locationLabel: includeLocation ? AgentMonitorLocationLabelFormatter.label(
+                worktreeLabel: primaryExecutionWorktreeIndicator(forTabID: identity.tabID)?.label,
                 workspaceName: workspaceManager?.workspace(withID: identity.workspaceID)?.name
-            ),
+            ) : nil,
             // Qualified here, in the endpoint's own window, against the binding state read in this
             // same MainActor pass. A proof left over from a superseded binding degrades to pending
             // rather than travelling on the candidate as authoritative.

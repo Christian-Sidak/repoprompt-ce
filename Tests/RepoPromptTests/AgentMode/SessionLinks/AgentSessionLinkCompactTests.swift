@@ -1,4 +1,5 @@
 import Foundation
+@testable import RepoPromptApp
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
@@ -1213,6 +1214,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
 
 /// A native runtime stub with an active session that records every provider-bound message.
 actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
+    private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
 
@@ -1241,14 +1243,27 @@ actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
-        NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "compact-recording")
+        configuration.replaceProcess()
+        return NativeAgentRuntimeSessionRef(sessionID: existingSessionID ?? "compact-recording")
     }
 
     func currentSessionRef() -> NativeAgentRuntimeSessionRef {
         NativeAgentRuntimeSessionRef(sessionID: "compact-recording")
     }
 
-    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {}
+    func applyModelAndEffort(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws {
+        _ = configuration.apply()
+    }
+
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        configuration.apply()
+    }
+
+    func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try configuration.validate(proof)
+        sentMessages.append(text)
+        return UUID()
+    }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         sentMessages.append(text)
@@ -1259,6 +1274,35 @@ actor CompactRecordingNativeController: NativeAgentRuntimeControlling {
         .noTurnInFlight
     }
 
-    func shutdown() {}
+    func shutdown() {
+        configuration.replaceProcess()
+    }
+
     func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) {}
+}
+
+/// Actor-owned fake receipt state. Every application intent supersedes earlier receipts, even
+/// identical values. Tests that replace a process rotate its lifetime rather than reuse counters.
+struct SessionLinkNativeConfigurationFixture {
+    private var lifetime = UUID()
+    private var generation: UInt64 = 0
+    private var current: NativeAgentRuntimeConfigurationProof?
+
+    mutating func apply() -> NativeAgentRuntimeConfigurationApplication {
+        generation &+= 1
+        let proof = NativeAgentRuntimeConfigurationProof(
+            lifetime: lifetime, intentGeneration: generation, requestGeneration: generation
+        )
+        current = proof
+        return .applied(proof)
+    }
+
+    mutating func replaceProcess() {
+        lifetime = UUID()
+        current = nil
+    }
+
+    func validate(_ proof: NativeAgentRuntimeConfigurationProof) throws {
+        guard current == proof else { throw NativeAgentRuntimeControllerError.configurationNotCurrent }
+    }
 }

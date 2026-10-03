@@ -1,5 +1,4 @@
 import Foundation
-@testable import RepoPromptApp
 @testable import RepoPromptSecureStorage
 
 final class TestSecureStorageBackend: SecureKeyValueStorageBackend, @unchecked Sendable {

@@ -3,49 +3,16 @@ import RepoPromptDomainRuntime
 import RepoPromptShared
 import RepoPromptWorkspaceCore
 
-/// One-shot, admitted routing evidence; never a lookup of the current presentation tab.
-struct MCPTabContextHint: Equatable {
-    let tabID: UUID
-    let workspaceID: UUID?
-    let windowID: Int?
-}
+typealias MCPTabContextHint = RepoPromptShared.MCPTabContextHint
 
-struct MCPRequestMetadata {
-    let connectionID: UUID?
-    let clientName: String?
-    let windowID: Int?
-    let runPurpose: MCPRunPurpose?
-    let tabContextHint: MCPTabContextHint?
-    let explicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
-    let invocationID: UUID?
-    let requestID: JSONRPCBridgeID?
-
-    init(
-        connectionID: UUID?,
-        clientName: String?,
-        windowID: Int?,
-        runPurpose: MCPRunPurpose? = nil,
-        tabContextHint: MCPTabContextHint? = nil,
-        explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil,
-        invocationID: UUID? = nil,
-        requestID: JSONRPCBridgeID? = nil
-    ) {
-        self.connectionID = connectionID
-        self.clientName = clientName
-        self.windowID = windowID
-        self.runPurpose = runPurpose
-        self.tabContextHint = tabContextHint
-        self.explicitWindowRoutingHint = explicitWindowRoutingHint
-        self.invocationID = invocationID
-        self.requestID = requestID
-    }
-}
+typealias MCPRequestMetadata = RepoPromptShared.MCPRequestMetadata
 
 struct MCPWindowToolDispatchIdentity {
     let windowID: Int
     let windowStateIdentity: ObjectIdentifier
     let serverViewModelIdentity: ObjectIdentifier
     let catalogRegistrationHandle: MCPDomainToolRegistrationHandle
+    var modelRouteToken: AgentSessionLinkRunCatalogRouteToken?
 }
 
 struct MCPToolDispatchAuthorization {
@@ -284,13 +251,7 @@ struct MCPTabContextSnapshot {
     }
 }
 
-enum MCPTabContextSnapshotSource: String, Equatable {
-    case explicitBinding
-    case runInstall
-    case runHandover
-    case pendingRunScoped
-    case explicitHint
-}
+typealias MCPTabContextSnapshotSource = RepoPromptShared.MCPTabContextSnapshotSource
 
 enum MCPTabContextResolution {
     case tabContextSnapshot(MCPTabContextSnapshot, source: MCPTabContextSnapshotSource)
@@ -301,25 +262,7 @@ enum MCPTabContextResolution {
     }
 }
 
-struct MCPConnectionBindingSnapshot: Equatable {
-    enum BindingKind: Equatable {
-        case unbound
-        case tabContext
-    }
-
-    let windowID: Int?
-    let tabID: UUID?
-    let workspaceID: UUID?
-    let workspaceName: String?
-    let tabName: String?
-    let repoPaths: [String]
-    let explicitlyBound: Bool
-    let runID: UUID?
-
-    var bindingKind: BindingKind {
-        tabID == nil ? .unbound : .tabContext
-    }
-}
+typealias MCPConnectionBindingSnapshot = RepoPromptShared.MCPConnectionBindingSnapshot
 
 struct MCPResolvedTabContextSnapshot {
     var snapshot: MCPTabContextSnapshot

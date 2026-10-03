@@ -560,7 +560,24 @@ class WindowStatesManager: ObservableObject {
     // ──────────────────────────────────────────────────────────────
 
     /// All active windows in the order they were created
-    @Published var allWindows: [WindowState] = []
+    @Published var allWindows: [WindowState] = [] {
+        didSet {
+            modelRoutingWindowIndexes = Dictionary(
+                allWindows.enumerated().map { ($1.windowID, $0) },
+                uniquingKeysWith: { _, _ in -1 }
+            )
+        }
+    }
+
+    private var modelRoutingWindowIndexes: [Int: Int] = [:]
+
+    /// Read-only exact lookup for configuration-only routing. Never falls back to discovery.
+    func modelRoutingWindow(withID id: Int) -> WindowState? {
+        guard !isTerminating, let index = modelRoutingWindowIndexes[id],
+              allWindows.indices.contains(index), allWindows[index].windowID == id,
+              !allWindows[index].isClosing else { return nil }
+        return allWindows[index]
+    }
 
     /// Any incoming URLs that arrived before a window was ready
     @Published var pendingURLs: [URL] = []
