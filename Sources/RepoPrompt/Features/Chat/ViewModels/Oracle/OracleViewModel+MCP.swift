@@ -718,6 +718,9 @@ extension OracleViewModel {
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async throws -> UUID {
         try contextBuilderScope?.checkpoint()
+        if let activeWorkspace = workspaceManager.activeWorkspace {
+            prepareChatSessionCatalog(for: activeWorkspace)
+        }
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         if forceNew {

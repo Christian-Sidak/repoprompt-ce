@@ -834,6 +834,7 @@ extension OracleViewModel {
     @MainActor
     func deleteOracleGroupIfNeeded(containing session: ChatSession) async throws -> Bool {
         guard let rawGroupID = session.oracleGroupID else { return false }
+        let invalidateDeletedSnapshot = captureChatSessionCatalogDeletionFence(for: session.workspaceID, sessionID: session.id)
         guard let tabID = session.composeTabID,
               let owner = try? Self.oracleGroupOwner(workspaceID: session.workspaceID, tabID: tabID)
         else {
@@ -846,20 +847,40 @@ extension OracleViewModel {
         ) else { return false }
         let memberIDs = Set(group.members.map(\.memberID.rawValue))
         guard memberIDs.contains(session.id) else { return false }
+        guard invalidateDeletedSnapshot.isCurrent() else {
+            throw ChatToolError.internalError("Workspace storage changed before the Oracle group could be deleted.")
+        }
         for memberSession in sessions where memberIDs.contains(memberSession.id) && isSessionStreaming(memberSession.id) {
-            await cancelAIResponse(in: memberSession.id, skipPartialParseAndSave: true)
+            guard invalidateDeletedSnapshot.isCurrent() else {
+                throw ChatToolError.internalError("Workspace storage changed before the Oracle group could be deleted.")
+            }
+            await cancelAIResponse(
+                in: memberSession.id,
+                skipPartialParseAndSave: true,
+                cleanupOwnerIsCurrent: invalidateDeletedSnapshot.isCurrent
+            )
+        }
+        guard invalidateDeletedSnapshot.isCurrent() else {
+            throw ChatToolError.internalError("Workspace storage changed before the Oracle group could be deleted.")
         }
         try await store.delete(
             groupID: group.group.id,
             owner: owner,
             expectedRevision: group.revision
         )
+        invalidateDeletedSnapshot.invalidate()
         // A released lane's save is an un-awaited tracked task; let it land (and record its file) before deleting files.
         if let workspaceID = session.workspaceID { await drainTrackedAutosaves(for: workspaceID) }
+        #if DEBUG
+            await workspaceChatSessionDeletionBeforeCommitForTesting?(session.id)
+        #endif
+        guard invalidateDeletedSnapshot.isCurrent() else {
+            throw ChatToolError.internalError("The Oracle group was deleted, but projection cleanup stopped because workspace storage changed.")
+        }
         let removed = sessions.filter { memberIDs.contains($0.id) }
         var projectionCleanupFailed = false
         for projection in removed {
-            clearMCPSessionUIState(for: projection.id)
+            if invalidateDeletedSnapshot.isCurrent() { clearMCPSessionUIState(for: projection.id) }
             if let fileURL = projection.fileURL {
                 do {
                     try await chatData.deleteChatSessionFile(fileURL)
@@ -867,8 +888,13 @@ extension OracleViewModel {
                     projectionCleanupFailed = true
                 }
             }
-            purgeSessionStorage(projection.id)
+            if invalidateDeletedSnapshot.isCurrent() { purgeSessionStorage(projection.id) }
         }
+        guard invalidateDeletedSnapshot.isCurrent() else {
+            throw ChatToolError.internalError("The Oracle group was deleted, but projection cleanup stopped because workspace storage changed.")
+        }
+        // Also fence snapshots started while projection cleanup was awaiting disk writes.
+        invalidateDeletedSnapshot.invalidate()
         sessions.removeAll { memberIDs.contains($0.id) }
         for projection in removed {
             if let tabID = projection.composeTabID,

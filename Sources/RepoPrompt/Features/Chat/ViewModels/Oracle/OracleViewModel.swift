@@ -505,6 +505,8 @@ class OracleViewModel: ObservableObject {
     private let recentDisplayedSessionLimit = 2
     private var sessionSwitchGeneration: Int = 0
     private var workspaceChatSessionLoadGeneration: UInt64 = 0
+    private var chatSessionCatalogWorkspaceID: UUID?
+    private var chatSessionCatalogStoragePath: URL?
     private let workspaceSwitchChatStubLoadConcurrency = 4
 
     /// Session management
@@ -1086,6 +1088,16 @@ class OracleViewModel: ObservableObject {
             OracleReviewPackagingTraceContext.Observer?
         private var oraclePostPackagingTransportOverrideForTesting:
             OraclePostPackagingTransportOverride?
+        var workspaceChatSessionCancellationBeforeCleanupForTesting: (@MainActor @Sendable (UUID, UUID?) async -> Void)?
+        var workspaceChatSessionDeletionBeforeCommitForTesting: (@MainActor @Sendable (UUID) async -> Void)?
+        var workspaceChatSessionLoadBeforePublicationForTesting: (@MainActor @Sendable (UUID, UInt64) async -> Void)?
+        var workspaceChatSessionLoadGenerationForTesting: UInt64 {
+            workspaceChatSessionLoadGeneration
+        }
+
+        func loadSessionsFromWorkspaceForTesting(_ workspace: WorkspaceModel?) async {
+            await handleWorkspaceSwitched(to: workspace)
+        }
 
         func setOracleReviewPackagingTraceObserverForTesting(
             _ observer: OracleReviewPackagingTraceContext.Observer?
@@ -1753,6 +1765,7 @@ class OracleViewModel: ObservableObject {
     /// 3) If this was the current session, switch to another or create a new one.
     @MainActor
     func deleteSession(_ session: ChatSession) async {
+        let invalidateDeletedSnapshot = captureChatSessionCatalogDeletionFence(for: session.workspaceID, sessionID: session.id)
         do {
             if try await deleteOracleGroupIfNeeded(containing: session) { return }
         } catch {
@@ -1761,10 +1774,14 @@ class OracleViewModel: ObservableObject {
         }
         sessionOperationError = nil
         sessionSwitchGeneration += 1
-        if isSessionStreaming(session.id) {
-            await cancelAIResponse(in: session.id, skipPartialParseAndSave: true)
+        if invalidateDeletedSnapshot.isCurrent(), isSessionStreaming(session.id) {
+            await cancelAIResponse(
+                in: session.id,
+                skipPartialParseAndSave: true,
+                cleanupOwnerIsCurrent: invalidateDeletedSnapshot.isCurrent
+            )
         }
-        clearMCPSessionUIState(for: session.id)
+        if invalidateDeletedSnapshot.isCurrent() { clearMCPSessionUIState(for: session.id) }
         // 1) Attempt to delete file from disk (if it exists).
         if let fileURL = session.fileURL {
             do {
@@ -1776,6 +1793,11 @@ class OracleViewModel: ObservableObject {
         }
 
         // 2) Remove from in-memory list with animation on the main actor
+        #if DEBUG
+            await workspaceChatSessionDeletionBeforeCommitForTesting?(session.id)
+        #endif
+        guard invalidateDeletedSnapshot.isCurrent() else { return }
+        invalidateDeletedSnapshot.invalidate()
         withAnimation {
             guard let idx = sessions.firstIndex(where: { $0.id == session.id }) else { return }
             purgeSessionStorage(session.id)
@@ -1804,12 +1826,15 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func clearAllChats() async {
-        await cancelAllActiveSessionStreams()
-        // 1) Identify the currently active workspace
+        // Capture the owner before any cancellation or disk suspension.
         guard let activeWS = workspaceManager.activeWorkspace else {
             print("No active workspace found; nothing to clear.")
             return
         }
+
+        let invalidateDeletedSnapshot = captureChatSessionCatalogDeletionFence(for: activeWS.id)
+        await cancelAllActiveSessionStreams(cleanupOwnerIsCurrent: invalidateDeletedSnapshot.isCurrent)
+        guard invalidateDeletedSnapshot.isCurrent(), isActiveChatWorkspace(activeWS) else { return }
 
         // 2) Delete chat JSON files only for this workspace
         do {
@@ -1828,7 +1853,9 @@ class OracleViewModel: ObservableObject {
         }
         sessionOperationError = nil
 
-        // 3) Remove from memory all sessions belonging to the active workspace
+        // 3) An obsolete deletion must not clear a successor workspace/root's runtime state.
+        guard invalidateDeletedSnapshot.isCurrent(), isActiveChatWorkspace(activeWS) else { return }
+        invalidateDeletedSnapshot.invalidate()
         sessions.removeAll()
         dropMessagesSafely()
         cleanupShadowHolders()
@@ -1967,9 +1994,60 @@ class OracleViewModel: ObservableObject {
 
     // MARK: - Workspace Switch Handling
 
+    /// Catalog ownership is bookkeeping, not permission authority. Same-owner hydration must
+    /// retain live messages, queries and pins; explicit per-session reload still reads disk.
+    func prepareChatSessionCatalog(for workspace: WorkspaceModel) {
+        let storagePath = workspace.customStoragePath?.standardizedFileURL
+        if chatSessionCatalogWorkspaceID != nil,
+           chatSessionCatalogWorkspaceID != workspace.id || chatSessionCatalogStoragePath != storagePath
+        {
+            invalidateWorkspaceChatSessionLoads()
+            sessions.removeAll()
+            dropMessagesSafely()
+            cleanupShadowHolders()
+            clearAllSessionStorage()
+            currentSessionID = nil
+        }
+        chatSessionCatalogWorkspaceID = workspace.id
+        chatSessionCatalogStoragePath = storagePath
+    }
+
+    /// Logical deletion invalidates every older disk snapshot, including disk-only entries.
+    func invalidateWorkspaceChatSessionLoads() {
+        workspaceChatSessionLoadGeneration += 1
+    }
+
+    /// Capture before deletion suspends; an old owner must not invalidate a successor's restore.
+    func captureChatSessionCatalogDeletionFence(
+        for workspaceID: UUID?, sessionID: UUID? = nil
+    ) -> (invalidate: @MainActor () -> Void, isCurrent: @MainActor () -> Bool) {
+        let ownerID = chatSessionCatalogWorkspaceID
+        let storagePath = chatSessionCatalogStoragePath
+        // Legacy disk headers can omit workspaceID. Only exact current-catalog membership
+        // supplies that bookkeeping fallback; it never grants continuation or routing authority.
+        let belongsToOwner = workspaceID == ownerID ||
+            (workspaceID == nil && sessions.contains { $0.id == sessionID })
+        let isCurrent: @MainActor () -> Bool = { [weak self] in
+            guard let self else { return false }
+            return chatSessionCatalogWorkspaceID == ownerID && chatSessionCatalogStoragePath == storagePath
+        }
+        return ({ [weak self] in
+            guard let self, ownerID != nil, belongsToOwner, isCurrent() else { return }
+            invalidateWorkspaceChatSessionLoads()
+        }, isCurrent)
+    }
+
+    private func isActiveChatWorkspace(_ workspace: WorkspaceModel?) -> Bool {
+        workspace?.id == workspaceManager.activeWorkspace?.id &&
+            workspace?.customStoragePath?.standardizedFileURL == workspaceManager.activeWorkspace?.customStoragePath?.standardizedFileURL
+    }
+
     @MainActor
     private func handleWorkspaceSwitched(to newWorkspace: WorkspaceModel?) async {
-        workspaceChatSessionLoadGeneration += 1
+        // A delayed listener callback must not clear a newer workspace's runtime ownership.
+        guard isActiveChatWorkspace(newWorkspace) else { return }
+        if let newWorkspace { prepareChatSessionCatalog(for: newWorkspace) }
+        invalidateWorkspaceChatSessionLoads()
         let chatSessionLoadGeneration = workspaceChatSessionLoadGeneration
 
         #if DEBUG
@@ -1986,6 +2064,8 @@ class OracleViewModel: ObservableObject {
         #endif
         // If there's no new workspace, clear sessions or do fallback
         guard let workspace = newWorkspace else {
+            chatSessionCatalogWorkspaceID = nil
+            chatSessionCatalogStoragePath = nil
             // Clear sessions
             #if DEBUG
                 let clearStateStartMS = restorePerfRecorder.timestampMSIfEnabled()
@@ -2021,11 +2101,6 @@ class OracleViewModel: ObservableObject {
         #if DEBUG
             let clearStateStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
-        sessions.removeAll()
-        dropMessagesSafely()
-        cleanupShadowHolders()
-        clearAllSessionStorage()
-        currentSessionID = nil
         #if DEBUG
             restorePerfRecorder.event(
                 "chat.workspaceSwitch.clearState",
@@ -2065,8 +2140,12 @@ class OracleViewModel: ObservableObject {
                 maxConcurrent: workspaceSwitchChatStubLoadConcurrency
             )
 
+            #if DEBUG
+                await workspaceChatSessionLoadBeforePublicationForTesting?(workspace.id, chatSessionLoadGeneration)
+            #endif
+
             guard chatSessionLoadGeneration == workspaceChatSessionLoadGeneration,
-                  workspaceManager.activeWorkspace?.id == workspace.id
+                  isActiveChatWorkspace(workspace)
             else {
                 #if DEBUG
                     restorePerfRecorder.event(
@@ -2099,7 +2178,10 @@ class OracleViewModel: ObservableObject {
             for failure in batch.failures {
                 print("Could not load session at \(failure.fileURL): \(failure.message)")
             }
-            sessions = batch.sessions
+            // Live entries may have been admitted or updated after the disk snapshot began.
+            // Never replace their authority, loaded messages or active query ownership with stubs.
+            let liveIDs = Set(sessions.map(\.id))
+            sessions.append(contentsOf: batch.sessions.filter { !liveIDs.contains($0.id) })
             #if DEBUG
                 restorePerfRecorder.event(
                     "chat.workspaceSwitch.loadStubs",
@@ -2131,7 +2213,7 @@ class OracleViewModel: ObservableObject {
         }
 
         guard chatSessionLoadGeneration == workspaceChatSessionLoadGeneration,
-              workspaceManager.activeWorkspace?.id == workspace.id
+              isActiveChatWorkspace(workspace)
         else {
             #if DEBUG
                 restorePerfRecorder.event(
@@ -2148,10 +2230,9 @@ class OracleViewModel: ObservableObject {
             return
         }
 
-        // The call below will create a fresh "New Chat". We do NOT want to
-        // autosave that blank session immediately, otherwise it would clobber
-        // the workspace’s restored file selection.  Set a one-shot guard flag.
-        skipAutosaveCurrentSessionOnce = true
+        // Suppression belongs only to implicit restoration, never a retained live chat.
+        skipAutosaveCurrentSessionOnce = currentSessionID == nil
+        defer { skipAutosaveCurrentSessionOnce = false }
 
         #if DEBUG
             let ensureActiveSessionStartMS = restorePerfRecorder.timestampMSIfEnabled()
@@ -2199,6 +2280,11 @@ class OracleViewModel: ObservableObject {
         setActiveForTab: Bool = true,
         reuseBlankSession: Bool = true
     ) async -> UUID? {
+        if let activeWorkspace = workspaceManager.activeWorkspace,
+           workspaceID == nil || workspaceID == activeWorkspace.id
+        {
+            prepareChatSessionCatalog(for: activeWorkspace)
+        }
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         // If there's already a blank session with that name, just switch to it
@@ -3958,8 +4044,10 @@ class OracleViewModel: ObservableObject {
     @MainActor
     func cancelAIResponse(
         in sessionID: UUID, skipPartialParseAndSave: Bool = false,
-        contextBuilderSuccessor: ContextBuilderOracleLaneScope? = nil
+        contextBuilderSuccessor: ContextBuilderOracleLaneScope? = nil,
+        cleanupOwnerIsCurrent: (@MainActor () -> Bool)? = nil
     ) async {
+        guard cleanupOwnerIsCurrent?() != false else { return }
         if let query = runStateBySession[sessionID]?.activeQueryId, let scope = contextBuilderScopes[query] {
             await scope.cancelAndDrain()
             return
@@ -3976,8 +4064,24 @@ class OracleViewModel: ObservableObject {
         if let streamId {
             await aiQueriesService.cancelStream(id: streamId)
         }
+        #if DEBUG
+            await workspaceChatSessionCancellationBeforeCleanupForTesting?(sessionID, qid)
+        #endif
         if let qid {
             streamIDsByQueryId.removeValue(forKey: qid)
+        }
+
+        // Deletion may suspend across a workspace/root switch or a replacement query.
+        // Retire only the captured query; never clear its same-UUID successor's runtime state.
+        if let cleanupOwnerIsCurrent,
+           !cleanupOwnerIsCurrent() || runStateBySession[sessionID]?.activeQueryId != qid
+        {
+            if let qid {
+                cancelFinalizationWatchdog(for: qid)
+                clearStreamActivityTracking(for: qid)
+                await concludeFinalisation(qid, outcome: .cancelled)
+            }
+            return
         }
 
         if contextBuilderSuccessor != nil {
@@ -4043,10 +4147,11 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    func cancelAllActiveSessionStreams() async {
+    func cancelAllActiveSessionStreams(cleanupOwnerIsCurrent: (@MainActor () -> Bool)? = nil) async {
         let activeSessions = Array(streamingSessions)
         for sessionID in activeSessions {
-            await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+            guard cleanupOwnerIsCurrent?() != false else { return }
+            await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true, cleanupOwnerIsCurrent: cleanupOwnerIsCurrent)
         }
     }
 
