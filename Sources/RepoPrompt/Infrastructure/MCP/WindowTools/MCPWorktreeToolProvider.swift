@@ -74,6 +74,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
             **Output**:
             - Management op JSON includes repository/worktree IDs, visual identity, bindings, previous_binding on replacement, and graph placeholders.
+            - `list` paginates: default \(Self.defaultWorktreeListLimit) worktrees per call. Response includes `total_count` and `truncated`; use `offset` to page forward.
             - Merge op JSON keeps merge details under the nested `merge` block.
             - Formatted output is compact and stable for humans.
             """,
@@ -88,6 +89,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     "session_id": .string(description: "Target Agent session for bind/select/unbind, or create with bind=true."),
                     "include_status": .boolean(description: "Include a compact dirty summary for each returned worktree. Default false."),
                     "persist_visuals": .boolean(description: "For list/show, persist fallback visual identities instead of returning deterministic fallbacks only."),
+                    "limit": .integer(description: "List: maximum worktrees to return. Default \(Self.defaultWorktreeListLimit); clamped to 1...\(Self.maxWorktreeListLimit). Use with offset to page through large repos."),
+                    "offset": .integer(description: "List: zero-based index of the first worktree to return. Use with total_count and limit to page forward."),
                     "branch": .string(description: "Create: branch name to create/check out."),
                     "base_ref": .string(description: "Create: optional base ref/commit for the new worktree."),
                     "path": .string(description: "Create: explicit absolute worktree path. External paths require allow_external_path=true."),
@@ -155,6 +158,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         }
     }
 
+    private static let defaultWorktreeListLimit = 50
+    private static let maxWorktreeListLimit = 200
+
     private func executeList(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
         let allWorktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
@@ -166,23 +172,34 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let omittedPrunableCount = allWorktrees.count - worktrees.count
         let includeStatus = parseBool(args["include_status"]) ?? false
         let persistVisuals = parseBool(args["persist_visuals"]) ?? false
+        // Default limit keeps responses well within MCP client result size constraints.
+        // Callers can raise up to maxWorktreeListLimit or use an offset to page forward.
+        let rawLimit = args["limit"]?.intValue.map { max(1, min($0, Self.maxWorktreeListLimit)) }
+        let limit = rawLimit ?? Self.defaultWorktreeListLimit
+        let offset = args["offset"]?.intValue.map { max(0, $0) } ?? 0
+        let pagedWorktrees = Array(worktrees.dropFirst(offset).prefix(limit))
+        let isTruncated = offset + pagedWorktrees.count < worktrees.count
         if persistVisuals {
-            if !worktrees.isEmpty {
+            if !pagedWorktrees.isEmpty {
                 let logicalRoot = try await logicalRoot(for: context)
                 try await admitLogicalMutationRoots([logicalRoot.standardizedFullPath])
             }
             try await MCPDomainMutationCommitContext.willCommit()
         }
-        let dtos = try await worktrees.asyncMap { worktree in
+        let dtos = try await pagedWorktrees.asyncMap { worktree in
             try await worktreeDTO(worktree, includeStatus: includeStatus, persistVisuals: persistVisuals)
         }
-        let warning: String? = if dtos.isEmpty {
-            "No worktrees found for repository."
-        } else if omittedPrunableCount > 0 {
-            "Omitted \(omittedPrunableCount) stale (prunable) worktree(s); run `git worktree prune` to remove them."
-        } else {
-            nil
+        var warningParts: [String] = []
+        if dtos.isEmpty && offset == 0 {
+            warningParts.append("No worktrees found for repository.")
         }
+        if omittedPrunableCount > 0 {
+            warningParts.append("Omitted \(omittedPrunableCount) stale (prunable) worktree(s); run `git worktree prune` to remove them.")
+        }
+        if isTruncated {
+            warningParts.append("Results limited to \(limit) of \(worktrees.count) worktrees. Use offset=\(offset + limit) to continue.")
+        }
+        let warning: String? = warningParts.isEmpty ? nil : warningParts.joined(separator: " ")
         return await ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "list",
             repository: repositoryDTO(
@@ -190,6 +207,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 fallback: context.repo
             ),
             worktrees: dtos,
+            totalCount: worktrees.count,
+            truncated: isTruncated ? true : nil,
             graph: graphDTOIfRequested(args: args, repoURL: context.repo.rootURL),
             warning: warning
         )

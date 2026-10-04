@@ -96,6 +96,43 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         )
     }
 
+    func testListReplyEncodesPaginationFields() throws {
+        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "list",
+            repository: .init(
+                repositoryID: nil,
+                repoKey: "repo-x",
+                displayName: "X",
+                rootPath: "/tmp/repo-x",
+                commonGitDir: nil,
+                mainWorktreeRoot: nil
+            ),
+            worktrees: [Self.worktreeDTO()],
+            totalCount: 42,
+            truncated: true
+        )
+
+        let value = try Self.value(dto)
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["total_count"]?.intValue, 42)
+        XCTAssertEqual(object["truncated"]?.boolValue, true)
+        XCTAssertNil(object["totalCount"], "camelCase key must not appear in output")
+    }
+
+    func testListReplyOmitsTruncatedWhenNil() throws {
+        let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "list",
+            worktrees: [Self.worktreeDTO()],
+            totalCount: 1
+        )
+
+        let value = try Self.value(dto)
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["total_count"]?.intValue, 1)
+        // truncated omitted when nil (not a full result but no truncation to report)
+        XCTAssertNil(object["truncated"])
+    }
+
     private static func value(_ dto: some Encodable) throws -> Value {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]

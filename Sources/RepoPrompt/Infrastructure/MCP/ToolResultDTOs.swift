@@ -1623,6 +1623,10 @@ enum ToolResultDTOs {
         let repositories: [RepositoryDTO]?
         let worktree: WorktreeDTO?
         let worktrees: [WorktreeDTO]?
+        /// Total non-prunable worktree count before the `limit` slice; nil for ops that don't paginate.
+        let totalCount: Int?
+        /// True when `worktrees` is a bounded prefix of the full list.
+        let truncated: Bool?
         let createdWorktree: WorktreeDTO?
         let binding: BindingDTO?
         let bindings: [BindingDTO]?
@@ -1638,6 +1642,8 @@ enum ToolResultDTOs {
             repositories: [RepositoryDTO]? = nil,
             worktree: WorktreeDTO? = nil,
             worktrees: [WorktreeDTO]? = nil,
+            totalCount: Int? = nil,
+            truncated: Bool? = nil,
             createdWorktree: WorktreeDTO? = nil,
             binding: BindingDTO? = nil,
             bindings: [BindingDTO]? = nil,
@@ -1652,6 +1658,8 @@ enum ToolResultDTOs {
             self.repositories = repositories
             self.worktree = worktree
             self.worktrees = worktrees
+            self.totalCount = totalCount
+            self.truncated = truncated
             self.createdWorktree = createdWorktree
             self.binding = binding
             self.bindings = bindings
@@ -1663,7 +1671,8 @@ enum ToolResultDTOs {
         }
 
         private enum CodingKeys: String, CodingKey {
-            case op, repository, repositories, worktree, worktrees, binding, bindings, graph, merge, warning, error
+            case op, repository, repositories, worktree, worktrees, truncated, binding, bindings, graph, merge, warning, error
+            case totalCount = "total_count"
             case createdWorktree = "created_worktree"
             case previousBinding = "previous_binding"
         }

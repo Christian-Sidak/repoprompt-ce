@@ -1529,15 +1529,6 @@ actor HistorySessionScanner: HistorySessionScanning {
             return .result(cachedResult, counters)
         }
 
-        if counters.indexDecodes >= inventoryBudget.maxIndexDecodes {
-            return .stopped(HistoryScanDiagnostic(
-                kind: .indexCount,
-                limit: Int64(inventoryBudget.maxIndexDecodes),
-                consumed: Int64(counters.indexDecodes),
-                unit: .indexes,
-                phase: "index_decode"
-            ), counters)
-        }
         let indexBytes = max(0, indexSignature.fileSize)
         let effectiveFileLimit = min(requestBudget.maxIndexFileBytes, inventoryBudget.maxIndexFileBytes)
         if indexBytes > effectiveFileLimit {
@@ -1563,20 +1554,21 @@ actor HistorySessionScanner: HistorySessionScanning {
             return .stopped(diagnostic, counters)
         }
 
-        var updatedCounters = counters
-        updatedCounters.indexDecodes += 1
-        updatedCounters.indexBytes += indexBytes
-        indexDecodeCountForTesting += 1
+        // indexBytes are always consumed once the file is read; indexDecodes is reserved
+        // only for indexes that pass the schema-version sniff and undergo full JSON decode.
+        // Stale-schema indexes (wrong version) are cheap: they only pay the byte budget.
+        var byteCounters = counters
+        byteCounters.indexBytes += indexBytes
 
         do {
             let data = try Data(contentsOf: indexFile, options: .mappedIfSafe)
             try Task.checkCancellation()
             if let diagnostic = requestBudget.elapsedDiagnostic(phase: "index_read") {
-                return .stopped(diagnostic, updatedCounters)
+                return .stopped(diagnostic, byteCounters)
             }
             guard let schemaVersion = schemaVersionSniff(from: data) else {
                 removeCachedIndexScan(cacheKey)
-                return .result(result(indexReadFailed: true), updatedCounters, [HistoryScanDiagnostic(
+                return .result(result(indexReadFailed: true), byteCounters, [HistoryScanDiagnostic(
                     kind: .indexReadFailure,
                     limit: 1,
                     consumed: 1,
@@ -1595,7 +1587,7 @@ actor HistorySessionScanner: HistorySessionScanning {
             let identityDiagnostics = identityResolution.diagnostic.map { [$0] } ?? []
             try Task.checkCancellation()
             if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_identity") {
-                return .stopped(diagnostic, updatedCounters)
+                return .stopped(diagnostic, byteCounters)
             }
             guard schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
                 rememberIndexScan(
@@ -1609,10 +1601,26 @@ actor HistorySessionScanner: HistorySessionScanning {
                 )
                 return .result(
                     result(indexSchemaVersion: schemaVersion, identity: identity),
-                    updatedCounters,
+                    byteCounters,
                     identityDiagnostics
                 )
             }
+
+            // Reserve the decode slot only after confirming the schema version is current.
+            // Stale-version indexes are not fully decoded, so they must not exhaust the
+            // decode budget that guards against an unbounded number of current-schema decodes.
+            if counters.indexDecodes >= inventoryBudget.maxIndexDecodes {
+                return .stopped(HistoryScanDiagnostic(
+                    kind: .indexCount,
+                    limit: Int64(inventoryBudget.maxIndexDecodes),
+                    consumed: Int64(counters.indexDecodes),
+                    unit: .indexes,
+                    phase: "index_decode"
+                ), byteCounters)
+            }
+            var updatedCounters = byteCounters
+            updatedCounters.indexDecodes += 1
+            indexDecodeCountForTesting += 1
 
             if case let .insufficient(diagnostic) = requestBudget.remainingTimeDecision(
                 minimumRemaining: minimumTranscriptDecodeRemaining(for: indexBytes),
@@ -1639,10 +1647,10 @@ actor HistorySessionScanner: HistorySessionScanning {
             throw CancellationError()
         } catch let error as HistorySessionScannerError {
             if let diagnostic = error.scanDiagnostic {
-                return .stopped(diagnostic, updatedCounters)
+                return .stopped(diagnostic, byteCounters)
             }
             removeCachedIndexScan(cacheKey)
-            return .result(result(indexReadFailed: true), updatedCounters, [HistoryScanDiagnostic(
+            return .result(result(indexReadFailed: true), byteCounters, [HistoryScanDiagnostic(
                 kind: .indexReadFailure,
                 limit: 1,
                 consumed: 1,
@@ -1652,7 +1660,7 @@ actor HistorySessionScanner: HistorySessionScanning {
             )])
         } catch is DecodingError {
             removeCachedIndexScan(cacheKey)
-            return .result(result(indexReadFailed: true), updatedCounters, [HistoryScanDiagnostic(
+            return .result(result(indexReadFailed: true), byteCounters, [HistoryScanDiagnostic(
                 kind: .indexReadFailure,
                 limit: 1,
                 consumed: 1,
@@ -1662,7 +1670,7 @@ actor HistorySessionScanner: HistorySessionScanning {
             )])
         } catch {
             removeCachedIndexScan(cacheKey)
-            return .result(result(indexReadFailed: true), updatedCounters, [HistoryScanDiagnostic(
+            return .result(result(indexReadFailed: true), byteCounters, [HistoryScanDiagnostic(
                 kind: .indexReadFailure,
                 limit: 1,
                 consumed: 1,
