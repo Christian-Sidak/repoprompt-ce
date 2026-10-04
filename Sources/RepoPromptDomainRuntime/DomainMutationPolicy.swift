@@ -96,6 +96,10 @@ package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, Custom
     case peerExecutableMissing(processID: Int32)
     case runtimeIdentityMismatch
     case routingContextUnavailable
+    /// The run-scoped connection's routing binding has not been published yet. Unlike
+    /// `routingContextUnavailable`, this condition is transient: the binding publish is
+    /// in-flight from the window layer and the caller may retry after a brief delay.
+    case routingBindingPending
     case grantMissing
     case grantExpired
     case grantRevoked
@@ -117,6 +121,8 @@ package enum DomainMutationPolicyError: Error, Equatable, LocalizedError, Custom
             "Protected mutation denied because the runtime generation changed."
         case .routingContextUnavailable:
             "Protected mutation denied because the connection has no authoritative routing registration."
+        case .routingBindingPending:
+            "Protected mutation denied because the run-scoped routing binding has not been published yet. Retry after reconnecting or after the agent session binding completes."
         case .grantMissing:
             "Protected mutation denied because no active grant covers this operation."
         case .grantExpired:
@@ -219,6 +225,13 @@ package actor DomainMutationPolicyStore {
             )
         }
         guard context.hasAuthoritativeRoutingContext else {
+            // A run-scoped connection whose binding has not landed yet is a transient condition:
+            // the window layer publishes the binding asynchronously on a serialized task chain.
+            // Surface a specific retryable error so callers can distinguish it from a permanent
+            // denial (e.g. wrong principal kind, revoked grant) and retry instead of giving up.
+            if context.principal.kind == .runScoped {
+                throw DomainMutationPolicyError.routingBindingPending
+            }
             throw DomainMutationPolicyError.routingContextUnavailable
         }
         let hasEphemeralGrant = context.ephemeralGrantedToolNames.contains(toolName)

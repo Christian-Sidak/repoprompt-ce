@@ -33,11 +33,16 @@ package enum MCPDomainProtectedMutationSettlementContext {
 }
 
 package enum DomainProtectedMutationError: Error, Equatable, LocalizedError {
-    case partialSuccessAfterCommit(operationID: String)
+    /// The mutation crossed its durable commit boundary but settlement was interrupted.
+    /// `underlyingErrorCategory` is a bounded, privacy-safe label derived from the underlying
+    /// error (e.g. "cancelled", "routingBindingPending", "policyError", "journalError",
+    /// "unknown") and is safe to log and include in diagnostic output. It never contains
+    /// user content.
+    case partialSuccessAfterCommit(operationID: String, underlyingErrorCategory: String)
 
     package var settlement: DomainProtectedMutationSettlement {
         switch self {
-        case let .partialSuccessAfterCommit(operationID):
+        case let .partialSuccessAfterCommit(operationID, _):
             DomainProtectedMutationSettlement(
                 state: .indeterminateAfterCommit,
                 operationID: operationID
@@ -47,8 +52,8 @@ package enum DomainProtectedMutationError: Error, Equatable, LocalizedError {
 
     package var errorDescription: String? {
         switch self {
-        case let .partialSuccessAfterCommit(operationID):
-            "Protected mutation crossed its durable commit boundary but reply settlement was interrupted. Inspect state before retrying operation ID \(operationID)."
+        case let .partialSuccessAfterCommit(operationID, underlyingErrorCategory):
+            "Protected mutation crossed its durable commit boundary but reply settlement was interrupted (\(underlyingErrorCategory)). Inspect state before retrying operation ID \(operationID)."
         }
     }
 }
@@ -284,7 +289,8 @@ package struct MCPDomainProtectedMutationToolProvider {
                     try await finishIndeterminateAfterCommitAndThrow(
                         journal: journal,
                         ticket: ticket,
-                        operationID: operationID
+                        operationID: operationID,
+                        underlyingError: CancellationError()
                     )
                 }
                 try await detachedFinishApplied(journal: journal, ticket: ticket, result: result)
@@ -298,7 +304,8 @@ package struct MCPDomainProtectedMutationToolProvider {
                     try await finishIndeterminateAfterCommitAndThrow(
                         journal: journal,
                         ticket: ticket,
-                        operationID: operationID
+                        operationID: operationID,
+                        underlyingError: error
                     )
                 }
                 do {
@@ -418,17 +425,36 @@ package struct MCPDomainProtectedMutationToolProvider {
         }.value
     }
 
+    /// Returns a bounded, privacy-safe category label for the underlying error.
+    /// The label is safe to log; it never contains user content, file paths, or message text.
+    private static func errorCategory(for error: Error?) -> String {
+        guard let error else { return "cancelled" }
+        if MCPToolExecutionCancelledError.matches(error) { return "cancelled" }
+        switch error {
+        case is DomainMutationPolicyError:
+            return "policyError"
+        case is DomainMutationJournalError:
+            return "journalError"
+        default:
+            return "unknown"
+        }
+    }
+
     private static func finishIndeterminateAfterCommitAndThrow(
         journal: DomainMutationJournal,
         ticket: DomainMutationJournalTicket,
-        operationID: String
+        operationID: String,
+        underlyingError: Error? = nil
     ) async throws -> Never {
         try? await detachedFinishIndeterminate(journal: journal, ticket: ticket)
         MCPDomainProtectedMutationSettlementContext.report(
             .indeterminateAfterCommit,
             operationID: operationID
         )
-        throw DomainProtectedMutationError.partialSuccessAfterCommit(operationID: operationID)
+        throw DomainProtectedMutationError.partialSuccessAfterCommit(
+            operationID: operationID,
+            underlyingErrorCategory: errorCategory(for: underlyingError)
+        )
     }
 }
 

@@ -483,7 +483,9 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
         }
 
-        let staleRouting = fixture.context(
+        // A run-scoped connection whose binding has not landed yet gets routingBindingPending,
+        // not the permanent routingContextUnavailable used for non-run-scoped connections.
+        let pendingBinding = fixture.context(
             kind: .runScoped,
             assurance: .hostLaunchToken,
             authorizedCanonicalRoots: [allowedRoot],
@@ -491,11 +493,11 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: ["manage_workspaces"]
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(staleRouting) {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(pendingBinding) {
                 try await binding(["action": .string("add_folder"), "folder_path": .string(inside)])
             }
         ) { error in
-            XCTAssertEqual(error as? DomainMutationPolicyError, .routingContextUnavailable)
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingBindingPending)
         }
         let callCount = await calls.value
         XCTAssertEqual(callCount, 1)
@@ -590,6 +592,143 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         } catch let error as DomainMutationPolicyError {
             XCTAssertEqual(error, .policyRevisionConflict(expected: 0, actual: 1))
         }
+    }
+
+    func testRunScopedPendingBindingIsRetryableAndNonRunScopedIsStillPermanentDenial() async throws {
+        let fixture = try RuntimeFixture(mode: .standalone)
+        let calls = CallCounter()
+        let binding = fixture.protectedBinding(toolName: "bind_context", calls: calls)
+
+        // A run-scoped connection with no routing context yet gets the retryable
+        // routingBindingPending error, not the permanent routingContextUnavailable.
+        let runScopedPending = fixture.context(
+            kind: .runScoped,
+            assurance: .verifiedProcess,
+            hasAuthoritativeRoutingContext: false,
+            ephemeralGrantedToolNames: ["bind_context"]
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.$current.withValue(runScopedPending) {
+                try await binding(["op": .string("bind")])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingBindingPending)
+            let rendered = "\(error as! DomainMutationPolicyError)"
+            XCTAssertTrue(rendered.contains("Retry"), rendered)
+        }
+
+        // A non-run-scoped connection with no routing context still gets the permanent
+        // routingContextUnavailable; the retryable path is gated to runScoped only.
+        let appProxyNoRouting = fixture.context(
+            kind: .appProxy,
+            assurance: .verifiedProcess,
+            hasAuthoritativeRoutingContext: false,
+            ephemeralGrantedToolNames: []
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.$current.withValue(appProxyNoRouting) {
+                try await binding(["op": .string("bind")])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingContextUnavailable)
+        }
+
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 0)
+    }
+
+    func testPartialSuccessAfterCommitCarriesUnderlyingErrorCategory() async throws {
+        let fixture = try RuntimeFixture(mode: .standalone)
+        // manage_worktree.select is a durable mutation that does not require physical admission,
+        // so willCommit() succeeds and the binding can fail post-commit to exercise the category.
+        let context = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            authorizedCanonicalRoots: [],
+            ephemeralGrantedToolNames: ["manage_worktree"]
+        )
+        let binding = MCPDomainToolBinding(
+            definition: MCPDomainToolDefinition(
+                name: "manage_worktree",
+                description: "fixture",
+                inputSchema: .object(["type": .string("object")]),
+                annotations: .init(readOnlyHint: false, destructiveHint: true)
+            ),
+            operation: { _ in
+                try await MCPDomainMutationCommitContext.willCommit()
+                // Fail after commit has begun; settlement must be indeterminate and carry
+                // a bounded error category derived from the underlying error type.
+                throw DomainMutationPolicyError.routingBindingPending
+            }
+        )
+        let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+
+        var settlementState: DomainProtectedMutationState?
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                settlementState = settlement.state
+            }) {
+                try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+                    try await protectedBinding(["op": .string("select"), "name": .string("main")])
+                }
+            }
+        ) { error in
+            guard let mutationError = error as? DomainProtectedMutationError,
+                  case let .partialSuccessAfterCommit(_, category) = mutationError
+            else {
+                XCTFail("Expected partialSuccessAfterCommit, got \(error)")
+                return
+            }
+            XCTAssertEqual(category, "policyError")
+            let rendered = "\(mutationError)"
+            XCTAssertTrue(rendered.contains("policyError"), rendered)
+            XCTAssertTrue(rendered.contains("Inspect state"), rendered)
+        }
+        XCTAssertEqual(settlementState, .indeterminateAfterCommit)
+
+        let journal = try await fixture.runtime.mutationJournal.snapshot()
+        let record = try XCTUnwrap(journal.recordSnapshots.first)
+        XCTAssertEqual(record.toolName, "manage_worktree")
+        XCTAssertEqual(record.status, .indeterminateAfterCommit)
+    }
+
+    func testRoutingBindingPendingCategoryInPartialSuccessAfterCommit() async throws {
+        // Verify that routingBindingPending specifically maps to "policyError" category,
+        // keeping the category bounded and not leaking error internals.
+        let fixture = try RuntimeFixture(mode: .standalone)
+        let context = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            authorizedCanonicalRoots: [],
+            ephemeralGrantedToolNames: ["manage_worktree"]
+        )
+        var capturedCategory: String?
+        let binding = MCPDomainToolBinding(
+            definition: MCPDomainToolDefinition(
+                name: "manage_worktree",
+                description: "fixture",
+                inputSchema: .object(["type": .string("object")]),
+                annotations: .init(readOnlyHint: false, destructiveHint: true)
+            ),
+            operation: { _ in
+                try await MCPDomainMutationCommitContext.willCommit()
+                throw DomainMutationJournalError.writerConflict
+            }
+        )
+        let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+                try await protectedBinding(["op": .string("select"), "name": .string("main")])
+            }
+        ) { error in
+            if let mutationError = error as? DomainProtectedMutationError,
+               case let .partialSuccessAfterCommit(_, category) = mutationError
+            {
+                capturedCategory = category
+            }
+        }
+        // Journal errors map to "journalError" category.
+        XCTAssertEqual(capturedCategory, "journalError")
     }
 
     private func operation(_ toolName: String, _ arguments: [String: Value]) -> DomainProtectedMutationOperation? {
