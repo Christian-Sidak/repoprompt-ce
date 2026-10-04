@@ -32,10 +32,10 @@ package enum MCPDomainProtectedMutationSettlementContext {
     }
 }
 
-package enum DomainProtectedMutationError: Error, Equatable, LocalizedError {
+package enum DomainProtectedMutationError: Error, Equatable, LocalizedError, CustomStringConvertible {
     /// The mutation crossed its durable commit boundary but settlement was interrupted.
     /// `underlyingErrorCategory` is a bounded, privacy-safe label derived from the underlying
-    /// error (e.g. "cancelled", "routingBindingPending", "policyError", "journalError",
+    /// error (e.g. "cancelled", "policyError", "journalError",
     /// "unknown") and is safe to log and include in diagnostic output. It never contains
     /// user content.
     case partialSuccessAfterCommit(operationID: String, underlyingErrorCategory: String)
@@ -50,11 +50,15 @@ package enum DomainProtectedMutationError: Error, Equatable, LocalizedError {
         }
     }
 
-    package var errorDescription: String? {
+    package var description: String {
         switch self {
         case let .partialSuccessAfterCommit(operationID, underlyingErrorCategory):
             "Protected mutation crossed its durable commit boundary but reply settlement was interrupted (\(underlyingErrorCategory)). Inspect state before retrying operation ID \(operationID)."
         }
+    }
+
+    package var errorDescription: String? {
+        description
     }
 }
 

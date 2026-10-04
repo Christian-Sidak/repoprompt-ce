@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import os
 @testable import RepoPromptDomainRuntime
 import XCTest
 
@@ -483,9 +484,8 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
         }
 
-        // A run-scoped connection whose binding has not landed yet gets routingBindingPending,
-        // not the permanent routingContextUnavailable used for non-run-scoped connections.
-        let pendingBinding = fixture.context(
+        // An unresolved run-scoped binding fails closed without assuming publication is pending.
+        let unavailableBinding = fixture.context(
             kind: .runScoped,
             assurance: .hostLaunchToken,
             authorizedCanonicalRoots: [allowedRoot],
@@ -493,11 +493,11 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: ["manage_workspaces"]
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(pendingBinding) {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(unavailableBinding) {
                 try await binding(["action": .string("add_folder"), "folder_path": .string(inside)])
             }
         ) { error in
-            XCTAssertEqual(error as? DomainMutationPolicyError, .routingBindingPending)
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingBindingUnavailable)
         }
         let callCount = await calls.value
         XCTAssertEqual(callCount, 1)
@@ -594,31 +594,31 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         }
     }
 
-    func testRunScopedPendingBindingIsRetryableAndNonRunScopedIsStillPermanentDenial() async throws {
+    func testMissingRunScopedBindingAndNonRunScopedRoutingFailClosed() async throws {
         let fixture = try RuntimeFixture(mode: .standalone)
         let calls = CallCounter()
         let binding = fixture.protectedBinding(toolName: "bind_context", calls: calls)
 
-        // A run-scoped connection with no routing context yet gets the retryable
-        // routingBindingPending error, not the permanent routingContextUnavailable.
-        let runScopedPending = fixture.context(
+        // Missing routing is not evidence of an in-flight publish, including in headless mode.
+        let runScopedUnavailable = fixture.context(
             kind: .runScoped,
             assurance: .verifiedProcess,
             hasAuthoritativeRoutingContext: false,
             ephemeralGrantedToolNames: ["bind_context"]
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(runScopedPending) {
+            try await MCPDomainInvocationSecurityContext.$current.withValue(runScopedUnavailable) {
                 try await binding(["op": .string("bind")])
             }
         ) { error in
-            XCTAssertEqual(error as? DomainMutationPolicyError, .routingBindingPending)
-            let rendered = "\(error as! DomainMutationPolicyError)"
-            XCTAssertTrue(rendered.contains("Retry"), rendered)
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingBindingUnavailable)
+            let rendered = error.localizedDescription
+            XCTAssertTrue(rendered.contains("unavailable"), rendered)
+            XCTAssertFalse(rendered.contains("has not been published yet"), rendered)
+            XCTAssertFalse(rendered.contains("Retry after"), rendered)
         }
 
-        // A non-run-scoped connection with no routing context still gets the permanent
-        // routingContextUnavailable; the retryable path is gated to runScoped only.
+        // Non-run-scoped connections retain their existing fail-closed denial.
         let appProxyNoRouting = fixture.context(
             kind: .appProxy,
             assurance: .verifiedProcess,
@@ -658,15 +658,15 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
                 try await MCPDomainMutationCommitContext.willCommit()
                 // Fail after commit has begun; settlement must be indeterminate and carry
                 // a bounded error category derived from the underlying error type.
-                throw DomainMutationPolicyError.routingBindingPending
+                throw DomainMutationPolicyError.routingBindingUnavailable
             }
         )
         let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
 
-        var settlementState: DomainProtectedMutationState?
+        let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
         await XCTAssertThrowsErrorAsync(
             try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
-                settlementState = settlement.state
+                settlementState.withLock { $0 = settlement.state }
             }) {
                 try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
                     try await protectedBinding(["op": .string("select"), "name": .string("main")])
@@ -683,8 +683,10 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             let rendered = "\(mutationError)"
             XCTAssertTrue(rendered.contains("policyError"), rendered)
             XCTAssertTrue(rendered.contains("Inspect state"), rendered)
+            XCTAssertEqual(rendered, error.localizedDescription)
+            XCTAssertEqual("\(error)", rendered)
         }
-        XCTAssertEqual(settlementState, .indeterminateAfterCommit)
+        XCTAssertEqual(settlementState.withLock { $0 }, .indeterminateAfterCommit)
 
         let journal = try await fixture.runtime.mutationJournal.snapshot()
         let record = try XCTUnwrap(journal.recordSnapshots.first)
@@ -692,9 +694,8 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         XCTAssertEqual(record.status, .indeterminateAfterCommit)
     }
 
-    func testRoutingBindingPendingCategoryInPartialSuccessAfterCommit() async throws {
-        // Verify that routingBindingPending specifically maps to "policyError" category,
-        // keeping the category bounded and not leaking error internals.
+    func testJournalErrorCategoryInPartialSuccessAfterCommit() async throws {
+        // A post-commit journal error retains a bounded category without leaking error internals.
         let fixture = try RuntimeFixture(mode: .standalone)
         let context = fixture.context(
             kind: .runScoped,
